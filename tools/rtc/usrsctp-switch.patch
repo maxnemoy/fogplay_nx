@@ -1,0 +1,16 @@
+diff --git a/usrsctplib/user_environment.c b/usrsctplib/user_environment.c
+index ea52f0a..d9782fa 100755
+--- a/usrsctplib/user_environment.c
++++ b/usrsctplib/user_environment.c
+@@ -379,6 +379,11 @@ finish_random(void)
+ {
+ 	return;
+ }
++#elif defined(__SWITCH__)
++#include <switch.h>
++void init_random(void) {}
++void read_random(void *buf, size_t size) { randomGet(buf, size); }
++void finish_random(void) {}
+ #else
+ #error "Unknown platform. Please provide platform specific RNG."
+ #endif

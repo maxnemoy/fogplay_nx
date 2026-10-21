@@ -1,0 +1,29 @@
+--- a/libavcodec/nvtegra_decode.c
++++ b/libavcodec/nvtegra_decode.c
+@@ -176,15 +176,23 @@
+     mem = av_nvtegra_map_get_addr(input_map);
+ 
+     err = av_nvtegra_syncpt_wait(ctx->channel, tf->fence, -1);
+-    if (err < 0)
+-        return err;
++    if (err < 0) {
++        av_log(logctx, AV_LOG_ERROR, "FOG_NVDEC_WAIT_V1 code=%d\n", err);
++        return err;
++    }
+ 
+     tf->in_flight = false;
+ 
+     if (!ctx->is_nvjpg) {
+         nvdec_status = (nvdec_status_s *)(mem + ctx->status_off);
+-        if (nvdec_status->error_status != 0 || nvdec_status->mbs_in_error != 0)
++        if (nvdec_status->error_status != 0 || nvdec_status->mbs_in_error != 0) {
++            av_log(logctx, AV_LOG_ERROR,
++                   "FOG_NVDEC_STATUS_V1 error_status=%u mbs_error=%u mbs_ok=%u cycles_raw=%u slice_header_error=%u\n",
++                   nvdec_status->error_status, nvdec_status->mbs_in_error,
++                   nvdec_status->mbs_correctly_decoded, nvdec_status->cycle_count,
++                   nvdec_status->slice_header_error_code);
+             return AVERROR_UNKNOWN;
++        }
+ 
+         decode_cycles = nvdec_status->cycle_count * 16;
+     } else {

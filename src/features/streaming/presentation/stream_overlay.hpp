@@ -1,0 +1,57 @@
+#pragma once
+#include "features/settings/domain/video_settings.hpp"
+#include <cstddef>
+#include <string>
+
+struct SDL_Renderer;
+namespace fog::ui { class Ui; }
+
+namespace fog::stream {
+enum class OverlayMode { Closed, Menu, Mouse, Keyboard, ImageSettings, StopConfirm };
+enum class OverlayActionType { None, SendText, Enter, Tab, Backspace, Escape, StopSession, SettingsChanged, RequestKeyframe };
+struct OverlayAction {
+    OverlayActionType type = OverlayActionType::None;
+    std::string text;
+};
+// Main-thread state and drawing only: no applets, IO, media pumping or presentation.
+// Controller directions are discrete/repeated presses supplied by the caller.
+class Overlay {
+public:
+    static constexpr std::size_t MaxTextBytes = 512;
+    static constexpr int KeyboardKeyCount = 59;
+    OverlayMode mode() const { return mode_; }
+    int selection() const { return selection_; }
+    const std::string& text() const { return text_; }
+    bool russian() const { return russian_; }
+    bool uppercase() const { return uppercase_; }
+    void openMenu();
+    void close(); // Discards unsent local text.
+    void up();
+    void down();
+    OverlayAction left();
+    OverlayAction right();
+    void setVideoSettings(const video::Settings& value) { videoSettings_ = value; }
+    const video::Settings& videoSettings() const { return videoSettings_; }
+    void setVideoStatus(const std::string& value) { videoStatus_ = value; }
+    void setSaveStatus(const std::string& value) { saveStatus_ = value; }
+    OverlayAction select();
+    OverlayAction back();
+    // Coordinates in the UI's logical 1280x720 space. Activates only hit buttons.
+    OverlayAction touch(int x, int y);
+    void paint(ui::Ui& ui, SDL_Renderer* renderer) const;
+    // Atomic append: rejects malformed UTF-8, embedded control bytes and overflow.
+    bool appendText(const std::string& value);
+    void eraseLast();
+private:
+    void move(int horizontal, int vertical);
+    OverlayAction adjustVideo(int direction);
+    std::string keyLabel(int index) const;
+    OverlayMode mode_ = OverlayMode::Closed;
+    int selection_ = 0;
+    bool russian_ = false;
+    bool uppercase_ = false;
+    std::string text_;
+    video::Settings videoSettings_;
+    std::string videoStatus_, saveStatus_;
+};
+}

@@ -1,0 +1,221 @@
+#include "features/streaming/infrastructure/media.hpp"
+#include "features/streaming/domain/media_annexb.hpp"
+#include <SDL.h>
+#include <opus/opus.h>
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/error.h>
+#include <libavutil/buffer.h>
+}
+#include <array>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using Bytes = std::vector<unsigned char>;
+using Units = std::vector<Bytes>;
+static void check(bool condition, const char* error) {
+    if (!condition) throw std::runtime_error(error);
+}
+struct Parser {
+    AVCodecParserContext* parser = av_parser_init(AV_CODEC_ID_H264);
+    AVCodecContext* context = avcodec_alloc_context3(avcodec_find_decoder(AV_CODEC_ID_H264));
+    ~Parser() { if (parser) av_parser_close(parser); avcodec_free_context(&context); }
+};
+static Units load(const char* path) {
+    std::ifstream input(path, std::ios::binary);
+    Bytes bytes((std::istreambuf_iterator<char>(input)), {});
+    check(!bytes.empty(), "fixture empty");
+    const auto length = bytes.size();
+    bytes.resize(length + AV_INPUT_BUFFER_PADDING_SIZE);
+    Parser parser;
+    check(parser.parser && parser.context, "parser unavailable");
+    Units units;
+    std::size_t offset = 0;
+    while (offset < length) {
+        unsigned char* output = nullptr; int outputSize = 0;
+        const int used = av_parser_parse2(parser.parser, parser.context, &output, &outputSize,
+            bytes.data() + offset, static_cast<int>(length - offset), AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+        check(used >= 0 && (used || outputSize), "parser stalled");
+        offset += used;
+        if (outputSize) units.emplace_back(output, output + outputSize);
+    }
+    unsigned char* output = nullptr; int outputSize = 0;
+    av_parser_parse2(parser.parser, parser.context, &output, &outputSize, nullptr, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+    if (outputSize) units.emplace_back(output, output + outputSize);
+    check(units.size() >= 3, "fixture needs IDR and delta frames");
+    return units;
+}
+
+extern "C" SDL_Texture* __real_SDL_CreateTexture(SDL_Renderer*, Uint32, int, int, int);
+extern "C" int __real_SDL_UpdateYUVTexture(SDL_Texture*, const SDL_Rect*, const Uint8*, int, const Uint8*, int, const Uint8*, int);
+extern "C" int __real_avcodec_receive_frame(AVCodecContext*, AVFrame*);
+extern "C" int __real_av_hwframe_transfer_data(AVFrame*, const AVFrame*, int);
+static bool failCreation = false, failUpload = false, emulateHardwareFrame = false;
+static bool failTransfer = false;
+extern "C" int __wrap_avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
+    const int result = __real_avcodec_receive_frame(context, frame);
+    if (result == 0 && emulateHardwareFrame) {
+        emulateHardwareFrame = false;
+        // A reference-counted marker exercises dispatch/ownership only, not a GPU.
+        frame->hw_frames_ctx = av_buffer_alloc(1);
+        if (!frame->hw_frames_ctx) return AVERROR(ENOMEM);
+    }
+    return result;
+}
+extern "C" int __wrap_av_hwframe_transfer_data(AVFrame* destination, const AVFrame* source, int flags) {
+    if (failTransfer) { failTransfer = false; return AVERROR_EXTERNAL; }
+    return __real_av_hwframe_transfer_data(destination, source, flags);
+}
+extern "C" SDL_Texture* __wrap_SDL_CreateTexture(SDL_Renderer* renderer, Uint32 format, int access, int w, int h) {
+    if (failCreation) { failCreation = false; return nullptr; }
+    return __real_SDL_CreateTexture(renderer, format, access, w, h);
+}
+extern "C" int __wrap_SDL_UpdateYUVTexture(SDL_Texture* texture, const SDL_Rect* rect,
+    const Uint8* y, int ys, const Uint8* u, int us, const Uint8* v, int vs) {
+    if (failUpload) { failUpload = false; return -1; }
+    return __real_SDL_UpdateYUVTexture(texture, rect, y, ys, u, us, v, vs);
+}
+static void feed(fog::Media& media, const Bytes& bytes) {
+    media.video(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+}
+static std::uint64_t counter(const fog::Media& media, const char* name) {
+    const auto text = media.diagnostics();
+    const std::string key = std::string(name) + '=';
+    const auto pos = text.find(key);
+    check(pos != std::string::npos, "missing presentation counter");
+    return std::stoull(text.substr(pos + key.size()));
+}
+static Bytes snapshot(fog::Media& media, SDL_Renderer* renderer) {
+    check(media.draw(), "last texture unavailable");
+    Bytes pixels(1280 * 720 * 4);
+    check(SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_RGBA32, pixels.data(), 1280 * 4) == 0,
+        "renderer readback failed");
+    return pixels;
+}
+struct Reference {
+    Bytes first, last;
+    std::uint64_t decoded = 0;
+};
+static Reference reference(SDL_Renderer* renderer, const Units& units) {
+    fog::Media media(renderer);
+    Reference result;
+    feed(media, units.front());
+    result.first = snapshot(media, renderer);
+    for (std::size_t i = 1; i < units.size(); ++i) feed(media, units[i]);
+    result.last = snapshot(media, renderer);
+    result.decoded = media.videoFrames();
+    check(result.decoded == units.size(), "reference did not decode every AU");
+    check(counter(media, "uploaded_frames") == result.decoded, "immediate compatibility changed");
+    check(!media.preparePresentation(), "immediate caller retained an output");
+    return result;
+}
+static void test(SDL_Renderer* renderer, const Units& units, const Units& changed) {
+    const auto expected = reference(renderer, units);
+    const auto changedExpected = reference(renderer, changed);
+    check(expected.first != expected.last, "fixture must change between first and last output");
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    feed(media, units.front());
+    check(media.videoFrames() == 1 && media.videoWidth() == 640 && media.videoHeight() == 360,
+        "decoded metadata unavailable before presentation");
+    check(!media.draw(), "draw uploaded pending output");
+    for (std::size_t i = 1; i < units.size(); ++i) feed(media, units[i]);
+    check(media.videoFrames() == expected.decoded, "deferred batch dropped compressed/decode work");
+    check(counter(media, "uploaded_frames") == 0 && counter(media, "scale_calls") == 0 &&
+        counter(media, "upload_calls") == 0 && counter(media, "pending_frames") == 1 &&
+        counter(media, "superseded_frames") == expected.decoded - 1, "batch was not coalesced before conversion/upload");
+    check(media.preparePresentation(), "batch was not presented");
+    check(snapshot(media, renderer) == expected.last, "coalesced output differs from actual last decoded frame");
+    check(!media.preparePresentation(), "same pending output uploaded twice");
+    check(counter(media, "uploaded_frames") == 1 && counter(media, "upload_calls") == 1 &&
+        counter(media, "scale_calls") == 1 && counter(media, "pending_frames") == 0,
+        "batch did not produce exactly one scale/upload");
+
+    feed(media, units.front());
+    check(snapshot(media, renderer) == expected.last, "draw performed hidden presentation");
+    const auto decodedBeforeReset = media.videoFrames();
+    media.resetVideoDecoder();
+    check(media.videoFrames() == decodedBeforeReset && media.waitingForVideoKeyframe() &&
+        !media.preparePresentation() && snapshot(media, renderer) == expected.last,
+        "reset lost last texture or retained pending output");
+    feed(media, units[1]);
+    check(media.videoFrames() == decodedBeforeReset, "reset accepted delta before IDR");
+    feed(media, units.front());
+    check(media.videoFrames() == decodedBeforeReset + 1 && !media.waitingForVideoKeyframe() &&
+        media.preparePresentation() && snapshot(media, renderer) == expected.first, "next IDR did not recover");
+
+    feed(media, changed.front());
+    check(media.videoWidth() == 640 && media.videoHeight() == 480 &&
+        snapshot(media, renderer) == expected.first, "pending resolution changed last texture geometry");
+    media.resetVideoDecoder();
+    check(!media.preparePresentation() && media.videoWidth() == 640 && media.videoHeight() == 360 &&
+        snapshot(media, renderer) == expected.first, "resolution reset did not discard staged output");
+    feed(media, changed.front());
+    failCreation = true;
+    bool rejected = false;
+    try { media.preparePresentation(); } catch (const std::runtime_error&) { rejected = true; }
+    check(rejected && snapshot(media, renderer) == expected.first && counter(media, "pending_frames") == 1,
+        "texture allocation failure lost last good output");
+    failUpload = true;
+    rejected = false;
+    try { media.preparePresentation(); } catch (const std::runtime_error&) { rejected = true; }
+    check(rejected && snapshot(media, renderer) == expected.first, "candidate upload failure lost last good texture");
+    check(media.preparePresentation() && snapshot(media, renderer) == changedExpected.first,
+        "resolution transition could not retry after candidate failure");
+    feed(media, changed[1]);
+    media.setVideoCodec(stream::VideoCodec::H265);
+    check(!media.preparePresentation() && snapshot(media, renderer) == changedExpected.first,
+        "codec switch retained staged output or lost texture");
+    media.setVideoCodec(stream::VideoCodec::H264);
+    feed(media, units.front());
+    check(media.preparePresentation() && snapshot(media, renderer) == expected.first,
+        "H264 switch-back recovery failed");
+    for (unsigned i = 0; i < 32; ++i) {
+        feed(media, units[1]);
+        media.resetVideoDecoder();
+        check(!media.preparePresentation(), "repeated reset retained a frame reference");
+        feed(media, units.front());
+        check(media.preparePresentation(), "repeated deferred reset failed");
+    }
+    const auto visible = snapshot(media, renderer);
+    const auto uploadsBeforeFailure = counter(media, "uploaded_frames");
+    emulateHardwareFrame = true;
+    failTransfer = true;
+    feed(media, units[1]);
+    check(counter(media, "transfer_calls") == 0 && snapshot(media, renderer) == visible,
+        "video/draw performed deferred hardware transfer");
+    bool codecError = false;
+    try { media.preparePresentation(); }
+    catch (const fog::VideoDecodeError& error) {
+        codecError = error.code() == AVERROR_EXTERNAL && error.recoverable() &&
+            std::string(error.what()).find("hardware frame transfer") != std::string::npos;
+    }
+    check(codecError && counter(media, "transfer_calls") == 1 &&
+        counter(media, "uploaded_frames") == uploadsBeforeFailure && snapshot(media, renderer) == visible,
+        "transfer failure escaped presentation recovery boundary or lost texture");
+    media.resetVideoDecoder();
+    check(!media.preparePresentation(), "transfer-error reset retained pending hardware reference");
+    feed(media, units.front());
+    check(media.preparePresentation(), "IDR recovery after transfer failure failed");
+    std::cout << "PASS deferred H264: " << expected.decoded << " decoded AUs -> one upload, exact last-frame readback, "
+        "draw isolation, pending reset, next IDR, dimensions, allocation/upload faults, codec switch, 32 resets, "
+        "simulated hardware transfer error boundary\n";
+    std::cout << media.diagnostics() << '\n';
+}
+int main(int argc, char** argv) {
+    if (argc != 3) return 2;
+    SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+    SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) return 3;
+    auto* surface = SDL_CreateRGBSurfaceWithFormat(0, 1280, 720, 32, SDL_PIXELFORMAT_RGBA32);
+    auto* renderer = surface ? SDL_CreateSoftwareRenderer(surface) : nullptr;
+    if (!renderer) { if (surface) SDL_FreeSurface(surface); SDL_Quit(); return 4; }
+    int result = 0;
+    try { test(renderer, load(argv[1]), load(argv[2])); }
+    catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
+    SDL_DestroyRenderer(renderer); SDL_FreeSurface(surface); SDL_Quit();
+    return result;
+}

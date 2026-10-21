@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
+if ! python3 tools/rtc/manifest.py check host; then
+    bash tools/rtc/build.sh host
+fi
+mkdir -p work/logs
+flags=(-std=c++17 -Wall -Wextra -Werror -pthread -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1 -Isrc -Ithird_party -Ithird_party/rtc/host/include)
+libs=(-Lthird_party/rtc/host/lib -Wl,--start-group -ldatachannel -ljuice -lusrsctp -lsrtp2 -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -Wl,--end-group)
+g++ "${flags[@]}" tests/stream_queue_tests.cpp -o work/stream_queue_tests
+./work/stream_queue_tests | tee work/logs/stream-queue-tests.log
+g++ "${flags[@]}" tests/auto_quality_tests.cpp -o work/auto_quality_tests
+./work/auto_quality_tests | tee work/logs/auto-quality-tests.log
+g++ "${flags[@]}" -DSTREAM_RTC_TESTS src/features/streaming/infrastructure/stream.cpp src/features/streaming/infrastructure/stream_protocol.cpp tests/stream_tests.cpp "${libs[@]}" -o work/stream_tests_rtc
+./work/stream_tests_rtc | tee work/logs/stream-tests.log
+g++ "${flags[@]}" -DFOG_STREAM_TESTING src/features/streaming/infrastructure/stream.cpp src/features/streaming/infrastructure/stream_protocol.cpp src/features/streaming/application/remote_input.cpp tests/stream_integration.cpp "${libs[@]}" -o work/stream_integration
+timeout 45 ./work/stream_integration | tee work/logs/stream-integration.log
