@@ -199,7 +199,7 @@ private:
             event("profile-observed", now);
         }
         if (pending_ == Action::None) return;
-        if (server.profile.fresh(now) && server.profile.revision > pendingRevision_ && server.profile.value != from_) {
+        if (server.profile.fresh(now) && server.profile.revision > pendingRevision_ && server.profile.at >= pendingAt_ && server.profile.value != from_) {
             const bool right = pending_ == Action::Enhance ? server.profile.value > from_ : server.profile.value < from_;
             event(right ? "confirmed" : "rejected-profile", now);
             pending_ = Action::None; stable_ = false;

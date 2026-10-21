@@ -13,6 +13,8 @@
 #include "features/session/application/session.hpp"
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/video_recovery.hpp"
+#include "features/streaming/domain/transport_reconnect.hpp"
+#include "features/streaming/domain/stream_input_gate.hpp"
 #include "core/logging/run_log.hpp"
 #include "features/streaming/infrastructure/stream.hpp"
 #include "features/session/application/checkout.hpp"
@@ -77,6 +79,9 @@ private:
     void disarmExitHandling();
     std::string playbackTimings() const;
     void closeStream() noexcept;
+    bool closeTransport(bool final) noexcept;
+    bool startTransport();
+    void retryTransport(const char* reason);
     void shutdownSession() noexcept;
     void syncPending();
     void logCheckoutResult(Task phase);
@@ -97,6 +102,8 @@ private:
     SDL_Rect videoRect() const;
     bool sendRemote(const Json& command);
     void releaseMouse() noexcept;
+    void neutralizeStreamInput();
+    void suspendVideoInput();
     void overlayTransition();
     void changeVideoSettings(const fog::video::Settings& value, bool live);
     void inputImageSettings(u64 keys);
@@ -168,7 +175,8 @@ private:
     fog::controller::Settings controllerSettings_;
     bool firstFramePresented_ = false;
     std::string videoSaveStatus_ = "Изменения сохраняются сразу на SD.";
-    bool suppressStreamInput_ = false, touchWasDown_ = false, touchDrag_ = false;
+    fog::stream::StreamInputGate streamInputGate_;
+    bool touchWasDown_ = false, touchDrag_ = false;
     bool mouseLeft_ = false, mouseRight_ = false;
     float pointerX_ = 640.0f, pointerY_ = 360.0f;
     std::chrono::steady_clock::time_point mouseAt_{}, lastPointerSent_{}, overlayNoticeAt_{}, overlayHintAt_{};
@@ -176,6 +184,9 @@ private:
     std::string lastStreamState_, lastStreamDiagnostics_;
     std::unique_ptr<fog::Media> media_;
     fog::VideoRecovery videoRecovery_;
+    fog::stream::TransportReconnect transportReconnect_;
+    // Private rental identity, retained only until final close; never logged.
+    std::string streamHash_;
     std::uint64_t videoWorkUs_ = 0, videoDecodeErrors_ = 0, lastVideoGeneration_ = 0;
     PlaybackTiming drainTiming_, presentTiming_;
     std::uint64_t pumpGapMaxUs_ = 0, drainBudgetHits_ = 0, catchupWindows_ = 0;

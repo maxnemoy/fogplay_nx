@@ -17,7 +17,13 @@ void ApplicationController::drawStreamOverlay() {
     // Mouse instructions fade so they do not obscure remote fields/taskbar.
     if (overlay_.mode() != Mode::Mouse || std::chrono::steady_clock::now()-overlayHintAt_ < std::chrono::seconds(5))
         overlay_.paint(ui_,rt_.renderer);
-    if (videoRecovery_.active() || videoLossWaiting_) {
+    if (transportReconnect_.recovering()) {
+        const auto attempt = transportReconnect_.connecting() ? transportReconnect_.attempts() :
+            std::min(transportReconnect_.attempts()+1,fog::stream::TransportReconnect::MaxAttempts);
+        box(0,0,1280,82,{23,32,46,255});
+        text("Восстанавливаем связь: попытка " + std::to_string(attempt) + "/3. Та же аренда; оплата продолжается.",20,8,accent,1240);
+        text("Минус + Плюс — меню и завершение аренды. Лимит восстановления — 90 секунд.",20,44,white,1240);
+    } else if (videoRecovery_.active() || videoLossWaiting_) {
         box(0,0,1280,45,{23,32,46,255});
         text("Восстанавливаем видео… Минус + Плюс — меню сессии",20,8,accent,1240);
     } else if (!overlayNotice_.empty() && std::chrono::steady_clock::now()-overlayNoticeAt_ < std::chrono::seconds(4)) {
@@ -144,7 +150,7 @@ void ApplicationController::draw() {
         ui_.history(cards,selection_,selection_/fog::ui::HistoryColumns*fog::ui::HistoryColumns);
         if (cards.empty() && !pending_.valid()) ui_.empty("Сессий пока нет", "Здесь появится история ваших игровых сессий.");
     } else if (screen_ == Screen::Settings) {
-        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.4.15","Удалить сохранённый вход с SD-карты"}},selection_);
+        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.4.17","Удалить сохранённый вход с SD-карты"}},selection_);
     } else if (screen_ == Screen::ImageSettings) {
         drawImageSettings();
     } else if (screen_ == Screen::Sessions) {
@@ -163,7 +169,9 @@ void ApplicationController::draw() {
     } else if (screen_ == Screen::Stopping || screen_ == Screen::Recovery) {
         ui_.dialog({"Завершение аренды не подтверждено",ui_.controllerHints("A — проверить и завершить. Y — войти в прежний аккаунт. При отсутствии связи завершите сессию на fogplay.mts.ru с телефона: списания могут продолжаться."),"Проверить","",true,true});
     } else if (screen_ == Screen::Streaming) {
-        ui_.empty("Подключаемся к ПК…","Ожидаем первый видеокадр. Минус + Плюс — меню трансляции.");
+        if (transportReconnect_.recovering())
+            ui_.empty("Восстанавливаем связь…","Повторное подключение к той же аренде. Оплата продолжается. Минус + Плюс — меню завершения.");
+        else ui_.empty("Подключаемся к ПК…","Ожидаем первый видеокадр. Минус + Плюс — меню трансляции.");
     } else if (screen_ == Screen::Consent) {
         ui_.dialog({"Вход в МТС Fog Play",ui_.controllerHints("A — согласиться с условиями сервиса fogplay.mts.ru и запросить SMS. Подписка на рассылку не включается. Токен сохранится на SD для следующего запуска. SMS-код не сохраняется."),"Войти","Назад"});
     } else if (screen_ == Screen::Auth) {

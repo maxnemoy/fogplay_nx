@@ -3,6 +3,8 @@
 #include "features/streaming/domain/h264_rtp.hpp"
 #include "features/streaming/infrastructure/stream_queue.hpp"
 #include "features/streaming/infrastructure/control_queue.hpp"
+#include "features/streaming/infrastructure/incoming_control.hpp"
+#include "features/streaming/infrastructure/transport_history.hpp"
 #include "features/streaming/domain/auto_quality.hpp"
 #include <functional>
 #include <cmath>
@@ -21,7 +23,9 @@ using Json = protocol::Json;
 // Only fixed client-generated text may use this exception. Parser/library errors
 // can contain SDP, session hashes or TURN credentials and remain sanitized below.
 struct TransportError final : std::runtime_error {
-    explicit TransportError(const char* message) : std::runtime_error(message) {}
+    bool retryable;
+    explicit TransportError(const char* message, bool mayRetry = false)
+        : std::runtime_error(message), retryable(mayRetry) {}
 };
 // Consume RTP only after the chained RTCP receiver has seen the original packet.
 // Ownership and timeout handling live in Shared; this callback never sends PLI.
@@ -60,10 +64,14 @@ struct Client::Impl {
         bool stopped = false;
         bool eventOverflow = false;
         bool callbackFailure = false;
+        IncomingControl::Kind terminalControl = IncomingControl::Kind::Ignored;
         std::size_t eventBytes = 0, eventHigh = 0;
         std::uint64_t eventDropped = 0;
         std::deque<Event> events;
         MediaQueue media;
+        TransportHistory transportHistory;
+        IncomingControl incoming;
+        std::uint64_t qualityTimeOffset = 0, eventDelayHighMs = 0;
         Clock::time_point lastVideo{};
         H264RtpAssembler video;
         bool videoTrack = false;
@@ -132,7 +140,9 @@ struct Client::Impl {
                 " controlAgeMs=" + std::to_string(age(lastControlMs)) +
                 " eventQueue=" + std::to_string(events.size()) + " eventBytes=" + std::to_string(eventBytes) +
                 " eventHigh=" + std::to_string(eventHigh) + " eventDrop=" + std::to_string(eventDropped) +
-                " eventOverflow=" + std::to_string(eventOverflow) + " callbackFailure=" + std::to_string(callbackFailure);
+                " eventOverflow=" + std::to_string(eventOverflow) + " callbackFailure=" + std::to_string(callbackFailure) +
+                transportHistory.diagnostics() + incoming.diagnostics() +
+                " eventDelayHighMs=" + std::to_string(eventDelayHighMs);
         }
         void event(Event e) {
             std::lock_guard<std::mutex> lock(mutex);
@@ -141,12 +151,75 @@ struct Client::Impl {
             if (e.type == EventType::PeerState) { peerState = e.peerState; lastPeerMs = now; }
             if (e.type == EventType::IceState) { iceState = e.iceState; lastIceMs = now; }
             if (e.type == EventType::GatheringState) { gatheringState = e.gatheringState; lastGatheringMs = now; }
-            if (e.type == EventType::Control) lastControlMs = now;
+            const auto age = [now](std::uint64_t at) -> long long {
+                return at ? static_cast<long long>(now - at) : -1;
+            };
+            using HistoryKind = TransportHistory::Kind;
+            if (e.type == EventType::PeerState)
+                transportHistory.record(HistoryKind::Peer, static_cast<int>(e.peerState), now,
+                    e.peerState == rtc::PeerConnection::State::Failed || e.peerState == rtc::PeerConnection::State::Closed,
+                    age(lastRtpMs), age(lastAudioMs), age(lastControlMs));
+            else if (e.type == EventType::IceState)
+                transportHistory.record(HistoryKind::Ice, static_cast<int>(e.iceState), now,
+                    e.iceState == rtc::PeerConnection::IceState::Failed || e.iceState == rtc::PeerConnection::IceState::Closed,
+                    age(lastRtpMs), age(lastAudioMs), age(lastControlMs));
+            else if (e.type == EventType::GatheringState)
+                transportHistory.record(HistoryKind::Gathering, static_cast<int>(e.gatheringState), now);
+            else if (e.type == EventType::ChannelOpen)
+                transportHistory.record(HistoryKind::ChannelOpen, 0, now);
+            else if (e.type == EventType::WsClosed || e.type == EventType::Failure) {
+                // Codes identify only fixed locally generated callback failures.
+                const int code = e.text == "Control channel closed" ? 1 : e.text == "Control channel failed" ? 2 :
+                    e.text == "Video track closed" ? 3 : e.text == "Audio track closed" ? 4 :
+                    e.text == "Video track failed" ? 5 : e.text == "Audio track failed" ? 6 :
+                    e.text == "Signaling transport failed" ? 7 : 0;
+                transportHistory.record(e.type == EventType::WsClosed ? HistoryKind::Closed : HistoryKind::Failure,
+                    code, now, true, age(lastRtpMs), age(lastAudioMs), age(lastControlMs));
+            }
             e.arrivedMs = now;
             const auto bytes = e.text.size() + e.mid.size();
             if (events.size() >= 128 || eventBytes + bytes > 1024 * 1024) { eventOverflow = true; ++eventDropped; return; }
             eventBytes += bytes; events.push_back(std::move(e));
             eventHigh = std::max(eventHigh, events.size());
+        }
+        void controlMessage(const std::string& text, const std::weak_ptr<rtc::DataChannel>& weakChannel) {
+            const auto message = IncomingControl::classify(text);
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (stopped) return;
+                lastControlMs = videoNow();
+                incoming.receive(message, lastControlMs + qualityTimeOffset);
+                if (message.kind == IncomingControl::Kind::Close || message.kind == IncomingControl::Kind::Error ||
+                    message.kind == IncomingControl::Kind::Invalid) terminalControl = message.kind;
+            }
+            if (message.kind == IncomingControl::Kind::Ping) {
+                bool sent = false;
+                try {
+                    // Local libdatachannel delivers messages outside its send mutex.
+                    // Never send while holding Shared::mutex, including teardown races.
+                    if (const auto dc = weakChannel.lock(); dc && dc->isOpen()) {
+                        if (dc->bufferedAmount() <= 64 * 1024) {
+                            dc->send(message.pong); // false is accepted into RTC's send queue.
+                            sent = true;
+                        }
+                    }
+                } catch (...) {}
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (stopped) return;
+                    if (sent) incoming.pongSent(); else incoming.pongFailed();
+                }
+                if (!sent) {
+                    Event e(EventType::Failure); e.text = "Ping response transport failed"; event(std::move(e));
+                }
+            } else if (message.kind == IncomingControl::Kind::Close ||
+                       message.kind == IncomingControl::Kind::Error ||
+                       message.kind == IncomingControl::Kind::Invalid) {
+                Event e(EventType::Control);
+                e.text = message.kind == IncomingControl::Kind::Close ? "close" :
+                    message.kind == IncomingControl::Kind::Error ? "error" : "invalid";
+                event(std::move(e));
+            }
         }
         void packet(Kind kind, rtc::binary bytes, std::uint32_t timestamp) {
             std::lock_guard<std::mutex> lock(mutex);
@@ -189,11 +262,11 @@ struct Client::Impl {
     std::vector<Json> pendingCandidates;
     std::vector<std::string> mids;
     protocol::Parser parser;
-    std::string hash, clientHash, suffix, state = "Idle", failure;
+    std::string hash, clientHash, suffix, state = "Idle", failure, pendingTransportFailure;
     Clock::time_point started{}, lastWs{}, lastHeartbeat{}, lastPli{};
     std::chrono::milliseconds heartbeat{0}, incomingHeartbeat{0};
     bool running = false, stompConnected = false, remoteSet = false, channelOpen = false;
-    bool isReady = false, decoderWaiting = false;
+    bool isReady = false, decoderWaiting = false, retryableFailure = false, closingForRetry = false;
     fog::video::Settings videoSettings;
     VideoCodec selectedCodec = VideoCodec::H264;
     bool qualityPending = true;
@@ -229,11 +302,11 @@ struct Client::Impl {
             static_cast<long long>(serverStats.codec.age(now)), qualityRequests, qualityPending ? 1 : 0);
         return std::string(numbers) + autoQuality.diagnostics();
     }
-    void readQualityStats(const Json& data) {
+    void readQualityStats(const quality::Telemetry& data) {
         // Each valid optional field owns its timestamp. Empty/malformed extensions
         // cannot refresh an old profile/target and never reach logs as raw text.
         const auto before = serverStats.profile.value;
-        serverStats.read(data, qualityNow());
+        serverStats = data;
         if (before != serverStats.profile.value)
             qualityEvent(std::string("qualityEvent=stats-profile profile=") + quality::name(serverStats.profile.value));
     }
@@ -283,11 +356,21 @@ struct Client::Impl {
         fail(detail.c_str());
     }
 
+    template<class Send> static void transportSend(Send&& send, const char* reason) {
+        try { send(); }
+        catch (const std::runtime_error&) { throw TransportError(reason, true); }
+        // Logic/size errors and allocation failures are not transport recovery.
+    }
+    void sendSignaling(const std::string& frame) {
+        if (closingForRetry) return;
+        transportSend([&] { ws->send(frame); }, "Signaling send failed");
+    }
     void signal(const Json& payload) {
-        if (!ws || !ws->isOpen() || !stompConnected) throw TransportError("Signaling unavailable");
-        if (ws->bufferedAmount() > 256 * 1024) throw TransportError("Signaling backpressure");
-        ws->send(protocol::frame("SEND", {{"destination", "/topic/" + hash + "/server"},
-                  {"content-type", "application/json"}, {"client-hash", clientHash}}, payload.dump()));
+        if (!ws || !ws->isOpen() || !stompConnected) throw TransportError("Signaling unavailable", true);
+        if (ws->bufferedAmount() > 256 * 1024) throw TransportError("Signaling backpressure", true);
+        const auto frame = protocol::frame("SEND", {{"destination", "/topic/" + hash + "/server"},
+                  {"content-type", "application/json"}, {"client-hash", clientHash}}, payload.dump());
+        sendSignaling(frame);
     }
     void flushControl() {
         if (!channel || !channel->isOpen()) return;
@@ -297,10 +380,10 @@ struct Client::Impl {
 #endif
             if (channel->bufferedAmount() > 64 * 1024) break;
             // false means accepted into libdatachannel's queue, not lost.
-            channel->send(controls.front().payload);
+            transportSend([&] { channel->send(controls.front().payload); }, "Control send failed");
             controls.pop(controlNow());
         }
-        if (controls.stalled(controlNow())) throw TransportError("Control channel stalled");
+        if (controls.stalled(controlNow())) throw TransportError("Control channel stalled", true);
     }
     bool control(const std::string& payload, ControlQueue::Mode mode = ControlQueue::Mode::Ordered,
                  const std::string& input = {}) {
@@ -311,7 +394,7 @@ struct Client::Impl {
         return accepted;
     }
     void openChannel() {
-        if (channelOpen || !channel || !channel->isOpen()) return;
+        if (closingForRetry || channelOpen || !channel || !channel->isOpen()) return;
         control(Json{{"id", "connection_ready"}}.dump());
         channelOpen = true;
         if (!isReady) state = "Waiting for video";
@@ -319,6 +402,7 @@ struct Client::Impl {
     void stop(bool notify) {
         // No shutdown exception can prevent release of the remaining transports.
         if (notify) {
+            closingForRetry = false; // A rejected retry follows ordinary final-close notification.
             try { control(protocol::gamepad(Gamepad{}).dump(), ControlQueue::Mode::Gamepad); }
             catch (const std::exception&) { if (failure.empty()) failure = "Neutral control send failed"; }
             try { if (stompConnected && ws && ws->isOpen()) signal({{"id", "close"}}); }
@@ -365,14 +449,24 @@ struct Client::Impl {
             ws.reset();
         }
         shared.reset();
-        controls.clear(); decoderWaiting = false;
+        controls.clear(); pendingTransportFailure.clear(); decoderWaiting = false;
         pendingCandidates.clear(); mids.clear();
         state = failure.empty() ? "Closed" : "Failed";
         hash.clear(); clientHash.clear(); suffix.clear();
     }
-    void fail(const char* reason) {
-        if (failure.empty()) failure = reason;
-        stop(true);
+    void fail(const char* reason, bool mayRetry = false) {
+        // Terminal evidence wins over concurrent transport loss, even when the FIFO is full.
+        if (mayRetry && shared) {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            if (shared->terminalControl == IncomingControl::Kind::Close) { reason = "Remote control closed"; mayRetry = false; }
+            else if (shared->terminalControl == IncomingControl::Kind::Error) { reason = "Remote control error"; mayRetry = false; }
+            else if (shared->terminalControl == IncomingControl::Kind::Invalid) { reason = "Malformed control message"; mayRetry = false; }
+            else if (shared->eventOverflow) { reason = "Signaling/control event queue capacity exceeded"; mayRetry = false; }
+            else if (shared->callbackFailure) { reason = "Stream callback failed"; mayRetry = false; }
+        }
+        if (failure.empty()) { failure = reason; retryableFailure = mayRetry; }
+        // A recoverable transport loss must never send the remote close notification.
+        stop(!retryableFailure);
     }
     void createPeer(const Json& init) {
         operation = "init.ice-servers";
@@ -385,6 +479,8 @@ struct Client::Impl {
             ice.username = item.username; ice.password = item.credential;
             config.iceServers.push_back(std::move(ice));
         }
+        // A frozen retry shutdown validates pending protocol but starts no new transport.
+        if (closingForRetry) return;
         operation = "init.peer-create";
         peer = std::make_shared<rtc::PeerConnection>(config);
         const std::weak_ptr<Shared> weak(shared);
@@ -425,11 +521,11 @@ struct Client::Impl {
                 dc->onError([weak](std::string) { callback(weak, [](Shared& st) {
                     Event e(EventType::Failure); e.text = "Control channel failed"; st.event(std::move(e));
                 }); });
-                dc->onMessage([weak](rtc::message_variant msg) {
-                    callback(weak, [&msg](Shared& st) {
-                        if (const auto text = std::get_if<std::string>(&msg)) {
-                            Event e(EventType::Control); e.text = *text; st.event(std::move(e));
-                        }
+                const std::weak_ptr<rtc::DataChannel> weakChannel(dc);
+                dc->onMessage([weak, weakChannel](rtc::message_variant msg) {
+                    callback(weak, [&msg, &weakChannel](Shared& st) {
+                        if (const auto text = std::get_if<std::string>(&msg))
+                            st.controlMessage(*text, weakChannel);
                     });
                 });
                 Event e(EventType::Channel); e.channel = dc; s.event(std::move(e));
@@ -567,13 +663,15 @@ struct Client::Impl {
         switch (event.type) {
         case EventType::WsOpen:
             state = "Connecting signaling";
-            ws->send(protocol::frame("CONNECT", {{"accept-version", "1.1,1.2"},
+            sendSignaling(protocol::frame("CONNECT", {{"accept-version", "1.1,1.2"},
                        {"heart-beat", "4000,4000"}, {"host", "remoteplay.mts.ru"}}));
             break;
-        case EventType::WsData:
+        case EventType::WsData: {
             operation = "stomp.parse";
             lastWs = Clock::now();
+            std::string frameTransportFailure;
             for (const auto& frame : parser.feed(event.text)) {
+                try {
                 if (frame.command == "CONNECTED") {
                     if (stompConnected) throw TransportError("Duplicate STOMP connection");
                     stompConnected = true;
@@ -594,14 +692,20 @@ struct Client::Impl {
                         heartbeat = outgoing == 0 ? std::chrono::milliseconds(0) : std::chrono::milliseconds(std::max(4000, outgoing));
                         incomingHeartbeat = incoming == 0 ? std::chrono::milliseconds(0) : std::chrono::milliseconds(std::max(4000, incoming));
                     }
-                    ws->send(protocol::frame("SUBSCRIBE", {{"destination", "/topic/" + clientHash + "/client"},
+                    sendSignaling(protocol::frame("SUBSCRIBE", {{"destination", "/topic/" + clientHash + "/client"},
                                {"ack", "auto"}, {"id", "nx-" + suffix}}));
                     signal({{"id", "enabled"}, {"client_hash", clientHash}});
                     state = "Waiting for remote host";
                 } else if (frame.command == "MESSAGE") { operation = "signal.json"; message(Json::parse(frame.body)); }
                 else if (frame.command == "ERROR") throw TransportError("STOMP rejected stream");
+                } catch (const TransportError& error) {
+                    if (!error.retryable) throw;
+                    if (frameTransportFailure.empty()) frameTransportFailure = error.what();
+                }
             }
+            if (!frameTransportFailure.empty()) throw TransportError(frameTransportFailure.c_str(), true);
             break;
+        }
         case EventType::Description:
             operation = "answer.send";
             signal({{"id", "answer"}, {"data", protocol::base64Encode(event.text)}});
@@ -622,39 +726,35 @@ struct Client::Impl {
         case EventType::ChannelOpen:
             openChannel();
             break;
-        case EventType::Control: {
+        case EventType::Control:
             operation = "control.json";
-            const auto data = Json::parse(event.text);
-            const auto id = data.value("id", "");
-            if (id == "ping") {
-                Json pong{{"id", "pong"}};
-                if (data.contains("ts")) pong["ts"] = data["ts"];
-                control(pong.dump(), ControlQueue::Mode::Pong);
-            } else if (id == "stats") readQualityStats(data);
-            else if (id == "close") throw TransportError("Remote control closed");
-            else if (id == "error") throw TransportError("Remote control error");
-            break;
-        }
+            if (event.text == "close") throw TransportError("Remote control closed");
+            if (event.text == "error") throw TransportError("Remote control error");
+            throw TransportError("Malformed control message");
         case EventType::Track: tracks.push_back(event.track); break;
         case EventType::PeerState:
             qualityEvent("transportEvent=peer state=" + std::to_string(static_cast<int>(event.peerState)) + " ms=" + std::to_string(event.arrivedMs));
-            if (event.peerState == rtc::PeerConnection::State::Failed) throw TransportError("Peer connection failed");
-            if (event.peerState == rtc::PeerConnection::State::Closed) throw TransportError("Peer connection closed");
+            if (event.peerState == rtc::PeerConnection::State::Failed) throw TransportError("Peer connection failed", true);
+            if (event.peerState == rtc::PeerConnection::State::Closed) throw TransportError("Peer connection closed", true);
             if (!isReady) {
                 if (event.peerState == rtc::PeerConnection::State::Connecting) state = "Connecting peer";
                 else if (event.peerState == rtc::PeerConnection::State::Connected) state = channelOpen ? "Waiting for video" : "Waiting for video/control";
             }
             break;
         case EventType::IceState:
+            if (event.iceState == rtc::PeerConnection::IceState::Failed)
+                throw TransportError("ICE connection failed", true);
+            if (event.iceState == rtc::PeerConnection::IceState::Closed)
+                throw TransportError("ICE connection closed", true);
             qualityEvent("transportEvent=ice state=" + std::to_string(static_cast<int>(event.iceState)) + " ms=" + std::to_string(event.arrivedMs));
             break;
         case EventType::GatheringState:
             qualityEvent("transportEvent=gathering state=" + std::to_string(static_cast<int>(event.gatheringState)) + " ms=" + std::to_string(event.arrivedMs));
             break;
         case EventType::WsClosed:
-            throw TransportError("Signaling transport closed");
+            throw TransportError("Signaling transport closed", true);
         case EventType::Failure:
-            throw TransportError(event.text.empty() ? "Transport failed" : event.text.c_str());
+            throw TransportError(event.text.empty() ? "Transport failed" : event.text.c_str(), true);
         }
     }
 };
@@ -669,7 +769,22 @@ bool Client::startForTesting(const std::string& hash, const std::string& suffix,
     if (url.rfind("ws://127.0.0.1:", 0) != 0) return false;
     return startEndpoint(hash, suffix, "unused-loopback.pem", url);
 }
-void Client::advanceQualityForTesting(unsigned milliseconds) { impl_->qualityTimeOffset += milliseconds; }
+void Client::advanceQualityForTesting(unsigned milliseconds) {
+    impl_->qualityTimeOffset += milliseconds;
+    if (impl_->shared) {
+        std::lock_guard<std::mutex> lock(impl_->shared->mutex);
+        impl_->shared->qualityTimeOffset = impl_->qualityTimeOffset;
+    }
+}
+void Client::failThenReceiveForTesting(const std::string& text, bool signaling) {
+    if (!impl_->shared) return;
+    Impl::Event failure(Impl::EventType::Failure); failure.text = "Signaling transport failed";
+    impl_->shared->event(std::move(failure));
+    if (signaling) {
+        Impl::Event data(Impl::EventType::WsData); data.text = text;
+        impl_->shared->event(std::move(data));
+    } else impl_->shared->controlMessage(text, impl_->channel);
+}
 void Client::blockControlForTesting(bool blocked) { impl_->controlBlocked = blocked; }
 void Client::advanceControlForTesting(unsigned milliseconds) { impl_->controlTimeOffset += milliseconds; }
 void Client::elapseForTesting(unsigned seconds) {
@@ -682,6 +797,7 @@ void Client::elapseForTesting(unsigned seconds) {
     i.lastPli -= elapsed;
     if (i.shared) {
         std::lock_guard<std::mutex> lock(i.shared->mutex);
+        i.shared->qualityTimeOffset = i.qualityTimeOffset;
         if (i.shared->lastVideo != Clock::time_point{}) i.shared->lastVideo -= elapsed;
     }
 }
@@ -737,7 +853,8 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
 void Client::pump() {
     auto& i = *impl_;
     if (!i.running || !i.shared) return;
-    bool eventOverflow, callbackFailure, needsPli;
+    bool eventOverflow, callbackFailure, needsPli, statsPending;
+    quality::Telemetry stats;
     Clock::time_point lastVideo;
     std::deque<Impl::Event> events;
     try {
@@ -753,6 +870,9 @@ void Client::pump() {
             i.lastRateBytes = i.shared->receivedVideoBytes; i.rateAt = now;
             i.rateKnown = true;
         }
+        statsPending = i.shared->incoming.takeStats(stats, i.qualityNow());
+        for (const auto& event : i.shared->events)
+            i.shared->eventDelayHighMs = std::max(i.shared->eventDelayHighMs, videoNow() - event.arrivedMs);
         events.swap(i.shared->events); i.shared->eventBytes = 0;
     } catch (...) {
         i.fail("Video receive processing failed"); return;
@@ -760,21 +880,35 @@ void Client::pump() {
     if (eventOverflow) { i.fail("Signaling/control event queue capacity exceeded"); return; }
     if (callbackFailure) { i.fail("Stream callback failed"); return; }
     try {
-        for (auto& event : events) i.event(event);
+        // Inspect the whole bounded batch before committing a retryable failure.
+        // A later remote close/error or malformed protocol must remain terminal.
+        std::string transportFailure;
+        for (auto& event : events) {
+            try { i.event(event); }
+            catch (const TransportError& error) {
+                if (!error.retryable) throw;
+                if (transportFailure.empty()) transportFailure = error.what();
+            }
+        }
+        if (!transportFailure.empty()) throw TransportError(transportFailure.c_str(), true);
+        if (!i.pendingTransportFailure.empty()) throw TransportError(i.pendingTransportFailure.c_str(), true);
+        if (statsPending) i.readQualityStats(stats);
+        if (i.closingForRetry) return;
         i.applyQuality();
         i.flushControl();
         const auto now = Clock::now();
         if (i.channelOpen && lastVideo != Clock::time_point{}) { i.isReady = true; i.state = "Streaming"; }
-        if (!i.isReady && now - i.started >= std::chrono::seconds(30)) { i.fail("Stream connection timed out"); return; }
-        if (i.isReady && now - lastVideo >= std::chrono::seconds(15)) { i.fail("Video stream stalled"); return; }
+        if (!i.isReady && now - i.started >= std::chrono::seconds(30)) { i.fail("Stream connection timed out", true); return; }
+        if (i.isReady && now - lastVideo >= std::chrono::seconds(15)) { i.fail("Video stream stalled", true); return; }
         // STOMP's server interval is the first negotiated value. A zero value
         // disables incoming heartbeats; setup and received-video deadlines still apply.
         if (i.stompConnected && i.incomingHeartbeat.count() &&
             now - i.lastWs >= std::max(std::chrono::milliseconds(15000), i.incomingHeartbeat * 3)) {
-            i.fail("Signaling stream stalled"); return;
+            i.fail("Signaling stream stalled", true); return;
         }
         if (i.stompConnected && i.heartbeat.count() && now - i.lastHeartbeat >= i.heartbeat) {
-            i.ws->send(std::string("\n")); i.lastHeartbeat = now; ++i.heartbeatsSent;
+            i.sendSignaling(std::string("\n"));
+            i.lastHeartbeat = now; ++i.heartbeatsSent;
         }
         if ((i.videoSettings.keyframeSeconds > 0 && now - i.lastPli >= std::chrono::seconds(i.videoSettings.keyframeSeconds)) ||
             (needsPli && now - i.lastPli >= std::chrono::milliseconds(250))) {
@@ -789,7 +923,7 @@ void Client::pump() {
                 ++i.shared->pliRequests;
             }
         }
-    } catch (const TransportError& e) { i.fail(e.what()); }
+    } catch (const TransportError& e) { i.fail(e.what(), e.retryable); }
       catch (const protocol::Error& e) { i.failAt(e.what()); }
       catch (const Json::exception& e) { i.failAt("JSON error id=" + std::to_string(e.id)); }
       catch (const std::exception& e) {
@@ -885,6 +1019,26 @@ void Client::observePlayback(std::uint64_t decodedFrames, std::uint64_t videoWor
 bool Client::ready() const { return impl_->isReady; }
 std::string Client::status() const { return impl_->state; }
 std::string Client::error() const { return impl_->failure; }
+bool Client::retryableError() const { return !impl_->failure.empty() && impl_->retryableFailure; }
+bool Client::disconnected() const {
+    if (!impl_->running || !impl_->shared) return false;
+    std::lock_guard<std::mutex> lock(impl_->shared->mutex);
+    return impl_->shared->peerState == rtc::PeerConnection::State::Disconnected ||
+           impl_->shared->iceState == rtc::PeerConnection::IceState::Disconnected;
+}
+bool Client::disconnectForRetry() {
+    auto& i = *impl_;
+    if (!i.running || !i.shared) return i.failure.empty() || i.retryableFailure;
+    {
+        std::lock_guard<std::mutex> lock(i.shared->mutex);
+        i.shared->stopped = true; // Atomic boundary: later callbacks belong to the old generation.
+    }
+    i.closingForRetry = true;
+    pump(); // Examine the frozen bounded batch before granting transport-only retry.
+    if (!i.running) return i.retryableFailure;
+    i.stop(false);
+    return true;
+}
 std::string Client::diagnostics() const { return impl_->diagnostics(); }
 std::string Client::videoDiagnostics() const {
     if (!impl_->shared) return impl_->finalVideoDiagnostics;
@@ -931,7 +1085,13 @@ bool Client::requestVideoKeyframe() {
 bool Client::sendGamepad(const Gamepad& state) {
     if (!impl_->running || !impl_->channelOpen) return false;
     try { return impl_->control(protocol::gamepad(state).dump(), ControlQueue::Mode::Gamepad); }
-    catch (const std::exception&) { impl_->fail("Control send failed"); return false; }
+    catch (const TransportError& error) {
+        // Public send may run before pump. Examine queued terminal signaling first.
+        if (error.retryable) {
+            if (impl_->pendingTransportFailure.empty()) impl_->pendingTransportFailure = error.what();
+        } else impl_->fail(error.what());
+        return false;
+    } catch (const std::exception&) { impl_->fail("Control send failed"); return false; }
 }
 bool Client::sendControl(const std::string& json) {
     if (!impl_->running || !impl_->channelOpen || json.size() > 64 * 1024) return false;
@@ -958,7 +1118,13 @@ bool Client::sendControl(const std::string& json) {
         }
     }
     try { return impl_->control(json, mode, input); }
-    catch (const std::exception&) { impl_->fail("Control send failed"); return false; }
+    catch (const TransportError& error) {
+        // Public send may run before pump. Examine queued terminal signaling first.
+        if (error.retryable) {
+            if (impl_->pendingTransportFailure.empty()) impl_->pendingTransportFailure = error.what();
+        } else impl_->fail(error.what());
+        return false;
+    } catch (const std::exception&) { impl_->fail("Control send failed"); return false; }
 }
 void Client::close() { if (impl_ && impl_->running) impl_->stop(true); }
 void Client::cleanupRuntime() {

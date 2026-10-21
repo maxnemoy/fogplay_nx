@@ -276,6 +276,13 @@ int main() {
         assert(h.controller.pending() && !h.event("qualityEvent=confirmed"));
     }
     {
+        // A delayed but still fresh pre-command update cannot confirm a command.
+        Harness h; h.advance(32); assert(h.controller.pending());
+        h.server.profile.set(Profile::Middle, h.now - 1);
+        h.controller.observe(h.now, h.sample, h.server);
+        assert(h.controller.pending() && !h.event("qualityEvent=confirmed"));
+    }
+    {
         // Manual profile changes must not be attributed to the next Auto run.
         Harness h; h.profile = Profile::High; h.advance(4);
         h.controller.enable(false, h.now);

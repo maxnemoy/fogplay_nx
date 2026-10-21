@@ -12,31 +12,86 @@ std::string ApplicationController::playbackTimings() const {
         " logBatchLastUs=" + std::to_string(log.lastBatchUs) + " logBatchMaxUs=" + std::to_string(log.maxBatchUs);
 }
 
-void ApplicationController::closeStream() noexcept {
-    recentLaunch_.close();
+bool ApplicationController::closeTransport(bool final) noexcept {
+    bool retryAllowed = true;
     releaseMouse();
-    overlay_.close();
     videoRecovery_.reset();
     videoLossWaiting_ = false;
     if (stream_) {
         try {
+            std::string event;
+            for (unsigned i = 0; i < 96 && stream_->pollVideoDiagnostic(event); ++i)
+                diagnostic("Stream final event: " + event,2048);
             diagnostic("Video RTP final: " + stream_->videoDiagnostics(),2048);
             diagnostic(playbackTimings(),2048);
             if (media_) diagnostic("Video decoder final: " + media_->diagnostics(),2048);
-        } catch (...) {} // Diagnostics must never prevent rental shutdown.
-        try { stream_->close(); } catch (...) {}
+        } catch (...) { retryAllowed = false; } // Cleanup must continue; an uncertain retry must stop.
+        try {
+            if (final) stream_->close();
+            else if (!stream_->disconnectForRetry()) {
+                retryAllowed = false;
+                diagnostic("Transport retry cancelled: " + safeText(stream_->error()));
+                diagnostic("Transport final protocol: " + stream_->diagnostics(),2048);
+            }
+        } catch (...) { retryAllowed = false; }
         stream_.reset();
     }
     media_.reset();
+    return final || retryAllowed;
+}
+
+void ApplicationController::closeStream() noexcept {
+    transportReconnect_.cancel();
+    closeTransport(true);
+    streamHash_.clear();
+    transportReconnect_.reset();
+    recentLaunch_.close();
+    overlay_.close();
+    overlayNotice_.clear();
+    streamInputGate_.reset();
+}
+
+bool ApplicationController::startTransport() {
+    // Transport replacement must not adopt, create, or reset rental ownership.
+    videoRecovery_.reset();
+    videoLossWaiting_ = false; firstFramePresented_ = false;
+    videoWorkUs_ = videoDecodeErrors_ = lastVideoGeneration_ = 0;
+    media_ = std::make_unique<fog::Media>(rt_.renderer,stream::VideoCodec::H264,true);
+    stream_ = std::make_unique<stream::Client>();
+    if (!stream_->configureVideo(videoSettings_))
+        throw std::runtime_error("Invalid video configuration; stopping rental");
+    overlay_.setVideoSettings(videoSettings_);
+    overlay_.setSaveStatus(videoSaveStatus_);
+    lastStreamState_.clear(); lastStreamDiagnostics_.clear();
+    std::array<unsigned char,5> random{}; randomGet(random.data(),random.size());
+    std::string suffix;
+    for (auto value : random) suffix += "0123456789abcdefghijklmnopqrstuvwxyz"[value % 36];
+    const bool started = stream_->start(streamHash_, suffix, "romfs:/cacert.pem");
+    streamStarted_ = lastVideo_ = lastMediaLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
+    return started;
+}
+
+void ApplicationController::retryTransport(const char* reason) {
+    if (screen_ != Screen::Streaming || !sessionPending_ || stopAfterTask_ ||
+        exitAfterStop_ || streamHash_.empty() || pending_.valid() ||
+        !transportReconnect_.retry(std::chrono::steady_clock::now())) {
+        beginFinish("transport-reconnect-exhausted");
+        return;
+    }
+    suspendVideoInput();
+    if (!closeTransport(false)) {
+        beginFinish("transport-retry-terminal"); return;
+    }
+    status_ = "Связь потеряна. Повторяем подключение к той же аренде; оплата продолжается.";
+    diagnostic("Transport recovery scheduled; reason=" + std::string(reason) +
+        " attemptsUsed=" + std::to_string(transportReconnect_.attempts()) + " limit=3 window=90s");
 }
 
 void ApplicationController::startStream(const std::string& hash, bool createdFromCatalog) {
     latency_.cancel();
     recentLaunch_.stream(createdFromCatalog);
     sessionPending_ = true;
-    videoRecovery_.reset();
-    videoLossWaiting_ = false; firstFramePresented_ = false;
-    videoWorkUs_ = videoDecodeErrors_ = lastVideoGeneration_ = 0;
+    transportReconnect_.reset();
     drainTiming_ = {}; presentTiming_ = {}; diagnosticTiming = {};
     lastPumpAt_ = {}; lastProtocolLog_ = {}; pumpGapMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
     ++sessionSequence_;
@@ -44,7 +99,7 @@ void ApplicationController::startStream(const std::string& hash, bool createdFro
         (createdFromCatalog ? " origin=catalog catalogGameId=" + std::to_string(selectedGameId_) +
          " catalogGame=" + safeText(selectedGameName_) : " origin=existing-rental catalogGame=unknown"));
     screen_ = Screen::Streaming;
-    overlay_.close(); suppressStreamInput_ = true; touchWasDown_ = touchDrag_ = false;
+    overlay_.close(); streamInputGate_.reset(); streamInputGate_.overlayTransition(); touchWasDown_ = touchDrag_ = false;
     pointerX_ = 640.0f; pointerY_ = 360.0f;
     mouseAt_ = std::chrono::steady_clock::now();
     overlayNotice_.clear();
@@ -54,19 +109,11 @@ void ApplicationController::startStream(const std::string& hash, bool createdFro
             " capMbps=" + std::to_string(videoSettings_.bitrateMbps) + " quality=" + std::to_string(videoSettings_.quality) +
             " pliSeconds=" + std::to_string(videoSettings_.keyframeSeconds));
         armExitHandling();
-        media_ = std::make_unique<fog::Media>(rt_.renderer,stream::VideoCodec::H264,true);
-        stream_ = std::make_unique<stream::Client>();
-        if (!stream_->configureVideo(videoSettings_))
-            throw std::runtime_error("Invalid video configuration; stopping rental");
-        overlay_.setVideoSettings(videoSettings_);
-        overlay_.setSaveStatus(videoSaveStatus_);
-        lastStreamState_.clear(); lastStreamDiagnostics_.clear();
-        std::array<unsigned char,5> random{}; randomGet(random.data(),random.size());
-        std::string suffix;
-        for (auto value : random) suffix += "0123456789abcdefghijklmnopqrstuvwxyz"[value % 36];
-        if (!stream_->start(hash, suffix, "romfs:/cacert.pem"))
+        streamHash_ = hash;
+        if (!startTransport()) {
+            if (stream_->retryableError()) { retryTransport("initial-start"); return; }
             throw std::runtime_error("Signaling startup failed; stopping rental");
-        streamStarted_ = lastVideo_ = lastMediaLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
+        }
         status_ = "Подключение. Минус + Плюс — меню трансляции.";
         diagnostic("Stream connection requested; recovery journal saved.");
     } catch (...) { beginFinish(); throw; }
@@ -84,7 +131,7 @@ void ApplicationController::recoverVideoError(const fog::VideoDecodeError& error
     if (!error.recoverable()) throw error;
     if (!videoRecovery_.begin(std::chrono::steady_clock::now()))
         throw std::runtime_error("Video recovery deadline/reset budget exhausted; stopping rental");
-    overlayTransition();
+    suspendVideoInput();
     stream_->setDecoderWaitingForKeyframe(true);
     media_->resetVideoDecoder();
     const bool requested = stream_->requestVideoKeyframe();
@@ -93,35 +140,71 @@ void ApplicationController::recoverVideoError(const fog::VideoDecodeError& error
 }
 
 void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
-    if (!stream_) return;
+    // Menu/finish intent wins over a due retry, including backoff with no Client.
+    bool overlayHandled = false;
+    const bool wasRecovering = transportReconnect_.recovering();
+    if (wasRecovering && screen_ == Screen::Streaming) {
+        overlayHandled = handleStreamOverlay(pad, held, down);
+        if (screen_ != Screen::Streaming || stopAfterTask_ || streamHash_.empty()) return;
+    }
     const auto pumpAt = std::chrono::steady_clock::now();
-    if (lastPumpAt_ != std::chrono::steady_clock::time_point{}) {
-        const auto gap = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(pumpAt-lastPumpAt_).count());
-        pumpGapMaxUs_ = std::max(pumpGapMaxUs_, gap);
-    }
-    lastPumpAt_ = pumpAt;
-    stream_->pump();
-    const auto streamState = stream_->status();
-    const bool stateChanged = streamState != lastStreamState_;
-    if (stateChanged) {
-        lastStreamState_ = streamState;
-        diagnostic("Stream stage: " + streamState);
-    }
-    // Build the mutex-protected snapshot only when a log is actually due.
-    if (stateChanged || !stream_->error().empty() || pumpAt-lastProtocolLog_ >= std::chrono::seconds(5)) {
-        const auto details = stream_->diagnostics();
-        if (details != lastStreamDiagnostics_) {
-            lastStreamDiagnostics_ = details;
-            diagnostic("Stream protocol: " + details,2048);
+    // Consume queued terminal/remote-close events before any timeout can replace
+    // this transport; a local deadline must never turn them into another retry.
+    if (stream_) {
+        if (lastPumpAt_ != std::chrono::steady_clock::time_point{}) {
+            const auto gap = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(pumpAt-lastPumpAt_).count());
+            pumpGapMaxUs_ = std::max(pumpGapMaxUs_, gap);
         }
-        lastProtocolLog_ = pumpAt;
+        lastPumpAt_ = pumpAt;
+        stream_->pump();
+        const auto streamState = stream_->status();
+        const bool stateChanged = streamState != lastStreamState_;
+        if (stateChanged) {
+            lastStreamState_ = streamState;
+            diagnostic("Stream stage: " + streamState);
+        }
+        // Build the mutex-protected snapshot only when a log is actually due.
+        if (stateChanged || !stream_->error().empty() || pumpAt-lastProtocolLog_ >= std::chrono::seconds(5)) {
+            const auto details = stream_->diagnostics();
+            if (details != lastStreamDiagnostics_) {
+                lastStreamDiagnostics_ = details;
+                diagnostic("Stream protocol: " + details,2048);
+            }
+            lastProtocolLog_ = pumpAt;
+        }
+        if (!stream_->error().empty()) {
+            diagnostic("Stream error: " + safeText(stream_->error()));
+            if (stream_->retryableError()) retryTransport("transport-error");
+            else beginFinish("transport-fatal");
+            return;
+        }
+        if (stream_->disconnected() && !transportReconnect_.recovering()) {
+            transportReconnect_.disconnected(pumpAt);
+            suspendVideoInput();
+            diagnostic("Transport disconnected; waiting up to 5s before replacement; rental remains active.");
+        }
     }
-    if (!stream_->error().empty()) {
-        diagnostic("Stream error: " + safeText(stream_->error()));
-        throw std::runtime_error("Stream failed; stopping rental");
+    const auto recoveryAction = transportReconnect_.poll(std::chrono::steady_clock::now());
+    if (recoveryAction == fog::stream::TransportReconnect::Action::Stop) {
+        beginFinish("transport-reconnect-deadline"); return;
     }
+    if (recoveryAction == fog::stream::TransportReconnect::Action::CloseTransport) {
+        suspendVideoInput();
+        if (!closeTransport(false)) {
+            beginFinish("transport-retry-terminal"); return;
+        }
+    }
+    if (recoveryAction == fog::stream::TransportReconnect::Action::StartTransport) {
+        diagnostic("Transport reconnect attempt=" + std::to_string(transportReconnect_.attempts()) + "/3");
+        if (!startTransport()) {
+            if (stream_->retryableError()) retryTransport("retry-start");
+            else beginFinish("transport-start-fatal");
+            return;
+        }
+    }
+    if (!stream_) return;
     const bool lossWaiting = stream_->waitingForVideoKeyframe();
-    if (lossWaiting && !videoLossWaiting_) overlayTransition();
+    if (lossWaiting && !videoLossWaiting_) suspendVideoInput();
     videoLossWaiting_ = lossWaiting;
     const auto diagnosticNow = std::chrono::steady_clock::now();
     // SD lines are durable: drain a bounded event ring at most once per second,
@@ -156,7 +239,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
                 if (packet.videoGeneration != lastVideoGeneration_) {
                     media_->resetVideoDecoder();
                     lastVideoGeneration_ = packet.videoGeneration;
-                    overlayTransition();
+                    suspendVideoInput();
                     diagnostic("Video chain resync: decoder reset generation=" + std::to_string(lastVideoGeneration_));
                 }
                 media_->video(packet.data.data(), packet.data.size());
@@ -198,6 +281,15 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             videoRecovery_.decoded();
             stream_->setDecoderWaitingForKeyframe(false);
         }
+        if (transportReconnect_.recovering() && stream_->ready() && !stream_->disconnected() &&
+            transportReconnect_.prepared(std::chrono::steady_clock::now())) {
+            diagnostic("Transport recovery succeeded; attemptsUsed=" + std::to_string(transportReconnect_.attempts()));
+            status_ = "Связь восстановлена. Минус + Плюс — меню трансляции.";
+        }
+        // Queue recovery may finish before the decoder produces an image. Resume
+        // only after this generation has successfully prepared a visible frame.
+        videoLossWaiting_ = stream_->waitingForVideoKeyframe();
+        streamInputGate_.videoPrepared(transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe());
         if (!firstFramePresented_) {
             diagnostic(media_->hardwareVideo() ? "First video frame prepared (hardware)." : "First video frame prepared (software).");
             firstFramePresented_ = true;
@@ -207,7 +299,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     // Counters describe successful decoding and the full video processing cost
     // (including transfer/upload); all observation remains on the app thread.
     stream_->observePlayback(media_->videoFrames(), videoWorkUs_, videoDecodeErrors_,
-        videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe(),
+        transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe(),
         media_->videoWidth(), media_->videoHeight());
     const auto now = std::chrono::steady_clock::now();
     if (now-lastMediaLog_ >= std::chrono::seconds(5)) {
@@ -227,10 +319,18 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         lastMediaLog_ = now;
     }
     if (videoRecovery_.expired(now)) throw std::runtime_error("Video recovery deadline reached; stopping rental");
-    if (!videoRecovery_.active() && now-lastVideo_ > std::chrono::seconds(firstFramePresented_ ? 10 : 35))
-        throw std::runtime_error("Video timeout; stopping rental");
-    if (screen_ != Screen::Streaming || handleStreamOverlay(pad, held, down)) return;
-    if (videoRecovery_.active() || videoLossWaiting_ || now-lastInput_ < std::chrono::milliseconds(30) || !stream_->ready()) return;
+    if (!transportReconnect_.recovering() && (!firstFramePresented_ || !stream_->ready()) &&
+        now-streamStarted_ >= std::chrono::seconds(30)) {
+        retryTransport("startup-timeout"); return;
+    }
+    if (!transportReconnect_.recovering() && !videoRecovery_.active() &&
+        now-lastVideo_ >= std::chrono::seconds(firstFramePresented_ ? 10 : 30)) {
+        retryTransport("media-timeout"); return;
+    }
+    if (screen_ != Screen::Streaming) return;
+    if (!wasRecovering) overlayHandled = handleStreamOverlay(pad, held, down);
+    if (!streamInputGate_.gamepadAllowed(overlayHandled)) return;
+    if (transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || now-lastInput_ < std::chrono::milliseconds(30) || !stream_->ready()) return;
     stream::Gamepad gamepad;
     const std::array<u64,16> buttons{HidNpadButton_B,HidNpadButton_A,HidNpadButton_Y,HidNpadButton_X,
         HidNpadButton_L,HidNpadButton_R,HidNpadButton_ZL,HidNpadButton_ZR,HidNpadButton_Minus,HidNpadButton_Plus,

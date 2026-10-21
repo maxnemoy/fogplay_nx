@@ -57,6 +57,7 @@ struct Fixture {
     stream::protocol::Parser parser;
     bool subscribed = false, enabled = false, answered = false, controlReady = false;
     bool pong = false, pressed = false, neutral = false, closed = false;
+    unsigned burstPongs = 0;
     Json remoteControls = Json::array();
     std::string qualityCommand;
     std::vector<std::string> adaptations;
@@ -69,8 +70,11 @@ struct Fixture {
     std::string heartbeat;
     bool initializePeer;
     bool hevc;
-    explicit Fixture(std::string serverHeartbeat = "4000,4000", bool initialize = true, bool useHevc = false)
-        : heartbeat(std::move(serverHeartbeat)), initializePeer(initialize), hevc(useHevc) {
+    std::string fixtureClientHash;
+    explicit Fixture(std::string serverHeartbeat = "4000,4000", bool initialize = true, bool useHevc = false,
+                     std::string clientSuffix = "abcde")
+        : heartbeat(std::move(serverHeartbeat)), initializePeer(initialize), hevc(useHevc),
+          fixtureClientHash("fixture" + std::move(clientSuffix)) {
         rtc::WebSocketServer::Configuration config;
         config.port = 0; config.bindAddress = "127.0.0.1";
         server = std::make_unique<rtc::WebSocketServer>(config);
@@ -95,7 +99,7 @@ struct Fixture {
         server->stop();
     }
     void signal(const Json& json) {
-        ws->send(stream::protocol::frame("MESSAGE", {{"destination", "/topic/fixtureabcde/client"}}, json.dump()));
+        ws->send(stream::protocol::frame("MESSAGE", {{"destination", "/topic/" + fixtureClientHash + "/client"}}, json.dump()));
     }
     void createPeer() {
         rtc::Configuration config;
@@ -145,7 +149,7 @@ struct Fixture {
     void message(const Json& j) {
         const auto id = j.at("id").get<std::string>();
         if (id == "enabled") {
-            assert(subscribed && j.at("client_hash") == "fixtureabcde"); enabled = true;
+            assert(subscribed && j.at("client_hash") == fixtureClientHash); enabled = true;
             if (initializePeer) signal({{"id", "init"}, {"data", Json::array({"[]"}).dump()}});
         } else if (id == "init_webrtc") {
             assert(enabled && j.at("limit_fps") == 30 && j.at("gamepad") == true && j.at("control_only") == false);
@@ -185,10 +189,10 @@ struct Fixture {
                         if (!heartbeat.empty()) headers.emplace("heart-beat", heartbeat);
                         ws->send(stream::protocol::frame("CONNECTED", headers));
                     } else if (f.command == "SUBSCRIBE") {
-                        assert(f.headers.at("destination") == "/topic/fixtureabcde/client" && f.headers.at("ack") == "auto");
+                        assert(f.headers.at("destination") == "/topic/" + fixtureClientHash + "/client" && f.headers.at("ack") == "auto");
                         subscribed = true;
                     } else if (f.command == "SEND") {
-                        assert(f.headers.at("destination") == "/topic/fixture/server" && f.headers.at("client-hash") == "fixtureabcde");
+                        assert(f.headers.at("destination") == "/topic/fixture/server" && f.headers.at("client-hash") == fixtureClientHash);
                         message(Json::parse(f.body));
                     }
                 }
@@ -210,7 +214,10 @@ struct Fixture {
                 const auto j = Json::parse(e.text);
                 const auto id = j.at("id").get<std::string>();
                 if (id == "connection_ready") { controlReady = true; dc->send(Json{{"id", "ping"}, {"ts", 42}}.dump()); }
-                else if (id == "pong") { assert(j.at("ts") == 42); pong = true; }
+                else if (id == "pong") {
+                    if (j.at("ts") == 42) pong = true;
+                    else { assert(j.at("ts").get<unsigned>() >= 1000 && j.at("ts").get<unsigned>() < 1010); ++burstPongs; }
+                }
                 else if (id.rfind("set_",0) == 0) {
                     qualityCommand = id;
                     dc->send(Json{{"id","stats"},{"target_bitrate",18000000},{"preset",qualityProfile},
@@ -504,6 +511,43 @@ int main() {
         client.elapseForTesting(1);
         assert(client.requestVideoKeyframe());
         assert(!client.requestVideoKeyframe());
+        if (round == 1 || round == 3) {
+            // No render pump while more than the observed 702 SCTP messages arrive.
+            for (unsigned n=0; n<1000; ++n) {
+                fixture.dc->send(Json{{"id","ignored-private-id"},{"payload","private"}}.dump());
+                fixture.dc->send(Json{{"id","stats"},{"fps",30},{"preset",Json::array({"private"})}}.dump());
+                if (n % 100 == 0) fixture.dc->send(Json{{"id","ping"},{"ts",1000+n/100}}.dump());
+                if (round == 3 && n == 500) fixture.dc->send(Json{{"id","close"}}.dump());
+            }
+            const auto burstStart = Clock::now();
+            while (Clock::now()-burstStart < std::chrono::seconds(3)) {
+                fixture.pump(); // Deliberately no client.pump()/poll().
+                if (fixture.burstPongs == 10 && client.diagnostics().find("incomingIgnored=1000 ") != std::string::npos) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(fixture.burstPongs == 10);
+            assert(client.diagnostics().find("incomingIgnored=1000 ") != std::string::npos);
+            assert(client.diagnostics().find("eventOverflow=0") != std::string::npos);
+            assert(client.diagnostics().find("private") == std::string::npos);
+            client.pump();
+            if (round == 3) {
+                assert(client.error() == "Remote control closed" && !client.retryableError());
+                assert(!client.ready() && !client.disconnected());
+            } else {
+                assert(client.error().empty() && client.ready() && !client.disconnected());
+                assert(client.videoDiagnostics().find("serverPreset=LOW") != std::string::npos);
+                // A public input send can fail before pump sees terminal signaling.
+                client.blockControlForTesting(true);
+                assert(client.sendControl(fog::remote::key(false,"Enter").dump()));
+                client.advanceControlForTesting(15001);
+                assert(!client.sendGamepad(stream::Gamepad{}));
+                assert(!client.sendControl(fog::remote::key(false,"Enter").dump()));
+                assert(client.error().empty() && client.ready());
+                client.failThenReceiveForTesting(stream::protocol::frame("MESSAGE",{},R"({"id":"close"})"),true);
+                client.pump();
+                assert(client.error() == "Remote signaling closed stream" && !client.retryableError());
+            }
+        }
         if (round == 2) {
             assert(client.sendGamepad(stream::Gamepad{}));
             // Ensure the neutral reaches the fixture before intentionally
@@ -517,7 +561,7 @@ int main() {
             assert(client.sendControl(fog::remote::key(false,"Enter").dump()));
             client.advanceControlForTesting(15001);
             client.pump();
-            assert(client.error() == "Control channel stalled" && !client.ready());
+            assert(client.error() == "Control channel stalled" && !client.ready() && client.retryableError());
         }
         client.close();
         const auto finalDiagnostics = client.videoDiagnostics();
@@ -529,7 +573,7 @@ int main() {
         while (Clock::now() - closeStart < std::chrono::seconds(2) && (!fixture.closed || !fixture.neutral)) {
             fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        assert(fixture.closed && fixture.neutral);
+        assert((round == 2 ? !fixture.closed : fixture.closed) && fixture.neutral);
         std::cout << "Local transport integration passed: STOMP, actual ICE/DTLS/SRTP/SCTP, "
                      "filtered answer, H264/H265 AnnexB, Opus, PLI, REMB, quality controls/stats/confirmed Auto enhance+degrade/manual isolation, gamepad/mouse/keyboard/close\n";
     }
@@ -550,12 +594,44 @@ int main() {
             if (!client.error().empty()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        assert(!client.ready() && !client.error().empty());
+        assert(!client.ready() && !client.error().empty() && !client.retryableError());
         assert(client.error().find("private") == std::string::npos);
         client.close();
         std::cout << "Local transport error/cleanup passed with sanitized diagnostics\n";
     }
     stream::Client::cleanupRuntime();
+    {
+        // Reuse one Client and rental hash, changing only its connection suffix.
+        // Old callbacks must not contaminate the replacement RTC generation.
+        stream::Client client;
+        for (unsigned attempt=0; attempt<2; ++attempt) {
+            const std::string suffix = attempt == 0 ? "abcde" : "abcdf";
+            Fixture fixture("4000,4000",true,false,suffix);
+            assert(client.startForTesting("fixture",suffix,"ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+            const auto begin = Clock::now();
+            bool gotFrame = false;
+            while (Clock::now()-begin < std::chrono::seconds(5)) {
+                fixture.pump(); client.pump(); fixture.sendMedia();
+                stream::Packet packet;
+                while (client.poll(packet)) gotFrame |= packet.kind == stream::Kind::Video;
+                assert(client.error().empty());
+                if (gotFrame && client.ready() && fixture.controlReady && fixture.pong) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(gotFrame && client.ready() && fixture.controlReady && fixture.pong);
+            assert(client.diagnostics().find("incomingIgnored=0 ") != std::string::npos);
+            if (attempt == 0) {
+                assert(client.disconnectForRetry());
+                assert(client.error().empty() && !client.ready() && !client.disconnected());
+            } else client.close();
+            for (unsigned tick=0; tick<20; ++tick) {
+                fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(fixture.closed == (attempt == 1));
+        }
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "Same Client/rental hash reinit with fresh suffix, real frames/ping, retry no-close/final-close passed\n";
     // Malformed remote data identifies only the local phase/error class, never body.
     for (bool invalidBase64 : {true, false}) {
         {
@@ -574,7 +650,7 @@ int main() {
                 if (!client.error().empty()) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
-            assert(sent && !client.error().empty());
+            assert(sent && !client.error().empty() && !client.retryableError());
             assert(client.error().find(invalidBase64 ? "candidate.base64" : "candidate.json") != std::string::npos);
             if (!invalidBase64) assert(client.error().find("JSON error id=101") != std::string::npos);
             assert(client.error().find("private") == std::string::npos);
@@ -584,6 +660,45 @@ int main() {
         stream::Client::cleanupRuntime();
     }
     std::cout << "Empty provider offer/ICE markers and safe failure phase diagnostics passed\n";
+    // A retryable transport error must not hide terminal evidence later in the batch.
+    for (unsigned test=0; test<11; ++test) {
+        {
+            Fixture fixture("0,4000", false);
+            stream::Client client;
+            assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+            const auto begin = Clock::now();
+            while (Clock::now()-begin < std::chrono::seconds(2) && !fixture.enabled) {
+                fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            assert(fixture.enabled && client.error().empty());
+            if (test == 0) client.failThenReceiveForTesting(R"({"id":"close"})",false);
+            else if (test == 1) client.failThenReceiveForTesting(R"({"id":"error"})",false);
+            else if (test == 2) client.failThenReceiveForTesting("{private-malformed",false);
+            else if (test == 3) client.failThenReceiveForTesting(stream::protocol::frame("MESSAGE",{},R"({"id":"close"})"),true);
+            else if (test == 4) client.failThenReceiveForTesting(stream::protocol::frame("MESSAGE",{},"{private-malformed"),true);
+            else if (test == 5) client.failThenReceiveForTesting(stream::protocol::frame("ERROR",{},"private"),true);
+            else if (test == 6) {
+                for (unsigned n=0; n<129; ++n) client.failThenReceiveForTesting("{}",false);
+            } else if (test == 7) client.failThenReceiveForTesting("{}",false);
+            else {
+                // Queue SIGNAL ping followed by a terminal frame in ONE WsData.
+                // Close the socket first to force ping's send failure.
+                fixture.ws->close();
+                const auto ping = stream::protocol::frame("MESSAGE",{},R"({"id":"ping"})");
+                const auto fatal = test == 8 ? stream::protocol::frame("ERROR",{},"private") :
+                    stream::protocol::frame("MESSAGE",{},test == 9 ? R"({"id":"close"})" : "{private-malformed");
+                client.failThenReceiveForTesting(ping+fatal,true);
+            }
+            if (test < 8) assert(client.disconnectForRetry() == (test == 7));
+            else client.pump();
+            assert(!client.error().empty() && !client.ready());
+            assert(client.retryableError() == (test == 7));
+            assert(client.error().find("private") == std::string::npos);
+            client.close();
+        }
+        stream::Client::cleanupRuntime();
+    }
+    std::cout << "Transport-failure-before-terminal-control/signaling/queue-overflow precedence passed\n";
     // STOMP receive liveness must follow the negotiated server-to-client interval.
     // Keep the fixture before init so no video-stall deadline masks these assertions.
     for (const auto& heartbeat : {"4000,4000", "60000,4000", "0,4000", "", "4000,4000junk", "4000,0,0", "-1,4000"}) {
@@ -600,7 +715,7 @@ int main() {
             const bool malformed = std::string(heartbeat).find("junk") != std::string::npos ||
                 std::string(heartbeat) == "4000,0,0" || std::string(heartbeat) == "-1,4000";
             if (malformed) {
-                assert(!client.error().empty());
+                assert(!client.error().empty() && !client.retryableError());
             } else {
                 assert(fixture.enabled && client.error().empty());
                 client.elapseForTesting(20);
@@ -613,6 +728,13 @@ int main() {
                     client.pump();
                     assert(client.error() == "Stream connection timed out");
                 }
+            }
+            if (!malformed) {
+                assert(client.retryableError());
+                for (unsigned tick=0; tick<10; ++tick) {
+                    fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                assert(!fixture.closed);
             }
             client.close();
         }

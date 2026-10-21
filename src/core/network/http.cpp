@@ -136,7 +136,7 @@ HttpResponse HttpClient::request(const std::string& method, const std::string& p
     ResponseBuffer buffer;
     check(curl_easy_setopt(handle.get(), CURLOPT_URL, url.c_str()));
     check(curl_easy_setopt(handle.get(), CURLOPT_HTTPHEADER, headers.get()));
-    check(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "FogPlayNX/0.4.15"));
+    check(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "FogPlayNX/0.4.17"));
 #if LIBCURL_VERSION_NUM >= 0x075500
     check(curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS_STR, "https"));
 #else

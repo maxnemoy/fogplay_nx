@@ -11,7 +11,7 @@ SDL_Rect ApplicationController::videoRect() const {
 }
 
 bool ApplicationController::sendRemote(const Json& command) {
-    return stream_ && stream_->ready() && stream_->sendControl(command.dump());
+    return !transportReconnect_.recovering() && stream_ && stream_->ready() && stream_->sendControl(command.dump());
 }
 
 void ApplicationController::releaseMouse() noexcept {
@@ -24,12 +24,21 @@ void ApplicationController::releaseMouse() noexcept {
     mouseLeft_ = mouseRight_ = touchDrag_ = false;
 }
 
-void ApplicationController::overlayTransition() {
+void ApplicationController::neutralizeStreamInput() {
     releaseMouse();
     if (stream_) stream_->sendGamepad(stream::Gamepad{});
-    suppressStreamInput_ = true;
     touchWasDown_ = false;
     mouseAt_ = overlayHintAt_ = std::chrono::steady_clock::now();
+}
+
+void ApplicationController::suspendVideoInput() {
+    neutralizeStreamInput();
+    streamInputGate_.suspendVideo();
+}
+
+void ApplicationController::overlayTransition() {
+    neutralizeStreamInput();
+    streamInputGate_.overlayTransition();
 }
 
 void ApplicationController::overlayAction(const fog::stream::OverlayAction& action) {
@@ -72,9 +81,8 @@ bool ApplicationController::handleStreamOverlay(PadState& pad, u64 held, u64 dow
         (down & (HidNpadButton_Plus | HidNpadButton_Minus))) {
         overlay_.openMenu(); overlayTransition(); return true;
     }
-    if (suppressStreamInput_) {
+    if (streamInputGate_.suppressOverlay(held != 0,touching)) {
         // Avoid click/key/gamepad leakage from the action that opened/closed UI.
-        if (!held && !touching) suppressStreamInput_ = false;
         touchWasDown_ = touching;
         mouseAt_ = std::chrono::steady_clock::now();
         return true;
@@ -107,7 +115,7 @@ void ApplicationController::updateMouse(PadState& pad,u64 held,u64 down,const Hi
     const auto now = std::chrono::steady_clock::now();
     const float elapsed = std::clamp(std::chrono::duration<float>(now-mouseAt_).count(),0.0f,0.05f);
     mouseAt_ = now;
-    if (videoRecovery_.active() || videoLossWaiting_ || !stream_ || !stream_->ready() || !media_ || !media_->videoFrames()) return;
+    if (streamInputGate_.videoSuspended() || videoRecovery_.active() || videoLossWaiting_ || !stream_ || !stream_->ready() || !media_ || !media_->videoFrames()) return;
     const auto rect = videoRect();
     const auto stick = padGetStickPos(&pad,0);
     pointerX_ += axis(stick.x)*900.0f*elapsed;

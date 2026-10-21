@@ -95,7 +95,7 @@ void ApplicationController::run() {
                 checkoutAutoPoll_ && std::chrono::steady_clock::now() >= checkoutAt_) {
                 if (stopAfterTask_) beginFinish(); else pollCheckout(false);
             }
-            if (stream_ && focused && !stopAfterTask_) pumpStream(pad, held, down);
+            if ((stream_ || transportReconnect_.recovering()) && focused && !stopAfterTask_) pumpStream(pad, held, down);
             if (!pending_.valid() && focused) input(uiDown);
             if (screen_ == Screen::Games && focused && (!sidebar_ || catalog_.items().empty())) requestCatalog();
             if (screen_ == Screen::Stopping && !pending_.valid() && api_.loggedIn() &&
@@ -104,7 +104,7 @@ void ApplicationController::run() {
         catch (const std::exception& error) {
             status_ = safeText(error.what()); diagnostic(status_);
             if (screen_ == Screen::Checkout && !pending_.valid()) checkoutStatus_ = status_;
-            if (sessionPending_ && stream_) beginFinish("stream-exception");
+            if (sessionPending_ && (stream_ || !streamHash_.empty() || transportReconnect_.recovering())) beginFinish("stream-exception");
         }
         if (exitAfterStop_ && !sessionPending_ && !pending_.valid()) break;
         try { if (focused) draw(); else svcSleepThread(16000000); }

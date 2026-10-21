@@ -35,7 +35,7 @@ LogSession::LogSession() {
     mkdir("sdmc:/switch",0777);
     mkdir(dataDir,0777);
     runLog.start(dataDir,std::time(nullptr),[]{ return R_SUCCEEDED(fsdevCommitDevice("sdmc")); });
-    diagnostic("FogPlay NX 0.4.15 startup. Live session candidate; tested LAN AV stack. No credentials logged.");
+    diagnostic("FogPlay NX 0.4.17 startup. Live session candidate; tested LAN AV stack. No credentials logged.");
     diagnostic("Diagnostic archive: " + runLog.archivePath());
     if (!runLog.error().empty()) diagnostic("Log initialization warning: " + runLog.error());
 }

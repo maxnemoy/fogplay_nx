@@ -5,8 +5,14 @@ if ! python3 tools/rtc/manifest.py check host; then
     bash tools/rtc/build.sh host
 fi
 mkdir -p work/logs
+bash tools/test/stream-input.sh
+bash tools/test/reconnect.sh
 flags=(-std=c++17 -Wall -Wextra -Werror -pthread -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1 -Isrc -Ithird_party -Ithird_party/rtc/host/include)
 libs=(-Lthird_party/rtc/host/lib -Wl,--start-group -ldatachannel -ljuice -lusrsctp -lsrtp2 -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -Wl,--end-group)
+g++ "${flags[@]}" tests/incoming_control_tests.cpp -o work/incoming_control_tests
+./work/incoming_control_tests | tee work/logs/incoming-control-tests.log
+g++ "${flags[@]}" tests/transport_history_tests.cpp -o work/transport_history_tests
+./work/transport_history_tests | tee work/logs/transport-history-tests.log
 g++ "${flags[@]}" tests/stream_queue_tests.cpp -o work/stream_queue_tests
 ./work/stream_queue_tests | tee work/logs/stream-queue-tests.log
 g++ "${flags[@]}" tests/auto_quality_tests.cpp -o work/auto_quality_tests

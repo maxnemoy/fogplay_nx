@@ -23,8 +23,8 @@ struct Gamepad {
     float rightTrigger = 0;
     float leftTrigger = 0;
 };
-// Single application-thread controller. Network callbacks only enqueue bounded data.
-// Call pump every frame, then drain poll. Errors require the owner to finish its session.
+// Single application-thread controller. Callbacks store bounded data and answer pings.
+// Call pump every frame, then drain poll. The owner chooses bounded transport retry or session finish after an error.
 class Client {
 public:
     Client();
@@ -47,6 +47,9 @@ public:
     bool ready() const;
     std::string status() const;
     std::string error() const;
+    bool retryableError() const; // Fixed transport failures/timeouts only; persists after teardown.
+    bool disconnected() const; // Live peer or ICE Disconnected; application applies its grace period.
+    bool disconnectForRetry(); // False if pending terminal evidence forbids retry; otherwise release transports.
     // Fixed operation names and counters only; no remote fields or identifiers.
     std::string diagnostics() const;
     std::string videoDiagnostics() const;
@@ -69,6 +72,8 @@ public:
     void elapseForTesting(unsigned seconds);
     // Quality clock only; deterministic controller coverage over the real RTC channel.
     void advanceQualityForTesting(unsigned milliseconds);
+    // Deterministic event ordering fixture; no network/service injection in production.
+    void failThenReceiveForTesting(const std::string& text, bool signaling);
     void blockControlForTesting(bool blocked);
     void advanceControlForTesting(unsigned milliseconds);
 #endif
