@@ -1,11 +1,20 @@
 #include "app/application_controller.hpp"
+#include "features/streaming/domain/playback_drain.hpp"
 
 namespace fogplay {
 
 std::string ApplicationController::playbackTimings() const {
     const auto log = runLog.stats();
     return "Playback timing: " + drainTiming_.text("drain") + " " + presentTiming_.text("present") +
+        " " + transportPumpTiming_.text("transportPump") + " " + videoFeedTiming_.text("videoFeed") +
+        " " + decoderResetTiming_.text("decoderReset") + " " + audioFeedTiming_.text("audioFeed") + " " + prepareTiming_.text("prepare") +
         " " + diagnosticTiming.text("logEnqueue") + " pumpGapMaxUs=" + std::to_string(pumpGapMaxUs_) +
+        " outsideMeasuredPumpMaxUs=" + std::to_string(outsideMeasuredPumpMaxUs_) +
+        " videoQueueWaitMaxMs=" + std::to_string(videoQueueWaitMaxMs_) +
+        " audioQueueWaitMaxMs=" + std::to_string(audioQueueWaitMaxMs_) +
+        " slowCycles=" + std::to_string(slowPlaybackCycles_) +
+        " batchVideoTotal=" + std::to_string(drainVideoTotal_) + " batchVideoMax=" + std::to_string(drainVideoMax_) +
+        " frameBudgetYields=" + std::to_string(drainVideoBudgetHits_) +
         " budgetYields=" + std::to_string(drainBudgetHits_) + " catchupWindows=" + std::to_string(catchupWindows_) +
         " logQueued=" + std::to_string(log.queuedLines) + " logDropped=" + std::to_string(log.droppedLines) +
         " logWritten=" + std::to_string(log.writtenLines) + " logBatches=" + std::to_string(log.batches) +
@@ -22,9 +31,13 @@ bool ApplicationController::closeTransport(bool final) noexcept {
             std::string event;
             for (unsigned i = 0; i < 96 && stream_->pollVideoDiagnostic(event); ++i)
                 diagnostic("Stream final event: " + event,2048);
-            diagnostic("Video RTP final: " + stream_->videoDiagnostics(),2048);
+            diagnostic("Video RTP final: " + stream_->videoDiagnostics(),4096);
+            diagnostic("Media queue final: " + stream_->queueDiagnostics(),2048);
             diagnostic(playbackTimings(),2048);
-            if (media_) diagnostic("Video decoder final: " + media_->diagnostics(),2048);
+            if (media_) {
+                diagnostic("Video decoder final: " + media_->diagnostics(),2048);
+                diagnostic("Audio playback final: " + media_->audioDiagnostics(),2048);
+            }
         } catch (...) { retryAllowed = false; } // Cleanup must continue; an uncertain retry must stop.
         try {
             if (final) stream_->close();
@@ -34,6 +47,11 @@ bool ApplicationController::closeTransport(bool final) noexcept {
                 diagnostic("Transport final protocol: " + stream_->diagnostics(),2048);
             }
         } catch (...) { retryAllowed = false; }
+        try {
+            diagnostic("Video gaps final: " + stream_->gapDiagnostics(),4096);
+            diagnostic("Stream DTLS final: " + stream_->dtlsDiagnostics(),2048);
+            diagnostic("Stream mutex final: " + stream_->mutexDiagnostics(),4096);
+        } catch (...) {} // Diagnostic failure cannot prevent rental termination.
         stream_.reset();
     }
     media_.reset();
@@ -102,7 +120,11 @@ void ApplicationController::startStream(const std::string& hash, bool createdFro
     sessionPending_ = true;
     transportReconnect_.reset();
     drainTiming_ = {}; presentTiming_ = {}; diagnosticTiming = {};
-    lastPumpAt_ = {}; lastProtocolLog_ = {}; pumpGapMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
+    lastPumpAt_ = {}; lastProtocolLog_ = {}; pumpGapMaxUs_ = 0; outsideMeasuredPumpMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
+    transportPumpTiming_ = {}; videoFeedTiming_ = {}; decoderResetTiming_ = {}; audioFeedTiming_ = {}; prepareTiming_ = {};
+    drainVideoTotal_ = drainVideoMax_ = drainVideoBudgetHits_ = 0;
+    videoQueueWaitMaxMs_ = audioQueueWaitMaxMs_ = lastPumpWorkUs_ = slowPlaybackCycles_ = 0;
+    lastSlowPlaybackLog_ = {};
     ++sessionSequence_;
     diagnostic("Stream session=" + std::to_string(sessionSequence_) +
         (createdFromCatalog ? " origin=catalog catalogGameId=" + std::to_string(selectedGameId_) +
@@ -135,19 +157,46 @@ void ApplicationController::recoverVideoError(const fog::VideoDecodeError& error
     if (packet) detail += " rtpTimestamp=" + std::to_string(packet->timestamp) +
         " rtpFirstSeq=" + std::to_string(packet->firstSequence) + " rtpLastSeq=" + std::to_string(packet->lastSequence);
     diagnostic(detail,2048);
-    diagnostic("Video RTP at decode error: " + stream_->videoDiagnostics(),2048);
+    diagnostic("Video RTP at decode error: " + stream_->videoDiagnostics(),4096);
+    diagnostic("Video gaps at decode error: " + stream_->gapDiagnostics(),4096);
+    diagnostic("Media queue at decode error: " + stream_->queueDiagnostics(),2048);
     diagnostic("Video decoder at error: " + media_->diagnostics(),2048);
     if (!error.recoverable()) throw error;
     if (!videoRecovery_.begin(std::chrono::steady_clock::now()))
         throw std::runtime_error("Video recovery deadline/reset budget exhausted; stopping rental");
     suspendVideoInput();
     stream_->setDecoderWaitingForKeyframe(true);
+    const auto resetStarted = std::chrono::steady_clock::now();
     media_->resetVideoDecoder();
+    decoderResetTiming_.record(resetStarted);
+    videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now()-resetStarted).count());
     const bool requested = stream_->requestVideoKeyframe();
     diagnostic("Video recovery begin; reset=" + std::to_string(videoRecovery_.recentResets()) +
         " limit=3/60s deadline=10s keyframeRequested=" + std::to_string(requested));
 }
 
+void ApplicationController::feedStreamAudio(const stream::Packet& packet) {
+    const auto now = std::chrono::steady_clock::now();
+    if (videoRecovery_.expired(now))
+        throw std::runtime_error("Video recovery deadline reached; stopping rental");
+    const auto ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+    audioQueueWaitMaxMs_ = std::max(audioQueueWaitMaxMs_, ms >= packet.enqueueMs ? ms-packet.enqueueMs : 0);
+    const auto before = media_->audioPackets();
+    media_->audio(packet.data.data(), packet.data.size());
+    audioFeedTiming_.record(now);
+    if (!before) diagnostic("First Opus packet decoded and queued.");
+}
+void ApplicationController::drainStreamAudio() {
+    const auto started = std::chrono::steady_clock::now();
+    stream::Packet packet;
+    // Independent bounded audio slice, including when video exhausts its budget.
+    for (unsigned n = 0; n < 12; ++n) {
+        if (n && std::chrono::steady_clock::now()-started >= std::chrono::milliseconds(3)) break;
+        if (!stream_->pollAudio(packet)) break;
+        feedStreamAudio(packet);
+    }
+}
 void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     // Menu/finish intent wins over a due retry, including backoff with no Client.
     bool overlayHandled = false;
@@ -157,15 +206,24 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         if (screen_ != Screen::Streaming || stopAfterTask_ || streamHash_.empty()) return;
     }
     const auto pumpAt = std::chrono::steady_clock::now();
+    std::uint64_t pumpGapUs = 0;
+    const auto previousPumpWorkUs = lastPumpWorkUs_;
+    std::uint64_t transportWorkUs = 0;
     // Consume queued terminal/remote-close events before any timeout can replace
     // this transport; a local deadline must never turn them into another retry.
     if (stream_) {
         if (lastPumpAt_ != std::chrono::steady_clock::time_point{}) {
             const auto gap = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(pumpAt-lastPumpAt_).count());
+            pumpGapUs = gap;
             pumpGapMaxUs_ = std::max(pumpGapMaxUs_, gap);
+            outsideMeasuredPumpMaxUs_ = std::max(outsideMeasuredPumpMaxUs_, gap > previousPumpWorkUs ? gap-previousPumpWorkUs : 0);
         }
         lastPumpAt_ = pumpAt;
+        const auto transportStarted = std::chrono::steady_clock::now();
         stream_->pump();
+        transportPumpTiming_.record(transportStarted);
+        transportWorkUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now()-transportStarted).count());
         const auto streamState = stream_->status();
         const bool stateChanged = streamState != lastStreamState_;
         if (stateChanged) {
@@ -179,6 +237,8 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
                 lastStreamDiagnostics_ = details;
                 diagnostic("Stream protocol: " + details,2048);
             }
+            diagnostic("Stream DTLS: " + stream_->dtlsDiagnostics(),2048);
+            diagnostic("Stream mutex: " + stream_->mutexDiagnostics(),4096);
             lastProtocolLog_ = pumpAt;
         }
         if (!stream_->error().empty()) {
@@ -229,50 +289,74 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     }
     if (videoRecovery_.expired(std::chrono::steady_clock::now()))
         throw std::runtime_error("Video recovery deadline reached; stopping rental");
+    drainStreamAudio();
     stream::Packet packet;
     int drained = 0;
+    const auto decoderResetBeforeUs = decoderResetTiming_.totalUs;
     const auto drainStarted = std::chrono::steady_clock::now();
-    const bool catchup = stream_->queuedVideoPackets() >= 2;
-    const auto drainBudget = std::chrono::milliseconds(catchup ? 20 : 8);
-    if (catchup) ++catchupWindows_;
-    // Yield to input/presentation after a small batch. Never drop compressed
-    // reference frames here: the receive queue owns IDR-safe resynchronization.
-    while (drained < 12) {
-        if (drained && std::chrono::steady_clock::now()-drainStarted >= drainBudget) {
-            ++drainBudgetHits_; break;
+    const auto queuedBeforeDrain = stream_->queuedVideoPackets();
+    fog::stream::PlaybackDrainBudget drainBudget(queuedBeforeDrain, stream_->queuedVideoAgeMs());
+    if (drainBudget.catchup()) ++catchupWindows_;
+    // Keep compressed references in FIFO order. Bound both work time and the
+    // number of video frames before input, presentation, and audio get a turn.
+    while (true) {
+        const auto elapsedUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now()-drainStarted).count());
+        const auto yield = drainBudget.yield(elapsedUs);
+        if (yield != fog::stream::PlaybackDrainBudget::Yield::None) {
+            if (yield == fog::stream::PlaybackDrainBudget::Yield::Video) ++drainVideoBudgetHits_;
+            if (yield == fog::stream::PlaybackDrainBudget::Yield::Time) ++drainBudgetHits_;
+            break;
         }
         if (!stream_->poll(packet)) break;
         ++drained;
+        drainBudget.consumed(packet.kind == stream::Kind::Video);
+        const auto dequeueMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        const auto waitMs = dequeueMs >= packet.enqueueMs ? dequeueMs-packet.enqueueMs : 0;
+        auto& waitMaximum = packet.kind == stream::Kind::Video ? videoQueueWaitMaxMs_ : audioQueueWaitMaxMs_;
+        waitMaximum = std::max(waitMaximum, waitMs);
         if (videoRecovery_.expired(std::chrono::steady_clock::now()))
             throw std::runtime_error("Video recovery deadline reached; stopping rental");
         if (packet.kind == stream::Kind::Video) {
-            const auto workStarted = std::chrono::steady_clock::now();
             try {
                 media_->setVideoCodec(stream_->selectedVideoCodec());
                 if (packet.videoGeneration != lastVideoGeneration_) {
+                    const auto resetStarted = std::chrono::steady_clock::now();
                     media_->resetVideoDecoder();
+                    decoderResetTiming_.record(resetStarted);
+                    const auto resetUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now()-resetStarted).count());
+                    videoWorkUs_ += resetUs;
                     lastVideoGeneration_ = packet.videoGeneration;
                     suspendVideoInput();
                     diagnostic("Video chain resync: decoder reset generation=" + std::to_string(lastVideoGeneration_));
                 }
-                media_->video(packet.data.data(), packet.data.size());
+            } catch (const fog::VideoDecodeError& error) {
+                recoverVideoError(error,&packet);
+                continue;
             }
+            const auto workStarted = std::chrono::steady_clock::now();
+            try { media_->video(packet.data.data(), packet.data.size()); }
             catch (const fog::VideoDecodeError& error) {
+                videoFeedTiming_.record(workStarted);
                 videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - workStarted).count());
                 recoverVideoError(error,&packet);
                 continue;
             }
+            videoFeedTiming_.record(workStarted);
             videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - workStarted).count());
             if (videoRecovery_.expired(std::chrono::steady_clock::now()))
                 throw std::runtime_error("Video recovery deadline reached; stopping rental");
         } else {
-            const auto before = media_->audioPackets();
-            media_->audio(packet.data.data(), packet.data.size());
-            if (!before) diagnostic("First Opus packet decoded and queued.");
+            feedStreamAudio(packet);
         }
     }
+    drainStreamAudio();
+    drainVideoTotal_ += drainBudget.video();
+    drainVideoMax_ = std::max(drainVideoMax_, static_cast<std::uint64_t>(drainBudget.video()));
     const auto presentationStarted = std::chrono::steady_clock::now();
     bool prepared = false;
     try { prepared = media_->preparePresentation(); }
@@ -281,6 +365,9 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             std::chrono::steady_clock::now()-presentationStarted).count());
         recoverVideoError(error,nullptr);
     }
+    prepareTiming_.record(presentationStarted);
+    const auto prepareWorkUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now()-presentationStarted).count());
     if (prepared) {
         videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now()-presentationStarted).count());
@@ -311,11 +398,35 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         }
     }
     drainTiming_.record(drainStarted);
-    // Counters describe successful decoding and the full video processing cost
-    // (including transfer/upload); all observation remains on the app thread.
-    stream_->observePlayback(media_->videoFrames(), videoWorkUs_, videoDecodeErrors_,
+    const auto measuredAt = std::chrono::steady_clock::now();
+    lastPumpWorkUs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(measuredAt-pumpAt).count());
+    // One alert per second at most; the five-second aggregates count all stalls.
+    // The previous measured work distinguishes an app-thread gap from slow media work.
+    if (pumpGapUs >= 50000 || lastPumpWorkUs_ >= 50000) {
+        ++slowPlaybackCycles_;
+        if (measuredAt-lastSlowPlaybackLog_ >= std::chrono::seconds(1)) {
+            diagnostic("Playback slow cycle: pumpGapUs=" + std::to_string(pumpGapUs) +
+                " outsideMeasuredPumpUs=" + std::to_string(pumpGapUs > previousPumpWorkUs ? pumpGapUs-previousPumpWorkUs : 0) +
+                " previousPumpMeasuredUs=" + std::to_string(previousPumpWorkUs) +
+                " pumpMeasuredUs=" + std::to_string(lastPumpWorkUs_) +
+                " transportUs=" + std::to_string(transportWorkUs) +
+                " mediaBatchUs=" + std::to_string(static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(measuredAt-drainStarted).count())) +
+                " prepareUs=" + std::to_string(prepareWorkUs) +
+                " decoderResetUs=" + std::to_string(decoderResetTiming_.totalUs-decoderResetBeforeUs) +
+                " videoDrained=" + std::to_string(drainBudget.video()) +
+                " videoBefore=" + std::to_string(queuedBeforeDrain) +
+                " videoAfter=" + std::to_string(stream_->queuedVideoPackets()) +
+                " drained=" + std::to_string(drained), 1024);
+            lastSlowPlaybackLog_ = measuredAt;
+        }
+    }
+    // Presentation counts come from the preceding completed RenderPresent, never
+    // repeated drawing of an old texture or decoding alone.
+    stream_->observePlayback({media_->presentedFrames(), media_->videoFrames(), media_->supersededFrames(),
+        videoWorkUs_, videoDecodeErrors_, media_->audioUnderruns(), media_->audioQueueResets(),
         transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe(),
-        media_->videoWidth(), media_->videoHeight());
+        media_->videoWidth(), media_->videoHeight()});
     const auto now = std::chrono::steady_clock::now();
     if (now-lastMediaLog_ >= std::chrono::seconds(5)) {
         diagnostic("Media video=" + std::to_string(media_->videoFrames()) +
@@ -325,11 +436,17 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             " width=" + std::to_string(media_->videoWidth()) + " height=" + std::to_string(media_->videoHeight()) +
             " recovering=" + std::to_string(videoRecovery_.active()) +
             " waitingIDR=" + std::to_string(media_->waitingForVideoKeyframe()));
-        diagnostic("Video RTP: " + stream_->videoDiagnostics(),2048);
+        diagnostic("Video RTP: " + stream_->videoDiagnostics(),4096);
+        diagnostic("Video gaps: " + stream_->gapDiagnostics(),4096);
+        diagnostic("Media queue: " + stream_->queueDiagnostics(),2048);
         diagnostic("Video decoder: " + media_->diagnostics(),2048);
+        diagnostic("Audio playback: " + media_->audioDiagnostics(),2048);
         const auto timings = playbackTimings();
         drainTiming_ = {}; presentTiming_ = {}; diagnosticTiming = {};
-        pumpGapMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
+        pumpGapMaxUs_ = 0; outsideMeasuredPumpMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
+        transportPumpTiming_ = {}; videoFeedTiming_ = {}; decoderResetTiming_ = {}; audioFeedTiming_ = {}; prepareTiming_ = {};
+        drainVideoTotal_ = drainVideoMax_ = drainVideoBudgetHits_ = 0;
+        videoQueueWaitMaxMs_ = audioQueueWaitMaxMs_ = slowPlaybackCycles_ = 0;
         diagnostic(timings,2048);
         lastMediaLog_ = now;
     }

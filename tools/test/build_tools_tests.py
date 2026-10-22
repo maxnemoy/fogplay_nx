@@ -90,6 +90,8 @@ class BuildToolsTests(unittest.TestCase):
         import zipfile
         with zipfile.ZipFile(archive) as check:
             self.assertEqual(len(check.namelist()), 4)
+            self.assertTrue(all(name.startswith('switch/fogplay_nx/') for name in check.namelist()))
+            self.assertIn('switch/fogplay_nx/fogplay_nx.nro', check.namelist())
             self.assertFalse(any('unrelated' in name for name in check.namelist()))
 
     def test_make_tracks_system_headers_flags_and_safe_clean(self):

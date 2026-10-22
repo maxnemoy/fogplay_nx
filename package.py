@@ -33,7 +33,7 @@ def main():
                               (ROOT / 'Makefile').read_text(), re.M)
     require(version_match is not None, 'APP_VERSION is missing or invalid in Makefile')
     version = version_match.group(1)
-    install = 'switch/fogplay_nx_' + version.replace('.', '')
+    install = 'switch/fogplay_nx'
     files = {'fogplay_nx.nro': nro, 'README.md': ROOT / 'README.md',
              'docs/THIRD-PARTY.md': ROOT / 'docs/THIRD-PARTY.md'}
     if (ROOT / 'LICENSE').exists(): files['LICENSE'] = ROOT / 'LICENSE'

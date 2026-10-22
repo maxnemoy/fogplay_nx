@@ -1,5 +1,6 @@
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/media_annexb.hpp"
+#include "features/streaming/domain/audio_queue_metrics.hpp"
 #include "features/streaming/infrastructure/media_decoder_diagnostics.hpp"
 #include <SDL.h>
 #include <opus/opus.h>
@@ -65,7 +66,9 @@ struct Media::Impl {
     bool deferredPresentation = false, pending = false;
     DecoderClock::time_point pendingSince{};
     std::uint64_t uploadedFrames = 0, supersededFrames = 0;
+    std::uint64_t presentedFrames = 0, drawnGeneration = 0, presentedGeneration = 0;
     std::uint64_t frames = 0, packets = 0;
+    detail::AudioQueueMetrics audioMetrics;
     bool hw = false;
     bool ownsCallback = false;
     bool waiting = false, awaitingIdr = false;
@@ -142,7 +145,7 @@ struct Media::Impl {
             "send_calls=%llu send_avg_us=%llu send_max_us=%llu receive_calls=%llu receive_avg_us=%llu receive_max_us=%llu "
             "transfer_calls=%llu transfer_avg_us=%llu transfer_max_us=%llu scale_calls=%llu scale_avg_us=%llu scale_max_us=%llu "
             "upload_calls=%llu upload_avg_us=%llu upload_max_us=%llu "
-            "uploaded_frames=%llu superseded_frames=%llu pending_frames=%d pending_frame_age_us=%llu "
+            "decoded_frames=%llu uploaded_frames=%llu presented_frames=%llu superseded_frames=%llu pending_frames=%d pending_frame_age_us=%llu "
             "nv_events=%llu nv_status=%d nv_fresh=%d nv_error=0x%08x nv_mbs_error=%u nv_mbs_ok=%u nv_cycles_raw=%u nv_header_error=0x%08x nv_wait_code=%d",
             decoder && decoder->codec ? decoder->codec->name : "none", decoder ? decoder->codec_id : 0,
             pixel ? pixel : "none", actual ? actual : "none", cpu ? cpu : "none",
@@ -153,12 +156,34 @@ struct Media::Impl {
             static_cast<unsigned long long>(transferTiming.calls), static_cast<unsigned long long>(transferTiming.average()), static_cast<unsigned long long>(transferTiming.maximum),
             static_cast<unsigned long long>(scaleTiming.calls), static_cast<unsigned long long>(scaleTiming.average()), static_cast<unsigned long long>(scaleTiming.maximum),
             static_cast<unsigned long long>(uploadTiming.calls), static_cast<unsigned long long>(uploadTiming.average()), static_cast<unsigned long long>(uploadTiming.maximum),
-            static_cast<unsigned long long>(uploadedFrames), static_cast<unsigned long long>(supersededFrames), pending ? 1 : 0,
+            static_cast<unsigned long long>(frames), static_cast<unsigned long long>(uploadedFrames),
+            static_cast<unsigned long long>(presentedFrames), static_cast<unsigned long long>(supersededFrames), pending ? 1 : 0,
             pending ? static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::microseconds>(
                 DecoderClock::now() - pendingSince).count()) : 0ULL,
             static_cast<unsigned long long>(status.events), status.hasStatus ? 1 : 0,
             status.events > hardwareEventsBeforePacket ? 1 : 0, status.error, status.badBlocks, status.goodBlocks,
             status.cycles, status.headerError, status.waitCode);
+        return text.data();
+    }
+    std::uint32_t observeAudioQueue() {
+        const auto bytes = SDL_GetQueuedAudioSize(audioDevice);
+        audioMetrics.observe(bytes, DecoderClock::now());
+        return bytes;
+    }
+    std::string audioDiagnostics() {
+        const auto bytes = observeAudioQueue();
+        std::array<char, 512> text{};
+        std::snprintf(text.data(), text.size(),
+            "audio_packets=%llu audio_queued_ms=%llu audio_max_queued_ms=%llu "
+            "audio_empty_observations=%llu audio_prolonged_empty_observations=%llu audio_empty_threshold_ms=40 "
+            "audio_queue_resets=%llu audio_reset_discarded_ms=%llu",
+            static_cast<unsigned long long>(packets),
+            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(bytes)),
+            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.maximumBytes)),
+            static_cast<unsigned long long>(audioMetrics.emptyObservations),
+            static_cast<unsigned long long>(audioMetrics.prolongedEmptyObservations),
+            static_cast<unsigned long long>(audioMetrics.resets),
+            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.discardedBytes)));
         return text.data();
     }
     int sendPacket() {
@@ -290,6 +315,8 @@ struct Media::Impl {
             texture = candidate.release();
             textureWidth = w; textureHeight = h;
         }
+        // A draw of the preceding texture cannot acknowledge this upload.
+        drawnGeneration = 0;
         ++uploadedFrames;
         pending = false;
         av_frame_unref(pendingFrame);
@@ -384,13 +411,19 @@ void Media::audio(const std::byte* data, std::size_t size) {
         static_cast<opus_int32>(size), pcm.data(), 5760, 0);
     if (count < 0) throw std::runtime_error("Opus decoding failed");
     // Drop stale queued audio after a scheduling stall instead of increasing latency.
-    if (SDL_GetQueuedAudioSize(impl_->audioDevice) > 48000*2*2/5) SDL_ClearQueuedAudio(impl_->audioDevice);
+    const auto queued = impl_->observeAudioQueue();
+    if (queued > detail::AudioQueueMetrics::bytesPerSecond / 5) {
+        SDL_ClearQueuedAudio(impl_->audioDevice);
+        impl_->audioMetrics.cleared(queued);
+    }
     if (SDL_QueueAudio(impl_->audioDevice, pcm.data(), static_cast<Uint32>(count*2*sizeof(opus_int16))) != 0)
         throw std::runtime_error("Cannot queue audio");
     ++impl_->packets;
+    impl_->audioMetrics.queued(SDL_GetQueuedAudioSize(impl_->audioDevice), DecoderClock::now());
 }
 bool Media::preparePresentation() { return impl_->preparePresentation(); }
 bool Media::draw() {
+    impl_->drawnGeneration = 0;
     if (!impl_->texture) return false;
     const double scale = std::min(1280.0/impl_->textureWidth, 720.0/impl_->textureHeight);
     const int w = static_cast<int>(impl_->textureWidth*scale), h = static_cast<int>(impl_->textureHeight*scale);
@@ -401,10 +434,28 @@ bool Media::draw() {
         throw std::runtime_error("Video background rendering failed");
     if (SDL_RenderCopy(impl_->renderer, impl_->texture, nullptr, &rect) != 0)
         throw std::runtime_error("Video rendering failed");
+    impl_->drawnGeneration = impl_->uploadedFrames;
     return true;
 }
+void Media::presented() {
+    const auto generation = impl_->drawnGeneration;
+    impl_->drawnGeneration = 0;
+    if (generation && generation != impl_->presentedGeneration) {
+        impl_->presentedGeneration = generation;
+        ++impl_->presentedFrames;
+    }
+}
 std::uint64_t Media::videoFrames() const { return impl_->frames; }
+std::uint64_t Media::uploadedFrames() const { return impl_->uploadedFrames; }
+std::uint64_t Media::presentedFrames() const { return impl_->presentedFrames; }
+std::uint64_t Media::supersededFrames() const { return impl_->supersededFrames; }
 std::uint64_t Media::audioPackets() const { return impl_->packets; }
+std::uint64_t Media::audioUnderruns() const {
+    impl_->observeAudioQueue();
+    return impl_->audioMetrics.prolongedEmptyObservations;
+}
+std::uint64_t Media::audioQueueResets() const { return impl_->audioMetrics.resets; }
+std::string Media::audioDiagnostics() const { return impl_->audioDiagnostics(); }
 bool Media::hardwareVideo() const { return impl_->hw; }
 int Media::videoWidth() const { return impl_->width; }
 int Media::videoHeight() const { return impl_->height; }

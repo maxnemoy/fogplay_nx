@@ -109,4 +109,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(rtc-ice-diagnostics-test ice-diagnostics-test.cpp)
   target_compile_options(rtc-ice-diagnostics-test PRIVATE -UNDEBUG)
   target_link_libraries(rtc-ice-diagnostics-test PRIVATE datachannel-static)
+  add_executable(rtc-dtls-queue-test dtls-queue-test.cpp)
+  target_include_directories(rtc-dtls-queue-test PRIVATE
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/src"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/include/rtc")
+  target_compile_options(rtc-dtls-queue-test PRIVATE -UNDEBUG)
+  target_link_libraries(rtc-dtls-queue-test PRIVATE datachannel-static)
+  add_executable(rtc-dtls-diagnostics-test dtls-diagnostics-test.cpp)
+  target_compile_options(rtc-dtls-diagnostics-test PRIVATE -UNDEBUG)
+  target_link_libraries(rtc-dtls-diagnostics-test PRIVATE datachannel-static)
 endif()

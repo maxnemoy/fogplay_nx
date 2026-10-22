@@ -65,7 +65,12 @@ private:
     }
 };
 struct Sample {
-    std::uint64_t frames = 0, workUs = 0, errors = 0;
+    // Session totals: frames counts only new frames successfully presented.
+    // Decoder work belongs to decodedFrames, including frames superseded before presentation.
+    std::uint64_t frames = 0, decodedFrames = 0, supersededFrames = 0, workUs = 0, errors = 0;
+    // Audio loss counters exclude startup/recovery priming and intentional resets.
+    std::uint64_t audioDropped = 0, audioUnderruns = 0;
+    std::uint64_t audioResets = 0; // Intentional PCM clears interrupt headroom, not proof of overload.
     std::uint64_t missing = 0, faults = 0, recoveries = 0, pressure = 0;
     std::size_t queuedVideo = 0;
     std::uint64_t oldestVideoMs = 0; // Residual queue after this playback slice, not a receive peak.
@@ -81,7 +86,7 @@ public:
         enabled_ = enabled; pending_ = Action::None; sampled_ = false; stable_ = false;
         observed_ = Profile::Unknown;
         attemptsUp_ = attemptsDown_ = downgradeStreak_ = 0; nextUp_ = nextDown_ = now; lastCommand_ = now;
-        lagging_ = false; lagSince_ = 0; queueWindows_ = 0; maxOldestVideoMs_ = 0;
+        lagging_ = false; lagSince_ = 0; queueWindows_ = deliveryWindows_ = audioWindows_ = 0; maxOldestVideoMs_ = 0;
         reason_ = enabled ? "startup" : "manual";
         event(enabled ? "enabled" : "disabled", now);
     }
@@ -92,13 +97,16 @@ public:
         // Check freshness on every playback observation, including between 2s
         // evaluations: an update at the window boundary cannot hide stale gaps.
         if (!server.profile.fresh(now) || !server.fps.fresh(now)) stable_ = false;
-        if (!server.profile.fresh(now)) queueWindows_ = 0;
+        if (!server.profile.fresh(now)) queueWindows_ = deliveryWindows_ = audioWindows_ = 0;
         if (!sampled_ || now < lastObserve_ || now - lastObserve_ > 1000 ||
-            sample.frames < base_.frames || sample.workUs < base_.workUs || sample.errors < base_.errors ||
+            sample.frames < base_.frames || sample.decodedFrames < base_.decodedFrames ||
+            sample.supersededFrames < base_.supersededFrames || sample.audioDropped < base_.audioDropped ||
+            sample.audioUnderruns < base_.audioUnderruns || sample.audioResets < base_.audioResets ||
+            sample.workUs < base_.workUs || sample.errors < base_.errors ||
             sample.missing < base_.missing || sample.faults < base_.faults ||
             sample.recoveries < base_.recoveries || sample.pressure < base_.pressure) {
             base_ = sample; baseAt_ = lastObserve_ = now; sampled_ = true;
-            stable_ = false; interrupted_ = sample.recovering; queueWindows_ = 0;
+            stable_ = false; interrupted_ = sample.recovering; queueWindows_ = deliveryWindows_ = audioWindows_ = 0;
             lagging_ = false; lagSince_ = now; maxOldestVideoMs_ = sample.oldestVideoMs;
             decide("sample-gap", now); return Action::None;
         }
@@ -115,36 +123,52 @@ public:
         if (now - baseAt_ < 2000) return Action::None;
         const double elapsed = static_cast<double>(now - baseAt_);
         const auto frames = sample.frames - base_.frames, work = sample.workUs - base_.workUs;
+        const auto decoded = sample.decodedFrames - base_.decodedFrames;
+        const auto superseded = sample.supersededFrames - base_.supersededFrames;
+        const auto audioDropped = sample.audioDropped - base_.audioDropped;
+        const auto audioUnderruns = sample.audioUnderruns - base_.audioUnderruns;
+        const auto audioResets = sample.audioResets - base_.audioResets;
         const auto errors = sample.errors - base_.errors, missing = sample.missing - base_.missing;
         const auto faults = sample.faults - base_.faults, pressure = sample.pressure - base_.pressure;
         const auto recoveries = sample.recoveries - base_.recoveries;
         fps_ = frames * 1000.0 / elapsed;
-        workMs_ = frames ? work / (1000.0 * frames) : 0;
+        decodedFps_ = decoded * 1000.0 / elapsed;
+        workMs_ = decoded ? work / (1000.0 * decoded) : 0;
         busy_ = work / (1000.0 * elapsed);
         const bool dimensions = sample.width > 0 && sample.height > 0 && sample.width <= 1920 && sample.height <= 1080;
         const bool contiguous = !interrupted_ && elapsed <= 3000;
         const auto oldest = maxOldestVideoMs_; maxOldestVideoMs_ = 0;
         const bool sustainedQueue = lagging_ && now - lagSince_ >= 1000;
         base_ = sample; baseAt_ = now; interrupted_ = sample.recovering;
-        if (!server.profile.fresh(now)) { stable_ = false; queueWindows_ = 0; decide("profile-stale", now); return Action::None; }
-        if (pending_ != Action::None) { stable_ = false; queueWindows_ = 0; decide("await-confirmation", now); return Action::None; }
-        if (!dimensions) { stable_ = false; queueWindows_ = 0; decide("dimensions", now); return Action::None; }
+        if (!server.profile.fresh(now)) { stable_ = false; queueWindows_ = deliveryWindows_ = audioWindows_ = 0; decide("profile-stale", now); return Action::None; }
+        if (pending_ != Action::None) { stable_ = false; queueWindows_ = deliveryWindows_ = audioWindows_ = 0; decide("await-confirmation", now); return Action::None; }
+        if (!dimensions) { stable_ = false; queueWindows_ = deliveryWindows_ = audioWindows_ = 0; decide("dimensions", now); return Action::None; }
         const double expected = server.fps.fresh(now) ? std::min(30.0, server.fps.value) : 30.0;
         queueWindows_ = sustainedQueue ? std::min(queueWindows_ + 1, 2u) : 0;
-        // Low FPS alone may be a static source. Demand measured local work, errors,
-        // repeated transport damage or persistent queued video before decreasing.
-        const bool overloaded = frames && (busy_ >= 0.85 || (workMs_ >= 30 && fps_ < expected * 0.8));
+        // Low source FPS alone may be a static scene. A local delivery shortfall
+        // needs decoded supply or substantial measured superseding, and must
+        // persist across two complete windows outside startup/recovery gaps.
+        const bool deliveryLoss = fps_ < expected * 0.8 &&
+            ((decodedFps_ >= expected * 0.85 && frames < decoded * 0.8) ||
+             (superseded >= 4 && superseded >= decoded * 0.2));
+        deliveryWindows_ = contiguous && deliveryLoss ? std::min(deliveryWindows_ + 1, 2u) : 0;
+        const bool audioLoss = audioDropped >= 2 || audioUnderruns >= 2;
+        audioWindows_ = contiguous && !audioResets && audioLoss ? std::min(audioWindows_ + 1, 2u) : 0;
+        const bool deliveryTrouble = deliveryWindows_ >= 2, audioTrouble = audioWindows_ >= 2;
+        const bool overloaded = decoded && (busy_ >= 0.85 || (workMs_ >= 30 && fps_ < expected * 0.8));
         const bool damaged = errors >= 2 || (errors && fps_ < expected * 0.8) ||
             missing >= 8 || recoveries >= 2 || pressure || queueWindows_ >= 2;
-        if (overloaded || damaged) {
+        if (overloaded || damaged || deliveryTrouble || audioTrouble) {
             stable_ = false;
             if (server.profile.value == Profile::Low) { decide("floor-low", now); return Action::None; }
             if (now - lastCommand_ < 5000 || now < nextDown_) { decide("down-cooldown", now); return Action::None; }
             if (attemptsDown_ >= 2) { decide("down-unconfirmed", now); return Action::None; }
-            decide(overloaded ? "video-work-overload" : "transport-decode-trouble", now);
+            decide(overloaded ? "video-work-overload" : damaged ? "transport-decode-trouble" :
+                deliveryTrouble ? "video-delivery-loss" : "audio-playback-loss", now);
             return Action::Degrade;
         }
         const bool healthy = contiguous && !sample.recovering && !errors && !missing && !faults && !pressure &&
+            !superseded && !audioDropped && !audioUnderruns && !audioResets &&
             // Brief young batches are normal, but every healthy window
             // must demonstrate that old queued video was actually drained.
             oldest <= 100 && !sustainedQueue && frames && fps_ >= expected * 0.85 && workMs_ <= 20 && busy_ < 0.65 &&
@@ -172,10 +196,10 @@ public:
     bool pending() const { return pending_ != Action::None; }
     double fps() const { return fps_; }
     std::string diagnostics() const {
-        char out[400];
-        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d sampleFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u",
-            enabled_, reason_, pending(), fps_, workMs_, busy_, attemptsUp_, attemptsDown_, downgradeStreak_,
-            static_cast<unsigned long long>(nextUp_), queueWindows_);
+        char out[640];
+        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u",
+            enabled_, reason_, pending(), fps_, decodedFps_, workMs_, busy_, attemptsUp_, attemptsDown_, downgradeStreak_,
+            static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_);
         return out;
     }
     bool pollEvent(std::string& out) {
@@ -187,6 +211,9 @@ private:
         if (server.profile.fresh(now) && server.profile.value != observed_) {
             const auto previous = observed_;
             observed_ = server.profile.value; attemptsUp_ = attemptsDown_ = 0; stable_ = false;
+            // A preset transition invalidates every in-progress measurement:
+            // even a mostly-HIGH window cannot become the first MID window.
+            sampled_ = false; deliveryWindows_ = audioWindows_ = 0;
             if (previous != Profile::Unknown && observed_ < previous) {
                 // Keep the failed capacity experiment for the whole session.
                 // A healthy MID immediately after a bad HIGH must not cause
@@ -218,21 +245,21 @@ private:
     }
     void event(const char* state, std::uint64_t now) {
         if (events_.size() >= 32) events_.pop_front();
-        char values[240];
-        std::snprintf(values, sizeof(values), " sampleFps=%.2f videoWorkMs=%.2f videoBusy=%.3f downgrades=%u nextUpMs=%llu queueWindows=%u", fps_, workMs_, busy_, downgradeStreak_, static_cast<unsigned long long>(nextUp_), queueWindows_);
+        char values[360];
+        std::snprintf(values, sizeof(values), " sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f downgrades=%u nextUpMs=%llu queueWindows=%u deliveryWindows=%u audioWindows=%u", fps_, decodedFps_, workMs_, busy_, downgradeStreak_, static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_);
         events_.push_back(std::string("qualityEvent=") + state + " ms=" + std::to_string(now) +
             " reason=" + reason_ + " profile=" + name(observed_) + values);
     }
     bool enabled_ = false, sampled_ = false, stable_ = false, interrupted_ = false;
     std::uint64_t baseAt_ = 0, lastObserve_ = 0, stableAt_ = 0, lastCommand_ = 0;
     std::uint64_t nextUp_ = 0, nextDown_ = 0, pendingAt_ = 0, pendingRevision_ = 0;
-    unsigned attemptsUp_ = 0, attemptsDown_ = 0, queueWindows_ = 0, downgradeStreak_ = 0;
+    unsigned attemptsUp_ = 0, attemptsDown_ = 0, queueWindows_ = 0, deliveryWindows_ = 0, audioWindows_ = 0, downgradeStreak_ = 0;
     Profile observed_ = Profile::Unknown, from_ = Profile::Unknown;
     Action pending_ = Action::None;
     bool lagging_ = false;
     std::uint64_t lagSince_ = 0, maxOldestVideoMs_ = 0;
     Sample base_;
-    double fps_ = 0, workMs_ = 0, busy_ = 0;
+    double fps_ = 0, decodedFps_ = 0, workMs_ = 0, busy_ = 0;
     const char* reason_ = "manual";
     std::deque<std::string> events_;
 };

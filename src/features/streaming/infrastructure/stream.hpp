@@ -17,6 +17,12 @@ struct Packet {
     std::uint64_t enqueueMs = 0; // Local steady clock, never a remote timestamp.
     std::uint64_t videoGeneration = 0; // Reset decoder when the next video AU changes generation.
 };
+struct PlaybackObservation {
+    std::uint64_t presentedFrames = 0, decodedFrames = 0, supersededFrames = 0;
+    std::uint64_t workUs = 0, errors = 0, audioUnderruns = 0, audioResets = 0;
+    bool recovering = false;
+    int width = 0, height = 0;
+};
 struct Gamepad {
     std::array<int, 18> buttons{};
     std::array<float, 4> axes{};
@@ -42,9 +48,10 @@ public:
     std::string qualityStatus() const;
     void pump();
     // Application thread, once per frame after draining packets. Counters are cumulative per session.
-    void observePlayback(std::uint64_t decodedFrames, std::uint64_t videoWorkUs,
-                         std::uint64_t decodeErrors, bool recovering, int width, int height);
+    void observePlayback(const PlaybackObservation& observation);
     bool poll(Packet& packet);
+    bool pollAudio(Packet& packet); // Audio FIFO, independent of queued compressed video.
+    std::uint64_t queuedVideoAgeMs() const;
     std::size_t queuedVideoPackets() const;
     bool ready() const;
     std::string status() const;
@@ -55,6 +62,10 @@ public:
     // Fixed operation names and counters only; no remote fields or identifiers.
     std::string diagnostics() const;
     std::string videoDiagnostics() const;
+    std::string gapDiagnostics() const;
+    std::string queueDiagnostics() const;
+    std::string mutexDiagnostics() const;
+    std::string dtlsDiagnostics() const;
     bool pollVideoDiagnostic(std::string& event);
     bool waitingForVideoKeyframe() const;
     bool requestVideoKeyframe(); // Best effort PLI on open video tracks; no transport reset.

@@ -20,7 +20,7 @@ int main() {
     for (const std::string fmtp : {"", "profile-id=1;sprop-max-don-diff=0;tx-mode=SRST", "Profile-ID = 1 ; sprop-max-don-diff = 0"}) {
         const auto selected=filterOffer(offer(fmtp),VideoCodec::H265);
         assert(offeredVideoCodec(selected)==VideoCodec::H265 && selected.find("rtpmap:96")==std::string::npos);
-        assert(selected.find("rtpmap:99")==std::string::npos && selected.find("rtcp-fb:98 nack pli")!=std::string::npos);
+        assert(selected.find("rtpmap:99 rtx/90000")!=std::string::npos && selected.find("rtcp-fb:98 nack pli")!=std::string::npos);
     }
     for (const std::string fmtp : {"sprop-max-don-diff=1", "sprop-max-don-diff=65535", "tx-mode=MST", "tx-mode=MSST",
                                   "sprop-depack-buf-nalus=1", "profile-id=2", "profile-space=1", "packetization-mode=1",
@@ -30,6 +30,14 @@ int main() {
         bool threw=false; try { (void)filterOffer(onlyHevc,VideoCodec::H265); } catch (const Error&) { threw=true; }
         assert(threw);
     }
+    const auto multipleFid=offer()+"a=ssrc-group:FID 1 2\r\na=ssrc-group:FID 3 4\r\n";
+    const auto fallback=filterOffer(multipleFid,VideoCodec::H265);
+    assert(fallback.find("rtpmap:99")==std::string::npos && offeredVideoCodec(fallback)==VideoCodec::H265);
+    const auto ambiguous=videoRepairConfig(multipleFid); assert(ambiguous.rtx.empty() && !ambiguous.mediaSsrc);
+    const auto repairOffer=filterOffer(offer()+"a=rtcp-fb:98 nack\r\na=ssrc-group:FID 1 2\r\n",VideoCodec::H265);
+    const auto config=videoRepairConfig(repairOffer);
+    assert(config.nack() && config.rtx.at(99)==98 && config.mediaSsrc==1 && config.rtxSsrc==2);
+    assert(!videoRepairConfig(filterOffer(offer(),VideoCodec::H265)).nack()); // PLI-only is not Generic NACK.
     auto tabs=offer("sprop-max-don-diff=1"); tabs.replace(tabs.find("a=fmtp:98 "),10,"a=fmtp:98\t");
     assert(offeredVideoCodec(filterOffer(tabs,VideoCodec::H265))==VideoCodec::H264);
     const auto h264Track="m=video 9 UDP/TLS/RTP/SAVPF 100\r\na=mid:second\r\na=sendonly\r\na=rtpmap:100 H264/90000\r\n";

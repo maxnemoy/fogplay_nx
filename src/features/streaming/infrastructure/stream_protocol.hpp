@@ -1,6 +1,7 @@
 #pragma once
 #include "features/streaming/infrastructure/stream.hpp"
 #include "features/streaming/domain/video_codec.hpp"
+#include "features/streaming/domain/rtp_repair.hpp"
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -37,6 +38,7 @@ std::vector<IceServer> iceServers(const Json& initMessage);
 // HEVC without a supported base-layer/no-DONL mode falls back to H.264.
 std::string filterOffer(const std::string& sdp, VideoCodec preferred = VideoCodec::H264);
 // Validate active filtered tracks and return their common selected video codec.
+RtpRepairConfig videoRepairConfig(const std::string& mediaSdp);
 VideoCodec offeredVideoCodec(const std::string& filteredSdp);
 std::vector<std::string> mediaMids(const std::string& sdp);
 }

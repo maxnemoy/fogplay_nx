@@ -90,12 +90,93 @@ struct Events {
 };
 class Feedback final : public rtc::MediaHandler {
 public:
-    std::atomic<int> plis{0};
+    std::atomic<int> plis{0}, nacks{0}, retransmits{0};
+    std::atomic<bool> dropNext{false};
+    std::atomic<unsigned> reportSsrc{0}, lastPliSsrc{0};
+    bool useRtx = true;
+    std::atomic<unsigned> responseDelayMs{0};
+    std::atomic<unsigned> actualResponseDelayMs{0};
+    bool requestKeyframe(const rtc::message_callback& send) override {
+        const auto source=reportSsrc.exchange(0); if (!source) return false;
+        rtc::binary report(28);report[0]=std::byte{0x80};report[1]=std::byte{200};report[3]=std::byte{6};
+        report[4]=std::byte(source>>24);report[5]=std::byte(source>>16);report[6]=std::byte(source>>8);report[7]=std::byte(source);
+        send(rtc::make_message(std::move(report),rtc::Message::Control)); return true;
+    }
+    std::mutex lostMutex;
+    rtc::binary lost;
+    rtc::binary pendingResponse;
+    rtc::message_callback pendingSend;
+    Clock::time_point responseQueuedAt{}, responseDue{};
+    void pump() {
+        rtc::binary response;
+        rtc::message_callback send;
+        {
+            std::lock_guard<std::mutex> lock(lostMutex);
+            if (!pendingResponse.empty() && Clock::now() >= responseDue) {
+                response.swap(pendingResponse);
+                send = std::move(pendingSend);
+                actualResponseDelayMs = static_cast<unsigned>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - responseQueuedAt).count());
+            }
+        }
+        if (send) { send(rtc::make_message(std::move(response))); ++retransmits; }
+    }
+    void cancelResponse() {
+        std::lock_guard<std::mutex> lock(lostMutex);
+        pendingResponse.clear(); pendingSend = {};
+    }
+    void outgoing(rtc::message_vector& messages, const rtc::message_callback&) override {
+        for (auto it = messages.begin(); it != messages.end();) {
+            const auto& msg = *it;
+            if (msg->type == rtc::Message::Binary && msg->size() >= 12 &&
+                (std::to_integer<unsigned>(msg->at(1)) & 127) == 98 && dropNext.exchange(false)) {
+                std::lock_guard<std::mutex> lock(lostMutex);
+                lost.assign(msg->begin(), msg->end()); it = messages.erase(it);
+            } else ++it;
+        }
+    }
     std::atomic<unsigned> remb{0};
-    void incoming(rtc::message_vector& messages, const rtc::message_callback&) override {
+    void incoming(rtc::message_vector& messages, const rtc::message_callback& send) override {
         for (const auto& msg : messages) {
+            if (msg->size() >= 16 && msg->at(1) == std::byte{205} && msg->at(0) == std::byte{0x81}) {
+                ++nacks; rtc::binary rtx;
+                {
+                    std::lock_guard<std::mutex> lock(lostMutex);
+                    assert(msg->at(8)==std::byte{0} && msg->at(9)==std::byte{0} && msg->at(10)==std::byte{4} && msg->at(11)==std::byte{0xd2});
+                    if (!lost.empty()) {
+                        const auto seq = (std::to_integer<unsigned>(lost[2]) << 8) | std::to_integer<unsigned>(lost[3]);
+                        for (std::size_t at=12; at+4<=msg->size(); at+=4) {
+                            const auto pid=(std::to_integer<unsigned>(msg->at(at)) << 8) | std::to_integer<unsigned>(msg->at(at+1));
+                            const auto mask=(std::to_integer<unsigned>(msg->at(at+2)) << 8) | std::to_integer<unsigned>(msg->at(at+3));
+                            const auto delta=std::uint16_t(seq-pid);
+                            if (delta==0 || (delta<=16 && (mask & (1u << (delta-1))))) {
+                                rtx = lost;
+                                if (useRtx) {
+                                    rtx.insert(rtx.begin()+12,{lost[2],lost[3]});
+                                    rtx[1]=std::byte((std::to_integer<unsigned>(rtx[1]) & 128) | 99);
+                                    rtx[2]=std::byte{0};rtx[3]=std::byte{77};
+                                    rtx[8]=std::byte{0};rtx[9]=std::byte{0};rtx[10]=std::byte{0x10};rtx[11]=std::byte{0xe1};
+                                }
+                                lost.clear(); break;
+                            }
+                        }
+                    }
+                }
+                if (!rtx.empty()) {
+                    const auto delayMs = responseDelayMs.load();
+                    if (delayMs) {
+                        std::lock_guard<std::mutex> lock(lostMutex);
+                        responseQueuedAt = Clock::now();
+                        responseDue = responseQueuedAt + std::chrono::milliseconds(delayMs);
+                        pendingResponse = std::move(rtx); pendingSend = send;
+                    } else { send(rtc::make_message(std::move(rtx))); ++retransmits; }
+                }
+            }
             if (msg->size() >= 12 && std::to_integer<unsigned>(msg->at(1)) == 206 &&
-                (std::to_integer<unsigned>(msg->at(0)) & 31) == 1) ++plis;
+                (std::to_integer<unsigned>(msg->at(0)) & 31) == 1) {
+                lastPliSsrc=(std::to_integer<unsigned>(msg->at(8))<<24)|(std::to_integer<unsigned>(msg->at(9))<<16)|
+                    (std::to_integer<unsigned>(msg->at(10))<<8)|std::to_integer<unsigned>(msg->at(11)); ++plis;
+            }
             if (msg->size() >= 24 && std::to_integer<unsigned>(msg->at(1)) == 206 &&
                 (std::to_integer<unsigned>(msg->at(0)) & 31) == 15 &&
                 msg->at(12) == std::byte{'R'} && msg->at(13) == std::byte{'E'} &&
@@ -137,6 +218,8 @@ struct Fixture {
     juice_server_t* turn = nullptr;
     std::string turnAddress;
     bool hevc;
+    bool omitRtxSource = false;
+    bool advertiseRtx = true;
     std::string fixtureClientHash;
     explicit Fixture(std::string serverHeartbeat = "4000,4000", bool initialize = true, bool useHevc = false,
                      std::string clientSuffix = "abcde", bool useTurn = false, bool requestedRelay = false)
@@ -174,6 +257,7 @@ struct Fixture {
         });
     }
     ~Fixture() {
+        feedback->cancelResponse();
         if (dc) { dc->resetCallbacks(); dc->close(); }
         if (video) video->close();
         if (audio) audio->close();
@@ -212,6 +296,12 @@ struct Fixture {
         rtc::Description::Video v("cam", rtc::Description::Direction::SendOnly);
         if (hevc) v.addH265Codec(98); else v.addH264Codec(98);
         v.addSSRC(1234, "fixture", "fixture", "cam");
+        if (advertiseRtx) {
+            v.addVideoCodec(99, "rtx", "apt=98");
+            if (!omitRtxSource) v.addSSRC(4321, "fixture", "fixture", "cam");
+            v.addAttribute("ssrc-group:FID 1234 4321");
+        }
+        v.rtpMap(98)->addFeedback("nack");
         // Advertise unsupported payloads too; client's answer must exclude them.
         v.addVP8Codec(120);
         video = peer->addTrack(v);
@@ -258,7 +348,8 @@ struct Fixture {
             rtc::Description desc(data.at("sdp"), "answer");
             const auto v = std::get<rtc::Description::Media*>(desc.media(0));
             const auto a = std::get<rtc::Description::Media*>(desc.media(1));
-            assert(v->payloadTypes() == std::vector<int>{98} && v->direction() == rtc::Description::Direction::RecvOnly);
+            assert(v->payloadTypes() == (advertiseRtx ? std::vector<int>{98,99} : std::vector<int>{98}) &&
+                   v->direction() == rtc::Description::Direction::RecvOnly);
             assert(a->payloadTypes() == std::vector<int>{103} && a->direction() == rtc::Description::Direction::RecvOnly);
             peer->setRemoteDescription(desc); answered = true;
 
@@ -273,6 +364,7 @@ struct Fixture {
         } else if (id == "close") closed = true;
     }
     void pump() {
+        feedback->pump();
         for (auto& e : events->take()) {
             if (e.type == Event::Socket) ws = e.socket;
             else if (e.type == Event::Stomp) {
@@ -587,18 +679,34 @@ int main(int argc, char** argv) {
             }
             assert(client.error().empty() && fixture.remoteControls == twiceExpected && fixture.neutral);
             assert(client.diagnostics().find("controlPending=0 ") != std::string::npos);
-            // A blocked consumer used to terminate a paid session at 128 combined
-            // packets. Burst real SRTP media without polling; recovery must keep
-            // transports alive and mark the next complete prediction chain.
+            // Authenticated SRTP burst: backpressure now keeps the complete
+            // ordered backlog in the assembler instead of overflowing MaxVideo.
             for (int n=0; n<64; ++n) fixture.sendMedia();
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
             client.pump();
             assert(client.error().empty() && client.ready());
             const auto queued = client.videoDiagnostics();
-            assert(queued.find("queueResync=0") == std::string::npos);
-            bool generation = false;
+            assert(queued.find("queueResync=0 ") != std::string::npos);
+            unsigned burstFrames = 0;
             const auto recoverStart = Clock::now();
-            while (Clock::now() - recoverStart < std::chrono::seconds(2) && !generation) {
+            while (Clock::now() - recoverStart < std::chrono::seconds(2) && burstFrames < 64) {
+                fixture.pump(); client.pump();
+                stream::Packet packet;
+                while (client.poll(packet)) if (packet.kind == stream::Kind::Video) {
+                    assert(packet.videoGeneration == 0); ++burstFrames;
+                }
+                assert(client.error().empty());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(burstFrames >= 64 && client.videoDiagnostics().find("queueResync=0 ") != std::string::npos);
+            // A genuinely stale consumer still needs an IDR-safe age flush.
+            fixture.sendMedia();
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            client.pump();
+            assert(client.error().empty() && client.videoDiagnostics().find("queueAge=0") == std::string::npos);
+            bool generation = false;
+            const auto staleRecoveryStart = Clock::now();
+            while (Clock::now() - staleRecoveryStart < std::chrono::seconds(2) && !generation) {
                 fixture.pump(); client.pump(); fixture.sendMedia();
                 stream::Packet packet;
                 while (client.poll(packet)) if (packet.kind == stream::Kind::Video)
@@ -607,12 +715,6 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
             assert(generation);
-            // Leave one frame queued long enough to require an IDR-safe age
-            // flush rather than rendering hundreds of milliseconds of backlog.
-            fixture.sendMedia();
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-            client.pump();
-            assert(client.error().empty() && client.videoDiagnostics().find("queueAge=0") == std::string::npos);
             assert(client.diagnostics().find("iceState=2") != std::string::npos ||
                    client.diagnostics().find("iceState=3") != std::string::npos);
         }
@@ -626,12 +728,12 @@ int main(int argc, char** argv) {
             if (step % 10 == 0) fixture.dc->send(Json{{"id","stats"},{"preset",fixture.qualityProfile},{"fps",30}}.dump());
             client.advanceQualityForTesting(100);
             playbackFrames += 3; playbackWork += 9000;
-            client.observePlayback(playbackFrames,playbackWork,0,false,1920,1080);
+            client.observePlayback({playbackFrames,playbackFrames,0,playbackWork,0,0,0,false,1920,1080});
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         for (unsigned step = 0; step < 10; ++step) {
             fixture.pump(); client.pump();
-            client.observePlayback(playbackFrames,playbackWork,0,false,1920,1080);
+            client.observePlayback({playbackFrames,playbackFrames,0,playbackWork,0,0,0,false,1920,1080});
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         if (fixture.adaptations != std::vector<std::string>{"enhancequality"}) std::cerr << "Auto fixture: " << client.videoDiagnostics() << " actions=" << fixture.adaptations.size() << "\n";
@@ -650,12 +752,12 @@ int main(int argc, char** argv) {
             if (step % 10 == 0) fixture.dc->send(Json{{"id","stats"},{"preset",fixture.qualityProfile},{"fps",30}}.dump());
             client.advanceQualityForTesting(100);
             playbackFrames += 3; playbackWork += 100000;
-            client.observePlayback(playbackFrames,playbackWork,0,false,1920,1080);
+            client.observePlayback({playbackFrames,playbackFrames,0,playbackWork,0,0,0,false,1920,1080});
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         for (unsigned step = 0; step < 10; ++step) {
             fixture.pump(); client.pump();
-            client.observePlayback(playbackFrames,playbackWork,0,false,1920,1080);
+            client.observePlayback({playbackFrames,playbackFrames,0,playbackWork,0,0,0,false,1920,1080});
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         const std::vector<std::string> expectedAdaptations{"enhancequality", "degradequality"};
@@ -684,7 +786,7 @@ int main(int argc, char** argv) {
             stream::Packet drained; while (client.poll(drained)) {}
             client.advanceQualityForTesting(100);
             playbackFrames += 3; playbackWork += 100000;
-            client.observePlayback(playbackFrames,playbackWork,step,false,1920,1080);
+            client.observePlayback({playbackFrames,playbackFrames,0,playbackWork,step,0,0,false,1920,1080});
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         fixture.pump(); assert(fixture.adaptations.size() == adaptationsBeforeManual);
@@ -770,6 +872,18 @@ int main(int argc, char** argv) {
         assert(client.diagnostics().find(turn ? "requested=relay actual=turn" : "requested=all actual=direct") != std::string::npos);
         assert(client.diagnostics().find("routeSnapshot=final") != std::string::npos);
         assert(client.diagnostics().find("iceReason=") != std::string::npos);
+        const auto finalDtls = client.dtlsDiagnostics();
+        assert(finalDtls.find("available=1") != std::string::npos);
+        assert(finalDtls.find("enqueued=0 ") == std::string::npos);
+        assert(finalDtls.find("recvRuns=0 ") == std::string::npos);
+        assert(finalDtls == client.dtlsDiagnostics());
+        const auto finalMutex = client.mutexDiagnostics();
+        assert(!finalMutex.empty() && finalMutex == client.mutexDiagnostics());
+        assert(finalDtls.find("private") == std::string::npos);
+
+        const auto finalGaps = client.gapDiagnostics();
+        assert(!finalGaps.empty() && finalGaps == client.gapDiagnostics());
+        assert(finalGaps.find("private") == std::string::npos);
         const auto finalDiagnostics = client.videoDiagnostics();
         assert(!finalDiagnostics.empty() && client.videoDiagnostics() == finalDiagnostics);
         std::string videoEvent; while (client.pollVideoDiagnostic(videoEvent)) assert(videoEvent.find("private") == std::string::npos);
@@ -787,6 +901,117 @@ int main(int argc, char** argv) {
     std::cout << "Full stream runtime cleanup round " << round << " passed\n";
     }
     if (turnOnly) return 0;
+    for (const bool hevc : {false,true}) {
+        Fixture fixture("4000,4000",true,hevc);
+        fixture.omitRtxSource = true; // FID announces RTX, with no individual a=ssrc attribute.
+        stream::Client client;
+        fog::video::Settings settings; settings.codec=hevc ? stream::VideoCodec::H265 : stream::VideoCodec::H264;
+        assert(client.configureVideo(settings));
+        assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+        const auto start = Clock::now();
+        unsigned frames = 0; bool requestedLoss = false;
+        while (Clock::now()-start < std::chrono::seconds(5)) {
+            fixture.pump(); client.pump();
+            if (frames >= 3 && !requestedLoss) { fixture.feedback->dropNext=true; requestedLoss=true; }
+            fixture.sendMedia();
+            stream::Packet packet;
+            while (client.poll(packet)) if (packet.kind == stream::Kind::Video) {
+                assert(packet.videoGeneration==0); ++frames;
+            }
+            assert(client.error().empty());
+            if (requestedLoss && frames >= 10 && fixture.feedback->retransmits > 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto diagnostic = client.videoDiagnostics();
+        assert(frames >= 10 && fixture.feedback->nacks > 0 && fixture.feedback->retransmits==1);
+        assert(diagnostic.find("rtxRestored=1")!=std::string::npos && diagnostic.find("repairedPackets=1")!=std::string::npos);
+        assert(diagnostic.find("gaps=0 ")!=std::string::npos && diagnostic.find("resync=0 ")!=std::string::npos);
+        assert(fixture.peer->remoteDescription()->generateSdp().find("rtpmap:99 rtx/90000")!=std::string::npos);
+        // No primary RTP after this point: an RTX SR must not overwrite the
+        // remembered media SSRC used for the next PLI by the pinned RTCP receiver.
+        fixture.feedback->reportSsrc=4321;assert(fixture.video->requestKeyframe());
+        for(unsigned tick=0;tick<60;++tick){fixture.pump();client.pump();stream::Packet ignored;while(client.poll(ignored)){}std::this_thread::sleep_for(std::chrono::milliseconds(5));}
+        const auto plis=fixture.feedback->plis.load();
+        const bool requested=client.requestVideoKeyframe();
+        if(!requested) std::cerr<<"SR regression request failed error="<<client.error()<<" video="<<client.videoDiagnostics()<<" transport="<<client.diagnostics()<<std::endl;
+        assert(requested);
+        for(unsigned tick=0;tick<30 && fixture.feedback->plis==plis;++tick){fixture.pump();client.pump();std::this_thread::sleep_for(std::chrono::milliseconds(5));}
+        assert(fixture.feedback->plis>plis && fixture.feedback->lastPliSsrc==1234);
+        assert(client.videoDiagnostics().find("repairControlRejected=1")!=std::string::npos);
+        client.close();
+        std::cout<<"Local WebRTC NACK/RTX passed: deliberate authenticated media loss, RTCP NACK to sender, RTX SSRC/PT/OSN restore, frame continued without decoder generation reset\n";
+    }
+    stream::Client::cleanupRuntime();
+    // Provider-style repair: NACK is negotiated, but retransmissions keep the
+    // primary SSRC/PT/sequence and arrive beyond the former fixed 120ms window.
+    for (const unsigned scenario : {0u, 1u, 2u}) {
+        const bool hevc = scenario != 0, catchupStress = scenario == 2;
+        Fixture fixture("4000,4000", true, hevc);
+        fixture.advertiseRtx = false;
+        fixture.feedback->useRtx = false;
+        fixture.feedback->responseDelayMs = 140;
+        stream::Client client;
+        fog::video::Settings settings;
+        settings.codec = hevc ? stream::VideoCodec::H265 : stream::VideoCodec::H264;
+        assert(client.configureVideo(settings));
+        assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+        const auto start = Clock::now();
+        auto nextMedia = start;
+        unsigned frames = 0, audioFrames = 0, requestedLosses = 0;
+        std::uint32_t previousTimestamp = 0;
+        std::int64_t previousSequence = -1;
+        while (Clock::now() - start < std::chrono::seconds(5)) {
+            fixture.pump(); client.pump();
+            if ((requestedLosses == 0 && frames >= 3) || (requestedLosses == 1 && frames >= 15)) {
+                if (catchupStress && requestedLosses == 1) fixture.feedback->responseDelayMs = 180;
+                fixture.feedback->dropNext = true; ++requestedLosses;
+            }
+            if (Clock::now() >= nextMedia) {
+                fixture.sendMedia();
+                nextMedia = Clock::now() + std::chrono::milliseconds(catchupStress && requestedLosses == 2 ? 16 : 20);
+            }
+            stream::Packet packet;
+            while (client.poll(packet)) {
+                if (packet.kind == stream::Kind::Video) {
+                    assert(packet.videoGeneration == 0);
+                    if (frames) assert(std::int32_t(packet.timestamp - previousTimestamp) > 0);
+                    assert(packet.firstSequence > previousSequence);
+                    previousTimestamp = packet.timestamp; previousSequence = packet.lastSequence;
+                    ++frames;
+                } else ++audioFrames;
+            }
+            assert(client.error().empty());
+            if (requestedLosses == 2 && frames >= 27 && fixture.feedback->retransmits == 2) break;
+            // Independent media and pump cadences avoid overfilling queues
+            // and keep the scheduled reply independent of frame production.
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto diagnostic = client.videoDiagnostics();
+        std::cout << "Delayed primary repair codec=" << (hevc ? "H265" : "H264")
+                  << " catchupStress=" << catchupStress << " responseDelayMs=" << fixture.feedback->actualResponseDelayMs << " " << diagnostic << "\n";
+        assert(frames >= 27 && audioFrames >= 27 && fixture.feedback->nacks > 0 && fixture.feedback->retransmits == 2);
+        const auto expectedDelay = catchupStress ? 180u : 140u;
+        assert(fixture.feedback->actualResponseDelayMs >= expectedDelay);
+        assert(diagnostic.find("repairedPackets=2 ") != std::string::npos);
+        assert(diagnostic.find("rtxRestored=0 ") != std::string::npos);
+        assert(diagnostic.find("gaps=0 ") != std::string::npos && diagnostic.find("resync=0 ") != std::string::npos);
+        const auto sampleAt = diagnostic.find("nackArrivalSamples=");
+        assert(sampleAt != std::string::npos && std::stoull(diagnostic.substr(sampleAt + 19)) >= 2);
+        const auto delayAt = diagnostic.find("nackFirstArrivalMaxMs=");
+        assert(delayAt != std::string::npos && std::stoull(diagnostic.substr(delayAt + 22)) >= expectedDelay);
+        if (catchupStress) {
+            const auto yieldsAt = diagnostic.find("catchupYields=");
+            assert(yieldsAt != std::string::npos && std::stoull(diagnostic.substr(yieldsAt + 14)) > 0);
+            assert(diagnostic.find("queueResync=0 ") != std::string::npos);
+        }
+        const auto answer = fixture.peer->remoteDescription()->generateSdp();
+        assert(answer.find("rtpmap:99 rtx/90000") == std::string::npos);
+        assert(answer.find("a=rtcp-fb:98 nack") != std::string::npos);
+        client.close();
+        std::cout << "Delayed primary NACK repair passed: no RTX SDP, two authenticated same-SSRC/PT responses,"
+                  << " measured latency, ordered assembled frame chain, catchupStress=" << catchupStress << "\n";
+    }
+    stream::Client::cleanupRuntime();
     {
         Fixture fixture;
         stream::Client client;

@@ -100,6 +100,8 @@ private:
     void beginFinish(const char* reason = "rental-guard");
     void recoverVideoError(const fog::VideoDecodeError& error, const stream::Packet* packet);
     void pumpStream(PadState& pad, u64 held, u64 down);
+    void feedStreamAudio(const stream::Packet& packet);
+    void drainStreamAudio();
     SDL_Rect videoRect() const;
     bool sendRemote(const Json& command);
     void releaseMouse() noexcept;
@@ -195,7 +197,12 @@ private:
     std::string streamHash_;
     std::uint64_t videoWorkUs_ = 0, videoDecodeErrors_ = 0, lastVideoGeneration_ = 0;
     PlaybackTiming drainTiming_, presentTiming_;
-    std::uint64_t pumpGapMaxUs_ = 0, drainBudgetHits_ = 0, catchupWindows_ = 0;
+    PlaybackTiming transportPumpTiming_, videoFeedTiming_, decoderResetTiming_, audioFeedTiming_, prepareTiming_;
+    std::uint64_t drainVideoTotal_ = 0, drainVideoMax_ = 0, drainVideoBudgetHits_ = 0;
+    std::uint64_t videoQueueWaitMaxMs_ = 0, audioQueueWaitMaxMs_ = 0;
+    std::uint64_t lastPumpWorkUs_ = 0, slowPlaybackCycles_ = 0;
+    std::chrono::steady_clock::time_point lastSlowPlaybackLog_{};
+    std::uint64_t pumpGapMaxUs_ = 0, outsideMeasuredPumpMaxUs_ = 0, drainBudgetHits_ = 0, catchupWindows_ = 0;
     std::chrono::steady_clock::time_point lastPumpAt_{}, lastProtocolLog_{};
     bool videoLossWaiting_ = false;
     std::chrono::steady_clock::time_point lastVideoEventLog_{};

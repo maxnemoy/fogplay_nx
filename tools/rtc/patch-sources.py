@@ -471,3 +471,4 @@ patch_literal(tls, 'int TlsTransport::ReadCallback(void *ctx, unsigned char *buf
 # Per-agent ICE diagnostics and the UDP fairness-budget regression fix.
 import runpy
 runpy.run_path(str(root / 'tools/rtc/patch-ice-diagnostics.py'), run_name='__main__')
+runpy.run_path(str(root / 'tools/rtc/patch-dtls-diagnostics.py'), run_name='__main__')

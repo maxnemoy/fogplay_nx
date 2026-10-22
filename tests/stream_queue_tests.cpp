@@ -95,11 +95,18 @@ int main() {
         for (unsigned i = 0; i < MediaQueue::MaxVideo; ++i) assert(q.push(packet(Kind::Video), 100));
         assert(!q.push(packet(Kind::Video), 100));
         assert(q.videoCount == MediaQueue::MaxVideo && q.videoHigh == MediaQueue::MaxVideo);
+        assert(q.pressureCount == 1 && q.lastPressure.reason == MediaQueue::PressureReason::Count);
+        assert(q.lastPressure.videoCount == 12 && q.lastPressure.videoBytes == 96 && q.lastPressure.incomingBytes == 8);
+        assert(q.lastPressure.atMs == 100 && q.lastPressure.videoAgeMs == 0);
         assert(q.push(packet(Kind::Audio), 100));
         q.clearVideo();
         assert(q.videoCount == 0 && q.videoBytes == 0 && q.audioCount == 1);
         assert(q.push(packet(Kind::Video, MediaQueue::MaxVideoBytes), 101));
         assert(!q.push(packet(Kind::Video, 1), 101));
+        assert(q.pressureCount == 2 && q.lastPressure.reason == MediaQueue::PressureReason::Bytes);
+        assert(q.lastPressure.videoCount == 1 && q.lastPressure.videoBytes == MediaQueue::MaxVideoBytes);
+        assert(q.lastPressure.audioCount == 1 && q.lastPressure.audioAgeMs == 1);
+        assert(q.pressureText().find("pressureReason=bytes") != std::string::npos);
         q.clearVideo();
         assert(q.push(packet(Kind::Audio, MediaQueue::MaxAudioBytes + 1), 101));
         assert(q.audioRejected == 1 && q.audioCount == 1);
@@ -113,12 +120,39 @@ int main() {
         assert(q.age(Kind::Video, 900) == 0); // Defensive nonnegative monotonic age.
         assert(q.age(Kind::Video, 1250) == MediaQueue::MaxVideoAgeMs);
         assert(q.age(Kind::Video, 1251) > MediaQueue::MaxVideoAgeMs);
+        q.recordVideoPressure(MediaQueue::PressureReason::Age, 1251);
+        assert(q.lastPressure.videoAgeMs == 251 && q.lastPressure.videoCount == 1);
+        q.clearVideo();
+        assert(q.lastPressure.videoCount == 1 && q.lastPressure.videoBytes == 8); // Captured before safe clear.
+        assert(q.pressureText().find("pressureReason=age") != std::string::npos);
+        v = packet(Kind::Video); v.videoGeneration = 42;
+        assert(q.push(std::move(v), 1000));
         Packet out; assert(q.pop(out) && out.videoGeneration == 42 && out.enqueueMs == 1000);
         for (unsigned i=0; i<200; ++i) {
             assert(q.push(packet(Kind::Audio, 24000), 2000));
             assert(q.audioCount <= 12 && q.audioBytes <= MediaQueue::MaxAudioBytes);
         }
         assert(q.audioDropped > 0);
+    }
+    {
+        MediaQueue q;
+        for (unsigned i=0;i<6;++i) {
+            auto v=packet(Kind::Video); v.timestamp=i;
+            auto a=packet(Kind::Audio); a.timestamp=i+100;
+            assert(q.push(std::move(v),100)); assert(q.push(std::move(a),100));
+        }
+        Packet out;
+        for (unsigned i=0;i<6;++i) {
+            assert(q.popAudio(out) && out.kind==Kind::Audio && out.timestamp==i+100);
+        }
+        assert(!q.popAudio(out) && q.audioCount==0 && q.audioBytes==0 && q.audioPriorityPopped==6);
+        for (unsigned i=0;i<6;++i) assert(q.pop(out) && out.kind==Kind::Video && out.timestamp==i);
+        assert(!q.pop(out) && q.videoBytes==0);
+        for (unsigned i=0;i<13;++i) assert(q.push(packet(Kind::Audio),100));
+        assert(q.audioCapacityDropped==1 && q.audioAgeDropped==0 && q.audioDropped==1);
+        q.expireAudio(221);
+        assert(q.audioAgeDropped==12 && q.audioCapacityDropped==1 && q.audioDropped==13);
+        assert(!q.popAudio(out));
     }
     std::cout << "Media queue independent bounds, age, audio shedding, bytes, generation PASS\n";
 }

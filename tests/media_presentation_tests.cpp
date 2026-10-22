@@ -1,5 +1,6 @@
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/media_annexb.hpp"
+#include "features/streaming/domain/audio_queue_metrics.hpp"
 #include <SDL.h>
 #include <opus/opus.h>
 extern "C" {
@@ -54,8 +55,32 @@ extern "C" SDL_Texture* __real_SDL_CreateTexture(SDL_Renderer*, Uint32, int, int
 extern "C" int __real_SDL_UpdateYUVTexture(SDL_Texture*, const SDL_Rect*, const Uint8*, int, const Uint8*, int, const Uint8*, int);
 extern "C" int __real_avcodec_receive_frame(AVCodecContext*, AVFrame*);
 extern "C" int __real_av_hwframe_transfer_data(AVFrame*, const AVFrame*, int);
+extern "C" int __real_SDL_RenderCopy(SDL_Renderer*, SDL_Texture*, const SDL_Rect*, const SDL_Rect*);
+extern "C" Uint32 __real_SDL_GetQueuedAudioSize(SDL_AudioDeviceID);
+extern "C" int __real_SDL_QueueAudio(SDL_AudioDeviceID, const void*, Uint32);
+extern "C" void __real_SDL_ClearQueuedAudio(SDL_AudioDeviceID);
 static bool failCreation = false, failUpload = false, emulateHardwareFrame = false;
-static bool failTransfer = false;
+static bool failTransfer = false, failDraw = false, mockAudio = false, failQueue = false;
+static Uint32 audioBytes = 0;
+static unsigned audioClears = 0;
+extern "C" int __wrap_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture,
+    const SDL_Rect* source, const SDL_Rect* destination) {
+    if (failDraw) { failDraw = false; return -1; }
+    return __real_SDL_RenderCopy(renderer, texture, source, destination);
+}
+extern "C" Uint32 __wrap_SDL_GetQueuedAudioSize(SDL_AudioDeviceID device) {
+    return mockAudio ? audioBytes : __real_SDL_GetQueuedAudioSize(device);
+}
+extern "C" int __wrap_SDL_QueueAudio(SDL_AudioDeviceID device, const void* bytes, Uint32 size) {
+    if (!mockAudio) return __real_SDL_QueueAudio(device, bytes, size);
+    if (failQueue) { failQueue = false; return -1; }
+    audioBytes += size;
+    return 0;
+}
+extern "C" void __wrap_SDL_ClearQueuedAudio(SDL_AudioDeviceID device) {
+    if (!mockAudio) { __real_SDL_ClearQueuedAudio(device); return; }
+    ++audioClears; audioBytes = 0;
+}
 extern "C" int __wrap_avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
     const int result = __real_avcodec_receive_frame(context, frame);
     if (result == 0 && emulateHardwareFrame) {
@@ -95,6 +120,129 @@ static Bytes snapshot(fog::Media& media, SDL_Renderer* renderer) {
     check(SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_RGBA32, pixels.data(), 1280 * 4) == 0,
         "renderer readback failed");
     return pixels;
+}
+static void present(fog::Media& media, SDL_Renderer* renderer) {
+    check(media.draw(), "presentation draw unavailable");
+    SDL_RenderPresent(renderer);
+    media.presented();
+}
+static void presentationCounts(SDL_Renderer* renderer, const Units& units) {
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    media.presented();
+    check(!media.draw() && media.presentedFrames() == 0, "empty present counted");
+    feed(media, units.front());
+    check(media.preparePresentation() && media.uploadedFrames() == 1, "new output upload missing");
+    media.presented();
+    check(media.presentedFrames() == 0, "upload without draw counted as present");
+    check(media.draw() && media.presentedFrames() == 0, "draw counted before RenderPresent");
+    SDL_RenderPresent(renderer);
+    media.presented(); media.presented();
+    present(media, renderer);
+    check(media.presentedFrames() == 1, "repeated present counted same generation twice");
+    feed(media, units[1]);
+    check(media.preparePresentation() && media.uploadedFrames() == 2, "next generation upload missing");
+    media.presented();
+    check(media.presentedFrames() == 1, "new upload reused preceding draw");
+    // A failed draw must invalidate a preceding successful draw token too.
+    check(media.draw(), "pre-failure draw missing");
+    failDraw = true;
+    bool rejected = false;
+    try { media.draw(); } catch (const std::runtime_error&) { rejected = true; }
+    media.presented();
+    check(rejected && media.presentedFrames() == 1, "failed draw counted a new generation");
+    present(media, renderer);
+    check(media.presentedFrames() == 2, "successful redraw after failure not counted");
+    media.resetVideoDecoder();
+    present(media, renderer);
+    check(media.presentedFrames() == 2, "retained recovery texture counted twice");
+    feed(media, units.front());
+    check(media.preparePresentation(), "recovery generation unavailable");
+    present(media, renderer);
+    check(media.presentedFrames() == 3 && media.videoFrames() == 3 && media.uploadedFrames() == 3 &&
+        media.supersededFrames() == 0, "decoded/uploaded/presented recovery counters diverged");
+    check(media.draw(), "preceding generation draw missing");
+    feed(media, units[1]);
+    check(media.preparePresentation(), "intervening generation unavailable");
+    media.presented();
+    check(media.presentedFrames() == 3, "intervening upload reused stale draw acknowledgement");
+    present(media, renderer);
+    check(media.presentedFrames() == 4, "intervening generation fresh draw not counted");
+    std::cout << "PASS new-generation presentation: draw/present separation, repeats, draw failure, decoder recovery\n";
+}
+static void audioObservations() {
+    using Metrics = fog::detail::AudioQueueMetrics;
+    using namespace std::chrono_literals;
+    Metrics metrics;
+    const auto start = Metrics::Clock::time_point{};
+    metrics.observe(0, start);
+    metrics.observe(0, start + 1s);
+    check(metrics.emptyObservations == 0 && metrics.prolongedEmptyObservations == 0,
+        "unprimed audio counted empty output");
+    metrics.queued(3840, start + 1s);
+    metrics.observe(0, start + 2s);
+    metrics.observe(0, start + 2039ms);
+    check(metrics.emptyObservations == 1 && metrics.prolongedEmptyObservations == 0,
+        "brief hardware queue transfer counted as prolonged empty");
+    metrics.observe(0, start + 2040ms);
+    metrics.observe(0, start + 3s);
+    check(metrics.emptyObservations == 1 && metrics.prolongedEmptyObservations == 1,
+        "prolonged empty episode was missed or counted repeatedly");
+    metrics.queued(1920, start + 3s);
+    metrics.observe(0, start + 3010ms);
+    metrics.queued(1920, start + 3020ms);
+    metrics.observe(0, start + 3030ms);
+    metrics.observe(0, start + 3070ms);
+    check(metrics.emptyObservations == 3 && metrics.prolongedEmptyObservations == 2,
+        "queue refill did not separate empty episodes");
+    metrics.cleared(42240);
+    metrics.observe(0, start + 4s);
+    metrics.observe(0, start + 5s);
+    check(metrics.resets == 1 && Metrics::milliseconds(metrics.discardedBytes) == 220 &&
+        metrics.emptyObservations == 3 && metrics.prolongedEmptyObservations == 2,
+        "intentional queue reset counted an underrun or lost discarded duration");
+}
+static Bytes opusPacket() {
+    int error = 0;
+    auto* encoder = opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, &error);
+    check(encoder && !error, "Opus encoder unavailable");
+    std::array<opus_int16, 960 * 2> pcm{};
+    Bytes encoded(4096);
+    const int size = opus_encode(encoder, pcm.data(), 960, encoded.data(), encoded.size());
+    opus_encoder_destroy(encoder);
+    check(size > 0, "Opus fixture encode failed");
+    encoded.resize(size);
+    return encoded;
+}
+static void audioCounts(SDL_Renderer* renderer) {
+    mockAudio = true; audioBytes = 0; audioClears = 0;
+    fog::Media media(renderer);
+    const auto packet = opusPacket();
+    const auto* bytes = reinterpret_cast<const std::byte*>(packet.data());
+    check(media.audioUnderruns() == 0 && media.audioQueueResets() == 0, "initial audio counters not empty");
+    media.audio(bytes, packet.size());
+    check(media.audioPackets() == 1 && audioBytes == 3840 &&
+        media.audioDiagnostics().find("audio_queued_ms=20") != std::string::npos, "queued duration not observed");
+    audioBytes = 38400;
+    media.audio(bytes, packet.size());
+    check(media.audioQueueResets() == 0 && audioBytes == 42240, "200 ms boundary policy changed");
+    media.audio(bytes, packet.size());
+    check(media.audioQueueResets() == 1 && audioClears == 1 && audioBytes == 3840 &&
+        media.audioDiagnostics().find("audio_reset_discarded_ms=220") != std::string::npos,
+        "stale queue clear not counted or bounded");
+    audioBytes = 0;
+    check(media.audioUnderruns() == 0 &&
+        media.audioDiagnostics().find("audio_empty_observations=1") != std::string::npos,
+        "newly observed empty queue treated as device underrun");
+    check(media.audioUnderruns() == 0, "same empty sample immediately counted prolonged");
+    media.audio(bytes, packet.size());
+    check(media.audioPackets() == 4 && media.audioQueueResets() == 1, "refill lost packet/reset counts");
+    failQueue = true;
+    bool rejected = false;
+    try { media.audio(bytes, packet.size()); } catch (const std::runtime_error&) { rejected = true; }
+    check(rejected && media.audioPackets() == 4, "failed queue counted as delivered audio");
+    std::cout << "PASS audio observations: no sleeps, 40 ms threshold, priming, episode/refill/reset accounting, queue cap, queue failure\n";
+    std::cout << media.audioDiagnostics() << '\n';
+    mockAudio = false;
 }
 struct Reference {
     Bytes first, last;
@@ -214,7 +362,13 @@ int main(int argc, char** argv) {
     auto* renderer = surface ? SDL_CreateSoftwareRenderer(surface) : nullptr;
     if (!renderer) { if (surface) SDL_FreeSurface(surface); SDL_Quit(); return 4; }
     int result = 0;
-    try { test(renderer, load(argv[1]), load(argv[2])); }
+    try {
+        const auto units = load(argv[1]);
+        test(renderer, units, load(argv[2]));
+        presentationCounts(renderer, units);
+        audioObservations();
+        audioCounts(renderer);
+    }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     SDL_DestroyRenderer(renderer); SDL_FreeSurface(surface); SDL_Quit();
     return result;

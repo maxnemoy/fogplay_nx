@@ -216,6 +216,24 @@ std::string normalized(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
     return value;
 }
+int rtxApt(const std::vector<std::string>& input, std::size_t begin, std::size_t end, int payload) {
+    int apt = -1;
+    for (auto i = begin; i < end; ++i) {
+        if (input[i].rfind("a=fmtp:", 0) != 0) continue;
+        std::istringstream fields(input[i].substr(7)); std::string id, body;
+        fields >> id; if (decimal(id) != payload) continue;
+        std::getline(fields, body); std::istringstream values(body); std::string entry;
+        while (std::getline(values, entry, ';')) {
+            const auto equal = entry.find('=');
+            if (equal == std::string::npos || normalized(entry.substr(0, equal)) != "apt") continue;
+            const auto value = normalized(entry.substr(equal + 1));
+            if (apt != -1 || value.empty()) return -1;
+            try { apt = decimal(value); } catch (const Error&) { return -1; }
+            if (apt > 127 || apt == payload) return -1;
+        }
+    }
+    return apt;
+}
 bool packetizationSupported(const std::vector<std::string>& input, std::size_t begin,
                             std::size_t end, const std::string& id, bool hevc) {
     std::map<std::string, std::string> parameters;
@@ -319,7 +337,15 @@ std::string filterOffer(const std::string& sdp, VideoCodec preferred) {
             } else if (type == "m=audio" && (codec == "opus/48000/2" || codec == "opus/48000/1" || codec == "opus/48000"))
                 keep.insert(payload);
         }
-        if (type == "m=video") keep = preferred == VideoCodec::H265 && !h265.empty() ? h265 : h264;
+        if (type == "m=video") {
+            keep = preferred == VideoCodec::H265 && !h265.empty() ? h265 : h264;
+            const auto media = keep;
+            unsigned fidGroups = 0;
+            for (auto i = begin + 1; i < end; ++i) if (input[i].rfind("a=ssrc-group:FID ", 0) == 0) ++fidGroups;
+            for (const auto& mapping : mappings)
+                if (fidGroups <= 1 && offered.count(mapping.first) && mapping.second == "rtx/90000" &&
+                    media.count(rtxApt(input, begin + 1, end, mapping.first))) keep.insert(mapping.first);
+        }
         // Unsupported active media is rejected explicitly, never advertised with invented IDs.
         bool receivesRemote = true;
         for (std::size_t j = begin + 1; j < end; ++j)
@@ -357,6 +383,41 @@ std::string filterOffer(const std::string& sdp, VideoCodec preferred) {
     if (!video) throw Error("No supported video codec offered");
     return result;
 }
+RtpRepairConfig videoRepairConfig(const std::string& sdp) {
+    if (sdp.size() > MaxFrame) throw Error("SDP limit exceeded");
+    RtpRepairConfig result; const auto input = lines(sdp);
+    std::map<unsigned, std::string> mappings;
+    for (const auto& line : input) if (line.rfind("a=rtpmap:", 0) == 0) {
+        std::istringstream fields(line.substr(9)); std::string id, codec; fields >> id >> codec;
+        const auto pt = decimal(id); if (pt > 127) throw Error("Invalid repair payload");
+        mappings.emplace(pt, normalized(codec));
+        if (normalized(codec) == "h264/90000" || normalized(codec) == "h265/90000") result.media.emplace(pt, false);
+    }
+    for (const auto& item : mappings) if (item.second == "rtx/90000") {
+        const auto apt = rtxApt(input, 0, input.size(), item.first);
+        if (apt >= 0 && result.media.count(apt)) result.rtx.emplace(item.first, apt);
+    }
+    unsigned fidGroups = 0;
+    for (const auto& line : input) {
+        if (line.rfind("a=rtcp-fb:", 0) == 0) {
+            std::istringstream fields(line.substr(10)); std::string id, feedback; fields >> id; std::getline(fields, feedback);
+            if (normalized(feedback) == "nack") {
+                if (id == "*") for (auto& item : result.media) item.second = true;
+                else { const auto it = result.media.find(decimal(id)); if (it != result.media.end()) it->second = true; }
+            }
+        }
+        if (line.rfind("a=ssrc-group:FID ", 0) == 0) {
+            std::istringstream fields(line.substr(17)); std::uint64_t media = 0, rtx = 0; std::string extra;
+            if (!(fields >> media >> rtx) || (fields >> extra) || !media || !rtx || media == rtx ||
+                media > 0xffffffffu || rtx > 0xffffffffu) throw Error("Invalid repair SSRC group");
+            ++fidGroups; result.mediaSsrc = media; result.rtxSsrc = rtx;
+        }
+    }
+    // Multiple FID groups need a simulcast-aware SSRC selector. Retain ordinary
+    // media and generic NACK, but do not guess an RTX association.
+    if (fidGroups > 1) { result.mediaSsrc = 0; result.rtxSsrc = 0; result.rtx.clear(); }
+    return result;
+}
 VideoCodec offeredVideoCodec(const std::string& sdp) {
     if (sdp.size() > MaxFrame) throw Error("SDP limit exceeded");
     const auto input = lines(sdp);
@@ -383,6 +444,11 @@ VideoCodec offeredVideoCodec(const std::string& sdp) {
                     if (input[i].rfind(prefix, 0) != 0) continue;
                     if (!codec.empty()) throw Error("Ambiguous video payload mapping");
                     codec = normalized(input[i].substr(prefix.size()));
+                }
+                if (codec == "rtx/90000") {
+                    const auto apt = rtxApt(input, begin + 1, end, decimal(payload));
+                    if (apt < 0 || !offered.count(std::to_string(apt))) throw Error("Invalid selected RTX mapping");
+                    continue;
                 }
                 if (codec != "h264/90000" && codec != "h265/90000") throw Error("Unsupported selected video codec");
                 const auto candidate = codec == "h265/90000" ? VideoCodec::H265 : VideoCodec::H264;

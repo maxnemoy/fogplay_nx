@@ -44,8 +44,19 @@ public:
     bool preparePresentation();
     // Draws only the last successfully uploaded texture.
     bool draw();
+    // Call immediately after SDL_RenderPresent returns. Only a new uploaded
+    // generation from the last successful draw counts, once.
+    void presented();
     std::uint64_t videoFrames() const;
+    std::uint64_t uploadedFrames() const;
+    std::uint64_t presentedFrames() const;
+    std::uint64_t supersededFrames() const;
     std::uint64_t audioPackets() const;
+    // Samples queued audio. Poll each application loop: counts observed empty
+    // episodes lasting >=40 ms after priming, not exact device underruns.
+    std::uint64_t audioUnderruns() const;
+    std::uint64_t audioQueueResets() const;
+    std::string audioDiagnostics() const;
     bool hardwareVideo() const;
     int videoWidth() const;
     int videoHeight() const;
