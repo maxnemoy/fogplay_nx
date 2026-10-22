@@ -9,6 +9,7 @@
 #include "features/streaming/infrastructure/timed_mutex.hpp"
 #include "features/streaming/infrastructure/stream_route.hpp"
 #include "features/streaming/domain/auto_quality.hpp"
+#include "features/streaming/domain/route_snapshot_schedule.hpp"
 #include <functional>
 #include <cmath>
 #include <cstdio>
@@ -22,6 +23,27 @@
 namespace stream {
 using Clock = std::chrono::steady_clock;
 using Json = protocol::Json;
+// Fixed-size, application-thread counters. Scopes can nest (events/quality may
+// flush control); measurements include waiting/preemption, not only CPU work.
+struct TransportStageTiming {
+    std::uint64_t calls = 0, totalUs = 0, maxUs = 0;
+    std::string text(const char* tag) const {
+        char out[180];
+        std::snprintf(out, sizeof(out), " %sCalls=%llu %sAvgUs=%llu %sMaxUs=%llu", tag,
+            static_cast<unsigned long long>(calls), tag,
+            static_cast<unsigned long long>(calls ? totalUs / calls : 0), tag,
+            static_cast<unsigned long long>(maxUs));
+        return out;
+    }
+};
+struct TransportStageScope {
+    TransportStageTiming& timing;
+    Clock::time_point started = Clock::now();
+    ~TransportStageScope() {
+        const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
+        ++timing.calls; timing.totalUs += us; timing.maxUs = std::max(timing.maxUs, us);
+    }
+};
 // Only fixed client-generated text may use this exception. Parser/library errors
 // can contain SDP, session hashes or TURN credentials and remain sanitized below.
 struct TransportError final : std::runtime_error {
@@ -336,21 +358,37 @@ struct Client::Impl {
     std::chrono::milliseconds heartbeat{0}, incomingHeartbeat{0};
     bool running = false, stompConnected = false, remoteSet = false, channelOpen = false;
     bool isReady = false, decoderWaiting = false, retryableFailure = false, closingForRetry = false;
-    bool relay = false, routeSelected = false, wasReady = false;
+    bool relay = false, routeSelected = false, routeCurrent = false, wasReady = false;
     Clock::time_point unprovenRouteAt{};
     SelectedRoute route;
     CandidateProofs remoteCandidateProofs;
-    bool routeProofDirty = false;
+    RouteSnapshotSchedule routeSnapshotSchedule;
+    TransportStageTiming pumpTiming, nackTiming, iceDiagnosticTiming, selectedPairTiming;
+    TransportStageTiming receiveTiming, eventsTiming, qualityTiming, controlTiming, pliTiming, heartbeatTiming;
+    std::string transportTimings() const {
+        return "scope=transport-lifetime nested=1" + pumpTiming.text("pump") + nackTiming.text("nack") +
+            iceDiagnosticTiming.text("iceDiag") + selectedPairTiming.text("icePair") + receiveTiming.text("receive") +
+            eventsTiming.text("events") + qualityTiming.text("quality") + controlTiming.text("controlFlush") +
+            pliTiming.text("pli") + heartbeatTiming.text("heartbeat");
+    }
+    void invalidateRoute() {
+        // Retain the last known enums for final diagnostics, but never authorize
+        // required-TURN media/control from a pre-transition cached selection.
+        routeCurrent = false;
+        if (relay) isReady = false;
+        routeSnapshotSchedule.invalidate();
+    }
     void addCandidateProof(rtc::Candidate candidate) {
         const auto before = remoteCandidateProofs.size();
         remoteCandidateProofs.add(std::move(candidate));
-        routeProofDirty |= remoteCandidateProofs.size() != before;
+        if (remoteCandidateProofs.size() != before) routeSnapshotSchedule.invalidate();
     }
 #ifdef FOG_STREAM_TESTING
-    bool routeOverride = false;
+    bool routeOverride = false, testPairAvailable = true, testPairThrows = false, fixedRouteClock = false;
+    std::uint64_t routeClock = 0;
     rtc::Candidate testLocal, testRemote;
 #endif
-    bool routeAllowed() const { return !relay || route.isTurn(); }
+    bool routeAllowed() const { return !relay || (routeCurrent && route.isTurn()); }
     rtc::Candidate selectedLocal, selectedRemote;
     unsigned routeSelections = 0, routeEventDrops = 0;
     std::deque<std::string> routeEvents;
@@ -360,7 +398,7 @@ struct Client::Impl {
     Clock::time_point iceSnapshotAt{};
     std::string routeDiagnostics() const {
         return std::string(" requested=") + (relay ? "relay" : "all") + route.diagnostics() +
-            " iceSnapshotAvailable=" + std::to_string(iceSnapshotAvailable) + " localPolicy=all routeKnown=" + std::to_string(routeSelected) + " routeSnapshot=" + (running ? "live" : "final") +
+            " iceSnapshotAvailable=" + std::to_string(iceSnapshotAvailable) + " localPolicy=all routeKnown=" + std::to_string(routeSelected) + " routeCurrent=" + std::to_string(routeCurrent) + " routeSnapshot=" + (running ? "live" : "final") +
             " candidateProofs=" + std::to_string(remoteCandidateProofs.size()) + " candidateProofDrops=" + std::to_string(remoteCandidateProofs.dropped()) +
             " routeSelections=" + std::to_string(routeSelections) + " routeEventDrops=" + std::to_string(routeEventDrops);
     }
@@ -368,20 +406,43 @@ struct Client::Impl {
         // Never acquire RTC transport locks while holding Shared::mutex:
         // RTC callbacks can enter Shared while still owning a transport lock.
         if (!peer) return;
-        routeProofDirty = false;
         const auto now = Clock::now();
         if (force || iceSnapshotAt == Clock::time_point{} || now - iceSnapshotAt >= std::chrono::seconds(1)) {
-            auto snapshot = peer->iceDiagnostics();
-            iceSnapshotAvailable = !snapshot.empty();
-            if (iceSnapshotAvailable) finalIceDiagnostics = std::move(snapshot);
             iceSnapshotAt = now;
+            TransportStageScope timing{iceDiagnosticTiming};
+            try {
+                auto snapshot = peer->iceDiagnostics();
+                iceSnapshotAvailable = !snapshot.empty();
+                if (iceSnapshotAvailable) finalIceDiagnostics = std::move(snapshot);
+            } catch (...) {} // Diagnostic failure must not suppress route verification.
         }
-        rtc::Candidate local, remote;
+        auto ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
 #ifdef FOG_STREAM_TESTING
-        if (routeOverride) { local = testLocal; remote = testRemote; }
-        else
+        if (fixedRouteClock) ms = routeClock;
 #endif
-        if (!peer->getSelectedCandidatePair(&local, &remote)) return;
+        if (!routeSnapshotSchedule.due(ms, force)) return;
+        TransportStageScope timing{selectedPairTiming};
+        rtc::Candidate local, remote;
+        bool selectedPair = false;
+        try {
+#ifdef FOG_STREAM_TESTING
+            if (testPairThrows) throw std::runtime_error("Selected pair fixture failure");
+            if (routeOverride) {
+                selectedPair = testPairAvailable;
+                if (selectedPair) { local = testLocal; remote = testRemote; }
+            }
+            else
+#endif
+            selectedPair = peer->getSelectedCandidatePair(&local, &remote);
+        } catch (...) {
+            invalidateRoute();
+            routeSnapshotSchedule.failed(ms);
+            throw;
+        }
+        // No pair is a valid observation and must not cause polling every frame.
+        routeSnapshotSchedule.queried(ms);
+        routeCurrent = selectedPair;
+        if (!selectedPair) { if (relay) isReady = false; return; }
         const SelectedRoute selected{local.type(), remote.type(), local.transportType(), remote.transportType(), remoteCandidateProofs.find(remote)};
         if (routeSelected && selected == route && local == selectedLocal && remote == selectedRemote) return;
         selectedLocal = local; selectedRemote = remote;
@@ -497,6 +558,7 @@ struct Client::Impl {
         sendSignaling(frame);
     }
     void flushControl() {
+        TransportStageScope timing{controlTiming};
         if (!channel || !channel->isOpen() || !routeAllowed()) return;
         while (!controls.empty()) {
 #ifdef FOG_STREAM_TESTING
@@ -519,8 +581,8 @@ struct Client::Impl {
     }
     void openChannel() {
         if (closingForRetry || channelOpen || !channel || !channel->isOpen()) return;
-        if (relay && !route.isTurn()) {
-            if (route.isDirect()) throw TransportError("TURN required but direct path selected");
+        if (!routeAllowed()) {
+            if (routeCurrent && route.isDirect()) throw TransportError("TURN required but direct path selected");
             state = "Waiting for TURN route";
             return;
         }
@@ -620,6 +682,7 @@ struct Client::Impl {
         if (closingForRetry) return;
         operation = "init.peer-create";
         peer = std::make_shared<rtc::PeerConnection>(config);
+        invalidateRoute();
         const std::weak_ptr<Shared> weak(shared);
         peer->onLocalDescription([weak](rtc::Description description) {
             callback(weak, [&description](Shared& s) {
@@ -885,10 +948,9 @@ struct Client::Impl {
         case EventType::Channel:
             if (channel) throw TransportError("Duplicate control channel");
             channel = event.channel;
-            openChannel();
             break;
         case EventType::ChannelOpen:
-            openChannel();
+            // Open only after this entire batch's ICE/provenance is verified.
             break;
         case EventType::Control:
             operation = "control.json";
@@ -954,7 +1016,27 @@ void Client::setSelectedCandidatesForTesting(const std::string& local, const std
     impl_->testLocal = rtc::Candidate(local); impl_->testRemote = rtc::Candidate(remote);
     impl_->testLocal.resolve(rtc::Candidate::ResolveMode::Simple);
     impl_->testRemote.resolve(rtc::Candidate::ResolveMode::Simple);
-    impl_->routeOverride = true;
+    impl_->routeOverride = impl_->testPairAvailable = true;
+    impl_->invalidateRoute();
+}
+void Client::clearSelectedCandidatesForTesting() {
+    impl_->routeOverride = true; impl_->testPairAvailable = false;
+    impl_->invalidateRoute();
+}
+void Client::failSelectedPairForTesting(bool fail) {
+    impl_->testPairThrows = fail;
+    impl_->invalidateRoute();
+}
+void Client::setRouteSnapshotTimeForTesting(std::uint64_t now) {
+    impl_->fixedRouteClock = true; impl_->routeClock = now;
+}
+void Client::repeatIceStateForTesting() {
+    Impl::Event event(Impl::EventType::IceState);
+    {
+        TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
+        event.iceState = impl_->shared->iceState;
+    }
+    impl_->shared->event(std::move(event));
 }
 void Client::addCandidateProofForTesting(const std::string& text) {
     Impl::Event event(Impl::EventType::TestCandidateProof); event.text = text;
@@ -1037,13 +1119,14 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
 void Client::pump() {
     auto& i = *impl_;
     if (!i.running || !i.shared) return;
-    i.shared->sendNacks();
-    try { i.snapshotIce(); } catch (...) {} // Diagnostics never change transport behavior.
+    TransportStageScope pumpTiming{i.pumpTiming};
+    { TransportStageScope timing{i.nackTiming}; i.shared->sendNacks(); }
     bool eventOverflow, callbackFailure, needsPli, statsPending;
     quality::Telemetry stats;
     Clock::time_point lastVideo;
     std::deque<Impl::Event> events;
     try {
+        TransportStageScope timing{i.receiveTiming};
         TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
         i.shared->video.tick(videoNow(), i.shared->videoFrameBudget()); i.shared->drainVideo();
         eventOverflow = i.shared->eventOverflow; callbackFailure = i.shared->callbackFailure;
@@ -1068,20 +1151,34 @@ void Client::pump() {
     try {
         // Inspect the whole bounded batch before committing a retryable failure.
         // A later remote close/error or malformed protocol must remain terminal.
-        std::string transportFailure;
-        for (auto& event : events) {
-            try { i.event(event); }
-            catch (const TransportError& error) {
-                if (!error.retryable) throw;
-                if (transportFailure.empty()) transportFailure = error.what();
+        // A channel event can precede a state/candidate event in the same batch.
+        // Invalidate before dispatching any event that might send control.
+        for (const auto& event : events)
+            if (event.type == Impl::EventType::PeerState || event.type == Impl::EventType::IceState ||
+                event.type == Impl::EventType::GatheringState || event.type == Impl::EventType::Candidate ||
+                event.type == Impl::EventType::Description || event.type == Impl::EventType::Channel ||
+                event.type == Impl::EventType::ChannelOpen) {
+                i.invalidateRoute(); break;
             }
+        std::string transportFailure;
+        {
+            TransportStageScope timing{i.eventsTiming};
+            for (auto& event : events) {
+                try { i.event(event); }
+                catch (const TransportError& error) {
+                    if (!error.retryable) throw;
+                    if (transportFailure.empty()) transportFailure = error.what();
+                }
+            }
+            if (!transportFailure.empty()) throw TransportError(transportFailure.c_str(), true);
+            if (!i.pendingTransportFailure.empty()) throw TransportError(i.pendingTransportFailure.c_str(), true);
+            if (statsPending) i.readQualityStats(stats);
         }
-        if (!transportFailure.empty()) throw TransportError(transportFailure.c_str(), true);
-        if (!i.pendingTransportFailure.empty()) throw TransportError(i.pendingTransportFailure.c_str(), true);
-        if (statsPending) i.readQualityStats(stats);
         if (i.closingForRetry) return;
-        if (i.routeProofDirty) i.snapshotIce(); // Proof admitted in this batch wins over its deadline.
-        if (i.relay && i.route.isDirect())
+        // New proof/state changes win over the unproven-route deadline, even
+        // between periodic queries. Unknown pairs also obey the interval.
+        try { i.snapshotIce(); } catch (...) {} // Failed query leaves required TURN gated.
+        if (i.relay && i.routeCurrent && i.route.isDirect())
             throw TransportError("TURN required but direct path selected");
         const auto routeNow = Clock::now();
         if (!i.routeAllowed()) {
@@ -1091,8 +1188,11 @@ void Client::pump() {
                 i.fail("Relay transport unavailable: selected route unproven", true); return;
             }
         } else i.unprovenRouteAt = {};
-        i.openChannel(); // A pending channel may now have a verified TURN route.
-        i.applyQuality();
+        {
+            TransportStageScope timing{i.qualityTiming};
+            i.openChannel(); // A pending channel may now have a verified TURN route.
+            i.applyQuality();
+        }
         i.flushControl();
         const auto now = Clock::now();
         if (i.channelOpen && i.routeAllowed() && lastVideo != Clock::time_point{}) {
@@ -1109,11 +1209,13 @@ void Client::pump() {
             i.fail("Signaling stream stalled", true); return;
         }
         if (i.stompConnected && i.heartbeat.count() && now - i.lastHeartbeat >= i.heartbeat) {
+            TransportStageScope timing{i.heartbeatTiming};
             i.sendSignaling(std::string("\n"));
             i.lastHeartbeat = now; ++i.heartbeatsSent;
         }
         if (i.routeAllowed() && ((i.videoSettings.keyframeSeconds > 0 && now - i.lastPli >= std::chrono::seconds(i.videoSettings.keyframeSeconds)) ||
             (needsPli && now - i.lastPli >= std::chrono::milliseconds(250)))) {
+            TransportStageScope timing{i.pliTiming};
             bool requested = false;
             for (const auto& track : i.tracks)
                 if (track->description().type() == "video" && track->isOpen()) {
@@ -1262,6 +1364,7 @@ bool Client::disconnectForRetry() {
     return true;
 }
 std::string Client::diagnostics() const { return impl_->diagnostics(); }
+std::string Client::transportTimings() const { return impl_->transportTimings(); }
 std::string Client::dtlsDiagnostics() const {
     // Query RTC without Shared locked: SRTP callbacks acquire Shared themselves.
     return dtlsDiagnosticText(impl_->peer ? impl_->peer->getDtlsDiagnostics() : impl_->finalDtlsDiagnostics);

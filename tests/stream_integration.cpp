@@ -593,6 +593,58 @@ int main(int argc, char** argv) {
         assert(client.videoDiagnostics().find("serverPreset=LOW") != std::string::npos);
         assert(client.videoDiagnostics().find("statsCount=1") != std::string::npos);
         if (turn) {
+            // Freeze only route sampling, independent of RTC/heartbeat deadlines.
+            client.setRouteSnapshotTimeForTesting(1000);
+            client.pump();
+            const auto pairCount = [](const stream::Client& current) {
+                const auto text = current.transportTimings();
+                const auto at = text.find("icePairCalls=");
+                assert(at != std::string::npos);
+                return std::stoull(text.substr(at + 13));
+            };
+            const auto stableQueries = pairCount(client);
+            for (unsigned tick = 0; tick < 20; ++tick) client.pump();
+            assert(pairCount(client) == stableQueries && client.ready());
+            // Query exceptions must gate historical TURN and obey the same
+            // retry interval, without consuming new-event invalidation.
+            client.failSelectedPairForTesting(true); client.pump();
+            assert(pairCount(client) == stableQueries + 1 && !client.ready());
+            assert(!client.sendGamepad(stream::Gamepad{}));
+            for (unsigned tick = 0; tick < 20; ++tick) client.pump();
+            assert(pairCount(client) == stableQueries + 1);
+            client.setRouteSnapshotTimeForTesting(1999); client.pump();
+            assert(pairCount(client) == stableQueries + 1);
+            client.setRouteSnapshotTimeForTesting(2000); client.pump();
+            assert(pairCount(client) == stableQueries + 2 && !client.ready());
+            client.failSelectedPairForTesting(false); client.pump();
+            assert(pairCount(client) == stableQueries + 3 && client.ready());
+            const auto verifiedQueries = pairCount(client);
+            client.repeatIceStateForTesting(); client.pump();
+            assert(pairCount(client) == verifiedQueries + 1 && client.ready());
+            // Never reuse the preceding TURN proof when the selected pair disappears.
+            client.clearSelectedCandidatesForTesting(); client.pump();
+            assert(pairCount(client) == verifiedQueries + 2 && !client.ready());
+            assert(client.diagnostics().find("routeCurrent=0") != std::string::npos);
+            assert(!client.sendGamepad(stream::Gamepad{}) && !client.requestVideoKeyframe());
+            stream::Packet unavailable; assert(!client.poll(unavailable));
+            for (unsigned tick = 0; tick < 20; ++tick) client.pump();
+            assert(pairCount(client) == verifiedQueries + 2);
+            client.setRouteSnapshotTimeForTesting(2999); client.pump();
+            assert(pairCount(client) == verifiedQueries + 2);
+            client.setRouteSnapshotTimeForTesting(3000); client.pump();
+            assert(pairCount(client) == verifiedQueries + 3 && !client.ready());
+            const auto timing = client.transportTimings();
+            assert(timing.find("scope=transport-lifetime nested=1") == 0);
+            for (const auto* stage : {"pump", "nack", "iceDiag", "icePair", "receive", "events", "quality", "controlFlush", "pli", "heartbeat"}) {
+                assert(timing.find(std::string(stage) + "Calls=") != std::string::npos);
+                assert(timing.find(std::string(stage) + "AvgUs=") != std::string::npos);
+                assert(timing.find(std::string(stage) + "MaxUs=") != std::string::npos);
+            }
+            assert(timing.size() < 2048 && timing.find("192.0.") == std::string::npos);
+            std::cout << "Route sampling: unchanged/no-pair cadence, ICE invalidation, required-TURN gate and bounded stage timings passed\n";
+            client.setSelectedCandidatesForTesting("local 1 UDP 1 192.0.2.20 50001 typ host",
+                                                  "relay 1 UDP 1 192.0.2.30 50002 typ relay");
+            client.pump(); assert(client.ready());
             // Keep the real TURN transport connected, but inject a newly selected
             // prflx route before its delayed SDP/trickle provenance arrives.
             assert(!fixture.neutral);
@@ -615,10 +667,13 @@ int main(int argc, char** argv) {
             assert(!fixture.neutral && client.diagnostics().find("controlPending=1 ") != std::string::npos);
             assert(client.diagnostics().find("actual=unknown") != std::string::npos);
             client.elapseForTesting(30);
+            const auto beforeProof = pairCount(client);
             client.addCandidateProofForTesting("relay-new-foundation 1 UDP 1 192.0.2.10 50000 typ relay");
             fixture.signal({{"id", "ping"}, {"ts", 0}});
             fixture.sendMedia();
             std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            client.pump();
+            assert(pairCount(client) == beforeProof + 1 && client.ready());
             const auto proofAt = Clock::now();
             while (!fixture.neutral && Clock::now() - proofAt < std::chrono::seconds(1)) {
                 fixture.pump(); client.pump(); fixture.sendMedia();

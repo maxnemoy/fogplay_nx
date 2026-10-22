@@ -13,6 +13,8 @@ g++ "${flags[@]}" tests/incoming_control_tests.cpp -o work/incoming_control_test
 ./work/incoming_control_tests | tee work/logs/incoming-control-tests.log
 g++ "${flags[@]}" tests/transport_history_tests.cpp -o work/transport_history_tests
 ./work/transport_history_tests | tee work/logs/transport-history-tests.log
+g++ "${flags[@]}" tests/route_snapshot_schedule_tests.cpp -o work/route_snapshot_schedule_tests
+./work/route_snapshot_schedule_tests | tee work/logs/route-snapshot-schedule-tests.log
 g++ "${flags[@]}" tests/stream_queue_tests.cpp -o work/stream_queue_tests
 ./work/stream_queue_tests | tee work/logs/stream-queue-tests.log
 g++ "${flags[@]}" tests/auto_quality_tests.cpp -o work/auto_quality_tests

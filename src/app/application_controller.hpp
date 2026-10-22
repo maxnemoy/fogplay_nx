@@ -16,6 +16,7 @@
 #include "features/streaming/domain/video_recovery.hpp"
 #include "features/streaming/domain/transport_reconnect.hpp"
 #include "features/streaming/domain/stream_input_gate.hpp"
+#include "features/streaming/domain/loop_timing.hpp"
 #include "core/logging/run_log.hpp"
 #include "features/streaming/infrastructure/stream.hpp"
 #include "features/session/application/checkout.hpp"
@@ -79,6 +80,7 @@ private:
     void armExitHandling();
     void disarmExitHandling();
     std::string playbackTimings() const;
+    void logOutputTimings(bool final);
     void closeStream() noexcept;
     bool closeTransport(bool final) noexcept;
     bool startTransport();
@@ -197,6 +199,9 @@ private:
     std::string streamHash_;
     std::uint64_t videoWorkUs_ = 0, videoDecodeErrors_ = 0, lastVideoGeneration_ = 0;
     PlaybackTiming drainTiming_, presentTiming_;
+    fog::stream::LoopTiming loopTiming_;
+    std::chrono::steady_clock::time_point loopTimingWindowAt_{};
+    std::chrono::steady_clock::time_point loopTimingLifetimeAt_{};
     PlaybackTiming transportPumpTiming_, videoFeedTiming_, decoderResetTiming_, audioFeedTiming_, prepareTiming_;
     std::uint64_t drainVideoTotal_ = 0, drainVideoMax_ = 0, drainVideoBudgetHits_ = 0;
     std::uint64_t videoQueueWaitMaxMs_ = 0, audioQueueWaitMaxMs_ = 0;

@@ -21,11 +21,41 @@ std::string ApplicationController::playbackTimings() const {
         " logBatchLastUs=" + std::to_string(log.lastBatchUs) + " logBatchMaxUs=" + std::to_string(log.maxBatchUs);
 }
 
+void ApplicationController::logOutputTimings(bool final) {
+    using Timing = fog::stream::LoopTiming;
+    const auto now = std::chrono::steady_clock::now();
+    const auto active = loopTiming_.activeText(now);
+    // Samples belong to the window in which their scope finishes. Nested draw
+    // stages overlap the outer draw/loop; these durations must not be summed.
+    for (const bool lifetime : {false, true}) {
+        if (lifetime && !final) break;
+        const auto& snapshot = lifetime ? loopTiming_.lifetime : loopTiming_.window;
+        const auto spanMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now-(lifetime ? loopTimingLifetimeAt_ : loopTimingWindowAt_)).count();
+        const std::string scope = final ? (lifetime ? "final lifetime" : "final window") : "window";
+        std::string loop = "Output loop " + scope + ": spanMs=" + std::to_string(spanMs) + " " + active;
+        for (const auto stage : {Timing::Stage::Loop, Timing::Stage::Events, Timing::Stage::Poll,
+            Timing::Stage::Pump, Timing::Stage::Input, Timing::Stage::Draw})
+            loop += " " + snapshot.at(stage).text(Timing::name(stage));
+        diagnostic(loop,4096);
+        std::string draw = "Output draw " + scope + ":";
+        for (const auto stage : {Timing::Stage::Artwork, Timing::Stage::MediaDraw, Timing::Stage::Overlay, Timing::Stage::Present})
+            draw += " " + snapshot.at(stage).text(Timing::name(stage));
+        draw += " " + snapshot.newPresentGap.text("newPresentGap") +
+            " newPresentAnchors=" + std::to_string(snapshot.anchors) +
+            " suppressedNewFrames=" + std::to_string(snapshot.suppressedFrames) +
+            " presentContinuityBreaks=" + std::to_string(snapshot.continuityBreaks);
+        diagnostic(draw,4096);
+    }
+    if (!final) { loopTiming_.clearWindow(); loopTimingWindowAt_ = now; }
+}
+
 bool ApplicationController::closeTransport(bool final) noexcept {
     bool retryAllowed = true;
     releaseMouse();
     videoRecovery_.reset();
     videoLossWaiting_ = false;
+    loopTiming_.suspendPresentation();
     if (stream_) {
         try {
             std::string event;
@@ -34,6 +64,8 @@ bool ApplicationController::closeTransport(bool final) noexcept {
             diagnostic("Video RTP final: " + stream_->videoDiagnostics(),4096);
             diagnostic("Media queue final: " + stream_->queueDiagnostics(),2048);
             diagnostic(playbackTimings(),2048);
+            logOutputTimings(true);
+            diagnostic("Stream transport final: " + stream_->transportTimings(),4096);
             if (media_) {
                 diagnostic("Video decoder final: " + media_->diagnostics(),2048);
                 diagnostic("Audio playback final: " + media_->audioDiagnostics(),2048);
@@ -74,6 +106,7 @@ bool ApplicationController::startTransport() {
     // Transport replacement must not adopt, create, or reset rental ownership.
     videoRecovery_.reset();
     videoLossWaiting_ = false; firstFramePresented_ = false;
+    loopTiming_.resetPresentationCounter();
     videoWorkUs_ = videoDecodeErrors_ = lastVideoGeneration_ = 0;
     media_ = std::make_unique<fog::Media>(rt_.renderer,stream::VideoCodec::H264,true);
     stream_ = std::make_unique<stream::Client>();
@@ -119,6 +152,7 @@ void ApplicationController::startStream(const std::string& hash, bool createdFro
     relaySelection_.reset(connectionSettings_);
     sessionPending_ = true;
     transportReconnect_.reset();
+    loopTiming_.reset(); loopTimingWindowAt_ = loopTimingLifetimeAt_ = std::chrono::steady_clock::now();
     drainTiming_ = {}; presentTiming_ = {}; diagnosticTiming = {};
     lastPumpAt_ = {}; lastProtocolLog_ = {}; pumpGapMaxUs_ = 0; outsideMeasuredPumpMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
     transportPumpTiming_ = {}; videoFeedTiming_ = {}; decoderResetTiming_ = {}; audioFeedTiming_ = {}; prepareTiming_ = {};
@@ -151,6 +185,7 @@ void ApplicationController::startStream(const std::string& hash, bool createdFro
 }
 
 void ApplicationController::recoverVideoError(const fog::VideoDecodeError& error, const stream::Packet* packet) {
+    loopTiming_.suspendPresentation();
     ++videoDecodeErrors_;
     std::string detail = packet ? "Video decode error: " : "Video presentation error: ";
     detail += error.what();
@@ -238,6 +273,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
                 diagnostic("Stream protocol: " + details,2048);
             }
             diagnostic("Stream DTLS: " + stream_->dtlsDiagnostics(),2048);
+            diagnostic("Stream transport: " + stream_->transportTimings(),4096);
             diagnostic("Stream mutex: " + stream_->mutexDiagnostics(),4096);
             lastProtocolLog_ = pumpAt;
         }
@@ -277,7 +313,10 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     }
     if (!stream_) return;
     const bool lossWaiting = stream_->waitingForVideoKeyframe();
-    if (lossWaiting && !videoLossWaiting_) suspendVideoInput();
+    if (lossWaiting && !videoLossWaiting_) {
+        loopTiming_.suspendPresentation();
+        suspendVideoInput();
+    }
     videoLossWaiting_ = lossWaiting;
     const auto diagnosticNow = std::chrono::steady_clock::now();
     // SD lines are durable: drain a bounded event ring at most once per second,
@@ -322,6 +361,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             try {
                 media_->setVideoCodec(stream_->selectedVideoCodec());
                 if (packet.videoGeneration != lastVideoGeneration_) {
+                    loopTiming_.suspendPresentation();
                     const auto resetStarted = std::chrono::steady_clock::now();
                     media_->resetVideoDecoder();
                     decoderResetTiming_.record(resetStarted);
@@ -441,6 +481,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         diagnostic("Media queue: " + stream_->queueDiagnostics(),2048);
         diagnostic("Video decoder: " + media_->diagnostics(),2048);
         diagnostic("Audio playback: " + media_->audioDiagnostics(),2048);
+        logOutputTimings(false);
         const auto timings = playbackTimings();
         drainTiming_ = {}; presentTiming_ = {}; diagnosticTiming = {};
         pumpGapMaxUs_ = 0; outsideMeasuredPumpMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;

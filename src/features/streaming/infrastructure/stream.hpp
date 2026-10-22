@@ -61,6 +61,8 @@ public:
     bool disconnectForRetry(); // False if pending terminal evidence forbids retry; otherwise release transports.
     // Fixed operation names and counters only; no remote fields or identifiers.
     std::string diagnostics() const;
+    // Application-thread lifetime stages; nested scopes are not additive.
+    std::string transportTimings() const;
     std::string videoDiagnostics() const;
     std::string gapDiagnostics() const;
     std::string queueDiagnostics() const;
@@ -88,6 +90,10 @@ public:
     // Deterministic event ordering fixture; no network/service injection in production.
     void failThenReceiveForTesting(const std::string& text, bool signaling);
     void setSelectedCandidatesForTesting(const std::string& local, const std::string& remote);
+    void clearSelectedCandidatesForTesting();
+    void failSelectedPairForTesting(bool fail);
+    void setRouteSnapshotTimeForTesting(std::uint64_t now);
+    void repeatIceStateForTesting();
     void addCandidateProofForTesting(const std::string& candidate);
     bool selectedRemoteMatchesForTesting(const std::string& candidate) const;
     void blockControlForTesting(bool blocked);

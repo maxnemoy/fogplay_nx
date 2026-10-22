@@ -55,6 +55,9 @@ void ApplicationController::run() {
     start(Task::RestoreAuth,[this] { return Json{{"restored",api_.restoreAuth()}}; });
     status_ = "Проверяем сохранённый вход…";
     for (;;) {
+        fog::stream::LoopTiming::Scope loopScope(loopTiming_, fog::stream::LoopTiming::Stage::Loop,
+            stream_ || transportReconnect_.recovering());
+        fog::stream::LoopTiming::Scope eventsScope(loopTiming_, fog::stream::LoopTiming::Stage::Events);
         const bool systemRunning = appletMainLoop();
         if (!systemRunning) {
             if (!sessionPending_) break;
@@ -74,7 +77,11 @@ void ApplicationController::run() {
             if (!sessionPending_) break;
             exitAfterStop_ = true; stopAfterTask_ = true;
         }
+        eventsScope.finish();
+        if (!focused || screen_ != Screen::Streaming || stopAfterTask_)
+            loopTiming_.suspendPresentation();
         try {
+            fog::stream::LoopTiming::Scope pollScope(loopTiming_, fog::stream::LoopTiming::Stage::Poll);
             if (exitAfterStop_ && sessionPending_ && !pending_.valid() && !stopStartedOnExit_) {
                 stopStartedOnExit_ = true;
                 beginFinish("application-exit");
@@ -100,7 +107,12 @@ void ApplicationController::run() {
                 checkoutAutoPoll_ && std::chrono::steady_clock::now() >= checkoutAt_) {
                 if (stopAfterTask_) beginFinish(); else pollCheckout(false);
             }
-            if ((stream_ || transportReconnect_.recovering()) && focused && !stopAfterTask_) pumpStream(pad, held, down);
+            pollScope.finish();
+            if ((stream_ || transportReconnect_.recovering()) && focused && !stopAfterTask_) {
+                fog::stream::LoopTiming::Scope pumpScope(loopTiming_, fog::stream::LoopTiming::Stage::Pump);
+                pumpStream(pad, held, down);
+            }
+            fog::stream::LoopTiming::Scope inputScope(loopTiming_, fog::stream::LoopTiming::Stage::Input);
             if (!pending_.valid() && focused) input(uiDown);
             if (screen_ == Screen::Games && focused && (!sidebar_ || catalog_.items().empty())) requestCatalog();
             if (screen_ == Screen::Stopping && !pending_.valid() && api_.loggedIn() &&
@@ -112,7 +124,10 @@ void ApplicationController::run() {
             if (sessionPending_ && (stream_ || !streamHash_.empty() || transportReconnect_.recovering())) beginFinish("stream-exception");
         }
         if (exitAfterStop_ && !sessionPending_ && !pending_.valid()) break;
-        try { if (focused) draw(); else svcSleepThread(16000000); }
+        try {
+            fog::stream::LoopTiming::Scope drawScope(loopTiming_, fog::stream::LoopTiming::Stage::Draw);
+            if (focused) draw(); else svcSleepThread(16000000);
+        }
         catch (const std::exception& error) {
             diagnostic(safeText(error.what()));
             if (sessionPending_ && !stopAfterTask_ && !pending_.valid()) beginFinish("render-exception");

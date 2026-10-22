@@ -45,19 +45,37 @@ SDL_Texture* ApplicationController::cover(const Json& game) {
 }
 
 void ApplicationController::draw() {
+    fog::stream::LoopTiming::Scope artworkScope(loopTiming_, fog::stream::LoopTiming::Stage::Artwork);
     artwork_.update(rt_.renderer);
-    if (screen_ == Screen::Streaming && media_ && media_->draw()) {
+    artworkScope.finish();
+    bool videoDrawn = false;
+    {
+        fog::stream::LoopTiming::Scope mediaScope(loopTiming_, fog::stream::LoopTiming::Stage::MediaDraw,
+            screen_ == Screen::Streaming && media_);
+        if (screen_ == Screen::Streaming && media_) videoDrawn = media_->draw();
+    }
+    if (videoDrawn) {
+        fog::stream::LoopTiming::Scope overlayScope(loopTiming_, fog::stream::LoopTiming::Stage::Overlay);
         if (overlay_.mode() == fog::stream::OverlayMode::Closed && std::chrono::steady_clock::now()-streamStarted_ < std::chrono::seconds(12)) {
             box(0,665,1280,55,{23,32,46,255});
             text("Минус + Плюс — меню: мышь, клавиатура, изображение, завершение.",30,680,accent);
         }
         drawStreamOverlay();
+        overlayScope.finish();
         const auto presentStarted = std::chrono::steady_clock::now();
+        fog::stream::LoopTiming::Scope presentScope(loopTiming_, fog::stream::LoopTiming::Stage::Present);
         SDL_RenderPresent(rt_.renderer);
         media_->presented();
         presentTiming_.record(presentStarted);
+        presentScope.finish();
+        loopTiming_.presented(media_->presentedFrames(),
+            !stopAfterTask_ && !transportReconnect_.recovering() && !videoRecovery_.active() &&
+            !videoLossWaiting_ && !media_->waitingForVideoKeyframe() &&
+            (overlay_.mode() == fog::stream::OverlayMode::Closed || overlay_.mode() == fog::stream::OverlayMode::Mouse),
+            std::chrono::steady_clock::now());
         return;
     }
+    loopTiming_.suspendPresentation();
     fog::ui::Chrome chrome;
     chrome.sidebarExpanded = sidebar_; chrome.sidebarFocused = sidebar_;
     chrome.account = api_.loggedIn() ? "Аккаунт подключён" : "Войти в аккаунт";
@@ -153,7 +171,7 @@ void ApplicationController::draw() {
         ui_.history(cards,selection_,selection_/fog::ui::HistoryColumns*fog::ui::HistoryColumns);
         if (cards.empty() && !pending_.valid()) ui_.empty("Сессий пока нет", "Здесь появится история ваших игровых сессий.");
     } else if (screen_ == Screen::Settings) {
-        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Подключение",fog::connection::label(connectionSettings_),"Выбор пути: обычный, авто или через TURN"},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.4.24","Удалить сохранённый вход с SD-карты"}},selection_);
+        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Подключение",fog::connection::label(connectionSettings_),"Выбор пути: обычный, авто или через TURN"},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.4.25","Удалить сохранённый вход с SD-карты"}},selection_);
     } else if (screen_ == Screen::ImageSettings) {
         drawImageSettings();
     } else if (screen_ == Screen::ConnectionSettings) {
