@@ -14,6 +14,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <cerrno>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <net/if.h>
 
 using Json = stream::protocol::Json;
 using Clock = std::chrono::steady_clock;
@@ -21,6 +25,8 @@ namespace {
 // Linker-local firewall for exactly one fixture peer socket. TURN allocation
 // traffic remains real; no system firewall or production transport is changed.
 std::atomic<unsigned> restrictedPeerPort{0}, allowedTurnPort{0}, blockedDirectSends{0};
+std::atomic<uint32_t> allowedTurnAddress{0};
+std::atomic<unsigned> allowedTurnSends{0}, permissionSends{0}, relayDataSends{0};
 }
 extern "C" ssize_t __real_sendto(int, const void*, size_t, int, const sockaddr*, socklen_t);
 extern "C" ssize_t __wrap_sendto(int fd, const void* data, size_t size, int flags, const sockaddr* destination, socklen_t length) {
@@ -31,18 +37,40 @@ extern "C" ssize_t __wrap_sendto(int fd, const void* data, size_t size, int flag
             source.sin_family == AF_INET && ntohs(source.sin_port) == peerPort) {
             const auto* target = reinterpret_cast<const sockaddr_in*>(destination);
             if ((ntohs(target->sin_port) != allowedTurnPort.load() && ntohs(target->sin_port) != peerPort) ||
-                target->sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+                target->sin_addr.s_addr != allowedTurnAddress.load()) {
                 ++blockedDirectSends;
-                return static_cast<ssize_t>(size);
+                errno = ENETUNREACH; return -1;
+            }
+            if (ntohs(target->sin_port) == allowedTurnPort.load()) {
+                ++allowedTurnSends;
+                if (size >= 2) {
+                    const auto* bytes = static_cast<const unsigned char*>(data);
+                    const auto type = (unsigned(bytes[0]) << 8) | unsigned(bytes[1]);
+                    if (type == 0x0008) ++permissionSends;
+                    if (type == 0x0016 || (bytes[0] & 0xc0) == 0x40) ++relayDataSends;
+                }
             }
         }
     }
     return __real_sendto(fd, data, size, flags, destination, length);
 }
 namespace {
+std::string localFixtureAddress() {
+    ifaddrs* interfaces = nullptr; assert(getifaddrs(&interfaces) == 0);
+    std::string result = "127.0.0.1";
+    for (auto* item = interfaces; item; item = item->ifa_next) {
+        if (!item->ifa_addr || item->ifa_addr->sa_family != AF_INET || (item->ifa_flags & IFF_LOOPBACK) ||
+            !(item->ifa_flags & IFF_UP)) continue;
+        const auto* address = reinterpret_cast<const sockaddr_in*>(item->ifa_addr);
+        if ((ntohl(address->sin_addr.s_addr) >> 24) == 127 || !address->sin_addr.s_addr) continue;
+        char numeric[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &address->sin_addr, numeric, sizeof(numeric))) { result = numeric; break; }
+    }
+    freeifaddrs(interfaces); return result;
+}
 unsigned availableUdpPort() {
     const int fd = socket(AF_INET, SOCK_DGRAM, 0); assert(fd >= 0);
-    sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_ANY);
     assert(bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
     socklen_t size = sizeof(address);
     assert(getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0);
@@ -107,6 +135,7 @@ struct Fixture {
     bool expectRelay;
     bool rejectWebrtc = false;
     juice_server_t* turn = nullptr;
+    std::string turnAddress;
     bool hevc;
     std::string fixtureClientHash;
     explicit Fixture(std::string serverHeartbeat = "4000,4000", bool initialize = true, bool useHevc = false,
@@ -116,14 +145,17 @@ struct Fixture {
         if (useTurn) {
             juice_server_credentials_t credentials{"fixture-user", "fixture-password", 4};
             juice_server_config_t turnConfig{};
-            turnConfig.bind_address = "127.0.0.1";
-            turnConfig.external_address = "127.0.0.1";
+            turnAddress = localFixtureAddress();
+            turnConfig.bind_address = turnAddress.c_str();
+            turnConfig.external_address = turnAddress.c_str();
             turnConfig.credentials = &credentials; turnConfig.credentials_count = 1;
             turnConfig.max_allocations = 4; turnConfig.max_peers = 8;
             turnConfig.realm = "fixture";
             turn = juice_server_create(&turnConfig);
             assert(turn && juice_server_get_port(turn));
-            blockedDirectSends = 0; allowedTurnPort = juice_server_get_port(turn);
+            blockedDirectSends = 0; allowedTurnSends = 0; permissionSends = 0; relayDataSends = 0; allowedTurnPort = juice_server_get_port(turn);
+            in_addr numeric{}; assert(inet_pton(AF_INET, turnAddress.c_str(), &numeric) == 1);
+            allowedTurnAddress = numeric.s_addr;
             restrictedPeerPort = availableUdpPort();
         }
         rtc::WebSocketServer::Configuration config;
@@ -158,11 +190,11 @@ struct Fixture {
         config.disableAutoNegotiation = true;
         // Local fixture only, including its embedded loopback TURN server.
         if (turn) {
-            config.bindAddress = "127.0.0.1";
+            config.bindAddress = turnAddress;
             config.portRangeBegin = static_cast<uint16_t>(restrictedPeerPort.load());
             config.portRangeEnd = config.portRangeBegin;
             config.iceTransportPolicy = rtc::TransportPolicy::Relay;
-            config.iceServers.emplace_back("127.0.0.1", juice_server_get_port(turn), "fixture-user", "fixture-password");
+            config.iceServers.emplace_back(turnAddress, juice_server_get_port(turn), "fixture-user", "fixture-password");
         }
         peer = std::make_shared<rtc::PeerConnection>(config);
         const std::weak_ptr<Events> weak(events);
@@ -229,6 +261,7 @@ struct Fixture {
             assert(v->payloadTypes() == std::vector<int>{98} && v->direction() == rtc::Description::Direction::RecvOnly);
             assert(a->payloadTypes() == std::vector<int>{103} && a->direction() == rtc::Description::Direction::RecvOnly);
             peer->setRemoteDescription(desc); answered = true;
+
             signal({{"id", "ice_candidate"}, {"data", ""}});
             for (const auto& c : candidates) peer->addRemoteCandidate(c);
             candidates.clear();
@@ -327,7 +360,8 @@ struct Fixture {
 };
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool turnOnly = argc == 2 && std::string(argv[1]) == "--turn-only";
     const std::vector<Json> remoteInputs{
         fog::remote::absoluteMouse(640, 360, 1280, 720, 1920, 1080),
         fog::remote::mouseButton(true, 0), fog::remote::mouseButton(false, 0),
@@ -379,7 +413,7 @@ int main() {
         assert(client.error() == "Relay transport unavailable: remote initialization rejected");
         assert(!client.ready() && client.diagnostics().find("actual=unknown") != std::string::npos);
     }
-    for (int round = 1; round <= 4; ++round) {
+    for (int round = turnOnly ? 4 : 1; round <= 4; ++round) {
     {
         const bool turn = round == 4;
         Fixture fixture("4000,4000", true, round == 3, "abcde", turn, turn);
@@ -443,7 +477,9 @@ int main() {
         if (!client.ready() || !fixture.controlReady || !fixture.pong || !fixture.pressed) {
             std::cerr << "Unready fixture round=" << round << " ready=" << client.ready() << " answered=" << fixture.answered
                 << " control=" << fixture.controlReady << " pong=" << fixture.pong << " pressed=" << fixture.pressed
-                << " blocked=" << blockedDirectSends.load() << " " << client.diagnostics() << "\n";
+                << " blocked=" << blockedDirectSends.load() << " allowedTurn=" << allowedTurnSends.load()
+                << " permissions=" << permissionSends.load() << " relayData=" << relayDataSends.load()
+                << " provider=" << fixture.peer->iceDiagnostics() << " client=" << client.diagnostics() << "\n";
         }
         assert(client.ready() && fixture.answered && fixture.controlReady && fixture.pong && fixture.pressed);
         const auto route = client.diagnostics();
@@ -455,6 +491,15 @@ int main() {
         assert(routeEvent.find(turn ? "actual=turn" : "actual=direct") != std::string::npos);
         if (turn) assert(blockedDirectSends > 0);
         std::cout << "Selected route fixture passed: " << routeEvent << "\n";
+        assert(videos >= 3 && audios >= 3 && fixture.feedback->plis > 0);
+        assert(fixture.remoteControls == expectedRemoteInputs);
+        assert(client.diagnostics().find("emptyCandidates=3") != std::string::npos);
+        assert(client.videoDiagnostics().find("waitIdr=0") != std::string::npos);
+        assert(client.selectedVideoCodec() == (fixture.hevc ? stream::VideoCodec::H265 : stream::VideoCodec::H264));
+        assert(fixture.feedback->remb == 15000000 && fixture.qualityCommand == "set_autoquality");
+        assert(client.qualityStatus().find("18.0") != std::string::npos);
+        assert(client.videoDiagnostics().find("serverPreset=LOW") != std::string::npos);
+        assert(client.videoDiagnostics().find("statsCount=1") != std::string::npos);
         if (turn) {
             // Keep the real TURN transport connected, but inject a newly selected
             // prflx route before its delayed SDP/trickle provenance arrives.
@@ -491,17 +536,16 @@ int main() {
             assert(client.diagnostics().find("actual=turn") != std::string::npos);
             assert(client.diagnostics().find("remoteType=prflx") != std::string::npos);
             assert(client.diagnostics().find("remoteProof=relay-endpoint") != std::string::npos);
+            const auto resumeAt = Clock::now();
+            bool resumedVideo = false;
+            while ((!resumedVideo || client.waitingForVideoKeyframe()) && Clock::now() - resumeAt < std::chrono::seconds(1)) {
+                fixture.pump(); client.pump(); fixture.sendMedia();
+                while (client.poll(withheld)) resumedVideo |= withheld.kind == stream::Kind::Video;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(resumedVideo && !client.waitingForVideoKeyframe() && client.error().empty());
             std::cout << "TURN route transition gates ready/input/queue/media/PLI until exact delayed endpoint proof\n";
         }
-        assert(videos >= 3 && audios >= 3 && fixture.feedback->plis > 0);
-        assert(fixture.remoteControls == expectedRemoteInputs);
-        assert(client.diagnostics().find("emptyCandidates=3") != std::string::npos);
-        assert(client.videoDiagnostics().find("waitIdr=0") != std::string::npos);
-        assert(client.selectedVideoCodec() == (fixture.hevc ? stream::VideoCodec::H265 : stream::VideoCodec::H264));
-        assert(fixture.feedback->remb == 15000000 && fixture.qualityCommand == "set_autoquality");
-        assert(client.qualityStatus().find("18.0") != std::string::npos);
-        assert(client.videoDiagnostics().find("serverPreset=LOW") != std::string::npos);
-        assert(client.videoDiagnostics().find("statsCount=1") != std::string::npos);
         if (round == 1) {
             // Lost/throttled decoder PLI must retry even with periodic PLI disabled,
             // while transport assembly itself has already recovered.
@@ -742,6 +786,7 @@ int main() {
     stream::Client::cleanupRuntime();
     std::cout << "Full stream runtime cleanup round " << round << " passed\n";
     }
+    if (turnOnly) return 0;
     {
         Fixture fixture;
         stream::Client client;
