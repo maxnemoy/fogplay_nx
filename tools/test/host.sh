@@ -50,3 +50,5 @@ g++ -std=c++17 -Wall -Wextra -Werror -Isrc -Ithird_party \
     src/features/session/application/session.cpp src/features/session/application/checkout.cpp \
     src/core/storage/storage.cpp tests/rental_service_tests.cpp -o work/rental_service_tests
 ./work/rental_service_tests | tee work/logs/rental-service-tests.log
+
+bash tools/test/connection-settings.sh

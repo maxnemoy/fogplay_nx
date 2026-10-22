@@ -39,7 +39,7 @@ int main() {
         require(overlay.select().type == OverlayActionType::StopSession && overlay.mode() == OverlayMode::Closed, "confirmed stop action");
         overlay.openMenu(); overlay.down(); overlay.down(); overlay.select();
         require(overlay.mode() == OverlayMode::ImageSettings && overlay.selection() == 1, "image settings opens on safe quality field");
-        require(overlay.videoSettings().codec == ::stream::VideoCodec::H264, "default overlay codec");
+        require(overlay.videoSettings().codec == ::stream::VideoCodec::H265, "fresh overlay defaults to H265");
         require(overlay.left().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 4, "left changes safe quality and reports action");
         require(overlay.right().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 0, "quality wraps back to auto");
         overlay.down();

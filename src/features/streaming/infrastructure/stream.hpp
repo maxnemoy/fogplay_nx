@@ -35,6 +35,8 @@ public:
                const std::string& caPath);
     // Preferences are retained across start(); codec changes require a new connection.
     bool configureVideo(const fog::video::Settings& settings);
+    // Pre-start transport preference, retained across start(). Relay never falls back to direct.
+    bool configureRelay(bool relay);
     bool updateVideoSettings(const fog::video::Settings& settings);
     VideoCodec selectedVideoCodec() const;
     std::string qualityStatus() const;
@@ -74,6 +76,9 @@ public:
     void advanceQualityForTesting(unsigned milliseconds);
     // Deterministic event ordering fixture; no network/service injection in production.
     void failThenReceiveForTesting(const std::string& text, bool signaling);
+    void setSelectedCandidatesForTesting(const std::string& local, const std::string& remote);
+    void addCandidateProofForTesting(const std::string& candidate);
+    bool selectedRemoteMatchesForTesting(const std::string& candidate) const;
     void blockControlForTesting(bool blocked);
     void advanceControlForTesting(unsigned milliseconds);
 #endif

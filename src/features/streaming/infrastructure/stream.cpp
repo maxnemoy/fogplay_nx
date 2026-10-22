@@ -5,6 +5,7 @@
 #include "features/streaming/infrastructure/control_queue.hpp"
 #include "features/streaming/infrastructure/incoming_control.hpp"
 #include "features/streaming/infrastructure/transport_history.hpp"
+#include "features/streaming/infrastructure/stream_route.hpp"
 #include "features/streaming/domain/auto_quality.hpp"
 #include <functional>
 #include <cmath>
@@ -45,7 +46,11 @@ static std::uint64_t videoNow() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
 }
 struct Client::Impl {
-    enum class EventType { WsOpen, WsData, WsClosed, Failure, Description, Candidate,
+    enum class EventType {
+#ifdef FOG_STREAM_TESTING
+                           TestCandidateProof,
+#endif
+                           WsOpen, WsData, WsClosed, Failure, Description, Candidate,
                            Channel, ChannelOpen, Control, PeerState, IceState, GatheringState, Track };
     struct Event {
         EventType type;
@@ -267,6 +272,59 @@ struct Client::Impl {
     std::chrono::milliseconds heartbeat{0}, incomingHeartbeat{0};
     bool running = false, stompConnected = false, remoteSet = false, channelOpen = false;
     bool isReady = false, decoderWaiting = false, retryableFailure = false, closingForRetry = false;
+    bool relay = false, routeSelected = false, wasReady = false;
+    Clock::time_point unprovenRouteAt{};
+    SelectedRoute route;
+    CandidateProofs remoteCandidateProofs;
+    bool routeProofDirty = false;
+    void addCandidateProof(rtc::Candidate candidate) {
+        const auto before = remoteCandidateProofs.size();
+        remoteCandidateProofs.add(std::move(candidate));
+        routeProofDirty |= remoteCandidateProofs.size() != before;
+    }
+#ifdef FOG_STREAM_TESTING
+    bool routeOverride = false;
+    rtc::Candidate testLocal, testRemote;
+#endif
+    bool routeAllowed() const { return !relay || route.isTurn(); }
+    rtc::Candidate selectedLocal, selectedRemote;
+    unsigned routeSelections = 0, routeEventDrops = 0;
+    std::deque<std::string> routeEvents;
+    std::string finalIceDiagnostics;
+    bool iceSnapshotAvailable = false;
+    Clock::time_point iceSnapshotAt{};
+    std::string routeDiagnostics() const {
+        return std::string(" requested=") + (relay ? "relay" : "all") + route.diagnostics() +
+            " iceSnapshotAvailable=" + std::to_string(iceSnapshotAvailable) + " localPolicy=all routeKnown=" + std::to_string(routeSelected) + " routeSnapshot=" + (running ? "live" : "final") +
+            " candidateProofs=" + std::to_string(remoteCandidateProofs.size()) + " candidateProofDrops=" + std::to_string(remoteCandidateProofs.dropped()) +
+            " routeSelections=" + std::to_string(routeSelections) + " routeEventDrops=" + std::to_string(routeEventDrops);
+    }
+    void snapshotIce(bool force = false) {
+        // Never acquire RTC transport locks while holding Shared::mutex:
+        // RTC callbacks can enter Shared while still owning a transport lock.
+        if (!peer) return;
+        routeProofDirty = false;
+        const auto now = Clock::now();
+        if (force || iceSnapshotAt == Clock::time_point{} || now - iceSnapshotAt >= std::chrono::seconds(1)) {
+            auto snapshot = peer->iceDiagnostics();
+            iceSnapshotAvailable = !snapshot.empty();
+            if (iceSnapshotAvailable) finalIceDiagnostics = std::move(snapshot);
+            iceSnapshotAt = now;
+        }
+        rtc::Candidate local, remote;
+#ifdef FOG_STREAM_TESTING
+        if (routeOverride) { local = testLocal; remote = testRemote; }
+        else
+#endif
+        if (!peer->getSelectedCandidatePair(&local, &remote)) return;
+        const SelectedRoute selected{local.type(), remote.type(), local.transportType(), remote.transportType(), remoteCandidateProofs.find(remote)};
+        if (routeSelected && selected == route && local == selectedLocal && remote == selectedRemote) return;
+        selectedLocal = local; selectedRemote = remote;
+        const bool first = !routeSelected;
+        route = selected; routeSelected = true; ++routeSelections;
+        if (routeEvents.size() >= 16) { routeEvents.pop_front(); ++routeEventDrops; }
+        routeEvents.push_back(std::string("routeEvent=") + (first ? "selected" : "changed") + routeDiagnostics());
+    }
     fog::video::Settings videoSettings;
     VideoCodec selectedCodec = VideoCodec::H264;
     bool qualityPending = true;
@@ -311,7 +369,7 @@ struct Client::Impl {
             qualityEvent(std::string("qualityEvent=stats-profile profile=") + quality::name(serverStats.profile.value));
     }
     void applyQuality() {
-        if (!qualityPending || !channelOpen) return;
+        if (!qualityPending || !channelOpen || !routeAllowed()) return;
         const auto now = Clock::now();
         if (qualityAttempt != Clock::time_point{} && now - qualityAttempt < std::chrono::seconds(1)) return;
         // RTCP needs the real remote SSRC learned from video RTP first.
@@ -337,7 +395,7 @@ struct Client::Impl {
     const char* operation = "idle";
     unsigned offers = 0, candidatesReceived = 0, emptyCandidates = 0, heartbeatsSent = 0;
     std::string diagnostics() const {
-        return std::string("operation=") + operation + " offers=" + std::to_string(offers) +
+        return routeDiagnostics() + " " + finalIceDiagnostics + " operation=" + operation + " offers=" + std::to_string(offers) +
             " candidates=" + std::to_string(candidatesReceived) + " emptyCandidates=" + std::to_string(emptyCandidates) +
             " hbOutMs=" + std::to_string(heartbeat.count()) + " hbInMs=" + std::to_string(incomingHeartbeat.count()) +
             " hbSent=" + std::to_string(heartbeatsSent) +
@@ -373,7 +431,7 @@ struct Client::Impl {
         sendSignaling(frame);
     }
     void flushControl() {
-        if (!channel || !channel->isOpen()) return;
+        if (!channel || !channel->isOpen() || !routeAllowed()) return;
         while (!controls.empty()) {
 #ifdef FOG_STREAM_TESTING
             if (controlBlocked) break;
@@ -387,7 +445,7 @@ struct Client::Impl {
     }
     bool control(const std::string& payload, ControlQueue::Mode mode = ControlQueue::Mode::Ordered,
                  const std::string& input = {}) {
-        if (!channel || !channel->isOpen()) return false;
+        if (!channel || !channel->isOpen() || !routeAllowed()) return false;
         flushControl();
         const bool accepted = controls.push(payload, mode, input, controlNow());
         flushControl();
@@ -395,15 +453,21 @@ struct Client::Impl {
     }
     void openChannel() {
         if (closingForRetry || channelOpen || !channel || !channel->isOpen()) return;
+        if (relay && !route.isTurn()) {
+            if (route.isDirect()) throw TransportError("TURN required but direct path selected");
+            state = "Waiting for TURN route";
+            return;
+        }
         control(Json{{"id", "connection_ready"}}.dump());
         channelOpen = true;
         if (!isReady) state = "Waiting for video";
     }
     void stop(bool notify) {
+        try { snapshotIce(true); } catch (...) {} // Preserve ICE evidence before close/reset.
         // No shutdown exception can prevent release of the remaining transports.
         if (notify) {
             closingForRetry = false; // A rejected retry follows ordinary final-close notification.
-            try { control(protocol::gamepad(Gamepad{}).dump(), ControlQueue::Mode::Gamepad); }
+            try { if (channelOpen) control(protocol::gamepad(Gamepad{}).dump(), ControlQueue::Mode::Gamepad); }
             catch (const std::exception&) { if (failure.empty()) failure = "Neutral control send failed"; }
             try { if (stompConnected && ws && ws->isOpen()) signal({{"id", "close"}}); }
             catch (const std::exception&) { if (failure.empty()) failure = "Close notification failed"; }
@@ -474,6 +538,9 @@ struct Client::Impl {
         rtc::Configuration config;
         config.disableAutoNegotiation = true;
         config.maxMessageSize = 64 * 1024;
+        // Match the Android protocol: relay constrains the provider peer.
+        // Local ALL permits a direct candidate paired with a remote TURN relay.
+        config.iceTransportPolicy = rtc::TransportPolicy::All;
         for (const auto& item : protocol::iceServers(init)) {
             rtc::IceServer ice(item.url);
             ice.username = item.username; ice.password = item.credential;
@@ -573,7 +640,7 @@ struct Client::Impl {
         state = "Waiting for offer";
         operation = "init.send-request";
         signal({{"id", "init_webrtc"}, {"client_hash", clientHash}, {"limit_fps", 30},
-                {"control_only", false}, {"iceTransportPolicy", "all"}, {"gamepad", true}, {"isPS", false}});
+                {"control_only", false}, {"iceTransportPolicy", relay ? "relay" : "all"}, {"gamepad", true}, {"isPS", false}});
     }
     void candidate(const Json& candidate) {
         operation = "candidate.validate";
@@ -595,7 +662,9 @@ struct Client::Impl {
         if (std::find(mids.begin(), mids.end(), mid) == mids.end()) throw TransportError("Invalid ICE mid");
         const auto value = candidate.at("candidate").get<std::string>();
         operation = "candidate.apply";
-        peer->addRemoteCandidate(rtc::Candidate(value, mid));
+        rtc::Candidate parsed(value, mid);
+        peer->addRemoteCandidate(parsed);
+        addCandidateProof(std::move(parsed));
     }
     void message(const Json& message) {
         operation = "signal.envelope";
@@ -632,6 +701,7 @@ struct Client::Impl {
             rtc::Description remote(sdp, "offer");
             operation = "offer.set-remote";
             peer->setRemoteDescription(remote);
+            for (const auto& embedded : remote.candidates()) addCandidateProof(embedded);
             remoteSet = true;
             for (const auto& c : pendingCandidates) candidate(c);
             pendingCandidates.clear();
@@ -652,7 +722,7 @@ struct Client::Impl {
         } else if (id == "init_webrtc_error" || id == "init_webrtc" || id == "error" || id == "close") {
             if (id == "close") throw TransportError("Remote signaling closed stream");
             if (id == "error") throw TransportError("Remote signaling error");
-            throw TransportError("Remote WebRTC initialization rejected");
+            throw TransportError(relay ? "Relay transport unavailable: remote initialization rejected" : "Remote WebRTC initialization rejected");
         } else if (id == "ping") {
             Json pong{{"id", "pong"}};
             if (message.contains("ts")) pong["ts"] = message["ts"];
@@ -661,6 +731,10 @@ struct Client::Impl {
     }
     void event(Event& event) {
         switch (event.type) {
+#ifdef FOG_STREAM_TESTING
+        case EventType::TestCandidateProof:
+            addCandidateProof(rtc::Candidate(event.text)); break;
+#endif
         case EventType::WsOpen:
             state = "Connecting signaling";
             sendSignaling(protocol::frame("CONNECT", {{"accept-version", "1.1,1.2"},
@@ -734,7 +808,8 @@ struct Client::Impl {
         case EventType::Track: tracks.push_back(event.track); break;
         case EventType::PeerState:
             qualityEvent("transportEvent=peer state=" + std::to_string(static_cast<int>(event.peerState)) + " ms=" + std::to_string(event.arrivedMs));
-            if (event.peerState == rtc::PeerConnection::State::Failed) throw TransportError("Peer connection failed", true);
+            if (event.peerState == rtc::PeerConnection::State::Failed)
+                throw TransportError(relay ? "Relay transport unavailable: peer failed" : "Peer connection failed", true);
             if (event.peerState == rtc::PeerConnection::State::Closed) throw TransportError("Peer connection closed", true);
             if (!isReady) {
                 if (event.peerState == rtc::PeerConnection::State::Connecting) state = "Connecting peer";
@@ -743,7 +818,7 @@ struct Client::Impl {
             break;
         case EventType::IceState:
             if (event.iceState == rtc::PeerConnection::IceState::Failed)
-                throw TransportError("ICE connection failed", true);
+                throw TransportError(relay ? "Relay transport unavailable: ICE failed" : "ICE connection failed", true);
             if (event.iceState == rtc::PeerConnection::IceState::Closed)
                 throw TransportError("ICE connection closed", true);
             qualityEvent("transportEvent=ice state=" + std::to_string(static_cast<int>(event.iceState)) + " ms=" + std::to_string(event.arrivedMs));
@@ -785,6 +860,22 @@ void Client::failThenReceiveForTesting(const std::string& text, bool signaling) 
         impl_->shared->event(std::move(data));
     } else impl_->shared->controlMessage(text, impl_->channel);
 }
+void Client::setSelectedCandidatesForTesting(const std::string& local, const std::string& remote) {
+    impl_->testLocal = rtc::Candidate(local); impl_->testRemote = rtc::Candidate(remote);
+    impl_->testLocal.resolve(rtc::Candidate::ResolveMode::Simple);
+    impl_->testRemote.resolve(rtc::Candidate::ResolveMode::Simple);
+    impl_->routeOverride = true;
+}
+void Client::addCandidateProofForTesting(const std::string& text) {
+    Impl::Event event(Impl::EventType::TestCandidateProof); event.text = text;
+    impl_->shared->event(std::move(event));
+}
+bool Client::selectedRemoteMatchesForTesting(const std::string& text) const {
+    rtc::Candidate candidate(text);
+    candidate.resolve(rtc::Candidate::ResolveMode::Simple);
+    return impl_->routeSelected && candidate.address() == impl_->selectedRemote.address() &&
+        candidate.port() == impl_->selectedRemote.port() && candidate.transportType() == impl_->selectedRemote.transportType();
+}
 void Client::blockControlForTesting(bool blocked) { impl_->controlBlocked = blocked; }
 void Client::advanceControlForTesting(unsigned milliseconds) { impl_->controlTimeOffset += milliseconds; }
 void Client::elapseForTesting(unsigned seconds) {
@@ -795,6 +886,7 @@ void Client::elapseForTesting(unsigned seconds) {
     i.lastWs -= elapsed;
     i.lastHeartbeat -= elapsed;
     i.lastPli -= elapsed;
+    if (i.unprovenRouteAt != Clock::time_point{}) i.unprovenRouteAt -= elapsed;
     if (i.shared) {
         std::lock_guard<std::mutex> lock(i.shared->mutex);
         i.shared->qualityTimeOffset = i.qualityTimeOffset;
@@ -805,9 +897,11 @@ void Client::elapseForTesting(unsigned seconds) {
 bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
                            const std::string& caPath, const std::string& url) {
     const auto preferences = impl_->videoSettings;
+    const auto relay = impl_->relay;
     close();
     impl_ = std::make_unique<Impl>();
     impl_->videoSettings = preferences;
+    impl_->relay = relay;
     auto& i = *impl_;
     // Do not permit STOMP header/destination injection.
     const auto safe = [](const std::string& s) {
@@ -853,6 +947,7 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
 void Client::pump() {
     auto& i = *impl_;
     if (!i.running || !i.shared) return;
+    try { i.snapshotIce(); } catch (...) {} // Diagnostics never change transport behavior.
     bool eventOverflow, callbackFailure, needsPli, statsPending;
     quality::Telemetry stats;
     Clock::time_point lastVideo;
@@ -894,11 +989,27 @@ void Client::pump() {
         if (!i.pendingTransportFailure.empty()) throw TransportError(i.pendingTransportFailure.c_str(), true);
         if (statsPending) i.readQualityStats(stats);
         if (i.closingForRetry) return;
+        if (i.routeProofDirty) i.snapshotIce(); // Proof admitted in this batch wins over its deadline.
+        if (i.relay && i.route.isDirect())
+            throw TransportError("TURN required but direct path selected");
+        const auto routeNow = Clock::now();
+        if (!i.routeAllowed()) {
+            i.isReady = false; i.state = "Waiting for TURN route";
+            if (i.unprovenRouteAt == Clock::time_point{}) i.unprovenRouteAt = routeNow;
+            if (routeNow - i.unprovenRouteAt >= std::chrono::seconds(30)) {
+                i.fail("Relay transport unavailable: selected route unproven", true); return;
+            }
+        } else i.unprovenRouteAt = {};
+        i.openChannel(); // A pending channel may now have a verified TURN route.
         i.applyQuality();
         i.flushControl();
         const auto now = Clock::now();
-        if (i.channelOpen && lastVideo != Clock::time_point{}) { i.isReady = true; i.state = "Streaming"; }
-        if (!i.isReady && now - i.started >= std::chrono::seconds(30)) { i.fail("Stream connection timed out", true); return; }
+        if (i.channelOpen && i.routeAllowed() && lastVideo != Clock::time_point{}) {
+            i.isReady = true; i.wasReady = true; i.state = "Streaming";
+        }
+        if (!i.wasReady && !i.isReady && now - i.started >= std::chrono::seconds(30)) {
+            i.fail(i.relay ? "Relay transport unavailable: connection timed out" : "Stream connection timed out", true); return;
+        }
         if (i.isReady && now - lastVideo >= std::chrono::seconds(15)) { i.fail("Video stream stalled", true); return; }
         // STOMP's server interval is the first negotiated value. A zero value
         // disables incoming heartbeats; setup and received-video deadlines still apply.
@@ -910,8 +1021,8 @@ void Client::pump() {
             i.sendSignaling(std::string("\n"));
             i.lastHeartbeat = now; ++i.heartbeatsSent;
         }
-        if ((i.videoSettings.keyframeSeconds > 0 && now - i.lastPli >= std::chrono::seconds(i.videoSettings.keyframeSeconds)) ||
-            (needsPli && now - i.lastPli >= std::chrono::milliseconds(250))) {
+        if (i.routeAllowed() && ((i.videoSettings.keyframeSeconds > 0 && now - i.lastPli >= std::chrono::seconds(i.videoSettings.keyframeSeconds)) ||
+            (needsPli && now - i.lastPli >= std::chrono::milliseconds(250)))) {
             bool requested = false;
             for (const auto& track : i.tracks)
                 if (track->description().type() == "video" && track->isOpen()) {
@@ -940,7 +1051,7 @@ void Client::pump() {
 }
 bool Client::poll(Packet& packet) {
     auto& i = *impl_;
-    if (!i.shared || !i.running) return false;
+    if (!i.shared || !i.running || !i.routeAllowed()) return false;
     std::lock_guard<std::mutex> lock(i.shared->mutex);
     i.shared->expireMedia(videoNow());
     return i.shared->media.pop(packet);
@@ -948,6 +1059,11 @@ bool Client::poll(Packet& packet) {
 bool Client::configureVideo(const fog::video::Settings& settings) {
     if (impl_->running || !fog::video::valid(settings)) return false;
     impl_->videoSettings = settings;
+    return true;
+}
+bool Client::configureRelay(bool relay) {
+    if (impl_->running) return false;
+    impl_->relay = relay;
     return true;
 }
 bool Client::updateVideoSettings(const fog::video::Settings& settings) {
@@ -992,7 +1108,7 @@ std::size_t Client::queuedVideoPackets() const {
 void Client::observePlayback(std::uint64_t decodedFrames, std::uint64_t videoWorkUs,
                              std::uint64_t decodeErrors, bool recovering, int width, int height) {
     auto& i = *impl_;
-    if (!i.running || !i.shared || !i.channelOpen || i.videoSettings.quality != 0 || i.qualityPending) return;
+    if (!i.running || !i.shared || !i.channelOpen || !i.routeAllowed() || i.videoSettings.quality != 0 || i.qualityPending) return;
     quality::Sample sample;
     sample.frames = decodedFrames; sample.workUs = videoWorkUs; sample.errors = decodeErrors;
     sample.recovering = recovering; sample.width = width; sample.height = height;
@@ -1046,6 +1162,9 @@ std::string Client::videoDiagnostics() const {
     return impl_->shared->videoDiagnostics() + impl_->qualityDiagnostics();
 }
 bool Client::pollVideoDiagnostic(std::string& event) {
+    if (!impl_->routeEvents.empty()) {
+        event = std::move(impl_->routeEvents.front()); impl_->routeEvents.pop_front(); return true;
+    }
     if (!impl_->qualityEvents.empty()) {
         event = std::move(impl_->qualityEvents.front()); impl_->qualityEvents.pop_front(); return true;
     }
@@ -1064,7 +1183,7 @@ bool Client::waitingForVideoKeyframe() const {
 }
 void Client::setDecoderWaitingForKeyframe(bool waiting) { impl_->decoderWaiting = waiting; }
 bool Client::requestVideoKeyframe() {
-    if (!impl_->running || Clock::now() - impl_->lastPli < std::chrono::milliseconds(250)) return false;
+    if (!impl_->running || !impl_->routeAllowed() || Clock::now() - impl_->lastPli < std::chrono::milliseconds(250)) return false;
     bool requested = false;
     try {
         for (const auto& track : impl_->tracks) {
@@ -1083,7 +1202,7 @@ bool Client::requestVideoKeyframe() {
     return requested;
 }
 bool Client::sendGamepad(const Gamepad& state) {
-    if (!impl_->running || !impl_->channelOpen) return false;
+    if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed()) return false;
     try { return impl_->control(protocol::gamepad(state).dump(), ControlQueue::Mode::Gamepad); }
     catch (const TransportError& error) {
         // Public send may run before pump. Examine queued terminal signaling first.
@@ -1094,7 +1213,7 @@ bool Client::sendGamepad(const Gamepad& state) {
     } catch (const std::exception&) { impl_->fail("Control send failed"); return false; }
 }
 bool Client::sendControl(const std::string& json) {
-    if (!impl_->running || !impl_->channelOpen || json.size() > 64 * 1024) return false;
+    if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed() || json.size() > 64 * 1024) return false;
     const auto data = Json::parse(json, nullptr, false);
     if (!data.is_object()) return false;
     auto mode = ControlQueue::Mode::Ordered;

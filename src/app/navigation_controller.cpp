@@ -58,6 +58,7 @@ void ApplicationController::input(u64 keys) {
         return;
     }
     if (screen_ == Screen::ImageSettings) { inputImageSettings(keys); return; }
+    if (screen_ == Screen::ConnectionSettings) { inputConnectionSettings(keys); return; }
     if (screen_ == Screen::Genres) { inputGenres(keys); return; }
     if (sidebar_) {
         if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) nav_ = (nav_ + 3) % 4;
@@ -108,7 +109,7 @@ void ApplicationController::input(u64 keys) {
         return;
     }
     if (screen_ == Screen::Settings) {
-        moveGrid(keys, 4, 2);
+        moveGrid(keys, 5, 2);
         if (keys & HidNpadButton_A) {
             if (!selection_) { screen_ = Screen::ImageSettings; selection_ = 0; }
             else if (selection_ == 1) {
@@ -119,7 +120,8 @@ void ApplicationController::input(u64 keys) {
                     status_ = "Раскладка сохранена на SD.";
                 } catch (...) { status_ = "Не удалось сохранить раскладку. Настройка не изменена."; }
             }
-            else if (selection_ == 2) loadSessions();
+            else if (selection_ == 2) { screen_ = Screen::ConnectionSettings; selection_ = 0; }
+            else if (selection_ == 3) loadSessions();
             else { api_.forgetAuth(); authSaveFailed_ = false; status_ = "Вы вышли из аккаунта. Сохранённый токен удалён."; }
         }
         return;

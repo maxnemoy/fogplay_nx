@@ -55,4 +55,31 @@ void ApplicationController::drawImageSettings() {
     ui_.text(videoSaveStatus_, area.x, 596, area.w, accent, false, 2);
 }
 
+void ApplicationController::inputConnectionSettings(u64 keys) {
+    if (keys & HidNpadButton_B) { screen_ = Screen::Settings; selection_ = 2; return; }
+    int direction = 0;
+    if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) direction = -1;
+    else if (keys & (HidNpadButton_Right | HidNpadButton_StickLRight | HidNpadButton_A)) direction = 1;
+    auto next = connectionSettings_;
+    if (!fog::connection::adjust(next, direction)) return;
+    try {
+        fog::connection::saveSettings(std::string(dataDir) + "/connection-settings.json", next);
+        connectionSettings_ = next;
+        connectionSaveStatus_ = "Сохранено на SD. Применится при следующем подключении.";
+    } catch (...) {
+        connectionSaveStatus_ = "Не удалось сохранить на SD. Режим не изменён.";
+        diagnostic("Connection settings save failed; no settings payload logged.");
+    }
+}
+
+void ApplicationController::drawConnectionSettings() {
+    const auto area = ui_.content();
+    ui_.button("Режим: " + fog::connection::label(connectionSettings_), {area.x, 154, area.w, 57}, true);
+    ui_.text("Обычный: автоматический выбор пути, как в прежних версиях.", area.x + 14, 240, area.w - 28, muted);
+    ui_.text("Авто: TURN после 2 обрывов за 2 мин, до конца текущей аренды.", area.x + 14, 310, area.w - 28, muted);
+    ui_.text("Повторные неудачные попытки одного восстановления не считаются новым обрывом.", area.x + 14, 365, area.w - 28, muted, false, 2);
+    ui_.text("Через TURN: подключаться через сервер ретрансляции с самого начала.", area.x + 14, 440, area.w - 28, muted);
+    ui_.text(connectionSaveStatus_, area.x, 560, area.w, accent, false, 2);
+}
+
 }

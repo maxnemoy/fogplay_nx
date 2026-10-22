@@ -19,5 +19,5 @@ g++ "${flags[@]}" tests/auto_quality_tests.cpp -o work/auto_quality_tests
 ./work/auto_quality_tests | tee work/logs/auto-quality-tests.log
 g++ "${flags[@]}" -DSTREAM_RTC_TESTS src/features/streaming/infrastructure/stream.cpp src/features/streaming/infrastructure/stream_protocol.cpp tests/stream_tests.cpp "${libs[@]}" -o work/stream_tests_rtc
 ./work/stream_tests_rtc | tee work/logs/stream-tests.log
-g++ "${flags[@]}" -DFOG_STREAM_TESTING src/features/streaming/infrastructure/stream.cpp src/features/streaming/infrastructure/stream_protocol.cpp src/features/streaming/application/remote_input.cpp tests/stream_integration.cpp "${libs[@]}" -o work/stream_integration
-timeout 45 ./work/stream_integration | tee work/logs/stream-integration.log
+g++ "${flags[@]}" -DFOG_STREAM_TESTING src/features/streaming/infrastructure/stream.cpp src/features/streaming/infrastructure/stream_protocol.cpp src/features/streaming/application/remote_input.cpp tests/stream_integration.cpp -Wl,--wrap=sendto "${libs[@]}" -o work/stream_integration
+timeout 60 ./work/stream_integration | tee work/logs/stream-integration.log

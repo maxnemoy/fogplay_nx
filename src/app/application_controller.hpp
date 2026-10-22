@@ -10,6 +10,7 @@
 #include "features/streaming/presentation/stream_overlay.hpp"
 #include "features/settings/domain/video_settings.hpp"
 #include "features/settings/infrastructure/video_settings_storage.hpp"
+#include "features/settings/infrastructure/connection_settings_storage.hpp"
 #include "features/session/application/session.hpp"
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/video_recovery.hpp"
@@ -65,7 +66,7 @@ inline constexpr SDL_Color white{234, 238, 245, 255};
 inline constexpr SDL_Color muted{163, 178, 200, 255};
 inline constexpr SDL_Color accent{107, 216, 190, 255};
 
-enum class Screen { Games, GameDetail, Computers, Details, History, Settings, ImageSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres };
+enum class Screen { Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres };
 enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth };
 
 // Main-thread presentation coordinator. Workers are joined before their state is read.
@@ -108,6 +109,8 @@ private:
     void changeVideoSettings(const fog::video::Settings& value, bool live);
     void inputImageSettings(u64 keys);
     void drawImageSettings();
+    void inputConnectionSettings(u64 keys);
+    void drawConnectionSettings();
     void overlayAction(const fog::stream::OverlayAction& action);
     bool handleStreamOverlay(PadState& pad, u64 held, u64 down);
     void updateMouse(PadState& pad,u64 held,u64 down,const HidTouchScreenState& touch);
@@ -172,9 +175,12 @@ private:
     std::unique_ptr<stream::Client> stream_;
     fog::stream::Overlay overlay_;
     fog::video::Settings videoSettings_;
+    fog::connection::Settings connectionSettings_;
+    fog::connection::RelaySelection relaySelection_;
     fog::controller::Settings controllerSettings_;
     bool firstFramePresented_ = false;
     std::string videoSaveStatus_ = "Изменения сохраняются сразу на SD.";
+    std::string connectionSaveStatus_ = "Изменения сохраняются на SD. Применяются при следующем подключении.";
     fog::stream::StreamInputGate streamInputGate_;
     bool touchWasDown_ = false, touchDrag_ = false;
     bool mouseLeft_ = false, mouseRight_ = false;

@@ -21,6 +21,7 @@ cmake -S "$ROOT/tools/rtc" -B "$BUILD" "${ARGS[@]}" > "$LOG" 2>&1
 LOG="$ROOT/work/rtc/build-$PLATFORM.log"
 cmake --build "$BUILD" --target rtc-link-smoke -j "${JOBS:-8}" > "$LOG" 2>&1
 cp -a "$ROOT/third_party/rtc/libdatachannel/include/rtc" "$PREFIX/include/"
+cp -a "$ROOT/third_party/rtc/libdatachannel/deps/libjuice/include/juice" "$PREFIX/include/"
 cp -a "$ROOT/third_party/rtc/mbedtls/include/mbedtls" "$ROOT/third_party/rtc/mbedtls/include/psa" "$PREFIX/include/"
 cp "$ROOT/tools/rtc/mbedtls-user-config.h" "$PREFIX/include/"
 cp "$BUILD/libdatachannel/libdatachannel-static.a" "$PREFIX/lib/libdatachannel.a"
@@ -36,6 +37,12 @@ if [ "$PLATFORM" = host ]; then
   cmake --build "$BUILD" --target rtc-host-loopback -j "${JOBS:-8}" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/loopback-run.log"
   timeout 25 "$BUILD/rtc-host-loopback" > "$LOG" 2>&1
+  LOG="$ROOT/work/rtc/udp-budget-build.log"
+  cmake --build "$BUILD" --target rtc-udp-budget-test rtc-ice-diagnostics-test -j "${JOBS:-8}" > "$LOG" 2>&1
+  LOG="$ROOT/work/rtc/udp-budget-run.log"
+  timeout 10 "$BUILD/rtc-udp-budget-test" > "$LOG" 2>&1
+  LOG="$ROOT/work/rtc/ice-diagnostics-run.log"
+  timeout 10 "$BUILD/rtc-ice-diagnostics-test" > "$LOG" 2>&1
 else
   LOG="$ROOT/work/rtc/undefined-switch.txt"
   "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm" -u "$BUILD/rtc-link-smoke.elf" > "$LOG"

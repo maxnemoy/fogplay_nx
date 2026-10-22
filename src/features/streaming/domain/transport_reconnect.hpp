@@ -1,9 +1,11 @@
 #pragma once
+#include <array>
 #include <chrono>
 
 namespace fog::stream {
-// A rental owns one lifetime attempt budget; successful playback only ends the
-// current recovery window. All deadlines use the caller's monotonic clock.
+// Count actual replacement starts in a rolling two-minute window. Successful
+// playback ends recovery, but does not clear recent attempts. All deadlines use
+// the caller's monotonic clock.
 class TransportReconnect {
 public:
     using Clock = std::chrono::steady_clock;
@@ -13,6 +15,7 @@ public:
 
     void reset() { phase_ = Phase::Idle; attempts_ = 0; }
     void cancel() { phase_ = Phase::Cancelled; }
+    // Recent starts as of the last supplied clock value.
     unsigned attempts() const { return attempts_; }
     bool recovering() const {
         return phase_ == Phase::Grace || phase_ == Phase::Backoff || phase_ == Phase::Connecting;
@@ -20,6 +23,7 @@ public:
     bool connecting() const { return phase_ == Phase::Connecting; }
     bool disconnected(Time now) {
         if (phase_ != Phase::Idle) return recovering();
+        expireAttempts(now);
         phase_ = Phase::Grace;
         windowBegan_ = phaseBegan_ = now;
         return true;
@@ -27,6 +31,7 @@ public:
     bool retry(Time now) {
         if (phase_ == Phase::Cancelled || phase_ == Phase::Exhausted) return false;
         if (recovering() && expired(now)) { phase_ = Phase::Exhausted; return false; }
+        expireAttempts(now);
         if (attempts_ >= MaxAttempts) { phase_ = Phase::Exhausted; return false; }
         if (!recovering()) windowBegan_ = now;
         // Duplicate loss reports must not extend a pending backoff.
@@ -34,13 +39,14 @@ public:
         return true;
     }
     Action poll(Time now) {
+        if (phase_ != Phase::Cancelled && phase_ != Phase::Exhausted) expireAttempts(now);
         if (!recovering()) return phase_ == Phase::Exhausted ? Action::Stop : Action::Continue;
         if (expired(now)) { phase_ = Phase::Exhausted; return Action::Stop; }
         if (phase_ == Phase::Grace && now-phaseBegan_ >= std::chrono::seconds(5))
             return retry(now) ? Action::CloseTransport : Action::Stop;
         if (phase_ == Phase::Backoff && now-phaseBegan_ >= std::chrono::seconds(2)) {
             if (attempts_ >= MaxAttempts) { phase_ = Phase::Exhausted; return Action::Stop; }
-            ++attempts_; phase_ = Phase::Connecting; phaseBegan_ = now;
+            attemptStarts_[attempts_++] = now; phase_ = Phase::Connecting; phaseBegan_ = now;
             return Action::StartTransport;
         }
         if (phase_ == Phase::Connecting && now-phaseBegan_ >= std::chrono::seconds(30))
@@ -52,14 +58,24 @@ public:
     bool prepared(Time now) {
         if ((phase_ != Phase::Grace && phase_ != Phase::Connecting) || expired(now) ||
             (phase_ == Phase::Connecting && now-phaseBegan_ >= std::chrono::seconds(30))) return false;
+        expireAttempts(now);
         phase_ = Phase::Idle;
         return true;
     }
 private:
     enum class Phase { Idle, Grace, Backoff, Connecting, Cancelled, Exhausted };
+    void expireAttempts(Time now) {
+        unsigned expiredCount = 0;
+        while (expiredCount < attempts_ &&
+               now-attemptStarts_[expiredCount] >= std::chrono::seconds(120)) ++expiredCount;
+        for (unsigned i = expiredCount; i < attempts_; ++i)
+            attemptStarts_[i-expiredCount] = attemptStarts_[i];
+        attempts_ -= expiredCount;
+    }
     bool expired(Time now) const { return now-windowBegan_ >= std::chrono::seconds(90); }
     Phase phase_ = Phase::Idle;
     unsigned attempts_ = 0;
+    std::array<Time, MaxAttempts> attemptStarts_{};
     Time windowBegan_{}, phaseBegan_{};
 };
 }

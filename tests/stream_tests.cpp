@@ -6,6 +6,7 @@
 #include <stdexcept>
 #ifdef STREAM_RTC_TESTS
 #include <rtc/rtc.hpp>
+#include "features/streaming/infrastructure/stream_route.hpp"
 #endif
 
 namespace {
@@ -100,6 +101,41 @@ int main() {
     cannotSend.replace(cannotSend.find("a=sendonly"), 10, "a=recvonly");
     rejects([&] { filterOffer(cannotSend); });
 #ifdef STREAM_RTC_TESTS
+    using Type = rtc::Candidate::Type;
+    using Transport = rtc::Candidate::TransportType;
+    assert(std::string(stream::SelectedRoute{}.actual()) == "unknown");
+    assert(std::string(stream::SelectedRoute{Type::Host, Type::Unknown}.actual()) == "unknown");
+    for (const auto local : {Type::Host, Type::ServerReflexive, Type::PeerReflexive})
+        for (const auto remote : {Type::Host, Type::ServerReflexive})
+            assert(std::string(stream::SelectedRoute{local, remote}.actual()) == "direct");
+    assert(std::string(stream::SelectedRoute{Type::Relayed, Type::Host}.actual()) == "turn");
+    assert(std::string(stream::SelectedRoute{Type::Host, Type::Relayed}.actual()) == "turn");
+    assert(std::string(stream::SelectedRoute{Type::Unknown, Type::Relayed}.actual()) == "turn");
+    assert(std::string(stream::SelectedRoute::protocol(Transport::TcpActive)) == "tcp-active");
+    assert(std::string(stream::SelectedRoute::protocol(static_cast<Transport>(999))) == "unknown");
+    assert(std::string(stream::SelectedRoute::type(static_cast<Type>(999))) == "unknown");
+    assert(std::string(stream::SelectedRoute{static_cast<Type>(999), Type::Host}.actual()) == "unknown");
+    stream::CandidateProofs proofs;
+    rtc::Candidate selected("prflx 1 UDP 1 192.0.2.4 50000 typ prflx");
+    assert(selected.resolve(rtc::Candidate::ResolveMode::Simple));
+    stream::SelectedRoute delayed{Type::Host, Type::PeerReflexive, Transport::Udp, Transport::Udp};
+    assert(std::string(delayed.actual()) == "unknown");
+    proofs.add(rtc::Candidate("decoy 1 UDP 1 192.0.2.5 50000 typ relay"));
+    proofs.add(rtc::Candidate("decoy 1 UDP 1 192.0.2.4 50001 typ relay"));
+    proofs.add(rtc::Candidate("decoy 1 TCP 1 192.0.2.4 50000 typ relay tcptype passive"));
+    delayed.remoteProof = proofs.find(selected);
+    assert(std::string(delayed.actual()) == "unknown");
+    proofs.add(rtc::Candidate("different-foundation 1 UDP 1 192.0.2.4 50000 typ relay"));
+    delayed.remoteProof = proofs.find(selected);
+    assert(delayed.isTurn() && std::string(delayed.actual()) == "turn");
+    stream::CandidateProofs directProofs;
+    directProofs.add(rtc::Candidate("host 1 UDP 1 192.0.2.4 50000 typ host"));
+    delayed.remoteProof = directProofs.find(selected); assert(delayed.isDirect());
+    proofs.add(rtc::Candidate("dns 1 UDP 1 forbidden.invalid 50000 typ relay"));
+    assert(proofs.size() == 4); // Numeric resolution only; no network lookup.
+    for (unsigned n = 0; n < 100; ++n)
+        proofs.add(rtc::Candidate("bounded 1 UDP 1 192.0.2.4 " + std::to_string(51000 + n) + " typ relay"));
+    assert(proofs.size() == stream::CandidateProofs::Limit && proofs.dropped() > 0);
     // Validate the generated SDP with the pinned library parser, not only string matching.
     rtc::Description desc(filtered, "offer");
     assert(desc.mediaCount() == 3);

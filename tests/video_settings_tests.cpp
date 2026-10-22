@@ -24,8 +24,12 @@ int main() {
     try {
         const Settings defaults;
         require(loadSettings(path) == defaults, "absent file uses defaults");
-        require(defaults.codec == ::stream::VideoCodec::H264 && defaults.bitrateMbps == 20 &&
+        require(defaults.codec == ::stream::VideoCodec::H265 && defaults.bitrateMbps == 20 &&
             defaults.quality == 0 && defaults.keyframeSeconds == 0, "documented defaults");
+        Settings savedH264;
+        savedH264.codec = ::stream::VideoCodec::H264;
+        saveSettings(path, savedH264);
+        require(loadSettings(path).codec == ::stream::VideoCodec::H264, "saved H264 preserved despite new HEVC default");
         Settings selected;
         selected.codec = ::stream::VideoCodec::H265;
         for (const int bitrate : Bitrates) for (const int interval : KeyframeIntervals) for (int quality = 0; quality < 5; ++quality) {
@@ -63,6 +67,7 @@ int main() {
         try { saveSettings((dir / "missing" / "video-settings.json").string(), defaults); } catch (...) { failed = true; }
         require(failed, "save failure observable");
         Settings value;
+        value.codec = ::stream::VideoCodec::H264;
         require(!adjust(value, Field::Codec, 1, false), "unsupported H265 cannot be selected");
         require(adjust(value, Field::Codec, 1) && value.codec == ::stream::VideoCodec::H265, "available H265 opt-in");
         require(adjust(value, Field::Quality, -1) && value.quality == 4, "quality backward wrap");

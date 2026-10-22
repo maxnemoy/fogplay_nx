@@ -21,7 +21,7 @@ void ApplicationController::drawStreamOverlay() {
         const auto attempt = transportReconnect_.connecting() ? transportReconnect_.attempts() :
             std::min(transportReconnect_.attempts()+1,fog::stream::TransportReconnect::MaxAttempts);
         box(0,0,1280,82,{23,32,46,255});
-        text("Восстанавливаем связь: попытка " + std::to_string(attempt) + "/3. Та же аренда; оплата продолжается.",20,8,accent,1240);
+        text("Связь: попытка " + std::to_string(attempt) + "/3 за 2 мин. Та же аренда; оплата продолжается.",20,8,accent,1240);
         text("Минус + Плюс — меню и завершение аренды. Лимит восстановления — 90 секунд.",20,44,white,1240);
     } else if (videoRecovery_.active() || videoLossWaiting_) {
         box(0,0,1280,45,{23,32,46,255});
@@ -64,10 +64,12 @@ void ApplicationController::draw() {
     chrome.section = fog::ui::Section::Games;
     if (screen_ == Screen::Computers || screen_ == Screen::Details || screen_ == Screen::GameDetail) { chrome.title = selectedGameName_; chrome.section = fog::ui::Section::Computers; }
     if (screen_ == Screen::History) { chrome.title = "ИСТОРИЯ СЕССИЙ"; chrome.section = fog::ui::Section::History; }
-    if (screen_ == Screen::Settings || screen_ == Screen::ImageSettings) {
-        chrome.title = screen_ == Screen::ImageSettings ? "ИЗОБРАЖЕНИЕ" : "НАСТРОЙКИ";
+    if (screen_ == Screen::Settings || screen_ == Screen::ImageSettings || screen_ == Screen::ConnectionSettings) {
+        chrome.title = screen_ == Screen::ImageSettings ? "ИЗОБРАЖЕНИЕ" :
+            screen_ == Screen::ConnectionSettings ? "ПОДКЛЮЧЕНИЕ" : "НАСТРОЙКИ";
         chrome.section = fog::ui::Section::Settings;
     }
+    if (screen_ == Screen::ConnectionSettings) chrome.hints = "← / → или A Изменить режим   B Настройки";
     if (screen_ == Screen::ImageSettings) chrome.hints = "↑ / ↓ Параметр   ← / → или A Изменить   B Настройки";
     if (sidebar_) chrome.section = std::array<fog::ui::Section,4>{fog::ui::Section::Search,fog::ui::Section::Games,fog::ui::Section::History,fog::ui::Section::Settings}[nav_];
     if (screen_ == Screen::Games) {
@@ -150,9 +152,11 @@ void ApplicationController::draw() {
         ui_.history(cards,selection_,selection_/fog::ui::HistoryColumns*fog::ui::HistoryColumns);
         if (cards.empty() && !pending_.valid()) ui_.empty("Сессий пока нет", "Здесь появится история ваших игровых сессий.");
     } else if (screen_ == Screen::Settings) {
-        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.4.17","Удалить сохранённый вход с SD-карты"}},selection_);
+        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Подключение",fog::connection::label(connectionSettings_),"Выбор пути: обычный, авто или через TURN"},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.4.19","Удалить сохранённый вход с SD-карты"}},selection_);
     } else if (screen_ == Screen::ImageSettings) {
         drawImageSettings();
+    } else if (screen_ == Screen::ConnectionSettings) {
+        drawConnectionSettings();
     } else if (screen_ == Screen::Sessions) {
         for (std::size_t i = selection_/5*5; i < sessions_.size() && i < selection_/5*5+5; ++i)
             ui_.button(field(sessions_[i],"computer_name"),{area.x,170+int(i%5)*75,area.w,65},i==selection_);

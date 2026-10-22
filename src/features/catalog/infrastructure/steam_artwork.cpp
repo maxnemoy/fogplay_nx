@@ -152,7 +152,7 @@ SteamSearchResponse download(const std::string& title, const std::atomic_bool& c
         encoded.get() + "&cc=us&l=en";
     ResponseBuffer buffer;
     check(curl_easy_setopt(handle.get(), CURLOPT_URL, url.c_str()));
-    check(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "FogPlayNX/0.4.17"));
+    check(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "FogPlayNX/0.4.19"));
 #if LIBCURL_VERSION_NUM >= 0x075500
     check(curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS_STR, "https"));
 #else

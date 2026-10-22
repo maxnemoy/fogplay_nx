@@ -91,3 +91,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_compile_definitions(rtc-init-rollback-test PRIVATE USE_MBEDTLS=1)
   target_link_options(rtc-init-rollback-test PRIVATE -Wl,--wrap=pipe -Wl,--export-dynamic)
 endif()
+
+# Direct production conn_poll.c regression, deterministic packet supply + real
+# local socket errors. No RTC globals, external signaling or paid sessions.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(JUICE_SOURCE "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/libjuice")
+  add_executable(rtc-udp-budget-test udp-budget-test.c
+    "${JUICE_SOURCE}/src/addr.c" "${JUICE_SOURCE}/src/log.c" "${JUICE_SOURCE}/src/timestamp.c")
+  target_include_directories(rtc-udp-budget-test PRIVATE "${JUICE_SOURCE}/include/juice")
+  target_compile_definitions(rtc-udp-budget-test PRIVATE _DEFAULT_SOURCE JUICE_STATIC)
+  target_compile_options(rtc-udp-budget-test PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+  target_link_options(rtc-udp-budget-test PRIVATE -Wl,--gc-sections)
+  target_link_libraries(rtc-udp-budget-test PRIVATE pthread)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(rtc-ice-diagnostics-test ice-diagnostics-test.cpp)
+  target_compile_options(rtc-ice-diagnostics-test PRIVATE -UNDEBUG)
+  target_link_libraries(rtc-ice-diagnostics-test PRIVATE datachannel-static)
+endif()

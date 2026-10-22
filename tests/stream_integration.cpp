@@ -3,6 +3,7 @@
 #include "features/streaming/infrastructure/stream_protocol.hpp"
 #include "features/streaming/application/remote_input.hpp"
 #include <rtc/rtc.hpp>
+#include <juice/juice.h>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -10,10 +11,43 @@
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
 
 using Json = stream::protocol::Json;
 using Clock = std::chrono::steady_clock;
 namespace {
+// Linker-local firewall for exactly one fixture peer socket. TURN allocation
+// traffic remains real; no system firewall or production transport is changed.
+std::atomic<unsigned> restrictedPeerPort{0}, allowedTurnPort{0}, blockedDirectSends{0};
+}
+extern "C" ssize_t __real_sendto(int, const void*, size_t, int, const sockaddr*, socklen_t);
+extern "C" ssize_t __wrap_sendto(int fd, const void* data, size_t size, int flags, const sockaddr* destination, socklen_t length) {
+    const auto peerPort = restrictedPeerPort.load();
+    if (peerPort && destination && destination->sa_family == AF_INET) {
+        sockaddr_in source{}; socklen_t sourceLength = sizeof(source);
+        if (getsockname(fd, reinterpret_cast<sockaddr*>(&source), &sourceLength) == 0 &&
+            source.sin_family == AF_INET && ntohs(source.sin_port) == peerPort) {
+            const auto* target = reinterpret_cast<const sockaddr_in*>(destination);
+            if ((ntohs(target->sin_port) != allowedTurnPort.load() && ntohs(target->sin_port) != peerPort) ||
+                target->sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+                ++blockedDirectSends;
+                return static_cast<ssize_t>(size);
+            }
+        }
+    }
+    return __real_sendto(fd, data, size, flags, destination, length);
+}
+namespace {
+unsigned availableUdpPort() {
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0); assert(fd >= 0);
+    sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    socklen_t size = sizeof(address);
+    assert(getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+    const auto port = ntohs(address.sin_port); close(fd); return port;
+}
 struct Event {
     enum Type { Socket, Stomp, Offer, Candidate, Control } type;
     std::shared_ptr<rtc::WebSocket> socket;
@@ -64,17 +98,34 @@ struct Fixture {
     std::string qualityProfile = "LOW";
     bool confirmAdaptations = true;
     std::vector<rtc::Candidate> candidates;
+    std::vector<std::string> advertisedRelayCandidates;
     std::vector<std::string> mids;
     std::string pendingOffer;
     std::uint32_t frame = 0;
     std::string heartbeat;
     bool initializePeer;
+    bool expectRelay;
+    bool rejectWebrtc = false;
+    juice_server_t* turn = nullptr;
     bool hevc;
     std::string fixtureClientHash;
     explicit Fixture(std::string serverHeartbeat = "4000,4000", bool initialize = true, bool useHevc = false,
-                     std::string clientSuffix = "abcde")
-        : heartbeat(std::move(serverHeartbeat)), initializePeer(initialize), hevc(useHevc),
+                     std::string clientSuffix = "abcde", bool useTurn = false, bool requestedRelay = false)
+        : heartbeat(std::move(serverHeartbeat)), initializePeer(initialize), expectRelay(requestedRelay), hevc(useHevc),
           fixtureClientHash("fixture" + std::move(clientSuffix)) {
+        if (useTurn) {
+            juice_server_credentials_t credentials{"fixture-user", "fixture-password", 4};
+            juice_server_config_t turnConfig{};
+            turnConfig.bind_address = "127.0.0.1";
+            turnConfig.external_address = "127.0.0.1";
+            turnConfig.credentials = &credentials; turnConfig.credentials_count = 1;
+            turnConfig.max_allocations = 4; turnConfig.max_peers = 8;
+            turnConfig.realm = "fixture";
+            turn = juice_server_create(&turnConfig);
+            assert(turn && juice_server_get_port(turn));
+            blockedDirectSends = 0; allowedTurnPort = juice_server_get_port(turn);
+            restrictedPeerPort = availableUdpPort();
+        }
         rtc::WebSocketServer::Configuration config;
         config.port = 0; config.bindAddress = "127.0.0.1";
         server = std::make_unique<rtc::WebSocketServer>(config);
@@ -97,6 +148,7 @@ struct Fixture {
         if (peer) { peer->resetCallbacks(); peer->close(); }
         if (ws) { ws->resetCallbacks(); ws->close(); }
         server->stop();
+        if (turn) { restrictedPeerPort = 0; juice_server_destroy(turn); }
     }
     void signal(const Json& json) {
         ws->send(stream::protocol::frame("MESSAGE", {{"destination", "/topic/" + fixtureClientHash + "/client"}}, json.dump()));
@@ -104,7 +156,14 @@ struct Fixture {
     void createPeer() {
         rtc::Configuration config;
         config.disableAutoNegotiation = true;
-        // Host candidates only: no STUN/TURN/service requests.
+        // Local fixture only, including its embedded loopback TURN server.
+        if (turn) {
+            config.bindAddress = "127.0.0.1";
+            config.portRangeBegin = static_cast<uint16_t>(restrictedPeerPort.load());
+            config.portRangeEnd = config.portRangeBegin;
+            config.iceTransportPolicy = rtc::TransportPolicy::Relay;
+            config.iceServers.emplace_back("127.0.0.1", juice_server_get_port(turn), "fixture-user", "fixture-password");
+        }
         peer = std::make_shared<rtc::PeerConnection>(config);
         const std::weak_ptr<Events> weak(events);
         peer->onLocalDescription([weak](rtc::Description desc) {
@@ -152,6 +211,8 @@ struct Fixture {
             assert(subscribed && j.at("client_hash") == fixtureClientHash); enabled = true;
             if (initializePeer) signal({{"id", "init"}, {"data", Json::array({"[]"}).dump()}});
         } else if (id == "init_webrtc") {
+            assert(j.at("iceTransportPolicy") == (expectRelay ? "relay" : "all"));
+            if (rejectWebrtc) { signal({{"id", "init_webrtc_error"}}); return; }
             assert(enabled && j.at("limit_fps") == 30 && j.at("gamepad") == true && j.at("control_only") == false);
             // Provider-style empty marker arrives before an offer. The old client
             // aborted here with JSON parse_error instead of continuing negotiation.
@@ -200,6 +261,7 @@ struct Fixture {
                 mids = stream::protocol::mediaMids(Json::parse(e.text).at("sdp"));
                 pendingOffer = e.text;
             } else if (e.type == Event::Candidate) {
+                if (rtc::Candidate(e.text).type() == rtc::Candidate::Type::Relayed) advertisedRelayCandidates.push_back(e.text);
                 const auto it = std::find(mids.begin(), mids.end(), e.mid);
                 assert(it != mids.end());
                 // Deliberately omit sdpMid; exercise index resolution on the client.
@@ -286,10 +348,43 @@ int main() {
         {"id":"unicode_input","data":{"input":"HwRABDgEMgQ1BEIE"}},
         {"id":"unicode_input","data":{"input":"PdgA3g=="}}
     ])");
-    for (int round = 1; round <= 3; ++round) {
+    // Relay requested but a provider selects direct: never expose ready/control/media.
     {
-        Fixture fixture("4000,4000",true,round==3);
+        Fixture fixture("4000,4000", true, false, "abcde", false, true);
         stream::Client client;
+        assert(client.configureRelay(true));
+        assert(client.diagnostics().find("requested=relay actual=unknown") != std::string::npos);
+        assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+        assert(!client.configureRelay(false));
+        const auto begin = Clock::now();
+        while (client.error().empty() && Clock::now() - begin < std::chrono::seconds(4)) {
+            fixture.pump(); client.pump(); fixture.sendMedia();
+            stream::Packet packet; assert(!client.poll(packet));
+            assert(!client.ready() && !fixture.controlReady);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        assert(client.error() == "TURN required but direct path selected" && !client.retryableError());
+        assert(client.diagnostics().find("requested=relay actual=direct") != std::string::npos);
+    }
+    {
+        Fixture fixture("4000,4000", true, false, "abcde", false, true);
+        fixture.rejectWebrtc = true;
+        stream::Client client;
+        assert(client.configureRelay(true));
+        assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+        const auto begin = Clock::now();
+        while (client.error().empty() && Clock::now() - begin < std::chrono::seconds(2)) {
+            fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        assert(client.error() == "Relay transport unavailable: remote initialization rejected");
+        assert(!client.ready() && client.diagnostics().find("actual=unknown") != std::string::npos);
+    }
+    for (int round = 1; round <= 4; ++round) {
+    {
+        const bool turn = round == 4;
+        Fixture fixture("4000,4000", true, round == 3, "abcde", turn, turn);
+        stream::Client client;
+        if (turn) assert(client.configureRelay(true));
         fog::video::Settings settings;
         settings.codec = stream::VideoCodec::H265; // Fixture only offers H264: test safe fallback.
         settings.bitrateMbps = 15;
@@ -304,6 +399,18 @@ int main() {
         bool sent = false;
         while (Clock::now() - begin < std::chrono::seconds(12)) {
             fixture.pump(); client.pump();
+            if (!client.error().empty()) {
+                std::cerr << "Stream fixture round=" << round << " failure=" << client.error() << " " << client.diagnostics() << "\n";
+                if (turn) {
+                    rtc::Candidate local, remote;
+                    const auto selected = fixture.peer->getSelectedCandidatePair(&local, &remote);
+                    bool relayMatch = false;
+                    for (const auto& advertised : fixture.advertisedRelayCandidates)
+                        relayMatch |= client.selectedRemoteMatchesForTesting(advertised);
+                    std::cerr << "TURN fixture selected=" << selected << " providerLocalType=" << static_cast<int>(local.type())
+                        << " selectedRemoteMatchesAdvertisedRelay=" << relayMatch << "\n";
+                }
+            }
             assert(client.error().empty());
             fixture.sendMedia();
             stream::Packet packet;
@@ -333,7 +440,59 @@ int main() {
                 fixture.qualityCommand == "set_autoquality" && client.qualityStatus().find("18.0") != std::string::npos) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+        if (!client.ready() || !fixture.controlReady || !fixture.pong || !fixture.pressed) {
+            std::cerr << "Unready fixture round=" << round << " ready=" << client.ready() << " answered=" << fixture.answered
+                << " control=" << fixture.controlReady << " pong=" << fixture.pong << " pressed=" << fixture.pressed
+                << " blocked=" << blockedDirectSends.load() << " " << client.diagnostics() << "\n";
+        }
         assert(client.ready() && fixture.answered && fixture.controlReady && fixture.pong && fixture.pressed);
+        const auto route = client.diagnostics();
+        assert(route.find(turn ? "requested=relay actual=turn" : "requested=all actual=direct") != std::string::npos);
+        assert(route.find("fixture-user") == std::string::npos && route.find("fixture-password") == std::string::npos);
+        assert(route.find("127.0.0.1") == std::string::npos);
+        std::string routeEvent;
+        assert(client.pollVideoDiagnostic(routeEvent) && routeEvent.find("routeEvent=selected") == 0);
+        assert(routeEvent.find(turn ? "actual=turn" : "actual=direct") != std::string::npos);
+        if (turn) assert(blockedDirectSends > 0);
+        std::cout << "Selected route fixture passed: " << routeEvent << "\n";
+        if (turn) {
+            // Keep the real TURN transport connected, but inject a newly selected
+            // prflx route before its delayed SDP/trickle provenance arrives.
+            assert(!fixture.neutral);
+            client.blockControlForTesting(true);
+            assert(client.sendGamepad(stream::Gamepad{}));
+            client.setSelectedCandidatesForTesting("local 1 UDP 1 192.0.2.20 50001 typ host",
+                                                  "unknown 1 UDP 1 192.0.2.10 50000 typ prflx");
+            client.blockControlForTesting(false);
+            client.pump();
+            assert(!client.ready() && client.error().empty());
+            assert(!client.sendGamepad(stream::Gamepad{}) && !client.sendControl(remoteInputs.front().dump()));
+            assert(!client.requestVideoKeyframe());
+            stream::Packet withheld; assert(!client.poll(withheld));
+            client.addCandidateProofForTesting("decoy 1 UDP 1 192.0.2.11 50000 typ relay");
+            for (unsigned tick=0; tick<10; ++tick) {
+                fixture.pump(); client.pump(); fixture.sendMedia();
+                assert(!client.ready() && !client.poll(withheld));
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(!fixture.neutral && client.diagnostics().find("controlPending=1 ") != std::string::npos);
+            assert(client.diagnostics().find("actual=unknown") != std::string::npos);
+            client.elapseForTesting(30);
+            client.addCandidateProofForTesting("relay-new-foundation 1 UDP 1 192.0.2.10 50000 typ relay");
+            fixture.signal({{"id", "ping"}, {"ts", 0}});
+            fixture.sendMedia();
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            const auto proofAt = Clock::now();
+            while (!fixture.neutral && Clock::now() - proofAt < std::chrono::seconds(1)) {
+                fixture.pump(); client.pump(); fixture.sendMedia();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(client.ready() && fixture.neutral && client.error().empty());
+            assert(client.diagnostics().find("actual=turn") != std::string::npos);
+            assert(client.diagnostics().find("remoteType=prflx") != std::string::npos);
+            assert(client.diagnostics().find("remoteProof=relay-endpoint") != std::string::npos);
+            std::cout << "TURN route transition gates ready/input/queue/media/PLI until exact delayed endpoint proof\n";
+        }
         assert(videos >= 3 && audios >= 3 && fixture.feedback->plis > 0);
         assert(fixture.remoteControls == expectedRemoteInputs);
         assert(client.diagnostics().find("emptyCandidates=3") != std::string::npos);
@@ -564,6 +723,9 @@ int main() {
             assert(client.error() == "Control channel stalled" && !client.ready() && client.retryableError());
         }
         client.close();
+        assert(client.diagnostics().find(turn ? "requested=relay actual=turn" : "requested=all actual=direct") != std::string::npos);
+        assert(client.diagnostics().find("routeSnapshot=final") != std::string::npos);
+        assert(client.diagnostics().find("iceReason=") != std::string::npos);
         const auto finalDiagnostics = client.videoDiagnostics();
         assert(!finalDiagnostics.empty() && client.videoDiagnostics() == finalDiagnostics);
         std::string videoEvent; while (client.pollVideoDiagnostic(videoEvent)) assert(videoEvent.find("private") == std::string::npos);
@@ -632,6 +794,37 @@ int main() {
     }
     stream::Client::cleanupRuntime();
     std::cout << "Same Client/rental hash reinit with fresh suffix, real frames/ping, retry no-close/final-close passed\n";
+    {
+        // The remote DTLS close can make PeerConnection release ICE before the
+        // application processes its queued callbacks. Preserve the RTC snapshot.
+        Fixture fixture;
+        stream::Client client;
+        assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+        const auto begin = Clock::now();
+        while (!client.ready() && Clock::now() - begin < std::chrono::seconds(4)) {
+            fixture.pump(); client.pump(); fixture.sendMedia();
+            stream::Packet packet; while (client.poll(packet)) {}
+            assert(client.error().empty());
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(client.ready());
+        fixture.peer->close();
+        // Let the RTC's own close task run before Client asks for its snapshot.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto closedAt = Clock::now();
+        while (client.error().empty() && Clock::now() - closedAt < std::chrono::seconds(2)) {
+            fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(!client.error().empty() && !client.ready());
+        const auto final = client.diagnostics();
+        assert(final.find("requested=all actual=direct") != std::string::npos);
+        assert(final.find("routeSnapshot=final") != std::string::npos);
+        assert(final.find("iceSnapshotAvailable=1") != std::string::npos);
+        assert(final.find("iceReason=") != std::string::npos && final.find("udpDatagrams=") != std::string::npos);
+        assert(final.find("127.0.0.1") == std::string::npos);
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "Automatic remote peer close retains final safe ICE diagnostics\n";
     // Malformed remote data identifies only the local phase/error class, never body.
     for (bool invalidBase64 : {true, false}) {
         {

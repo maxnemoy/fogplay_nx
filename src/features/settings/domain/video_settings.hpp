@@ -6,7 +6,7 @@
 
 namespace fog::video {
 struct Settings {
-    ::stream::VideoCodec codec = ::stream::VideoCodec::H264;
+    ::stream::VideoCodec codec = ::stream::VideoCodec::H265;
     int bitrateMbps = 20;
     int keyframeSeconds = 0;
     int quality = 0;

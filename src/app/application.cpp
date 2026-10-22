@@ -12,14 +12,19 @@ ApplicationController::ApplicationController(Runtime& runtime, const std::string
     syncPending();
     try {
         videoSettings_ = fog::video::loadSettings(std::string(dataDir) + "/video-settings.json");
-        if (videoSettings_.codec == ::stream::VideoCodec::H265 && !fog::Media::supportsH265()) {
-            videoSettings_.codec = ::stream::VideoCodec::H264;
-            videoSaveStatus_ = "H.265 недоступен в этой сборке. Выбран H.264; файл не изменён.";
-        }
     } catch (...) {
         videoSettings_ = {};
         videoSaveStatus_ = "Настройки не прочитаны. Используются стандартные; измените, чтобы сохранить.";
         diagnostic("Video settings unreadable or invalid; using defaults.");
+    }
+    if (videoSettings_.codec == ::stream::VideoCodec::H265 && !fog::Media::supportsH265()) {
+        videoSettings_.codec = ::stream::VideoCodec::H264;
+        videoSaveStatus_ = "H.265 недоступен в этой сборке. Выбран H.264; файл не изменён.";
+    }
+    try { connectionSettings_ = fog::connection::loadSettings(std::string(dataDir) + "/connection-settings.json"); }
+    catch (...) {
+        connectionSaveStatus_ = "Настройки не прочитаны. Используется обычный режим; измените, чтобы сохранить.";
+        diagnostic("Connection settings unreadable or invalid; using normal mode.");
     }
     try { controllerSettings_ = fog::controller::loadSettings(std::string(dataDir) + "/controller-settings.json"); }
     catch (...) { diagnostic("Controller settings unreadable; using Xbox layout default."); }

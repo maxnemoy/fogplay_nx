@@ -44,6 +44,7 @@ void ApplicationController::closeStream() noexcept {
     transportReconnect_.cancel();
     closeTransport(true);
     streamHash_.clear();
+    relaySelection_.reset();
     transportReconnect_.reset();
     recentLaunch_.close();
     overlay_.close();
@@ -58,6 +59,9 @@ bool ApplicationController::startTransport() {
     videoWorkUs_ = videoDecodeErrors_ = lastVideoGeneration_ = 0;
     media_ = std::make_unique<fog::Media>(rt_.renderer,stream::VideoCodec::H264,true);
     stream_ = std::make_unique<stream::Client>();
+    if (!stream_->configureRelay(relaySelection_.relay()))
+        throw std::runtime_error("Invalid connection configuration; stopping rental");
+    diagnostic(std::string("Transport ICE policy: ") + (relaySelection_.relay() ? "relay" : "all"));
     if (!stream_->configureVideo(videoSettings_))
         throw std::runtime_error("Invalid video configuration; stopping rental");
     overlay_.setVideoSettings(videoSettings_);
@@ -72,6 +76,10 @@ bool ApplicationController::startTransport() {
 }
 
 void ApplicationController::retryTransport(const char* reason) {
+    const bool wasRelay = relaySelection_.relay();
+    if (relaySelection_.broken(std::chrono::steady_clock::now()))
+        diagnostic("Transport break recorded; recentBreaks=" + std::to_string(relaySelection_.breaks()));
+    if (!wasRelay && relaySelection_.relay()) diagnostic("Auto TURN selected after two breaks in 120s; retained until rental closes.");
     if (screen_ != Screen::Streaming || !sessionPending_ || stopAfterTask_ ||
         exitAfterStop_ || streamHash_.empty() || pending_.valid() ||
         !transportReconnect_.retry(std::chrono::steady_clock::now())) {
@@ -84,12 +92,13 @@ void ApplicationController::retryTransport(const char* reason) {
     }
     status_ = "Связь потеряна. Повторяем подключение к той же аренде; оплата продолжается.";
     diagnostic("Transport recovery scheduled; reason=" + std::string(reason) +
-        " attemptsUsed=" + std::to_string(transportReconnect_.attempts()) + " limit=3 window=90s");
+        " attemptsIn120s=" + std::to_string(transportReconnect_.attempts()) + " limit=3 rollingWindow=120s recoveryDeadline=90s");
 }
 
 void ApplicationController::startStream(const std::string& hash, bool createdFromCatalog) {
     latency_.cancel();
     recentLaunch_.stream(createdFromCatalog);
+    relaySelection_.reset(connectionSettings_);
     sessionPending_ = true;
     transportReconnect_.reset();
     drainTiming_ = {}; presentTiming_ = {}; diagnosticTiming = {};
@@ -189,13 +198,17 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         beginFinish("transport-reconnect-deadline"); return;
     }
     if (recoveryAction == fog::stream::TransportReconnect::Action::CloseTransport) {
+        const bool wasRelay = relaySelection_.relay();
+        if (relaySelection_.broken(std::chrono::steady_clock::now()))
+            diagnostic("Transport break recorded after unresolved grace; recentBreaks=" + std::to_string(relaySelection_.breaks()));
+        if (!wasRelay && relaySelection_.relay()) diagnostic("Auto TURN selected after two breaks in 120s; retained until rental closes.");
         suspendVideoInput();
         if (!closeTransport(false)) {
             beginFinish("transport-retry-terminal"); return;
         }
     }
     if (recoveryAction == fog::stream::TransportReconnect::Action::StartTransport) {
-        diagnostic("Transport reconnect attempt=" + std::to_string(transportReconnect_.attempts()) + "/3");
+        diagnostic("Transport reconnect attempt=" + std::to_string(transportReconnect_.attempts()) + "/3 rollingWindow=120s");
         if (!startTransport()) {
             if (stream_->retryableError()) retryTransport("retry-start");
             else beginFinish("transport-start-fatal");
@@ -283,9 +296,11 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         }
         if (transportReconnect_.recovering() && stream_->ready() && !stream_->disconnected() &&
             transportReconnect_.prepared(std::chrono::steady_clock::now())) {
-            diagnostic("Transport recovery succeeded; attemptsUsed=" + std::to_string(transportReconnect_.attempts()));
+            diagnostic("Transport recovery succeeded; attemptsIn120s=" + std::to_string(transportReconnect_.attempts()));
             status_ = "Связь восстановлена. Минус + Плюс — меню трансляции.";
         }
+        if (!transportReconnect_.recovering() && stream_->ready() && !stream_->disconnected())
+            relaySelection_.connected();
         // Queue recovery may finish before the decoder produces an image. Resume
         // only after this generation has successfully prepared a visible frame.
         videoLossWaiting_ = stream_->waitingForVideoKeyframe();
