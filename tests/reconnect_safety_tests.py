@@ -34,6 +34,7 @@ assert 'if (final) stream_->close();' in close
 assert 'else if (!stream_->disconnectForRetry()) {\n                retryAllowed = false;' in close
 assert 'catch (...) { retryAllowed = false; }' in close
 assert 'return final || retryAllowed;' in close
+assert close.index('if (!final && !retryAllowed) return false;') < close.index('stream_.reset();')
 for site in (retry, pump):
     assert 'if (!closeTransport(false)) {' in site
     assert 'beginFinish("transport-retry-terminal"); return;' in site
@@ -48,7 +49,11 @@ assert 'if (stream_->retryableError()) retryTransport(' in pump
 assert 'transportReconnect_.recovering() || videoRecovery_.active()' in pump
 assert 'return !transportReconnect_.recovering() && stream_' in inputs
 finish = method(rental, 'beginFinish')
-assert finish.index('closeStream();') < finish.index('guard_.finishAttempt()')
+assert finish.index('stopAfterTask_ = true;') < finish.index('start(Task::Finish')
+assert finish.index('start(Task::CheckoutStop') < finish.index('closeStream();')
+assert finish.index('start(Task::Finish') < finish.index('closeStream();')
+shutdown = method(rental, 'shutdownSession')
+assert shutdown.index('beginFinish(') < shutdown.index('closeStream();')
 assert 'if (sessionPending_ && !stopAfterTask_ && !focused)' in app
 assert 'beginFinish("focus-lost")' in app and 'beginFinish("application-exit")' in app
 print('Same-rental reconnect application safety boundaries passed (static only)')

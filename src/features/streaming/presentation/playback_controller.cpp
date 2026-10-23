@@ -52,7 +52,8 @@ void ApplicationController::logOutputTimings(bool final) {
 
 bool ApplicationController::closeTransport(bool final) noexcept {
     bool retryAllowed = true;
-    releaseMouse();
+    if (final) releaseMouse();
+    else mouseLeft_ = mouseRight_ = touchDrag_ = touchWasDown_ = false;
     videoRecovery_.reset();
     videoLossWaiting_ = false;
     loopTiming_.suspendPresentation();
@@ -80,10 +81,15 @@ bool ApplicationController::closeTransport(bool final) noexcept {
             }
         } catch (...) { retryAllowed = false; }
         try {
+            diagnostic("Stream transport closed: " + stream_->transportTimings(),4096);
             diagnostic("Video gaps final: " + stream_->gapDiagnostics(),4096);
-            diagnostic("Stream DTLS final: " + stream_->dtlsDiagnostics(),2048);
+            diagnostic("Stream DTLS final: " + stream_->dtlsDiagnostics(),8192);
+            diagnostic("Stream RTCP final: " + stream_->rtcpDiagnostics(),4096);
             diagnostic("Stream mutex final: " + stream_->mutexDiagnostics(),4096);
         } catch (...) {} // Diagnostic failure cannot prevent rental termination.
+        // A refused retry can still own an in-flight RTC call. Keep it alive
+        // until beginFinish dispatches the rental stop, then performs final close.
+        if (!final && !retryAllowed) return false;
         stream_.reset();
     }
     media_.reset();
@@ -137,7 +143,7 @@ void ApplicationController::retryTransport(const char* reason) {
         beginFinish("transport-reconnect-exhausted");
         return;
     }
-    suspendVideoInput();
+    streamInputGate_.suspendVideo();
     if (!closeTransport(false)) {
         beginFinish("transport-retry-terminal"); return;
     }
@@ -272,7 +278,8 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
                 lastStreamDiagnostics_ = details;
                 diagnostic("Stream protocol: " + details,2048);
             }
-            diagnostic("Stream DTLS: " + stream_->dtlsDiagnostics(),2048);
+            diagnostic("Stream DTLS: " + stream_->dtlsDiagnostics(),8192);
+            diagnostic("Stream RTCP: " + stream_->rtcpDiagnostics(),4096);
             diagnostic("Stream transport: " + stream_->transportTimings(),4096);
             diagnostic("Stream mutex: " + stream_->mutexDiagnostics(),4096);
             lastProtocolLog_ = pumpAt;
@@ -298,7 +305,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         if (relaySelection_.broken(std::chrono::steady_clock::now()))
             diagnostic("Transport break recorded after unresolved grace; recentBreaks=" + std::to_string(relaySelection_.breaks()));
         if (!wasRelay && relaySelection_.relay()) diagnostic("Auto TURN selected after two breaks in 120s; retained until rental closes.");
-        suspendVideoInput();
+        streamInputGate_.suspendVideo();
         if (!closeTransport(false)) {
             beginFinish("transport-retry-terminal"); return;
         }

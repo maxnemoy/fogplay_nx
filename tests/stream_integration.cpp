@@ -137,7 +137,23 @@ public:
     }
     std::atomic<unsigned> remb{0};
     void incoming(rtc::message_vector& messages, const rtc::message_callback& send) override {
-        for (const auto& msg : messages) {
+        // Regular RR and REMB share one SRTCP datagram. Inspect every RTCP
+        // member, preserving the original compound for the remaining chain.
+        rtc::message_vector packets;
+        for (const auto& message : messages) {
+            if (message->type != rtc::Message::Control) continue;
+            std::size_t offset = 0;
+            while (offset < message->size()) {
+                assert(message->size() - offset >= sizeof(rtc::RtcpHeader));
+                const auto *header = reinterpret_cast<const rtc::RtcpHeader *>(message->data() + offset);
+                const auto bytes = header->lengthInBytes();
+                assert(header->version() == 2 && bytes >= sizeof(rtc::RtcpHeader) && bytes <= message->size() - offset);
+                packets.push_back(rtc::make_message(message->begin() + offset,
+                    message->begin() + offset + bytes, rtc::Message::Control));
+                offset += bytes;
+            }
+        }
+        for (const auto& msg : packets) {
             if (msg->size() >= 16 && msg->at(1) == std::byte{205} && msg->at(0) == std::byte{0x81}) {
                 ++nacks; rtc::binary rtx;
                 {
@@ -212,6 +228,16 @@ struct Fixture {
     std::string pendingOffer;
     std::uint32_t frame = 0;
     std::string heartbeat;
+    std::chrono::milliseconds serverHeartbeatInterval{0};
+    Clock::time_point lastServerHeartbeat{};
+    void enableHeartbeats() {
+        const auto comma = heartbeat.find(',');
+        assert(comma != std::string::npos);
+        const auto advertised = std::stoul(heartbeat.substr(0, comma));
+        assert(advertised <= 60000);
+        serverHeartbeatInterval = advertised ? std::chrono::milliseconds(std::max(4000ul, advertised)) : std::chrono::milliseconds(0);
+        lastServerHeartbeat = Clock::now();
+    }
     bool initializePeer;
     bool expectRelay;
     bool rejectWebrtc = false;
@@ -428,6 +454,12 @@ struct Fixture {
                 }
             }
         }
+        const auto now = Clock::now();
+        if (subscribed && ws && ws->isOpen() && serverHeartbeatInterval.count() &&
+            now - lastServerHeartbeat >= serverHeartbeatInterval) {
+            ws->send(std::string("\n"));
+            lastServerHeartbeat = now;
+        }
     }
     void sendMedia() {
         if (!video || !video->isOpen() || !audio->isOpen()) return;
@@ -454,6 +486,22 @@ struct Fixture {
 
 int main(int argc, char** argv) {
     const bool turnOnly = argc == 2 && std::string(argv[1]) == "--turn-only";
+    {
+        Feedback feedback;
+        auto compound = rtc::make_message(rtc::RtcpRr::SizeWithReportBlocks(1), rtc::Message::Control);
+        auto *report = reinterpret_cast<rtc::RtcpRr *>(compound->data());
+        report->preparePacket(1234, 1);
+        report->getReportBlock(0)->preparePacket(1234, 0, 0, 100, 0, 0, 0, 0);
+        auto remb = rtc::make_message(rtc::RtcpRemb::SizeWithSSRCs(1), rtc::Message::Control);
+        auto *bitrate = reinterpret_cast<rtc::RtcpRemb *>(remb->data());
+        bitrate->preparePacket(1234, 1, 30000000); bitrate->setSsrc(0, 1234);
+        compound->insert(compound->end(), remb->begin(), remb->end());
+        rtc::message_vector messages{compound};
+        feedback.incoming(messages, [](rtc::message_ptr) { assert(false); });
+        assert(feedback.remb == 30000000 && feedback.plis == 0 && feedback.nacks == 0);
+        assert(messages.size() == 1 && messages.front() == compound);
+        std::cout << "Compound RR/REMB fixture parser passed\n";
+    }
     const std::vector<Json> remoteInputs{
         fog::remote::absoluteMouse(640, 360, 1280, 720, 1920, 1080),
         fog::remote::mouseButton(true, 0), fog::remote::mouseButton(false, 0),
@@ -509,6 +557,9 @@ int main(int argc, char** argv) {
     {
         const bool turn = round == 4;
         Fixture fixture("4000,4000", true, round == 3, "abcde", turn, turn);
+        // Long streaming scenarios advertise heartbeats and must actually send
+        // them. Dedicated liveness fixtures below deliberately keep them off.
+        fixture.enableHeartbeats();
         stream::Client client;
         if (turn) assert(client.configureRelay(true));
         fog::video::Settings settings;
@@ -593,45 +644,123 @@ int main(int argc, char** argv) {
         assert(client.videoDiagnostics().find("serverPreset=LOW") != std::string::npos);
         assert(client.videoDiagnostics().find("statsCount=1") != std::string::npos);
         if (turn) {
+            const auto settleIce = [&client] {
+                const auto began = Clock::now();
+                for (;;) {
+                    client.pump();
+                    const auto d = client.diagnostics();
+                    if (d.find("iceInFlight=0 ") != std::string::npos && d.find("icePending=0 ") != std::string::npos) {
+                        client.pump(); return;
+                    }
+                    assert(Clock::now() - began < std::chrono::seconds(2));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            };
             // Freeze only route sampling, independent of RTC/heartbeat deadlines.
             client.setRouteSnapshotTimeForTesting(1000);
-            client.pump();
+            settleIce();
             const auto pairCount = [](const stream::Client& current) {
                 const auto text = current.transportTimings();
                 const auto at = text.find("icePairCalls=");
                 assert(at != std::string::npos);
                 return std::stoull(text.substr(at + 13));
             };
+            // Expiry also applies without a route event or frame pump. The
+            // autonomous sender must withhold an old queued input on its own.
+            client.blockControlForTesting(true);
+            stream::Gamepad repeatedPress; repeatedPress.buttons[0] = 1;
+            assert(client.sendGamepad(repeatedPress));
+            const auto sentBeforeExpiryText = client.diagnostics();
+            const auto sentBeforeExpiry = std::stoull(sentBeforeExpiryText.substr(sentBeforeExpiryText.find("controlSent=") + 12));
+            const auto expiryAt = Clock::now();
+            while (Clock::now() - expiryAt < std::chrono::milliseconds(2050)) {
+                fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            assert(!client.ready() && !client.sendGamepad(repeatedPress));
+            client.blockControlForTesting(false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            const auto expiredText = client.diagnostics();
+            assert(std::stoull(expiredText.substr(expiredText.find("controlSent=") + 12)) == sentBeforeExpiry);
+            client.repeatIceStateForTesting(); settleIce(); assert(client.ready());
+            std::cout << "Fresh TURN proof expires without pump/events and independently gates autonomous queued sends\n";
+            // A getter that began with TURN proof cannot publish it after a
+            // route event replaces its epoch. Media and queued input stay gated.
+            client.blockIceForTesting(true);
+            client.pump();
+            const auto blockedIceAt = Clock::now();
+            while (client.diagnostics().find("iceInFlight=1 ") == std::string::npos) {
+                assert(Clock::now() - blockedIceAt < std::chrono::seconds(2));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            client.setSelectedCandidatesForTesting("local 1 UDP 1 192.0.2.20 50001 typ host",
+                                                  "unknown 1 UDP 1 192.0.2.10 50000 typ prflx");
+            const auto pumping = Clock::now();
+            for (unsigned tick = 0; tick < 100; ++tick) {
+                client.pump(); assert(!client.ready() && client.error().empty());
+                assert(!client.sendGamepad(stream::Gamepad{}));
+                stream::Packet withheld; assert(!client.poll(withheld));
+                (void)client.diagnostics(); (void)client.dtlsDiagnostics();
+            }
+            assert(Clock::now() - pumping < std::chrono::milliseconds(200));
+            client.blockIceForTesting(false); settleIce();
+            assert(!client.ready() && client.diagnostics().find("actual=unknown") != std::string::npos);
+            assert(client.diagnostics().find("iceDiscarded=0 ") == std::string::npos);
+            client.setSelectedCandidatesForTesting("local 1 UDP 1 192.0.2.20 50001 typ host",
+                                                  "relay 1 UDP 1 192.0.2.30 50002 typ relay");
+            settleIce(); assert(client.ready());
+            std::cout << "Blocked ICE read keeps pump/diagnostics responsive, rejects stale TURN proof, and gates input/media until fresh epoch\n";
+            // A periodic completion in the SAME epoch must revoke cached TURN
+            // authorization too, including the worker's queued-send gate.
+            const auto generation = client.diagnostics().substr(client.diagnostics().find(" iceGeneration="), 18);
+            client.blockControlForTesting(true);
+            stream::Gamepad heldPad; heldPad.buttons[0] = 1;
+            assert(client.sendGamepad(heldPad));
+            const auto controlSent = [](const stream::Client& current) {
+                const auto d = current.diagnostics(); return std::stoull(d.substr(d.find("controlSent=") + 12));
+            };
+            const auto sentBeforeNoPair = controlSent(client);
+            client.clearSelectedCandidatesForTesting(false);
+            client.setRouteSnapshotTimeForTesting(2000); settleIce();
+            assert(client.diagnostics().substr(client.diagnostics().find(" iceGeneration="), 18) == generation);
+            assert(!client.ready() && !client.sendGamepad(heldPad));
+            client.blockControlForTesting(false);
+            for (unsigned tick = 0; tick < 20; ++tick) {
+                client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            assert(controlSent(client) == sentBeforeNoPair);
+            client.setSelectedCandidatesForTesting("local 1 UDP 1 192.0.2.20 50001 typ host",
+                                                  "relay 1 UDP 1 192.0.2.30 50002 typ relay");
+            client.setRouteSnapshotTimeForTesting(1000); settleIce(); assert(client.ready());
             const auto stableQueries = pairCount(client);
             for (unsigned tick = 0; tick < 20; ++tick) client.pump();
             assert(pairCount(client) == stableQueries && client.ready());
             // Query exceptions must gate historical TURN and obey the same
             // retry interval, without consuming new-event invalidation.
-            client.failSelectedPairForTesting(true); client.pump();
+            client.failSelectedPairForTesting(true); settleIce();
             assert(pairCount(client) == stableQueries + 1 && !client.ready());
             assert(!client.sendGamepad(stream::Gamepad{}));
             for (unsigned tick = 0; tick < 20; ++tick) client.pump();
             assert(pairCount(client) == stableQueries + 1);
-            client.setRouteSnapshotTimeForTesting(1999); client.pump();
+            client.setRouteSnapshotTimeForTesting(1999); settleIce();
             assert(pairCount(client) == stableQueries + 1);
-            client.setRouteSnapshotTimeForTesting(2000); client.pump();
+            client.setRouteSnapshotTimeForTesting(2000); settleIce();
             assert(pairCount(client) == stableQueries + 2 && !client.ready());
-            client.failSelectedPairForTesting(false); client.pump();
+            client.failSelectedPairForTesting(false); settleIce();
             assert(pairCount(client) == stableQueries + 3 && client.ready());
             const auto verifiedQueries = pairCount(client);
-            client.repeatIceStateForTesting(); client.pump();
+            client.repeatIceStateForTesting(); settleIce();
             assert(pairCount(client) == verifiedQueries + 1 && client.ready());
             // Never reuse the preceding TURN proof when the selected pair disappears.
-            client.clearSelectedCandidatesForTesting(); client.pump();
+            client.clearSelectedCandidatesForTesting(); settleIce();
             assert(pairCount(client) == verifiedQueries + 2 && !client.ready());
             assert(client.diagnostics().find("routeCurrent=0") != std::string::npos);
             assert(!client.sendGamepad(stream::Gamepad{}) && !client.requestVideoKeyframe());
             stream::Packet unavailable; assert(!client.poll(unavailable));
             for (unsigned tick = 0; tick < 20; ++tick) client.pump();
             assert(pairCount(client) == verifiedQueries + 2);
-            client.setRouteSnapshotTimeForTesting(2999); client.pump();
+            client.setRouteSnapshotTimeForTesting(2999); settleIce();
             assert(pairCount(client) == verifiedQueries + 2);
-            client.setRouteSnapshotTimeForTesting(3000); client.pump();
+            client.setRouteSnapshotTimeForTesting(3000); settleIce();
             assert(pairCount(client) == verifiedQueries + 3 && !client.ready());
             const auto timing = client.transportTimings();
             assert(timing.find("scope=transport-lifetime nested=1") == 0);
@@ -644,7 +773,7 @@ int main(int argc, char** argv) {
             std::cout << "Route sampling: unchanged/no-pair cadence, ICE invalidation, required-TURN gate and bounded stage timings passed\n";
             client.setSelectedCandidatesForTesting("local 1 UDP 1 192.0.2.20 50001 typ host",
                                                   "relay 1 UDP 1 192.0.2.30 50002 typ relay");
-            client.pump(); assert(client.ready());
+            settleIce(); assert(client.ready());
             // Keep the real TURN transport connected, but inject a newly selected
             // prflx route before its delayed SDP/trickle provenance arrives.
             assert(!fixture.neutral);
@@ -653,30 +782,30 @@ int main(int argc, char** argv) {
             client.setSelectedCandidatesForTesting("local 1 UDP 1 192.0.2.20 50001 typ host",
                                                   "unknown 1 UDP 1 192.0.2.10 50000 typ prflx");
             client.blockControlForTesting(false);
-            client.pump();
+            settleIce();
             assert(!client.ready() && client.error().empty());
             assert(!client.sendGamepad(stream::Gamepad{}) && !client.sendControl(remoteInputs.front().dump()));
             assert(!client.requestVideoKeyframe());
             stream::Packet withheld; assert(!client.poll(withheld));
             client.addCandidateProofForTesting("decoy 1 UDP 1 192.0.2.11 50000 typ relay");
             for (unsigned tick=0; tick<10; ++tick) {
-                fixture.pump(); client.pump(); fixture.sendMedia();
+                fixture.pump(); settleIce(); fixture.sendMedia();
                 assert(!client.ready() && !client.poll(withheld));
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             assert(!fixture.neutral && client.diagnostics().find("controlPending=1 ") != std::string::npos);
             assert(client.diagnostics().find("actual=unknown") != std::string::npos);
-            client.elapseForTesting(30);
+            client.elapseForTesting(29);
             const auto beforeProof = pairCount(client);
             client.addCandidateProofForTesting("relay-new-foundation 1 UDP 1 192.0.2.10 50000 typ relay");
             fixture.signal({{"id", "ping"}, {"ts", 0}});
             fixture.sendMedia();
             std::this_thread::sleep_for(std::chrono::milliseconds(15));
-            client.pump();
+            settleIce();
             assert(pairCount(client) == beforeProof + 1 && client.ready());
             const auto proofAt = Clock::now();
             while (!fixture.neutral && Clock::now() - proofAt < std::chrono::seconds(1)) {
-                fixture.pump(); client.pump(); fixture.sendMedia();
+                fixture.pump(); settleIce(); fixture.sendMedia();
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             assert(client.ready() && fixture.neutral && client.error().empty());
@@ -686,12 +815,13 @@ int main(int argc, char** argv) {
             const auto resumeAt = Clock::now();
             bool resumedVideo = false;
             while ((!resumedVideo || client.waitingForVideoKeyframe()) && Clock::now() - resumeAt < std::chrono::seconds(1)) {
-                fixture.pump(); client.pump(); fixture.sendMedia();
+                fixture.pump(); settleIce(); fixture.sendMedia();
                 while (client.poll(withheld)) resumedVideo |= withheld.kind == stream::Kind::Video;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             assert(resumedVideo && !client.waitingForVideoKeyframe() && client.error().empty());
             std::cout << "TURN route transition gates ready/input/queue/media/PLI until exact delayed endpoint proof\n";
+            client.setRouteSnapshotTimeForTesting(0); // Resume real cadence for later long-running quality checks.
         }
         if (round == 1) {
             // Lost/throttled decoder PLI must retry even with periodic PLI disabled,
@@ -894,6 +1024,9 @@ int main(int argc, char** argv) {
                 assert(client.error() == "Remote control closed" && !client.retryableError());
                 assert(!client.ready() && !client.disconnected());
             } else {
+                if (!client.error().empty() || !client.ready() || client.disconnected())
+                    std::cerr << ("Post-burst failure round=" + std::to_string(round) + " error=[" + client.error() +
+                                  "] status=" + client.status() + " " + client.rtcpDiagnostics() + "\n");
                 assert(client.error().empty() && client.ready() && !client.disconnected());
                 assert(client.videoDiagnostics().find("serverPreset=LOW") != std::string::npos);
                 // A public input send can fail before pump sees terminal signaling.
@@ -921,7 +1054,7 @@ int main(int argc, char** argv) {
             assert(client.sendControl(fog::remote::key(false,"Enter").dump()));
             client.advanceControlForTesting(15001);
             client.pump();
-            assert(client.error() == "Control channel stalled" && !client.ready() && client.retryableError());
+            assert(client.error() == "Control channel stalled" && !client.ready() && !client.retryableError());
         }
         client.close();
         assert(client.diagnostics().find(turn ? "requested=relay actual=turn" : "requested=all actual=direct") != std::string::npos);
@@ -948,7 +1081,7 @@ int main(int argc, char** argv) {
         while (Clock::now() - closeStart < std::chrono::seconds(2) && (!fixture.closed || !fixture.neutral)) {
             fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        assert((round == 2 ? !fixture.closed : fixture.closed) && fixture.neutral);
+        assert(fixture.closed && fixture.neutral);
         std::cout << "Local transport integration passed: STOMP, actual ICE/DTLS/SRTP/SCTP, "
                      "filtered answer, H264/H265 AnnexB, Opus, PLI, REMB, quality controls/stats/confirmed Auto enhance+degrade/manual isolation, gamepad/mouse/keyboard/close\n";
     }
@@ -1095,6 +1228,10 @@ int main(int argc, char** argv) {
             const std::string suffix = attempt == 0 ? "abcde" : "abcdf";
             Fixture fixture("4000,4000",true,false,suffix);
             assert(client.startForTesting("fixture",suffix,"ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+            // Callback ping before sender publication must survive in a bounded
+            // slot and transfer to the worker only after route authorization.
+            client.receiveControlForTesting(R"({"id":"ping","ts":42})");
+            assert(client.error().empty() && client.diagnostics().find("incomingPing=1 ") != std::string::npos);
             const auto begin = Clock::now();
             bool gotFrame = false;
             while (Clock::now()-begin < std::chrono::seconds(5)) {
@@ -1119,6 +1256,118 @@ int main(int argc, char** argv) {
     }
     stream::Client::cleanupRuntime();
     std::cout << "Same Client/rental hash reinit with fresh suffix, real frames/ping, retry no-close/final-close passed\n";
+    // Failure before any control channel exists must retain the ICE owner too.
+    {
+        Fixture fixture("4000,4000", false);
+        stream::Client client;
+        assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+        const auto begin = Clock::now();
+        while (!fixture.enabled) {
+            fixture.pump(); client.pump();
+            assert(Clock::now() - begin < std::chrono::seconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        client.blockIceForTesting(true);
+        fixture.signal({{"id", "init"}, {"data", Json::array({"[]"}).dump()}});
+        // Do not pump provider events: no offer/data channel can be delivered.
+        while (client.diagnostics().find("iceInFlight=1 ") == std::string::npos) {
+            client.pump(); assert(client.error().empty());
+            assert(Clock::now() - begin < std::chrono::seconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const auto failedAt = Clock::now();
+        client.failThenReceiveForTesting("{}", false); client.pump();
+        assert(Clock::now() - failedAt < std::chrono::milliseconds(200));
+        assert(client.error() == "ICE snapshot in flight; ending rental before transport cleanup" && !client.retryableError());
+        assert(!client.disconnectForRetry());
+        client.blockIceForTesting(false); client.close();
+    }
+    stream::Client::cleanupRuntime();
+    // Block each application-facing RTC read stage. Failure/retry must expose
+    // terminal state without joining, so the app can send rental HTTP stop first.
+    for (unsigned stage : {0u, 1u}) for (unsigned failureMode : {0u, 1u, 2u}) {
+        Fixture fixture;
+        stream::Client client;
+        assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+        const auto begin = Clock::now();
+        while (!client.ready() && Clock::now() - begin < std::chrono::seconds(4)) {
+            fixture.pump(); client.pump(); fixture.sendMedia();
+            stream::Packet packet; while (client.poll(packet)) {}
+            assert(client.error().empty());
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(client.ready());
+        client.blockIceForTesting(true, stage); client.pump();
+        const auto blockedAt = Clock::now();
+        while (client.diagnostics().find("iceInFlight=1 ") == std::string::npos) {
+            assert(Clock::now() - blockedAt < std::chrono::seconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const auto failedAt = Clock::now();
+        if (failureMode) {
+            client.failThenReceiveForTesting(failureMode == 2 ? "{\"id\":\"close\"}" : "{}", false);
+            client.pump();
+        }
+        assert(!client.disconnectForRetry());
+        assert(Clock::now() - failedAt < std::chrono::milliseconds(200));
+        assert(!client.ready() && !client.retryableError());
+        assert(client.error() == (failureMode == 2 ? "Remote control closed" :
+            "ICE snapshot in flight; ending rental before transport cleanup"));
+        const auto frozen = client.diagnostics();
+        for (unsigned n = 0; n < 1000; ++n) client.receiveControlForTesting("{}");
+        const auto after = client.diagnostics();
+        assert(after.substr(after.find("incomingIgnored=")) == frozen.substr(frozen.find("incomingIgnored=")));
+        // This boundary models the controller's already-tested HTTP dispatch.
+        // The transport worker remains owned and joinable until explicit close.
+        bool rentalStopDispatched = true;
+        assert(rentalStopDispatched && client.diagnostics().find("iceInFlight=1 ") != std::string::npos);
+        client.blockIceForTesting(false); client.close();
+        assert(client.diagnostics().find("iceStopping=1") != std::string::npos);
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "Blocked diagnostic/pair read: retry/failure terminal publication, terminal-control precedence and HTTP-before-join ownership passed\n";
+    // A transport event or retry request while a control send is blocked must
+    // publish a terminal error without joining. The application then dispatches
+    // rental termination before close() owns the unavoidable transport join.
+    for (bool transportFailure : {false, true}) {
+        Fixture fixture;
+        stream::Client client;
+        assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+        const auto begin = Clock::now();
+        while (!client.ready() && Clock::now() - begin < std::chrono::seconds(4)) {
+            fixture.pump(); client.pump(); fixture.sendMedia();
+            stream::Packet packet; while (client.poll(packet)) {}
+            assert(client.error().empty());
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(client.ready());
+        client.blockControlSendForTesting(true);
+        stream::Gamepad pad; pad.buttons[0] = 1;
+        assert(client.sendGamepad(pad));
+        const auto blockedAt = Clock::now();
+        while (client.diagnostics().find("controlInFlight=1 ") == std::string::npos && Clock::now() - blockedAt < std::chrono::seconds(2))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        assert(client.diagnostics().find("controlInFlight=1 ") != std::string::npos);
+        assert(client.sendControl(fog::remote::key(true, "Enter").dump()));
+        const auto failedAt = Clock::now();
+        if (transportFailure) {
+            client.failThenReceiveForTesting("{}", false); client.pump();
+            assert(!client.retryableError() && !client.error().empty());
+        }
+        assert(!client.disconnectForRetry());
+        assert(Clock::now() - failedAt < std::chrono::milliseconds(200));
+        assert(!client.ready() && !client.retryableError());
+        const auto frozen = client.diagnostics();
+        for (unsigned n = 0; n < 1000; ++n) client.receiveControlForTesting("{}");
+        assert(client.diagnostics().find("incomingIgnored=") != std::string::npos);
+        assert(client.diagnostics().substr(client.diagnostics().find("incomingIgnored=")) == frozen.substr(frozen.find("incomingIgnored=")));
+        client.blockControlSendForTesting(false);
+        client.close();
+        for (unsigned n = 0; n < 20; ++n) { fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+        assert(fixture.closed && fixture.remoteControls.empty()); // Queued old-generation Enter never drains.
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "Blocked sender failure/retry publishes terminal error without join; frozen callbacks and old queued inputs discarded\n";
     {
         // The remote DTLS close can make PeerConnection release ICE before the
         // application processes its queued callbacks. Preserve the RTC snapshot.

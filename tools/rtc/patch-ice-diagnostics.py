@@ -5,9 +5,12 @@ def apply(root):
     rtc = root / 'third_party/rtc/libdatachannel'
     juice = rtc / 'deps/libjuice'
 
-    def replace(path, old, new):
+    def replace(path, old, new, previous=None):
         source = path.read_text()
         if new in source:
+            return
+        if previous is not None and previous in source:
+            path.write_text(source.replace(previous, new, 1))
             return
         if ((old == 'namespace rtc::impl {' and 'string IceTransport::iceDiagnostics() const' in source) or
                 (old.startswith('bool PeerConnection::getSelectedCandidatePair(') and
@@ -277,9 +280,24 @@ string IceTransport::iceDiagnostics() const {
     replace(peer_header, '\tshared_ptr<IceTransport> mIceTransport;',
             """	shared_ptr<IceTransport> mIceTransport;
 	mutable std::mutex mIceDiagnosticsMutex;
+	mutable string mFinalIceDiagnostics;""", previous="""	shared_ptr<IceTransport> mIceTransport;
+	mutable std::mutex mIceDiagnosticsMutex;
 	string mFinalIceDiagnostics;""")
     replace(peer, 'shared_ptr<DtlsTransport> PeerConnection::getDtlsTransport() const {',
             """string PeerConnection::iceDiagnostics() const {
+	if (auto ice = getIceTransport()) {
+		// The caller chooses where this potentially blocking ICE read runs.
+		// Never hold the cache mutex while acquiring the ICE connection lock.
+		auto snapshot = ice->iceDiagnostics();
+		std::lock_guard lock(mIceDiagnosticsMutex);
+		if (!snapshot.empty()) mFinalIceDiagnostics = snapshot;
+		return snapshot;
+	}
+	std::lock_guard lock(mIceDiagnosticsMutex);
+	return mFinalIceDiagnostics;
+}
+
+shared_ptr<DtlsTransport> PeerConnection::getDtlsTransport() const {""", previous="""string PeerConnection::iceDiagnostics() const {
 	if (auto ice = getIceTransport())
 		return ice->iceDiagnostics();
 	std::lock_guard lock(mIceDiagnosticsMutex);
@@ -289,6 +307,9 @@ string IceTransport::iceDiagnostics() const {
 shared_ptr<DtlsTransport> PeerConnection::getDtlsTransport() const {""")
     replace(peer, '\t// Pass the pointers to a thread, allowing to terminate a transport from its own thread',
             """	// Retain the final per-peer snapshot before the ICE pointer disappears.
+	// The last explicit iceDiagnostics() sample is cached; teardown never queries ICE.
+
+	// Pass the pointers to a thread, allowing to terminate a transport from its own thread""", previous="""	// Retain the final per-peer snapshot before the ICE pointer disappears.
 	// Snapshot on this processor thread, outside libjuice callbacks and without
 	// holding the cache lock while acquiring the libjuice connection lock.
 	try {

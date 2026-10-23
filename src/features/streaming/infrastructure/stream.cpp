@@ -3,7 +3,9 @@
 #include "features/streaming/infrastructure/stream_protocol.hpp"
 #include "features/streaming/domain/h264_rtp.hpp"
 #include "features/streaming/infrastructure/stream_queue.hpp"
-#include "features/streaming/infrastructure/control_queue.hpp"
+#include "features/streaming/infrastructure/async_control_sender.hpp"
+#include "features/streaming/infrastructure/async_ice_snapshot.hpp"
+#include "features/streaming/infrastructure/rtcp_feedback_worker.hpp"
 #include "features/streaming/infrastructure/incoming_control.hpp"
 #include "features/streaming/infrastructure/transport_history.hpp"
 #include "features/streaming/infrastructure/timed_mutex.hpp"
@@ -93,6 +95,15 @@ static std::uint64_t videoNow() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
 }
 struct Client::Impl {
+    struct IceData {
+        std::string diagnostics;
+        rtc::DtlsDiagnostics dtls;
+        rtc::Candidate local, remote;
+        bool pair = false, pairFailed = false;
+        TransportStageTiming diagnosticTiming, pairTiming;
+    };
+    using IceWorker = AsyncIceSnapshot<IceData>;
+
     enum class EventType {
 #ifdef FOG_STREAM_TESTING
                            TestCandidateProof,
@@ -123,6 +134,13 @@ struct Client::Impl {
         MediaQueue media;
         TransportHistory transportHistory;
         IncomingControl incoming;
+        std::shared_ptr<AsyncControlSender> controlSender;
+        std::shared_ptr<IceWorker> iceWorker;
+        std::shared_ptr<RtcpFeedbackWorker> rtcpWorker;
+        bool relay = false, turnAuthorized = false;
+        std::uint64_t routeRevision = 0;
+        Clock::time_point routeCapturedAt{};
+        std::string pendingPong;
         std::uint64_t qualityTimeOffset = 0, eventDelayHighMs = 0;
         Clock::time_point lastVideo{};
         H264RtpAssembler video;
@@ -239,6 +257,12 @@ struct Client::Impl {
             TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
             if (stopped) return;
             const auto now = videoNow();
+            if (e.type == EventType::PeerState || e.type == EventType::IceState ||
+                e.type == EventType::GatheringState || e.type == EventType::Candidate ||
+                e.type == EventType::Description || e.type == EventType::Channel || e.type == EventType::ChannelOpen) {
+                if (iceWorker) iceWorker->invalidate();
+                if (relay && controlSender) controlSender->allow(false);
+            }
             if (e.type == EventType::PeerState) { peerState = e.peerState; lastPeerMs = now; }
             if (e.type == EventType::IceState) { iceState = e.iceState; lastIceMs = now; }
             if (e.type == EventType::GatheringState) { gatheringState = e.gatheringState; lastGatheringMs = now; }
@@ -273,8 +297,9 @@ struct Client::Impl {
             eventBytes += bytes; events.push_back(std::move(e));
             eventHigh = std::max(eventHigh, events.size());
         }
-        void controlMessage(const std::string& text, const std::weak_ptr<rtc::DataChannel>& weakChannel) {
+        void controlMessage(const std::string& text) {
             const auto message = IncomingControl::classify(text);
+            std::shared_ptr<AsyncControlSender> sender;
             {
                 TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
                 if (stopped) return;
@@ -282,25 +307,19 @@ struct Client::Impl {
                 incoming.receive(message, lastControlMs + qualityTimeOffset);
                 if (message.kind == IncomingControl::Kind::Close || message.kind == IncomingControl::Kind::Error ||
                     message.kind == IncomingControl::Kind::Invalid) terminalControl = message.kind;
+                sender = controlSender;
+                if (!sender && message.kind == IncomingControl::Kind::Ping) pendingPong = message.pong;
             }
             if (message.kind == IncomingControl::Kind::Ping) {
-                bool sent = false;
-                try {
-                    // Local libdatachannel delivers messages outside its send mutex.
-                    // Never send while holding Shared::mutex, including teardown races.
-                    if (const auto dc = weakChannel.lock(); dc && dc->isOpen()) {
-                        if (dc->bufferedAmount() <= 64 * 1024) {
-                            dc->send(message.pong); // false is accepted into RTC's send queue.
-                            sent = true;
-                        }
+                // Pong dispatch is independent of the application's frame pump,
+                // but shares the same serialized, route-gated sender as input.
+                if (!sender) return; // Channel publication will transfer the bounded latest pong.
+                if (!sender->enqueue(message.pong, ControlQueue::Mode::Pong)) {
+                    {
+                        TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
+                        if (stopped) return;
+                        incoming.pongFailed();
                     }
-                } catch (...) {}
-                {
-                    TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
-                    if (stopped) return;
-                    if (sent) incoming.pongSent(); else incoming.pongFailed();
-                }
-                if (!sent) {
                     Event e(EventType::Failure); e.text = "Ping response transport failed"; event(std::move(e));
                 }
             } else if (message.kind == IncomingControl::Kind::Close ||
@@ -344,12 +363,37 @@ struct Client::Impl {
     std::shared_ptr<rtc::PeerConnection> peer;
     std::shared_ptr<rtc::DataChannel> channel;
     std::vector<std::shared_ptr<rtc::Track>> tracks;
-    ControlQueue controls;
-    std::uint64_t controlTimeOffset = 0;
+    std::shared_ptr<AsyncControlSender> controlSender;
+    std::shared_ptr<IceWorker> iceWorker;
+    std::shared_ptr<RtcpFeedbackWorker> rtcpWorker;
+    RtcpFeedbackWorker::Snapshot finalRtcp;
+    std::uint64_t routeRevision = 0, publishedSerial = 0;
+    Clock::time_point routeCapturedAt{};
+    TransportStageTiming icePublishTiming;
+    AsyncControlSender::Snapshot finalControl;
 #ifdef FOG_STREAM_TESTING
-    bool controlBlocked = false;
+    struct ControlSendFixture {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool blocked = false;
+        void wait() {
+            std::unique_lock<std::mutex> lock(mutex);
+            condition.wait(lock, [this] { return !blocked; });
+        }
+    };
+    std::shared_ptr<ControlSendFixture> controlSendFixture = std::make_shared<ControlSendFixture>();
+    struct IceReadFixture {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool blocked = false;
+        unsigned stage = 0;
+        void wait(unsigned currentStage) {
+            std::unique_lock<std::mutex> lock(mutex);
+            condition.wait(lock, [this, currentStage] { return !blocked || stage != currentStage; });
+        }
+    };
+    std::shared_ptr<IceReadFixture> iceReadFixture = std::make_shared<IceReadFixture>();
 #endif
-    std::uint64_t controlNow() const { return videoNow() + controlTimeOffset; }
     std::vector<Json> pendingCandidates;
     std::vector<std::string> mids;
     protocol::Parser parser;
@@ -363,11 +407,11 @@ struct Client::Impl {
     SelectedRoute route;
     CandidateProofs remoteCandidateProofs;
     RouteSnapshotSchedule routeSnapshotSchedule;
-    TransportStageTiming pumpTiming, nackTiming, iceDiagnosticTiming, selectedPairTiming;
+    TransportStageTiming pumpTiming, nackTiming;
     TransportStageTiming receiveTiming, eventsTiming, qualityTiming, controlTiming, pliTiming, heartbeatTiming;
     std::string transportTimings() const {
-        return "scope=transport-lifetime nested=1" + pumpTiming.text("pump") + nackTiming.text("nack") +
-            iceDiagnosticTiming.text("iceDiag") + selectedPairTiming.text("icePair") + receiveTiming.text("receive") +
+        return "scope=transport-lifetime nested=1 iceThread=worker" + pumpTiming.text("pump") + nackTiming.text("nack") +
+            icePublishTiming.text("icePublish") + iceWorkerTimings() + receiveTiming.text("receive") +
             eventsTiming.text("events") + qualityTiming.text("quality") + controlTiming.text("controlFlush") +
             pliTiming.text("pli") + heartbeatTiming.text("heartbeat");
     }
@@ -375,81 +419,144 @@ struct Client::Impl {
         // Retain the last known enums for final diagnostics, but never authorize
         // required-TURN media/control from a pre-transition cached selection.
         routeCurrent = false;
+        if (iceWorker) iceWorker->invalidate();
+        if (controlSender && relay) controlSender->allow(false);
         if (relay) isReady = false;
         routeSnapshotSchedule.invalidate();
     }
     void addCandidateProof(rtc::Candidate candidate) {
         const auto before = remoteCandidateProofs.size();
         remoteCandidateProofs.add(std::move(candidate));
-        if (remoteCandidateProofs.size() != before) routeSnapshotSchedule.invalidate();
+        if (remoteCandidateProofs.size() != before) invalidateRoute();
     }
 #ifdef FOG_STREAM_TESTING
     bool routeOverride = false, testPairAvailable = true, testPairThrows = false, fixedRouteClock = false;
     std::uint64_t routeClock = 0;
     rtc::Candidate testLocal, testRemote;
 #endif
-    bool routeAllowed() const { return !relay || (routeCurrent && route.isTurn()); }
+    bool currentRoute() const {
+        return routeCurrent && iceWorker && routeRevision == iceWorker->state().revision &&
+            routeCapturedAt != Clock::time_point{} && Clock::now() - routeCapturedAt < std::chrono::milliseconds(RouteSnapshotSchedule::IntervalMs * 2);
+    }
+    bool routeAllowed() const { return !relay || (currentRoute() && route.isTurn()); }
     rtc::Candidate selectedLocal, selectedRemote;
     unsigned routeSelections = 0, routeEventDrops = 0;
     std::deque<std::string> routeEvents;
     std::string finalIceDiagnostics;
     rtc::DtlsDiagnostics finalDtlsDiagnostics;
     bool iceSnapshotAvailable = false;
-    Clock::time_point iceSnapshotAt{};
     std::string routeDiagnostics() const {
         return std::string(" requested=") + (relay ? "relay" : "all") + route.diagnostics() +
-            " iceSnapshotAvailable=" + std::to_string(iceSnapshotAvailable) + " localPolicy=all routeKnown=" + std::to_string(routeSelected) + " routeCurrent=" + std::to_string(routeCurrent) + " routeSnapshot=" + (running ? "live" : "final") +
-            " candidateProofs=" + std::to_string(remoteCandidateProofs.size()) + " candidateProofDrops=" + std::to_string(remoteCandidateProofs.dropped()) +
+            " iceSnapshotAvailable=" + std::to_string(iceSnapshotAvailable) + " localPolicy=all routeKnown=" + std::to_string(routeSelected) + " routeCurrent=" + std::to_string(currentRoute()) + " routeSnapshot=" + (running ? "live" : "final") +
+            iceWorkerDiagnostics() + " candidateProofs=" + std::to_string(remoteCandidateProofs.size()) + " candidateProofDrops=" + std::to_string(remoteCandidateProofs.dropped()) +
             " routeSelections=" + std::to_string(routeSelections) + " routeEventDrops=" + std::to_string(routeEventDrops);
     }
-    void snapshotIce(bool force = false) {
-        // Never acquire RTC transport locks while holding Shared::mutex:
-        // RTC callbacks can enter Shared while still owning a transport lock.
-        if (!peer) return;
-        const auto now = Clock::now();
-        if (force || iceSnapshotAt == Clock::time_point{} || now - iceSnapshotAt >= std::chrono::seconds(1)) {
-            iceSnapshotAt = now;
-            TransportStageScope timing{iceDiagnosticTiming};
-            try {
-                auto snapshot = peer->iceDiagnostics();
-                iceSnapshotAvailable = !snapshot.empty();
-                if (iceSnapshotAvailable) finalIceDiagnostics = std::move(snapshot);
-            } catch (...) {} // Diagnostic failure must not suppress route verification.
-        }
-        auto ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+    std::string iceWorkerTimings() const {
+        if (!iceWorker) return {};
+        const auto stats = iceWorker->state();
+        const auto text = [](const IceWorker::Timing& t, const char* tag) {
+            return TransportStageTiming{t.calls, t.totalUs, t.maxUs}.text(tag);
+        };
+        return text(stats.diagnostic, "iceDiag") + text(stats.pair, "icePair") + text(stats.schedule, "iceSchedule") + text(stats.wait, "iceWorkerIdle") + text(stats.work, "iceWork");
+    }
+    std::string iceWorkerDiagnostics() const {
+        if (!iceWorker) return " iceGeneration=0 iceInFlight=0 iceSnapshotAgeMs=-1";
+        const auto stats = iceWorker->state();
+        const auto age = routeCapturedAt == Clock::time_point{} ? -1LL :
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - routeCapturedAt).count());
+        return " iceGeneration=" + std::to_string(stats.revision) + " icePublishedGeneration=" + std::to_string(routeRevision) +
+            " iceInFlight=" + std::to_string(stats.active) + " iceInFlightMs=" + std::to_string(stats.activeMs) +
+            " icePending=" + std::to_string(stats.pending) + " iceRequested=" + std::to_string(stats.requested) +
+            " icePublishedSerial=" + std::to_string(publishedSerial) + " iceCompleted=" + std::to_string(stats.completed) + " iceDiscarded=" + std::to_string(stats.discarded) +
+            " iceSnapshotAgeMs=" + std::to_string(age) + " iceStopping=" + std::to_string(stats.stopping);
+    }
+    std::uint64_t routeNow() const {
 #ifdef FOG_STREAM_TESTING
-        if (fixedRouteClock) ms = routeClock;
+        if (fixedRouteClock) return routeClock;
 #endif
-        if (!routeSnapshotSchedule.due(ms, force)) return;
-        TransportStageScope timing{selectedPairTiming};
-        rtc::Candidate local, remote;
-        bool selectedPair = false;
-        try {
-#ifdef FOG_STREAM_TESTING
-            if (testPairThrows) throw std::runtime_error("Selected pair fixture failure");
-            if (routeOverride) {
-                selectedPair = testPairAvailable;
-                if (selectedPair) { local = testLocal; remote = testRemote; }
-            }
-            else
-#endif
-            selectedPair = peer->getSelectedCandidatePair(&local, &remote);
-        } catch (...) {
-            invalidateRoute();
-            routeSnapshotSchedule.failed(ms);
-            throw;
+        return videoNow();
+    }
+    void publishIce() {
+        TransportStageScope timing{icePublishTiming};
+        if (!iceWorker) return;
+        auto completed = iceWorker->take();
+        if (!completed || completed->revision != iceWorker->state().revision) return;
+        publishedSerial = completed->serial;
+        auto& value = completed->value;
+        iceSnapshotAvailable = !value.diagnostics.empty();
+        if (iceSnapshotAvailable) finalIceDiagnostics = std::move(value.diagnostics);
+        finalDtlsDiagnostics = value.dtls;
+        routeCapturedAt = completed->capturedAt; routeRevision = completed->revision;
+        routeCurrent = !value.pairFailed && value.pair;
+        {
+            TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
+            // Every completion replaces authorization, including no pair and
+            // exceptions from an ordinary periodic read of the same epoch.
+            shared->turnAuthorized = false;
+            shared->routeRevision = completed->revision; shared->routeCapturedAt = completed->capturedAt;
+            if (relay && controlSender) controlSender->allow(false);
         }
-        // No pair is a valid observation and must not cause polling every frame.
-        routeSnapshotSchedule.queried(ms);
-        routeCurrent = selectedPair;
-        if (!selectedPair) { if (relay) isReady = false; return; }
+        if (value.pairFailed) { routeSnapshotSchedule.failed(routeNow()); if (relay) isReady = false; return; }
+        // Re-read provenance only after the generation check. A delayed result
+        // can never bring a previous endpoint's authorization into a new epoch.
+        routeSnapshotSchedule.queried(routeNow());
+        if (!value.pair) { if (relay) isReady = false; return; }
+        const auto& local = value.local; const auto& remote = value.remote;
         const SelectedRoute selected{local.type(), remote.type(), local.transportType(), remote.transportType(), remoteCandidateProofs.find(remote)};
+        {
+            TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
+            shared->turnAuthorized = selected.isTurn();
+            shared->routeRevision = completed->revision; shared->routeCapturedAt = completed->capturedAt;
+        }
         if (routeSelected && selected == route && local == selectedLocal && remote == selectedRemote) return;
         selectedLocal = local; selectedRemote = remote;
         const bool first = !routeSelected;
         route = selected; routeSelected = true; ++routeSelections;
         if (routeEvents.size() >= 16) { routeEvents.pop_front(); ++routeEventDrops; }
         routeEvents.push_back(std::string("routeEvent=") + (first ? "selected" : "changed") + routeDiagnostics());
+    }
+    void snapshotIce() {
+        if (!peer || !iceWorker) return;
+        publishIce();
+        const auto ms = routeNow();
+        if (!routeSnapshotSchedule.due(ms)) return;
+        const auto transport = peer;
+#ifdef FOG_STREAM_TESTING
+        const auto fixture = iceReadFixture;
+        const auto override = routeOverride, available = testPairAvailable, throws = testPairThrows;
+        const auto testL = testLocal, testR = testRemote;
+#endif
+        const auto revision = iceWorker->state().revision;
+        if (iceWorker->request(revision, [transport
+#ifdef FOG_STREAM_TESTING
+            , fixture, override, available, throws, testL, testR
+#endif
+        ] {
+            IceData value;
+#ifdef FOG_STREAM_TESTING
+            fixture->wait(0);
+#endif
+            {
+                TransportStageScope timing{value.diagnosticTiming};
+                try { value.diagnostics = transport->iceDiagnostics(); } catch (...) {}
+            }
+            try { value.dtls = transport->getDtlsDiagnostics(); } catch (...) {}
+#ifdef FOG_STREAM_TESTING
+            fixture->wait(1);
+#endif
+            {
+                TransportStageScope timing{value.pairTiming};
+                try {
+#ifdef FOG_STREAM_TESTING
+                    if (throws) throw std::runtime_error("Selected pair fixture failure");
+                    if (override) { value.pair = available; value.local = testL; value.remote = testR; }
+                    else
+#endif
+                    value.pair = transport->getSelectedCandidatePair(&value.local, &value.remote);
+                } catch (...) { value.pairFailed = true; }
+            }
+            return value;
+        })) routeSnapshotSchedule.queried(ms);
     }
     fog::video::Settings videoSettings;
     VideoCodec selectedCodec = VideoCodec::H264;
@@ -527,8 +634,7 @@ struct Client::Impl {
             " hbOutMs=" + std::to_string(heartbeat.count()) + " hbInMs=" + std::to_string(incomingHeartbeat.count()) +
             " hbSent=" + std::to_string(heartbeatsSent) +
             " wsAgeMs=" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - lastWs).count()) +
-            " controlPending=" + std::to_string(controls.size()) +
-            " controlBytes=" + std::to_string(controls.bytes()) + " controlRejected=" + std::to_string(controls.rejected()) +
+            controlDiagnostics() +
             transportDiagnostics();
     }
     std::string transportDiagnostics() const {
@@ -557,32 +663,44 @@ struct Client::Impl {
                   {"content-type", "application/json"}, {"client-hash", clientHash}}, payload.dump());
         sendSignaling(frame);
     }
+    std::string controlDiagnostics() const {
+        const auto out = controlSender ? controlSender->snapshot() : finalControl;
+        return " controlPending=" + std::to_string(out.pending) + " controlBytes=" + std::to_string(out.bytes) +
+            " controlRejected=" + std::to_string(out.rejected) + " controlSent=" + std::to_string(out.sent) + " controlPongCoalesced=" + std::to_string(out.pongCoalesced) +
+            " controlAgeMs=" + std::to_string(out.ageMs) + " controlAgeMaxMs=" + std::to_string(out.ageMaxMs) +
+            " controlTransportActive=" + std::to_string(out.transportActive) + " controlInFlight=" + std::to_string(out.inFlight) + " controlInFlightMs=" + std::to_string(out.inFlightMs) +
+            " controlSendCalls=" + std::to_string(out.sendCalls) + " controlSendAvgUs=" +
+            std::to_string(out.sendCalls ? out.sendTotalUs / out.sendCalls : 0) + " controlSendMaxUs=" + std::to_string(out.sendMaxUs) +
+            " controlWorkerIdleCalls=" + std::to_string(out.waitCalls) + " controlWorkerIdleAvgUs=" +
+            std::to_string(out.waitCalls ? out.waitTotalUs / out.waitCalls : 0) + " controlWorkerIdleMaxUs=" + std::to_string(out.waitMaxUs);
+    }
     void flushControl() {
+        // Historical controlFlush stage now measures publication and health only;
+        // transport work is measured by controlSend* on the dedicated worker.
         TransportStageScope timing{controlTiming};
-        if (!channel || !channel->isOpen() || !routeAllowed()) return;
-        while (!controls.empty()) {
-#ifdef FOG_STREAM_TESTING
-            if (controlBlocked) break;
-#endif
-            if (channel->bufferedAmount() > 64 * 1024) break;
-            // false means accepted into libdatachannel's queue, not lost.
-            transportSend([&] { channel->send(controls.front().payload); }, "Control send failed");
-            controls.pop(controlNow());
+        if (!controlSender) return;
+        {
+            // Serialize authorization with callback invalidation. An event that
+            // revokes a route cannot be overwritten by an older allow(true).
+            TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
+            controlSender->allow(routeAllowed());
         }
-        if (controls.stalled(controlNow())) throw TransportError("Control channel stalled", true);
+        const auto out = controlSender->snapshot();
+        if (out.failure == AsyncControlSender::Failure::Transport) throw TransportError("Control send failed", true);
+        if (out.failure == AsyncControlSender::Failure::Unexpected) throw TransportError("Control sender failed");
+        // A stalled synchronous sender must reach rental termination before any
+        // cleanup join; retry cleanup could otherwise wait on the stalled call.
+        if (out.stalled) throw TransportError("Control channel stalled");
     }
     bool control(const std::string& payload, ControlQueue::Mode mode = ControlQueue::Mode::Ordered,
-                 const std::string& input = {}) {
-        if (!channel || !channel->isOpen() || !routeAllowed()) return false;
-        flushControl();
-        const bool accepted = controls.push(payload, mode, input, controlNow());
-        flushControl();
-        return accepted;
+                 const std::string& input = {}, const std::string& release = {}) {
+        if (!controlSender || !routeAllowed() || controlSender->snapshot().stalled) return false;
+        return controlSender->enqueue(payload, mode, input, release);
     }
     void openChannel() {
         if (closingForRetry || channelOpen || !channel || !channel->isOpen()) return;
         if (!routeAllowed()) {
-            if (routeCurrent && route.isDirect()) throw TransportError("TURN required but direct path selected");
+            if (currentRoute() && route.isDirect()) throw TransportError("TURN required but direct path selected");
             state = "Waiting for TURN route";
             return;
         }
@@ -590,14 +708,29 @@ struct Client::Impl {
         channelOpen = true;
         if (!isReady) state = "Waiting for video";
     }
+    std::string neutralControl() const noexcept {
+        try { if (channelOpen) return protocol::gamepad(Gamepad{}).dump(); } catch (...) {}
+        return {};
+    }
     void stop(bool notify) {
-        try { if (peer) finalDtlsDiagnostics = peer->getDtlsDiagnostics(); } catch (...) {}
-        try { snapshotIce(true); } catch (...) {} // Preserve ICE evidence before close/reset.
+        // Publish stop intent before querying any RTC locks. The worker drops
+        // pending old-generation states immediately, then releases held input.
+        if (controlSender) controlSender->requestStop(neutralControl());
+        if (rtcpWorker) rtcpWorker->requestStop();
+        // Cached evidence only: final diagnostics must not enter RTC locks.
+        if (iceWorker) { iceWorker->requestStop(); iceWorker->stop(); }
+        // Join outside callback/RTC locks, before closing channel/peer handles.
+        if (controlSender) {
+            controlSender->stop();
+            finalControl = controlSender->snapshot();
+        }
+        if (rtcpWorker) {
+            rtcpWorker->join();
+            finalRtcp = rtcpWorker->snapshot();
+        }
         // No shutdown exception can prevent release of the remaining transports.
         if (notify) {
             closingForRetry = false; // A rejected retry follows ordinary final-close notification.
-            try { if (channelOpen) control(protocol::gamepad(Gamepad{}).dump(), ControlQueue::Mode::Gamepad); }
-            catch (const std::exception&) { if (failure.empty()) failure = "Neutral control send failed"; }
             try { if (stompConnected && ws && ws->isOpen()) signal({{"id", "close"}}); }
             catch (const std::exception&) { if (failure.empty()) failure = "Close notification failed"; }
         }
@@ -645,7 +778,7 @@ struct Client::Impl {
             ws.reset();
         }
         shared.reset();
-        controls.clear(); pendingTransportFailure.clear(); decoderWaiting = false;
+        controlSender.reset(); rtcpWorker.reset(); pendingTransportFailure.clear(); decoderWaiting = false;
         pendingCandidates.clear(); mids.clear();
         state = failure.empty() ? "Closed" : "Failed";
         hash.clear(); clientHash.clear(); suffix.clear();
@@ -660,7 +793,42 @@ struct Client::Impl {
             else if (shared->eventOverflow) { reason = "Signaling/control event queue capacity exceeded"; mayRetry = false; }
             else if (shared->callbackFailure) { reason = "Stream callback failed"; mayRetry = false; }
         }
+        // Seal queued input before ICE's final-neutral allowance becomes
+        // visible. No ordinary press may start in the shutdown handoff gap.
+        if (controlSender)
+            controlSender->requestStop(mayRetry ? std::string{} : neutralControl(), !mayRetry);
+        if (rtcpWorker) {
+            rtcpWorker->requestStop();
+            if (mayRetry && !rtcpWorker->quiescent()) {
+                reason = "RTCP send in flight; ending rental before transport cleanup"; mayRetry = false;
+            }
+        }
+        if (iceWorker) {
+            iceWorker->requestStop();
+            if (mayRetry && iceWorker->state().active) {
+                reason = "ICE snapshot in flight; ending rental before transport cleanup"; mayRetry = false;
+            }
+        }
+        if (controlSender) {
+            // A completed failure may retry, but never join a still-running RTC
+            // call before the owner can dispatch its rental-stop request.
+            if (mayRetry && controlSender->snapshot().transportActive) {
+                reason = "Control operation blocked during transport failure"; mayRetry = false;
+            }
+        }
         if (failure.empty()) { failure = reason; retryableFailure = mayRetry; }
+        // Publish failure without waiting for an in-flight synchronous RTC send.
+        // The owner sees error() this frame and can dispatch rental termination
+        // before close()/retry joins the worker. Keep transport ownership intact
+        // until that explicit lifecycle boundary; callbacks cannot grow queues.
+        if (controlSender || iceWorker || rtcpWorker) {
+            if (shared) {
+                TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
+                shared->stopped = true;
+            }
+            running = false; isReady = false; state = "Failed";
+            return;
+        }
         // A recoverable transport loss must never send the remote close notification.
         stop(!retryableFailure);
     }
@@ -682,6 +850,14 @@ struct Client::Impl {
         if (closingForRetry) return;
         operation = "init.peer-create";
         peer = std::make_shared<rtc::PeerConnection>(config);
+        iceWorker = std::make_shared<IceWorker>();
+        rtcpWorker = std::make_shared<RtcpFeedbackWorker>();
+        rtcpWorker->start();
+        {
+            TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
+            shared->iceWorker = iceWorker; shared->relay = relay;
+            shared->rtcpWorker = rtcpWorker;
+        }
         invalidateRoute();
         const std::weak_ptr<Shared> weak(shared);
         peer->onLocalDescription([weak](rtc::Description description) {
@@ -721,11 +897,10 @@ struct Client::Impl {
                 dc->onError([weak](std::string) { callback(weak, [](Shared& st) {
                     Event e(EventType::Failure); e.text = "Control channel failed"; st.event(std::move(e));
                 }); });
-                const std::weak_ptr<rtc::DataChannel> weakChannel(dc);
-                dc->onMessage([weak, weakChannel](rtc::message_variant msg) {
-                    callback(weak, [&msg, &weakChannel](Shared& st) {
+                dc->onMessage([weak](rtc::message_variant msg) {
+                    callback(weak, [&msg](Shared& st) {
                         if (const auto text = std::get_if<std::string>(&msg))
-                            st.controlMessage(*text, weakChannel);
+                            st.controlMessage(*text);
                     });
                 });
                 Event e(EventType::Channel); e.channel = dc; s.event(std::move(e));
@@ -757,7 +932,17 @@ struct Client::Impl {
                     kind = Kind::Audio; depacketizer = std::make_shared<rtc::OpusRtpDepacketizer>();
                 } else return;
                 // incomingChain runs next first: RTCP sees original RTP before depacketization.
-                depacketizer->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
+                auto receiver = std::make_shared<rtc::RtcpReceivingSession>();
+                receiver->setDeferredReports(true);
+                std::shared_ptr<RtcpFeedbackWorker> feedback;
+                {
+                    TimedMutex::Guard lock(s.mutex, TimedMutex::Scope::Callback);
+                    if (s.stopped) return;
+                    feedback = s.rtcpWorker;
+                }
+                if (!feedback || !feedback->addSession(receiver))
+                    throw TransportError("RTCP receiver registration failed");
+                depacketizer->addToChain(receiver);
                 if (kind == Kind::Video) depacketizer->addToChain(std::make_shared<RtxRtpHandler>([weak](rtc::binary& packet, bool control) {
                     bool accepted = false;
                     callback(weak, [&packet, &accepted, control](Shared& st) { accepted = st.normalizeVideo(packet, control); });
@@ -948,6 +1133,51 @@ struct Client::Impl {
         case EventType::Channel:
             if (channel) throw TransportError("Duplicate control channel");
             channel = event.channel;
+            {
+                const auto dc = channel;
+                const std::weak_ptr<Shared> weak(shared);
+                controlSender = std::make_shared<AsyncControlSender>(
+                    [dc, weak] {
+                        {
+                            const auto s = weak.lock();
+                            if (!s) return false;
+                            TimedMutex::Guard lock(s->mutex, TimedMutex::Scope::Callback);
+                            if (s->relay) {
+                                if (!s->turnAuthorized || !s->iceWorker) return false;
+                                const auto ice = s->iceWorker->state();
+                                // A final neutral/release may use the last fresh
+                                // authorized route after sealing this worker.
+                                const bool same = s->routeRevision == ice.revision ||
+                                    (ice.stopping && s->routeRevision + 1 == ice.revision);
+                                if (!same || Clock::now() - s->routeCapturedAt >=
+                                    std::chrono::milliseconds(RouteSnapshotSchedule::IntervalMs * 2)) return false;
+                            }
+                        }
+                        return dc->isOpen() && dc->bufferedAmount() <= 64 * 1024;
+                    },
+                    [dc
+#ifdef FOG_STREAM_TESTING
+                     , fixture = controlSendFixture
+#endif
+                    ](const std::string& payload) {
+#ifdef FOG_STREAM_TESTING
+                        fixture->wait();
+#endif
+                        dc->send(payload);
+                    },
+                    [weak](bool sent) {
+                        callback(weak, [sent](Shared& s) {
+                            TimedMutex::Guard lock(s.mutex, TimedMutex::Scope::Callback);
+                            if (!s.stopped) { if (sent) s.incoming.pongSent(); else s.incoming.pongFailed(); }
+                        });
+                    });
+                TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
+                if (!shared->pendingPong.empty()) {
+                    controlSender->enqueue(std::move(shared->pendingPong), ControlQueue::Mode::Pong);
+                    shared->pendingPong.clear();
+                }
+                shared->controlSender = controlSender;
+            }
             break;
         case EventType::ChannelOpen:
             // Open only after this entire batch's ICE/provenance is verified.
@@ -1010,7 +1240,7 @@ void Client::failThenReceiveForTesting(const std::string& text, bool signaling) 
     if (signaling) {
         Impl::Event data(Impl::EventType::WsData); data.text = text;
         impl_->shared->event(std::move(data));
-    } else impl_->shared->controlMessage(text, impl_->channel);
+    } else impl_->shared->controlMessage(text);
 }
 void Client::setSelectedCandidatesForTesting(const std::string& local, const std::string& remote) {
     impl_->testLocal = rtc::Candidate(local); impl_->testRemote = rtc::Candidate(remote);
@@ -1019,16 +1249,16 @@ void Client::setSelectedCandidatesForTesting(const std::string& local, const std
     impl_->routeOverride = impl_->testPairAvailable = true;
     impl_->invalidateRoute();
 }
-void Client::clearSelectedCandidatesForTesting() {
+void Client::clearSelectedCandidatesForTesting(bool invalidate) {
     impl_->routeOverride = true; impl_->testPairAvailable = false;
-    impl_->invalidateRoute();
+    if (invalidate) impl_->invalidateRoute();
 }
 void Client::failSelectedPairForTesting(bool fail) {
     impl_->testPairThrows = fail;
     impl_->invalidateRoute();
 }
 void Client::setRouteSnapshotTimeForTesting(std::uint64_t now) {
-    impl_->fixedRouteClock = true; impl_->routeClock = now;
+    impl_->fixedRouteClock = now != 0; impl_->routeClock = now;
 }
 void Client::repeatIceStateForTesting() {
     Impl::Event event(Impl::EventType::IceState);
@@ -1048,8 +1278,22 @@ bool Client::selectedRemoteMatchesForTesting(const std::string& text) const {
     return impl_->routeSelected && candidate.address() == impl_->selectedRemote.address() &&
         candidate.port() == impl_->selectedRemote.port() && candidate.transportType() == impl_->selectedRemote.transportType();
 }
-void Client::blockControlForTesting(bool blocked) { impl_->controlBlocked = blocked; }
-void Client::advanceControlForTesting(unsigned milliseconds) { impl_->controlTimeOffset += milliseconds; }
+void Client::receiveControlForTesting(const std::string& text) {
+    if (impl_->shared) impl_->shared->controlMessage(text);
+}
+void Client::blockIceForTesting(bool blocked, unsigned stage) {
+    const auto fixture = impl_->iceReadFixture;
+    std::lock_guard<std::mutex> lock(fixture->mutex);
+    fixture->blocked = blocked; fixture->stage = stage; fixture->condition.notify_all();
+    if (blocked) impl_->invalidateRoute();
+}
+void Client::blockControlForTesting(bool blocked) { if (impl_->controlSender) impl_->controlSender->block(blocked); }
+void Client::blockControlSendForTesting(bool blocked) {
+    const auto fixture = impl_->controlSendFixture;
+    std::lock_guard<std::mutex> lock(fixture->mutex);
+    fixture->blocked = blocked; fixture->condition.notify_all();
+}
+void Client::advanceControlForTesting(unsigned milliseconds) { if (impl_->controlSender) impl_->controlSender->advance(milliseconds); }
 void Client::elapseForTesting(unsigned seconds) {
     const auto elapsed = std::chrono::seconds(seconds);
     auto& i = *impl_;
@@ -1178,7 +1422,7 @@ void Client::pump() {
         // New proof/state changes win over the unproven-route deadline, even
         // between periodic queries. Unknown pairs also obey the interval.
         try { i.snapshotIce(); } catch (...) {} // Failed query leaves required TURN gated.
-        if (i.relay && i.routeCurrent && i.route.isDirect())
+        if (i.relay && i.currentRoute() && i.route.isDirect())
             throw TransportError("TURN required but direct path selected");
         const auto routeNow = Clock::now();
         if (!i.routeAllowed()) {
@@ -1340,7 +1584,7 @@ void Client::observePlayback(const PlaybackObservation& observation) {
         } else i.autoQuality.sendFailed(now);
     } catch (const std::exception&) { i.autoQuality.sendFailed(now); }
 }
-bool Client::ready() const { return impl_->isReady; }
+bool Client::ready() const { return impl_->isReady && impl_->routeAllowed(); }
 std::string Client::status() const { return impl_->state; }
 std::string Client::error() const { return impl_->failure; }
 bool Client::retryableError() const { return !impl_->failure.empty() && impl_->retryableFailure; }
@@ -1352,22 +1596,55 @@ bool Client::disconnected() const {
 }
 bool Client::disconnectForRetry() {
     auto& i = *impl_;
-    if (!i.running || !i.shared) return i.failure.empty() || i.retryableFailure;
+    if (!i.running || !i.shared) {
+        if (!i.failure.empty() && !i.retryableFailure) return false;
+        if (i.shared) i.stop(false);
+        return true;
+    }
+    // Seal before inspecting activity: after this boundary no new probe/send or
+    // shutdown-neutral operation may start on a transport selected for retry.
+    if (i.controlSender) i.controlSender->requestStop({}, false);
+    if (i.iceWorker) i.iceWorker->requestStop();
+    if (i.rtcpWorker) i.rtcpWorker->requestStop();
     {
         TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
-        i.shared->stopped = true; // Atomic boundary: later callbacks belong to the old generation.
+        i.shared->stopped = true;
     }
     i.closingForRetry = true;
-    pump(); // Examine the frozen bounded batch before granting transport-only retry.
-    if (!i.running) return i.retryableFailure;
+    pump(); // Frozen terminal evidence still wins over transport-only recovery.
+    if (!i.running) {
+        if (i.retryableFailure) i.stop(false);
+        return i.retryableFailure;
+    }
+    if (i.rtcpWorker && !i.rtcpWorker->quiescent()) {
+        i.fail("RTCP send in flight; ending rental before transport cleanup");
+        return false; // HTTP rental stop precedes an uncancellable send join.
+    }
+    if (i.iceWorker && i.iceWorker->state().active) {
+        i.fail("ICE snapshot in flight; ending rental before transport cleanup");
+        return false; // Rental HTTP stop precedes the unavoidable close join.
+    }
+    if (i.controlSender) {
+        const auto sender = i.controlSender->snapshot();
+        if (sender.stalled || sender.transportActive) {
+            i.fail(sender.stalled ? "Control channel stalled" : "Control operation blocked during transport failure");
+            return false; // Owner dispatches rental stop BEFORE close/destructor.
+        }
+        if (sender.failure == AsyncControlSender::Failure::Unexpected) {
+            i.fail("Control sender failed"); return false;
+        }
+    }
     i.stop(false);
     return true;
 }
 std::string Client::diagnostics() const { return impl_->diagnostics(); }
 std::string Client::transportTimings() const { return impl_->transportTimings(); }
+std::string Client::rtcpDiagnostics() const {
+    return (impl_->rtcpWorker ? impl_->rtcpWorker->snapshot() : impl_->finalRtcp).text();
+}
 std::string Client::dtlsDiagnostics() const {
-    // Query RTC without Shared locked: SRTP callbacks acquire Shared themselves.
-    return dtlsDiagnosticText(impl_->peer ? impl_->peer->getDtlsDiagnostics() : impl_->finalDtlsDiagnostics);
+    // Worker-owned snapshot only; logging never enters RTC transport locks.
+    return dtlsDiagnosticText(impl_->finalDtlsDiagnostics);
 }
 
 std::string Client::mutexDiagnostics() const {
@@ -1450,7 +1727,7 @@ bool Client::sendControl(const std::string& json) {
     const auto data = Json::parse(json, nullptr, false);
     if (!data.is_object()) return false;
     auto mode = ControlQueue::Mode::Ordered;
-    std::string input;
+    std::string input, release;
     const auto id = data.find("id");
     if (id != data.end() && id->is_string()) {
         const auto& name = id->get_ref<const std::string&>();
@@ -1468,8 +1745,11 @@ bool Client::sendControl(const std::string& json) {
                 if (button != details->end() && button->is_number_integer()) input = "mouse:" + button->dump();
             }
         }
+        if (!input.empty() && (name == "keydown" || name == "mousedown")) {
+            auto up = data; up["id"] = name == "keydown" ? "keyup" : "mouseup"; release = up.dump();
+        }
     }
-    try { return impl_->control(json, mode, input); }
+    try { return impl_->control(json, mode, input, release); }
     catch (const TransportError& error) {
         // Public send may run before pump. Examine queued terminal signaling first.
         if (error.retryable) {
@@ -1478,7 +1758,10 @@ bool Client::sendControl(const std::string& json) {
         return false;
     } catch (const std::exception&) { impl_->fail("Control send failed"); return false; }
 }
-void Client::close() { if (impl_ && impl_->running) impl_->stop(true); }
+void Client::close() {
+    if (impl_ && (impl_->running || impl_->shared))
+        impl_->stop(impl_->failure.empty() || !impl_->retryableFailure);
+}
 void Client::cleanupRuntime() {
     auto cleanup = rtc::Cleanup();
     cleanup.wait();

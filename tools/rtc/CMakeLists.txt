@@ -109,6 +109,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(rtc-ice-diagnostics-test ice-diagnostics-test.cpp)
   target_compile_options(rtc-ice-diagnostics-test PRIVATE -UNDEBUG)
   target_link_libraries(rtc-ice-diagnostics-test PRIVATE datachannel-static)
+  target_include_directories(rtc-ice-diagnostics-test PRIVATE
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/libjuice/include")
+  target_link_options(rtc-ice-diagnostics-test PRIVATE -Wl,--wrap=juice_get_diagnostics)
   add_executable(rtc-dtls-queue-test dtls-queue-test.cpp)
   target_include_directories(rtc-dtls-queue-test PRIVATE
     "${RTC_ROOT}/third_party/rtc/libdatachannel/src"
@@ -118,4 +121,42 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(rtc-dtls-diagnostics-test dtls-diagnostics-test.cpp)
   target_compile_options(rtc-dtls-diagnostics-test PRIVATE -UNDEBUG)
   target_link_libraries(rtc-dtls-diagnostics-test PRIVATE datachannel-static)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(rtc-dtls-receive-test dtls-receive-test.cpp)
+  target_include_directories(rtc-dtls-receive-test PRIVATE
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/src"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/include/rtc"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/plog/include"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/libjuice/include"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/usrsctp/usrsctplib"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/libsrtp/include")
+  target_compile_definitions(rtc-dtls-receive-test PRIVATE USE_MBEDTLS=1)
+  target_compile_options(rtc-dtls-receive-test PRIVATE -UNDEBUG)
+  target_link_libraries(rtc-dtls-receive-test PRIVATE datachannel-static mbedtls)
+  add_executable(rtc-dtls-ingress-test dtls-ingress-test.cpp)
+  target_include_directories(rtc-dtls-ingress-test PRIVATE
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/src"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/include/rtc"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/plog/include"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/libjuice/include"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/usrsctp/usrsctplib"
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/libsrtp/include")
+  target_compile_definitions(rtc-dtls-ingress-test PRIVATE USE_MBEDTLS=1)
+  target_compile_options(rtc-dtls-ingress-test PRIVATE -UNDEBUG)
+  target_link_libraries(rtc-dtls-ingress-test PRIVATE datachannel-static mbedtls)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(rtc-media-send-diagnostics-test media-send-diagnostics-test.cpp)
+  target_compile_options(rtc-media-send-diagnostics-test PRIVATE -UNDEBUG)
+  target_link_libraries(rtc-media-send-diagnostics-test PRIVATE datachannel-static)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(rtc-rtcp-feedback-test rtcp-feedback-test.cpp)
+  target_compile_options(rtc-rtcp-feedback-test PRIVATE -UNDEBUG)
+  target_include_directories(rtc-rtcp-feedback-test PRIVATE "${RTC_ROOT}/src")
+  target_link_libraries(rtc-rtcp-feedback-test PRIVATE datachannel-static)
 endif()

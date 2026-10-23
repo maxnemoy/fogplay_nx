@@ -6,17 +6,17 @@
 #include <utility>
 
 namespace stream {
-// Application-thread outbox. Ordered input retains down/up order; reserve
+// Outbox, externally serialized by its owner. Ordered input retains down/up order; reserve
 // capacity for releases even when ordinary commands saturate the queue.
 class ControlQueue {
 public:
     enum class Mode { Ordered, Gamepad, MouseMove, Pong, Release };
-    struct Message { std::string payload, input; Mode mode; };
+    struct Message { std::string payload, input; Mode mode; std::uint64_t enqueuedMs = 0; std::string release; };
     static constexpr std::size_t MaxMessages = 64, ReleaseReserve = 16;
     static constexpr std::size_t MaxBytes = 256 * 1024, ReleaseBytes = 16 * 1024;
     static constexpr std::size_t GamepadBytes = 64 * 1024;
     static constexpr std::uint64_t StallMs = 15000;
-    bool push(std::string payload, Mode mode, std::string input, std::uint64_t now) {
+    bool push(std::string payload, Mode mode, std::string input, std::uint64_t now, std::string releasePayload = {}) {
         if (mode == Mode::Release && !input.empty()) {
             // Multiple best-effort releases for an already released key/button
             // need one entry, unless a newer press for that input intervened.
@@ -38,7 +38,7 @@ public:
         const bool gamepad = mode == Mode::Gamepad;
         const bool release = mode == Mode::Release;
         const auto retainedCount = queue_.size() - (replaced == queue_.end() ? 0 : 1);
-        const auto retainedBytes = bytes_ - (replaced == queue_.end() ? 0 : replaced->payload.size());
+        const auto retainedBytes = bytes_ - (replaced == queue_.end() ? 0 : (replaced->payload.size() + replaced->release.size()));
         std::size_t stateBytes = 0, stateCount = 0;
         for (auto it = queue_.begin(); it != queue_.end(); ++it)
             if (it != replaced && it->mode == Mode::Gamepad) {
@@ -51,25 +51,28 @@ public:
         const auto byteLimit = gamepad ? MaxBytes :
             MaxBytes - GamepadBytes + stateBytes - (release ? 0 : ReleaseBytes);
         if ((gamepad && payload.size() > GamepadBytes) || retainedCount >= countLimit ||
-            payload.size() > byteLimit - std::min(retainedBytes, byteLimit)) {
+            payload.size() + releasePayload.size() > byteLimit - std::min(retainedBytes, byteLimit)) {
             ++rejected_; return false;
         }
         // Admit replacements before removing the previous state: rejected
         // oversize updates must leave the last accepted state deliverable.
         if (replaced != queue_.end()) queue_.erase(replaced);
         if (!pending_) { pending_ = true; began_ = now; }
-        bytes_ = retainedBytes + payload.size();
-        queue_.push_back({std::move(payload), std::move(input), mode});
+        bytes_ = retainedBytes + payload.size() + releasePayload.size();
+        queue_.push_back({std::move(payload), std::move(input), mode, now, std::move(releasePayload)});
         return true;
     }
     bool empty() const { return queue_.empty(); }
     const Message& front() const { return queue_.front(); }
     void pop(std::uint64_t now) {
-        bytes_ -= queue_.front().payload.size(); queue_.pop_front();
+        bytes_ -= queue_.front().payload.size() + queue_.front().release.size(); queue_.pop_front();
         // Sending is progress even while more messages remain. Coalescing or
         // admitting new messages alone must never extend this stall deadline.
         if (queue_.empty()) pending_ = false;
         else began_ = std::max(began_, now);
+    }
+    void progress(std::uint64_t now) {
+        if (pending_) began_ = std::max(began_, now);
     }
     bool stalled(std::uint64_t now) const { return pending_ && now >= began_ && now - began_ >= StallMs; }
     std::size_t size() const { return queue_.size(); }

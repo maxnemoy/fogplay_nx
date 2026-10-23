@@ -38,7 +38,7 @@ if [ "$PLATFORM" = host ]; then
   LOG="$ROOT/work/rtc/loopback-run.log"
   timeout 25 "$BUILD/rtc-host-loopback" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/udp-budget-build.log"
-  cmake --build "$BUILD" --target rtc-udp-budget-test rtc-ice-diagnostics-test rtc-dtls-queue-test rtc-dtls-diagnostics-test -j "${JOBS:-8}" > "$LOG" 2>&1
+  cmake --build "$BUILD" --target rtc-udp-budget-test rtc-ice-diagnostics-test rtc-dtls-queue-test rtc-dtls-diagnostics-test rtc-dtls-receive-test rtc-dtls-ingress-test rtc-media-send-diagnostics-test rtc-rtcp-feedback-test -j "${JOBS:-8}" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/udp-budget-run.log"
   timeout 10 "$BUILD/rtc-udp-budget-test" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/ice-diagnostics-run.log"
@@ -47,6 +47,14 @@ if [ "$PLATFORM" = host ]; then
   timeout 10 "$BUILD/rtc-dtls-queue-test" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/dtls-diagnostics-run.log"
   timeout 25 "$BUILD/rtc-dtls-diagnostics-test" > "$LOG" 2>&1
+  LOG="$ROOT/work/rtc/dtls-receive-run.log"
+  timeout 15 "$BUILD/rtc-dtls-receive-test" > "$LOG" 2>&1
+  LOG="$ROOT/work/rtc/dtls-ingress-run.log"
+  timeout 20 "$BUILD/rtc-dtls-ingress-test" > "$LOG" 2>&1
+  LOG="$ROOT/work/rtc/media-send-diagnostics-run.log"
+  timeout 20 "$BUILD/rtc-media-send-diagnostics-test" > "$LOG" 2>&1
+  LOG="$ROOT/work/rtc/rtcp-feedback-run.log"
+  timeout 20 "$BUILD/rtc-rtcp-feedback-test" > "$LOG" 2>&1
 else
   LOG="$ROOT/work/rtc/undefined-switch.txt"
   "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm" -u "$BUILD/rtc-link-smoke.elf" > "$LOG"

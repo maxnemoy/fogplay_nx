@@ -52,3 +52,5 @@ g++ -std=c++17 -Wall -Wextra -Werror -Isrc -Ithird_party \
 ./work/rental_service_tests | tee work/logs/rental-service-tests.log
 
 bash tools/test/connection-settings.sh
+
+python3 tests/rental_stop_dispatch_tests.py | tee work/logs/rental-stop-dispatch-tests.log

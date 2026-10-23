@@ -29,7 +29,8 @@ struct Gamepad {
     float rightTrigger = 0;
     float leftTrigger = 0;
 };
-// Single application-thread controller. Callbacks store bounded data and answer pings.
+// Application-thread controller. Callbacks store bounded data; a serialized worker
+// sends input and pongs. Public enqueue/pump calls never send data-channel traffic.
 // Call pump every frame, then drain poll. The owner chooses bounded transport retry or session finish after an error.
 class Client {
 public:
@@ -68,6 +69,7 @@ public:
     std::string queueDiagnostics() const;
     std::string mutexDiagnostics() const;
     std::string dtlsDiagnostics() const;
+    std::string rtcpDiagnostics() const;
     bool pollVideoDiagnostic(std::string& event);
     bool waitingForVideoKeyframe() const;
     bool requestVideoKeyframe(); // Best effort PLI on open video tracks; no transport reset.
@@ -90,13 +92,16 @@ public:
     // Deterministic event ordering fixture; no network/service injection in production.
     void failThenReceiveForTesting(const std::string& text, bool signaling);
     void setSelectedCandidatesForTesting(const std::string& local, const std::string& remote);
-    void clearSelectedCandidatesForTesting();
+    void clearSelectedCandidatesForTesting(bool invalidate = true);
     void failSelectedPairForTesting(bool fail);
     void setRouteSnapshotTimeForTesting(std::uint64_t now);
     void repeatIceStateForTesting();
     void addCandidateProofForTesting(const std::string& candidate);
     bool selectedRemoteMatchesForTesting(const std::string& candidate) const;
+    void receiveControlForTesting(const std::string& text);
+    void blockIceForTesting(bool blocked, unsigned stage = 0);
     void blockControlForTesting(bool blocked);
+    void blockControlSendForTesting(bool blocked);
     void advanceControlForTesting(unsigned milliseconds);
 #endif
 private:

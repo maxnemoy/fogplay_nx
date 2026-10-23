@@ -5,6 +5,14 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <juice/juice.h>
+
+static std::atomic<unsigned> iceSamples{0};
+extern "C" int __real_juice_get_diagnostics(juice_agent_t *, juice_diagnostics_t *);
+extern "C" int __wrap_juice_get_diagnostics(juice_agent_t *agent, juice_diagnostics_t *out) {
+    ++iceSamples;
+    return __real_juice_get_diagnostics(agent, out);
+}
 
 int main() {
     rtc::InitLogger(rtc::LogLevel::Warning);
@@ -12,6 +20,24 @@ int main() {
     config.bindAddress = "127.0.0.1";
     config.iceServers.clear();
     config.enableIceTcp = false;
+    {
+        rtc::PeerConnection peer(config);
+        (void)peer.createOffer(); // ICE only: closeTransports is synchronous.
+        const auto snapshot = peer.iceDiagnostics();
+        assert(!snapshot.empty());
+        const auto samples = iceSamples.load();
+        peer.close();
+        assert(peer.state() == rtc::PeerConnection::State::Closed);
+        assert(iceSamples.load() == samples); // close must not sample live ICE
+        for (int i = 0; i < 1000; ++i) assert(peer.iceDiagnostics() == snapshot);
+        assert(iceSamples.load() == samples); // final snapshot comes from cache
+
+        rtc::PeerConnection neverSampled(config);
+        (void)neverSampled.createOffer();
+        neverSampled.close();
+        assert(neverSampled.iceDiagnostics().empty());
+        assert(iceSamples.load() == samples);
+    }
     {
         rtc::PeerConnection peer(config);
         assert(peer.iceDiagnostics().empty());
@@ -47,6 +73,6 @@ int main() {
     assert(cleanup.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
     rtc::JoinCleanupThreads();
     cleanup.get();
-    std::puts("Public ICE diagnostics: empty before ICE, sanitized live fields, concurrent close retention, per-peer isolation PASS");
+    std::puts("Public ICE diagnostics: zero fresh ICE queries on close, last explicit sample retained, empty before sampling, sanitized live fields, concurrent close retention, per-peer isolation PASS");
 }
 

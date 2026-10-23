@@ -472,3 +472,9 @@ patch_literal(tls, 'int TlsTransport::ReadCallback(void *ctx, unsigned char *buf
 import runpy
 runpy.run_path(str(root / 'tools/rtc/patch-ice-diagnostics.py'), run_name='__main__')
 runpy.run_path(str(root / 'tools/rtc/patch-dtls-diagnostics.py'), run_name='__main__')
+
+runpy.run_path(str(root / 'tools/rtc/patch-dtls-receive.py'), run_name='__main__')
+runpy.run_path(str(root / 'tools/rtc/patch-dtls-ingress.py'), run_name='__main__')
+
+runpy.run_path(str(root / 'tools/rtc/patch-rtcp-feedback.py'), run_name='__main__')
+runpy.run_path(str(root / 'tools/rtc/patch-media-send-diagnostics.py'), run_name='__main__')

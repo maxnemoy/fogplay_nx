@@ -18,6 +18,12 @@ void ApplicationController::shutdownSession() noexcept {
     if (shutdownDone_) return;
     shutdownDone_ = true;
     diagnostic("Application shutdown: checking owned rental cleanup.");
+    // Dispatch the owned rental stop before transport shutdown can wait for an
+    // in-flight control send. Its worker uses checkout/guard, not the transport.
+    if (sessionPending_ && !pending_.valid()) {
+        try { beginFinish("application-shutdown"); }
+        catch (...) { diagnostic("Shutdown stop dispatch failed; recovery records retained."); }
+    }
     closeStream();
     // Join any owner of checkout/guard before inspecting them. Do not permanently
     // cancel API requests yet: an unresolved order can still need its hash polled.
@@ -198,21 +204,28 @@ void ApplicationController::connectSession() {
 void ApplicationController::beginFinish(const char* reason) {
     if (pending_.valid() || !sessionPending_) return;
     diagnostic("Rental stop begin; reason=" + std::string(reason) + " screen=" + std::to_string(static_cast<int>(screen_)));
-    closeStream();
     stopAfterTask_ = true;
-    if (checkout_.unresolved()) {
-        screen_ = Screen::Checkout;
-        start(Task::CheckoutStop,[this] { checkout_.stop(); return Json::object(); });
-        checkoutStatus_ = status_ = "Запрашиваем завершение аренды…";
-        return;
+    // The server stop must not wait for a synchronous RTC send already in flight.
+    // Join the transport only after the independent rental owner has started.
+    try {
+        if (checkout_.unresolved()) {
+            screen_ = Screen::Checkout;
+            start(Task::CheckoutStop,[this] { checkout_.stop(); return Json::object(); });
+            checkoutStatus_ = status_ = "Запрашиваем завершение аренды…";
+        } else {
+            screen_ = Screen::Stopping;
+            retryAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
+            start(Task::Finish, [this] {
+                const auto result = guard_.finishAttempt();
+                return Json{{"terminated",result.terminated},{"cleared",result.journalCleared},{"message",result.message}};
+            });
+            status_ = "Завершаем аренду на сервере. Ждём подтверждение.";
+        }
+    } catch (...) {
+        closeStream();
+        throw;
     }
-    screen_ = Screen::Stopping;
-    retryAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
-    start(Task::Finish, [this] {
-        const auto result = guard_.finishAttempt();
-        return Json{{"terminated",result.terminated},{"cleared",result.journalCleared},{"message",result.message}};
-    });
-    status_ = "Завершаем аренду на сервере. Ждём подтверждение.";
+    closeStream();
 }
 
 }

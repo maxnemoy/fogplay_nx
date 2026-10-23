@@ -11,8 +11,9 @@ public:
         return force || !sampled_ || now < last_ || now - last_ >= IntervalMs || (dirty_ && !failed_);
     }
     void invalidate() { dirty_ = true; failed_ = false; }
-    // Only after the pair API returns (including a successful no-pair result).
-    // An exception must not consume pending lifecycle/provenance invalidation.
+    // Bound accepted async dispatches as well as completed no-pair reads.
+    // A failed completion calls failed(); new lifecycle/proof events invalidate
+    // both the schedule and the worker epoch, so a stale result cannot clear it.
     void queried(std::uint64_t now) { last_ = now; sampled_ = true; dirty_ = failed_ = false; }
     // Keep invalidation pending after an exception, but bound retries unless a
     // new event/proof arrives. The caller keeps the previous route unauthorized.

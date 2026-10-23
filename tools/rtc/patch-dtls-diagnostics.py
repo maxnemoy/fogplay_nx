@@ -8,6 +8,8 @@ def apply(root):
     def replace(name, old, new, count=1):
         path = rtc / name
         source = path.read_text()
+        if name == 'src/impl/dtlstransport.cpp' and old == 'void DtlsTransport::enqueueRecv() {' and 'DtlsDiagnostics DtlsTransport::getDtlsDiagnostics() const {' in source:
+            return
         if new in source:
             return
         if source.count(old) != count:
@@ -39,11 +41,23 @@ struct DtlsDiagnostics {
     uint64_t fullPushWaitCount = 0, fullPushWaitTotalUs = 0, fullPushWaitMaxUs = 0;
     uint64_t recvRuns = 0, recvScheduleCount = 0;
     // Immediate enqueueRecv tasks only: submission to receiver lock acquisition.
-    // Includes thread-pool and receiver-lock contention; excludes handshake timers.
+    // Includes thread-pool and receiver-lock contention. For mbedTLS, timer
+    // wakeups also submit coalesced receive tasks and are included.
     uint64_t recvScheduleWaitTotalUs = 0, recvScheduleWaitMaxUs = 0;
     // Completed doRecv calls: after receiver lock acquisition to return, including
     // synchronous demux/application callbacks. Average = total / recvRuns.
     uint64_t recvProcessingTotalUs = 0, recvProcessingMaxUs = 0;
+    // mbedTLS only: completed lock acquisitions around application writes and
+    // receiver TLS calls/staging (handshake key derivation included). Callback
+    // delivery and SRTP decryption are excluded. Average = total / lock count.
+    uint64_t sendSslLockCount = 0, sendSslLockWaitTotalUs = 0, sendSslLockWaitMaxUs = 0;
+    uint64_t sendSslLockHoldTotalUs = 0, sendSslLockHoldMaxUs = 0;
+    uint64_t recvSslLockCount = 0, recvSslLockWaitTotalUs = 0, recvSslLockWaitMaxUs = 0;
+    uint64_t recvSslLockHoldTotalUs = 0, recvSslLockHoldMaxUs = 0;
+    // Completed receive batches: datagrams popped, maximum per batch, and
+    // explicit fairness continuations (64 work units or 2 ms; one callback
+    // itself can overrun the time budget). TLS buffered records also continue.
+    uint64_t recvBatchPacketsTotal = 0, recvBatchPacketsMax = 0, recvBatchYields = 0;
 };
 
 } // namespace rtc
@@ -204,6 +218,19 @@ string PeerConnection::iceDiagnostics() const {''')
 \tresult.recvScheduleWaitMaxUs = mRecvDiagnostics.recvScheduleWaitMaxUs;
 \tresult.recvProcessingTotalUs = mRecvDiagnostics.recvProcessingTotalUs;
 \tresult.recvProcessingMaxUs = mRecvDiagnostics.recvProcessingMaxUs;
+\tresult.sendSslLockCount = mRecvDiagnostics.sendSslLockCount;
+\tresult.sendSslLockWaitTotalUs = mRecvDiagnostics.sendSslLockWaitTotalUs;
+\tresult.sendSslLockWaitMaxUs = mRecvDiagnostics.sendSslLockWaitMaxUs;
+\tresult.sendSslLockHoldTotalUs = mRecvDiagnostics.sendSslLockHoldTotalUs;
+\tresult.sendSslLockHoldMaxUs = mRecvDiagnostics.sendSslLockHoldMaxUs;
+\tresult.recvSslLockCount = mRecvDiagnostics.recvSslLockCount;
+\tresult.recvSslLockWaitTotalUs = mRecvDiagnostics.recvSslLockWaitTotalUs;
+\tresult.recvSslLockWaitMaxUs = mRecvDiagnostics.recvSslLockWaitMaxUs;
+\tresult.recvSslLockHoldTotalUs = mRecvDiagnostics.recvSslLockHoldTotalUs;
+\tresult.recvSslLockHoldMaxUs = mRecvDiagnostics.recvSslLockHoldMaxUs;
+\tresult.recvBatchPacketsTotal = mRecvDiagnostics.recvBatchPacketsTotal;
+\tresult.recvBatchPacketsMax = mRecvDiagnostics.recvBatchPacketsMax;
+\tresult.recvBatchYields = mRecvDiagnostics.recvBatchYields;
 \treturn result;
 }
 

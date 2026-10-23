@@ -171,7 +171,7 @@ void ApplicationController::draw() {
         ui_.history(cards,selection_,selection_/fog::ui::HistoryColumns*fog::ui::HistoryColumns);
         if (cards.empty() && !pending_.valid()) ui_.empty("Сессий пока нет", "Здесь появится история ваших игровых сессий.");
     } else if (screen_ == Screen::Settings) {
-        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Подключение",fog::connection::label(connectionSettings_),"Выбор пути: обычный, авто или через TURN"},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.4.25","Удалить сохранённый вход с SD-карты"}},selection_);
+        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Подключение",fog::connection::label(connectionSettings_),"Выбор пути: обычный, авто или через TURN"},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.4.28","Удалить сохранённый вход с SD-карты"}},selection_);
     } else if (screen_ == Screen::ImageSettings) {
         drawImageSettings();
     } else if (screen_ == Screen::ConnectionSettings) {
