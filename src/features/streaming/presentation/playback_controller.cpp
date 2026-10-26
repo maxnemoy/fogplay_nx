@@ -127,7 +127,10 @@ bool ApplicationController::startTransport() {
     loopTiming_.resetPresentationCounter();
     videoWorkUs_ = videoDecodeErrors_ = lastVideoGeneration_ = 0;
     media_ = std::make_unique<fog::Media>(rt_.renderer,stream::VideoCodec::H264,true);
-    stream_ = services_->stream();
+    auto* provider = providerServices(streamRental_.provider);
+    if (!provider) throw std::runtime_error("Stream provider unavailable; stopping rental");
+    stream_ = provider->stream();
+    if (!stream_) throw std::runtime_error("Stream transport unavailable; stopping rental");
     if (!stream_->configurePlayStation(streamPlayStation_))
         throw std::runtime_error("Invalid controller configuration; stopping rental");
     if (streamPlayStation_) {
@@ -137,12 +140,18 @@ bool ApplicationController::startTransport() {
         diagnostic("PS touch reset: pending both contacts UP for new transport");
     }
     diagnostic(std::string("Controller mode: ") + (streamPlayStation_ ? "PlayStation (isPS=1); native gamepad_touch/gamepad_sensor enabled; tap=button17; ack=unavailable" : "standard (isPS=0)"));
-    if (!stream_->configureRelay(relaySelection_.relay()))
+    const bool rtcTransport = streamRental_.provider == fog::ProviderId::Mts;
+    if (!stream_->configureRelay(rtcTransport && relaySelection_.relay()))
         throw std::runtime_error("Invalid connection configuration; stopping rental");
-    diagnostic(std::string("Transport ICE policy: ") + (relaySelection_.relay() ? "relay" : "all"));
-    if (!stream_->configureVideo(videoSettings_))
+    diagnostic(rtcTransport ? std::string("Transport ICE policy: ") + (relaySelection_.relay() ? "relay" : "all") : "Moonlight direct transport; RTC relay policy unavailable");
+    auto streamSettings = videoSettings_;
+    if (!rtcTransport) {
+        streamSettings.codec = stream::VideoCodec::H264;
+        streamSettings.quality = 0; streamSettings.keyframeSeconds = 0;
+    }
+    if (!stream_->configureVideo(streamSettings))
         throw std::runtime_error("Invalid video configuration; stopping rental");
-    overlay_.setVideoSettings(videoSettings_);
+    overlay_.setVideoSettings(streamSettings);
     overlay_.setSaveStatus(videoSaveStatus_);
     lastStreamState_.clear(); lastStreamDiagnostics_.clear();
     const bool started = stream_->start({streamRental_});
@@ -151,6 +160,8 @@ bool ApplicationController::startTransport() {
 }
 
 void ApplicationController::retryTransport(const char* reason) {
+    // FH has no verified same-rental reconnect endpoint. Never re-launch or re-pair a paid PC on transport failure.
+    if (streamRental_.provider == fog::ProviderId::FogHub) { beginFinish("paired-transport-failed"); return; }
     const bool wasRelay = relaySelection_.relay();
     if (relaySelection_.broken(std::chrono::steady_clock::now()))
         diagnostic("Transport break recorded; recentBreaks=" + std::to_string(relaySelection_.breaks()));
@@ -309,6 +320,9 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             else beginFinish("transport-fatal");
             return;
         }
+        if (stream_->disconnected() && streamRental_.provider == fog::ProviderId::FogHub) {
+            beginFinish("paired-transport-disconnected"); return;
+        }
         if (stream_->disconnected() && !transportReconnect_.recovering()) {
             transportReconnect_.disconnected(pumpAt);
             suspendVideoInput();
@@ -360,7 +374,10 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     const auto decoderResetBeforeUs = decoderResetTiming_.totalUs;
     const auto drainStarted = std::chrono::steady_clock::now();
     const auto queuedBeforeDrain = stream_->queuedVideoPackets();
-    fog::stream::PlaybackDrainBudget drainBudget(queuedBeforeDrain, stream_->queuedVideoAgeMs());
+    const auto drainPolicy = streamRental_.provider == fog::ProviderId::FogHub
+        ? fog::stream::PlaybackDrainPolicy::BoundedQueue
+        : fog::stream::PlaybackDrainPolicy::PresentationFirst;
+    fog::stream::PlaybackDrainBudget drainBudget(queuedBeforeDrain, stream_->queuedVideoAgeMs(), drainPolicy);
     if (drainBudget.catchup()) ++catchupWindows_;
     // Keep compressed references in FIFO order. Bound both work time and the
     // number of video frames before input, presentation, and audio get a turn.
@@ -441,11 +458,12 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             throw std::runtime_error("Video recovery deadline reached; stopping rental");
         lastVideo_ = std::chrono::steady_clock::now();
         rememberDecodedGame();
+        // Startup also waits for the decoder's first image, without a recovery episode.
+        stream_->setDecoderWaitingForKeyframe(false);
         if (videoRecovery_.active()) {
             diagnostic("Video recovery succeeded; frames=" + std::to_string(media_->videoFrames()) +
                 " width=" + std::to_string(media_->videoWidth()) + " height=" + std::to_string(media_->videoHeight()));
             videoRecovery_.decoded();
-            stream_->setDecoderWaitingForKeyframe(false);
         }
         if (transportReconnect_.recovering() && stream_->ready() && !stream_->disconnected() &&
             transportReconnect_.prepared(std::chrono::steady_clock::now())) {
@@ -489,7 +507,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     }
     // Presentation counts come from the preceding completed RenderPresent, never
     // repeated drawing of an old texture or decoding alone.
-    stream_->observePlayback({media_->presentedFrames(), media_->videoFrames(), media_->supersededFrames(),
+    if (streamRental_.provider == fog::ProviderId::Mts) stream_->observePlayback({media_->presentedFrames(), media_->videoFrames(), media_->supersededFrames(),
         videoWorkUs_, videoDecodeErrors_, media_->audioUnderruns(), media_->audioQueueResets(),
         transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe(),
         media_->videoWidth(), media_->videoHeight()});

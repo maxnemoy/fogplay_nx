@@ -35,6 +35,8 @@ std::vector<Computer> playStationComputerPlaceholders() {
 struct FakeRepository;
 std::function<std::vector<Computer>(FakeRepository&,const CatalogProgress&,const CatalogCancellation&)> loader;
 struct FakeRepository final : CatalogRepository {
+    bool featured=false;
+    explicit FakeRepository(bool secondary=false) : featured(secondary) {}
     std::atomic_bool wasCancelled{false};
     Page<Game> games(const GameQuery&) override {return {};}
     Game game(const EntityId&) override {return {};}
@@ -46,7 +48,8 @@ struct FakeRepository final : CatalogRepository {
     void cancel() noexcept override {wasCancelled=true;}
 };
 struct FakeServices {
-    std::shared_ptr<CatalogRepository> publicCatalog() {return std::make_shared<FakeRepository>();}
+    bool featured=false;
+    std::shared_ptr<CatalogRepository> publicCatalog() {return std::make_shared<FakeRepository>(featured);}
 };
 }
 std::string safeText(const std::string& value) {return value;}
@@ -65,6 +68,8 @@ struct ApplicationController {
     std::chrono::steady_clock::time_point playStationLoadedAt_{};
     std::string playStationError_,status_;
     std::future<std::vector<fog::Computer>> playStationPending_;
+    fog::FakeServices* pairedServices_ = nullptr;
+    std::shared_ptr<fog::CatalogRepository> featuredRepository_;
     std::shared_ptr<fog::CatalogRepository> playStationRepository_;
     std::shared_ptr<fog::PlayStationCatalogProgressChannel> playStationUpdates_;
     void loadPlayStation();
@@ -79,6 +84,29 @@ harness += r'''
 int main() {
     using fogplay::ApplicationController;
     using fogplay::Screen;
+    for(int failureCase=0;failureCase<4;++failureCase) {
+        std::promise<void> featuredPublished, releasePrimary;
+        auto gate=releasePrimary.get_future().share();
+        fog::loader=[&,gate](fog::FakeRepository& repository,const fog::CatalogProgress& progress,const fog::CatalogCancellation&) {
+            if(repository.featured) {
+                if(failureCase&1) { featuredPublished.set_value(); throw std::runtime_error("FH outage"); }
+                fog::Computer pc;pc.id={fog::ProviderId::FogHub,"1838"};pc.name="f4bX8";pc.listed=pc.launchable=true;
+                std::vector<fog::Computer> cards{pc}; progress(cards);featuredPublished.set_value();return cards;
+            }
+            gate.wait();
+            if(failureCase&2) throw std::runtime_error("MTS outage");
+            return fog::playStationComputerPlaceholders();
+        };
+        fog::FakeServices featureService; featureService.featured=true;
+        ApplicationController app; app.pairedServices_=&featureService;app.loadPlayStation();featuredPublished.get_future().wait();
+        app.pollPlayStation();
+        if(!(failureCase&1)) assert(app.playStationComputers_.size()==8 && app.playStationComputers_.back().id.provider==fog::ProviderId::FogHub);
+        assert(app.playStationPending_.valid()); // FH progress arrives without waiting for MTS.
+        releasePrimary.set_value();app.playStationPending_.wait();app.pollPlayStation();
+        if(failureCase==3) assert(!app.playStationError_.empty() && app.playStationLoadedAt_==std::chrono::steady_clock::time_point{});
+        else assert(app.playStationError_.empty() && app.playStationLoadedAt_!=std::chrono::steady_clock::time_point{});
+        if(failureCase==1) assert(app.playStationComputers_.size()==7); // FH outage cannot block MTS checkout.
+    }
     for(int scenario=0;scenario<5;++scenario) {
         std::promise<void> published,finish;
         auto finishGate=finish.get_future().share();
@@ -131,7 +159,7 @@ int main() {
         {ApplicationController app;app.loadPlayStation();weak=app.playStationUpdates_;started.get_future().wait();}
         assert(weak.expired());
     }
-    std::cout<<"PlayStation actual coordinator: immediate placeholders, independent progress, selected ID, offscreen/checkout isolation, cancellation, failure and shutdown join PASS\n";
+    std::cout<<"PlayStation actual coordinator: immediate placeholders, independent MTS/FH progress and failure isolation, selected ID, offscreen/checkout isolation, cancellation, failure and shutdown join PASS\n";
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fog-playstation-progress-') as directory:

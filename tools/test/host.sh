@@ -54,3 +54,13 @@ g++ -std=c++17 -Wall -Wextra -Werror -Isrc -Ithird_party \
 bash tools/test/connection-settings.sh
 
 python3 tests/rental_stop_dispatch_tests.py | tee work/logs/rental-stop-dispatch-tests.log
+
+python3 tests/startup_recovery_order_tests.py | tee work/logs/startup-recovery-order-tests.log
+
+python3 tests/authentication_glue_tests.py | tee work/logs/authentication-glue-tests.log
+
+python3 tests/software_keyboard_tests.py | tee work/logs/software-keyboard-tests.log
+
+python3 tests/playback_decoder_waiting_tests.py | tee work/logs/playback-decoder-waiting-tests.log
+
+python3 tests/moonlight_video_queue_tests.py | tee work/logs/moonlight-video-queue-tests.log

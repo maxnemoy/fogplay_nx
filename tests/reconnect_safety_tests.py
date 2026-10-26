@@ -57,3 +57,11 @@ assert shutdown.index('beginFinish(') < shutdown.index('closeStream();')
 assert 'if (sessionPending_ && !stopAfterTask_ && !focused)' in app
 assert 'beginFinish("focus-lost")' in app and 'beginFinish("application-exit")' in app
 print('Same-rental reconnect application safety boundaries passed (static only)')
+
+# FH transport failures always dispatch the website close; no RTC retry/relay state is entered.
+retry = method(playback, 'retryTransport')
+assert retry.index('streamRental_.provider == fog::ProviderId::FogHub') < retry.index('relaySelection_.broken')
+assert 'beginFinish("paired-transport-failed"); return;' in retry
+pump = method(playback, 'pumpStream')
+assert pump.index('beginFinish("paired-transport-disconnected")') < pump.index('transportReconnect_.disconnected(')
+print('FogHub transport failure/disconnection close routing passed (static only)')

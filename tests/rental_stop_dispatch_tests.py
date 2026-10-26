@@ -33,8 +33,8 @@ using TaskResult = std::variant<std::monostate,fog::FinishResult>;
 namespace uiText = fog::constants::ui;
 using namespace std::chrono_literals;
 struct ApplicationController {
-    enum class Task { None, Finish, CheckoutStop };
-    enum class Screen { Streaming, Stopping, Checkout };
+    enum class Task { None, Finish, CheckoutStop, PairedStop };
+    enum class Screen { Streaming, Stopping, Checkout, Recovery };
     struct Checkout {
         ApplicationController* owner;
         bool unresolved_ = false;
@@ -46,6 +46,13 @@ struct ApplicationController {
         using Result = fog::FinishResult;
         Result finishAttempt() { owner->apiCalled = true; return {true,true,"done"}; }
     } guard_{this};
+    struct Paired {
+        ApplicationController* owner;
+        void requestStop() { owner->stopAfterTask_ = true; }
+        void stop() { owner->apiCalled = true; }
+    } pairedOwner_{this};
+    Paired* paired_ = &pairedOwner_;
+    bool pairedPending_ = false, checkoutAutoPoll_ = true;
     std::future<TaskResult> pending_;
     Task task_ = Task::None;
     Screen screen_ = Screen::Streaming;
@@ -77,9 +84,11 @@ bool waitFor(const std::atomic<bool>& flag) {
     return flag;
 }
 int main() {
-    for (const bool checkout : {false,true}) {
+    for (const int providerCase : {0,1,2}) {
+        const bool checkout = providerCase == 1;
         ApplicationController app;
         app.checkout_.unresolved_ = checkout;
+        app.pairedPending_ = providerCase == 2;
         std::thread mainLoop([&] { app.beginFinish("test"); });
         const bool closeStarted = waitFor(app.closeEntered);
         const bool requestStarted = waitFor(app.apiCalled);
@@ -90,13 +99,13 @@ int main() {
         assert(app.pending_.valid());
         app.pending_.get();
         assert(app.closeExited && app.sessionPending_);
-        assert(app.task_ == (checkout ? ApplicationController::Task::CheckoutStop : ApplicationController::Task::Finish));
+        assert(app.task_ == (app.pairedPending_ ? ApplicationController::Task::PairedStop : checkout ? ApplicationController::Task::CheckoutStop : ApplicationController::Task::Finish));
     }
     ApplicationController noRental;
     noRental.sessionPending_ = false;
     noRental.beginFinish("test");
     assert(!noRental.apiCalled && !noRental.closeEntered);
-    std::cout << "Rental stop dispatch precedes blocked transport cleanup: session/order PASS (real glue, fake API/transport)\n";
+    std::cout << "Rental stop dispatch precedes blocked transport cleanup: MTS session/order and paired FH PASS (real glue, fake API/transport)\n";
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fog-rental-stop-') as directory:

@@ -25,6 +25,7 @@
 #include "core/logging/run_log.hpp"
 #include "features/streaming/domain/streaming_client.hpp"
 #include "features/session/application/checkout.hpp"
+#include "features/session/application/paired_checkout.hpp"
 #include "core/storage/storage.hpp"
 #include "app/presentation/ui.hpp"
 #include "features/catalog/infrastructure/artwork.hpp"
@@ -79,13 +80,18 @@ inline constexpr SDL_Color white{234, 238, 245, 255};
 inline constexpr SDL_Color muted{163, 178, 200, 255};
 inline constexpr SDL_Color accent{107, 216, 190, 255};
 
-enum class Screen { Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails };
-enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation };
+enum class Screen { Profile, Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails };
+enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation, PairedCreate, PairedPoll, PairedStop, ProviderProfile, ProviderForget };
 
+struct RestoredProviders {
+    bool mts = false, foghub = false;
+    std::optional<fog::UserProfile> mtsProfile, foghubProfile;
+    bool mtsFailed = false, foghubFailed = false;
+};
 struct RecoveryResult { bool matched = false; };
 struct VerifiedOffer { fog::StartRentalRequest request; };
 struct ChangedOffer { std::vector<fog::Computer> computers; };
-using TaskResult = std::variant<std::monostate, fog::RestoreAuthResult, fog::AuthResult,
+using TaskResult = std::variant<std::monostate, RestoredProviders, fog::RestoreAuthResult, fog::AuthResult,
     fog::UserProfile, fog::GameDetail, fog::Page<fog::Computer>, std::vector<fog::HistoryEntry>,
     std::vector<fog::Rental>, fog::FinishResult, RecoveryResult, VerifiedOffer, ChangedOffer>;
 
@@ -96,6 +102,14 @@ public:
     ~ApplicationController();
     void run();
 private:
+    Services* providerServices(fog::ProviderId id) const;
+    fog::AuthRepository& loginAuth();
+    fog::AccountRepository& loginAccount();
+    void openProfile();
+    void refreshProfile();
+    RestoredProviders restoreProviders();
+    void handlePairedCheckout();
+    bool pairedPending() const { return pairedPending_; }
     void armExitHandling();
     void disarmExitHandling();
     std::string playbackTimings() const;
@@ -115,6 +129,7 @@ private:
     void handleCheckout();
     void pollCheckout(bool manual);
     void createSession();
+    void createPairedSession(const fog::Computer& pc);
     void loadHistory();
     void loadGameDetail();
     void loadSessions();
@@ -177,6 +192,11 @@ private:
     fog::AccountRepository& account_;
     fog::CatalogRepository& catalogRepository_;
     fog::RentalRepository& rentals_;
+    Services* pairedServices_ = nullptr;
+    std::unique_ptr<fog::PairedCheckoutGuard> paired_;
+    bool pairedPending_ = false;
+    fog::ProviderId loginProvider_ = fog::ProviderId::Mts;
+    std::optional<fog::UserProfile> mtsProfile_, foghubProfile_;
     fog::Catalog catalog_;
     fog::LatencyService latency_;
     int genreId_ = 0;
@@ -212,6 +232,7 @@ private:
     std::vector<fog::Computer> playStationComputers_;
     std::future<std::vector<fog::Computer>> playStationPending_;
     std::shared_ptr<fog::CatalogRepository> playStationRepository_;
+    std::shared_ptr<fog::CatalogRepository> featuredRepository_;
     std::shared_ptr<fog::PlayStationCatalogProgressChannel> playStationUpdates_;
     std::string playStationError_;
     std::chrono::steady_clock::time_point playStationLoadedAt_{};

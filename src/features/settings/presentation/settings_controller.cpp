@@ -9,6 +9,12 @@ namespace storagePaths = ::fog::constants::storage;
 namespace fogplay {
 
 void ApplicationController::changeVideoSettings(const fog::video::Settings& value, bool live) {
+    if (live && streamRental_.provider == fog::ProviderId::FogHub) {
+        auto active = videoSettings_; active.codec = stream::VideoCodec::H264; active.quality = 0; active.keyframeSeconds = 0;
+        overlay_.setVideoSettings(active);
+        overlay_.setSaveStatus("FogHub: H.264 720p60; меняйте битрейт до подключения. Качество/PLI недоступны.");
+        return;
+    }
     videoSettings_ = value;
     bool saved = false;
     try {

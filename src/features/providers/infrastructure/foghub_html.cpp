@@ -1,7 +1,13 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "features/providers/infrastructure/foghub_html.hpp"
 #include "core/domain/repository_error.hpp"
 #include <libxml/HTMLparser.h>
 #include <libxml/xpath.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <algorithm>
 #include <cctype>
 #include <map>
@@ -309,6 +315,159 @@ void emptyList(xmlNode* list) {
     auto* empty = one(list, ".//*[contains(concat(' ',normalize-space(@class),' '),' empty ')]");
     require(text(empty) == "Ничего не найдено.");
 }
+bool hasAttr(xmlNode* node, const char* name) { return xmlHasProp(node, BAD_CAST name) != nullptr; }
+bool printable(const std::string& value) {
+    return std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= 32 && c != 127; });
+}
+xmlNode* rentalDocument(xmlDoc* doc) {
+    auto* root = xmlDocGetRootElement(doc);
+    if (!select(root, "//form[@id='login-form' or @action='/site/login']").empty())
+        throw RepositoryError(RepositoryErrorKind::NotAuthenticated, "FogHub authentication is required");
+    require(select(root, "//base | //*[@id='cf-challenge-running' or @id='challenge-form' or @id='captcha' or contains(@id,'recaptcha') or contains(concat(' ',normalize-space(@class),' '),' g-recaptcha ')]").empty());
+    return root;
+}
+void noRoutingOverride(xmlNode* node) {
+    for (const auto* name : {"onclick", "onsubmit", "formaction", "formmethod", "formenctype", "formtarget", "data-method", "data-params"})
+        require(!hasAttr(node, name));
+}
+}
+
+MoonlightEndpoint parseMoonlightEndpoint(const std::string& value) {
+    require(!value.empty() && value.size() <= 320 && printable(value));
+    require(value.find_first_of("/\\?#@% \t\r\n") == std::string::npos);
+    MoonlightEndpoint endpoint;
+    std::string port;
+    if (value.front() == '[') {
+        const auto end = value.find(']');
+        require(end != std::string::npos && end > 1 && end + 2 < value.size() && value[end + 1] == ':');
+        endpoint.host = value.substr(1, end - 1);
+        in6_addr address{};
+        require(inet_pton(AF_INET6, endpoint.host.c_str(), &address) == 1);
+        port = value.substr(end + 2);
+    } else {
+        const auto colon = value.find(':');
+        require(colon != std::string::npos && colon > 0 && value.find(':', colon + 1) == std::string::npos);
+        endpoint.host = value.substr(0, colon);
+        port = value.substr(colon + 1);
+        require(endpoint.host.size() <= 253);
+        const bool numericHost = std::all_of(endpoint.host.begin(), endpoint.host.end(), [](unsigned char c) { return (c >= '0' && c <= '9') || c == '.'; });
+        if (numericHost) {
+            in_addr address{};
+            require(inet_pton(AF_INET, endpoint.host.c_str(), &address) == 1);
+        } else {
+            // Only DNS labels, not URLs, IP literals in alternate encodings,
+            // unqualified local names, shell syntax, or resolver search paths.
+            require(endpoint.host.find('.') != std::string::npos);
+            std::size_t start = 0;
+            while (start < endpoint.host.size()) {
+                auto end = endpoint.host.find('.', start);
+                if (end == std::string::npos) end = endpoint.host.size();
+                const auto label = endpoint.host.substr(start, end - start);
+                require(!label.empty() && label.size() <= 63 && label.front() != '-' && label.back() != '-');
+                require(std::all_of(label.begin(), label.end(), [](unsigned char c) {
+                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-';
+                }));
+                start = end + 1;
+            }
+            require(endpoint.host.back() != '.');
+            const auto suffix = endpoint.host.substr(endpoint.host.rfind('.') + 1);
+            // A numeric/hex final component may be interpreted as an alternate
+            // IPv4 encoding by a resolver rather than as a DNS name.
+            require((suffix.front() >= 'a' && suffix.front() <= 'z') || (suffix.front() >= 'A' && suffix.front() <= 'Z'));
+        }
+    }
+    require(port.size() <= 5 && digits(port) && port.front() != '0');
+    const auto portNumber = number(port);
+    require(portNumber > 0 && portNumber <= 65535);
+    endpoint.port = static_cast<std::uint16_t>(portNumber);
+    return endpoint;
+}
+
+std::string freshPairingLink(const std::string& html, const std::string& expectedComputerId) {
+    identifier(expectedComputerId);
+    auto doc = document(html);
+    auto* root = rentalDocument(doc.get());
+    if (!select(root, "//form[.//input[@name='moonlight_url']]").empty()) return {};
+    const auto expected = "/pc/play?id=" + expectedComputerId + "&resume=0";
+    xmlNode* fresh = nullptr;
+    for (auto* link : select(root,"//a[@href]")) {
+        if (attr(link,"href") != expected) continue;
+        require(!fresh); fresh = link;
+    }
+    require(fresh);
+    noRoutingOverride(fresh);
+    require(!hasAttr(fresh,"target") && !hasAttr(fresh,"download"));
+    return expected;
+}
+
+ConnectForm parseConnectForm(const std::string& html, const std::string& expectedComputerId) {
+    identifier(expectedComputerId);
+    auto doc = document(html);
+    auto* root = rentalDocument(doc.get());
+    // Names/types/action/method are verified metadata. Form IDs, surrounding
+    // headings and layout were not captured and must not be invented here.
+    auto* form = one(root, "//form[.//input[@name='moonlight_url']]");
+    noRoutingOverride(form);
+    const auto base = "/pc/play?id=" + expectedComputerId;
+    const auto action = attr(form,"action");
+    require((action == base || action == base+"&resume=0") && lower(attr(form, "method")) == "post");
+    require(!hasAttr(form, "target") && !hasAttr(form, "enctype"));
+    require(select(root, "//*[@form]").empty());
+    for (auto* control : select(form, ".//input | .//select | .//textarea | .//button")) {
+        noRoutingOverride(control);
+        require(!hasAttr(control, "disabled"));
+        const auto name = attr(control, "name");
+        if (name.empty()) continue;
+        require(tag(control, "input") && (name == "_csrf" || name == "moonlight_url" || name == "Pc[pin]"));
+    }
+    auto* csrf = one(form, ".//input[@name='_csrf']");
+    auto* address = one(form, ".//input[@name='moonlight_url']");
+    auto* pin = one(form, ".//input[@name='Pc[pin]']");
+    require(lower(attr(csrf, "type")) == "hidden" && lower(attr(address, "type")) == "text" && lower(attr(pin, "type")) == "text");
+    ConnectForm result;
+    result.csrf = attr(csrf, "value");
+    require(!result.csrf.empty() && result.csrf.size() <= 4096 && printable(result.csrf));
+    result.actionPath = action;
+    result.moonlightUrl = attr(address, "value");
+    result.endpoint = parseMoonlightEndpoint(result.moonlightUrl);
+    return result;
+}
+
+LaunchSuccess parseLaunchSuccess(const std::string& html, const std::string& expectedComputerId,
+    const std::string& effectivePath) {
+    identifier(expectedComputerId);
+    require(effectivePath == "/pc/play-success?id=" + expectedComputerId + "&withResume=0");
+    auto doc = document(html);
+    auto* root = rentalDocument(doc.get());
+    const auto review = select(root, "//a[contains(@href,'/session/review')]");
+    require(review.size() == 1);
+    noRoutingOverride(review.front());
+    const auto rentalId = linkId(review.front(), "/session/review");
+    require(attr(review.front(), "href") == "/session/review?id=" + rentalId);
+    return {rentalId};
+}
+
+CloseAction parseCloseAction(const std::string& html, const std::string& expectedRentalId) {
+    identifier(expectedRentalId);
+    const auto history = parseHistory(html);
+    const auto row = std::find_if(history.rows.begin(), history.rows.end(), [&](const HistoryRow& item) { return item.id == expectedRentalId; });
+    require(row != history.rows.end() && row->state == HistoryState::Active);
+    auto doc = document(html);
+    auto* root = rentalDocument(doc.get());
+    xmlNode* found = nullptr;
+    for (auto* tr : select(root, "//table/tbody/tr[@data-key]")) {
+        if (attr(tr, "data-key") != expectedRentalId) continue;
+        require(!found);
+        found = tr;
+    }
+    require(found);
+    auto* close = one(found, ".//a[contains(@href,'/session/close')]");
+    const auto path = "/session/close?id=" + expectedRentalId;
+    require(attr(close, "href") == path);
+    require(attr(close, "data-confirm") == "Вы уверены, что хотите завершить эту сессию?");
+    noRoutingOverride(close);
+    require(!hasAttr(close, "target") && !hasAttr(close, "download"));
+    return {path, CloseMethod::Get};
 }
 
 LoginForm parseLogin(const std::string& html) {
@@ -326,7 +485,16 @@ LoginForm parseLogin(const std::string& html) {
 
 AccountPage parseAccount(const std::string& html) {
     auto doc = document(html);
-    auto* main = mainNode(doc.get(), "Информация", true);
+    auto* main = mainNode(doc.get(), {}, true);
+    // Account tabs include empty h1 elements. Keep exactly one meaningful
+    // page title, without relaxing title checks for the other page types.
+    std::size_t headings = 0;
+    for (auto* heading : select(main, ".//h1")) {
+        const auto title = text(heading);
+        if (title.empty()) continue;
+        require(title == "Информация" && ++headings == 1);
+    }
+    require(headings == 1);
     auto* table = one(main, ".//table[contains(concat(' ',normalize-space(@class),' '),' detail-view ')]");
     std::string login;
     for (auto* row : select(table, ".//tr")) {
@@ -437,6 +605,48 @@ GamesPage parseGames(const std::string& html) {
     page.totalItems = paging.total;
     page.firstIndex = paging.firstIndex;
     return page;
+}
+
+ComputerRow parseComputerPreview(const std::string& html, const std::string& computerId) {
+    identifier(computerId);
+    auto doc = document(html);
+    auto* main = mainNode(doc.get(), {}, false);
+    // The PC detail page has one bordered summary card, independent from its
+    // paginated games. Never use game play links as current PC price evidence.
+    auto* card = one(main, ".//div[contains(concat(' ',normalize-space(@class),' '),' rounded ') and contains(concat(' ',normalize-space(@class),' '),' p-3 ')]/div");
+    const auto previews = links(card, "/pc/preview");
+    require(previews.size() == 1);
+    const auto identity = query(attr(previews.front(), "href"), "/pc/preview");
+    require(identity.count("id") && identity.at("id") == computerId &&
+        (identity.size() == 1 || (identity.size() == 2 && identity.count("mode"))));
+    ComputerRow row;
+    row.id = computerId; row.name = text(previews.front());
+    require(!row.name.empty() && row.name.size() <= 128);
+    require(text(one(main, ".//h1")).rfind("Компьютер " + row.name + " ", 0) == 0);
+    const auto owners = links(card, "/promo/");
+    require(owners.size() == 1); row.owner = text(owners.front());
+    row.description = text(one(card, "./div[2]/small"));
+    for (auto* badge : select(card, ".//span[contains(concat(' ',normalize-space(@class),' '),' badge ')]")) {
+        const auto label = text(badge);
+        if (label == "Онлайн") row.online = true;
+        if (label == "Занят") row.busy = true;
+    }
+    const auto play = links(card, "/pc/play");
+    require(play.size() <= 1);
+    if (!play.empty()) {
+        require(linkId(play.front(), "/pc/play") == computerId);
+        const auto label = text(play.front());
+        const std::string prefix = "Играть FH ", suffix = "₽";
+        require(label.rfind(prefix, 0) == 0 && label.size() > prefix.size()+suffix.size() &&
+            label.compare(label.size()-suffix.size(),suffix.size(),suffix) == 0);
+        row.pricePerHour = label.substr(prefix.size(),label.size()-prefix.size()-suffix.size());
+        require(digits(row.pricePerHour) || money(row.pricePerHour));
+        require(std::any_of(row.pricePerHour.begin(),row.pricePerHour.end(),
+            [](unsigned char c) { return c >= '1' && c <= '9'; }));
+        // A contradictory page must not make this PC launchable.
+        row.fhAvailable = row.online && !row.busy;
+    }
+    return row;
 }
 
 ComputersPage parseComputers(const std::string& html, const std::string& gameId) {

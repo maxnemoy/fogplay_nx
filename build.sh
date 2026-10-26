@@ -19,5 +19,8 @@ if ! python3 tools/rtc/manifest.py check switch; then
     bash tools/rtc/build.sh switch
 fi
 bash tools/ffmpeg/build-diag-overlay.sh
+if ! python3 tools/moonlight/check.py; then
+    bash tools/moonlight/build.sh
+fi
 make -j"${JOBS:-$(nproc)}" "$@" 2>&1 | tee work/logs/switch-build.log
 sha256sum dist/fogplay_nx.nro | tee dist/fogplay_nx.nro.sha256

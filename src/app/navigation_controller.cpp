@@ -27,17 +27,30 @@ void ApplicationController::input(u64 keys) {
         else if (keys & HidNpadButton_B) screen_ = Screen::Checkout;
         return;
     }
+    if (screen_ == Screen::Profile) {
+        if (keys & (HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_StickLUp | HidNpadButton_StickLDown)) selection_ = selection_ ? 0 : 1;
+        loginProvider_ = selection_ ? fog::ProviderId::FogHub : fog::ProviderId::Mts;
+        if (keys & HidNpadButton_B) { screen_ = sessionPending_ ? Screen::Recovery : Screen::Games; return; }
+        if (!providerServices(loginProvider_)) return;
+        if (keys & HidNpadButton_A) refreshProfile();
+        else if ((keys & HidNpadButton_X) && !sessionPending_) {
+            start(Task::ProviderForget,[this] { loginAuth().forget(); return std::monostate{}; });
+        } else if ((keys & HidNpadButton_R) && loginProvider_ == fog::ProviderId::Mts) loadSessions();
+        else if ((keys & HidNpadButton_R) && pairedPending_) recoverSession();
+        return;
+    }
     if (screen_ == Screen::Checkout) {
-        if (keys & HidNpadButton_Y) screen_ = Screen::Consent;
+        if (keys & HidNpadButton_Y) openProfile();
         else if (keys & HidNpadButton_B) queueCheckoutStop();
-        else if ((keys & HidNpadButton_A) && auth_.authenticated()) pollCheckout(true);
-        else if ((keys & HidNpadButton_X) && !guard_.persistent() && guard_.pendingRental().empty()) screen_ = Screen::ManualResolution;
+        else if ((keys & HidNpadButton_A) && (pairedPending_ ? pairedServices_->auth().authenticated() : auth_.authenticated())) pollCheckout(true);
+        else if ((keys & HidNpadButton_X) && !pairedPending_ && !guard_.persistent() && guard_.pendingRental().empty()) screen_ = Screen::ManualResolution;
         return;
     }
     if (screen_ == Screen::Stopping || screen_ == Screen::Recovery) {
-        if (keys & HidNpadButton_Y) screen_ = Screen::Consent;
-        else if ((keys & HidNpadButton_A) && auth_.authenticated()) {
-            if (guard_.ownsSession()) beginFinish(); else recoverSession();
+        if (keys & HidNpadButton_Y) openProfile();
+        else if ((keys & HidNpadButton_A) && (pairedPending_ ? pairedServices_->auth().authenticated() : auth_.authenticated())) {
+            if (pairedPending_) pollCheckout(true);
+            else if (guard_.ownsSession()) beginFinish(); else recoverSession();
         }
         return;
     }
@@ -69,7 +82,7 @@ void ApplicationController::input(u64 keys) {
         if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) nav_ = (nav_ + 4) % 5;
         if (keys & (HidNpadButton_Down | HidNpadButton_StickLDown)) nav_ = (nav_ + 1) % 5;
         if (keys & (HidNpadButton_B | HidNpadButton_Right | HidNpadButton_StickLRight)) sidebar_ = false;
-        if (keys & HidNpadButton_Y) { sidebar_ = false; loginReturn_ = screen_; if (auth_.authenticated()) loadSessions(); else screen_ = Screen::Consent; }
+        if (keys & HidNpadButton_Y) { openProfile(); }
         if (keys & HidNpadButton_A) {
             sidebar_ = false; selection_ = 0;
             if (nav_ == 0) searchGames();
@@ -80,7 +93,7 @@ void ApplicationController::input(u64 keys) {
         }
         return;
     }
-    if (keys & HidNpadButton_Y) { loginReturn_ = screen_; if (auth_.authenticated()) loadSessions(); else screen_ = Screen::Consent; return; }
+    if (keys & HidNpadButton_Y) { openProfile(); return; }
     if (keys & HidNpadButton_B) {
         if (screen_ == Screen::PlayStationDetails) screen_ = Screen::PlayStation;
         else if (screen_ == Screen::Details) {
@@ -156,7 +169,7 @@ void ApplicationController::input(u64 keys) {
             }
             else if (selection_ == 2) { screen_ = Screen::ConnectionSettings; selection_ = 0; }
             else if (selection_ == 3) loadSessions();
-            else { auth_.forget(); authSaveFailed_ = false; status_ = uiText::Profile::SignedOut; }
+            else { openProfile(); }
         }
         return;
     }

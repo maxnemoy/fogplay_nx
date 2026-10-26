@@ -16,7 +16,7 @@ struct WebResponse {
     std::string contentType;
 };
 
-enum class TransportFailure { InvalidRequest, CookieRejected, Cancelled, Network, ResponseTooLarge, Internal };
+enum class TransportFailure { InvalidRequest, CookieRejected, Cancelled, Network, ResponseTooLarge, Internal, Unsupported };
 
 class TransportError final : public std::runtime_error {
 public:
@@ -33,6 +33,17 @@ public:
     virtual ~WebTransport() = default;
     virtual WebResponse get(const std::string& relativePath) = 0;
     virtual WebResponse submitLogin(const Query& fields) = 0;
+    // Mutating routes have dedicated operations; get() must never accept close.
+    virtual WebResponse submitPairing(const std::string&, const Query&) {
+        throw TransportError(TransportFailure::Unsupported);
+    }
+    virtual WebResponse submitPairing(const std::string& computer, const Query& fields, bool freshPair) {
+        if (freshPair) throw TransportError(TransportFailure::Unsupported);
+        return submitPairing(computer,fields);
+    }
+    virtual WebResponse closeRental(const std::string&) {
+        throw TransportError(TransportFailure::Unsupported);
+    }
     virtual std::vector<std::string> cookies() = 0;
     virtual void restoreCookies(const std::vector<std::string>& cookies) = 0;
     virtual void clearCookies() = 0;

@@ -76,6 +76,8 @@ template<class F> auto transportCall(F&& call) -> decltype(call()) {
     try { return call(); }
     catch (const TransportError& error) {
         switch (error.kind()) {
+            case TransportFailure::Unsupported:
+                fail(RepositoryErrorKind::Unsupported,"FogHub transport operation is unsupported");
             case TransportFailure::InvalidRequest: case TransportFailure::CookieRejected:
                 fail(RepositoryErrorKind::InvalidRequest,"Invalid FogHub transport request");
             case TransportFailure::ResponseTooLarge:
@@ -87,6 +89,14 @@ template<class F> auto transportCall(F&& call) -> decltype(call()) {
 void htmlResponse(const WebResponse& response) {
     if (response.contentType.rfind("text/html",0) != 0)
         fail(RepositoryErrorKind::InvalidResponse,"Expected FogHub HTML page");
+}
+template<class Parser> auto verifiedAuthPage(const std::string& body, Parser parser, const char* failure)
+    -> decltype(parser(body)) {
+    try { return parser(body); }
+    catch (const RepositoryError& error) {
+        if (error.kind() != RepositoryErrorKind::InvalidResponse) throw;
+        fail(RepositoryErrorKind::InvalidResponse, failure);
+    }
 }
 Game mapGame(const GameRow& row) {
     Game game;
@@ -163,7 +173,8 @@ WebResponse Session::get(const std::string& path, bool requiresAuth) {
 }
 UserProfile Session::verifiedProfile() {
     const auto response = get("/user/info",false); htmlResponse(response);
-    const auto page = parseAccount(response.body);
+    const auto page = verifiedAuthPage(response.body, parseAccount,
+        "FogHub page could not be verified (stage=account)");
     UserProfile profile{{ProviderId::FogHub,page.accountId},page.displayName,{}};
     const auto balance = get("/user/balance",false);
     if (balance.contentType.rfind("application/json",0) != 0)
@@ -179,7 +190,8 @@ AuthResult Session::login(const LoginRequest& request) {
     invalidate(true);
     try {
         const auto response = get("/site/login",false); htmlResponse(response);
-        const auto form = parseLogin(response.body);
+        const auto form = verifiedAuthPage(response.body, parseLogin,
+            "FogHub page could not be verified (stage=login-form)");
         const Query fields{{"_csrf",form.csrf},{"LoginForm[username]",request.identifier},
             {"LoginForm[password]",request.secret},{"LoginForm[rememberMe]","1"}};
         const auto submitted = transportCall([&]{ return transport_.submitLogin(fields); });
@@ -231,43 +243,83 @@ UserProfile Session::profile() {
         throw;
     }
 }
-std::vector<HistoryEntry> Session::history() {
+Session::OwnHistory Session::ownHistory() {
     // Also verifies the account attached to the cookie session before reading its history.
     profile();
     try {
-        std::vector<HistoryEntry> result;
+        OwnHistory result;
+        result.owner = auth_;
         std::set<std::string> ids, paths;
         std::string next = "/session/list";
         std::optional<std::size_t> expected;
+        std::size_t evidenceBytes = 0;
         while (!next.empty()) {
             if (paths.size() >= 100 || !paths.insert(next).second)
                 fail(RepositoryErrorKind::InvalidResponse,"Incomplete FogHub history pagination");
             const auto response = get(next,true); htmlResponse(response);
+            if (response.body.size() > 8*1024*1024-evidenceBytes)
+                fail(RepositoryErrorKind::InvalidResponse,"FogHub history evidence limit exceeded");
+            evidenceBytes += response.body.size();
             const auto page = parseHistory(response.body);
             if (page.totalItems > 10000 || (expected && *expected != page.totalItems))
                 fail(RepositoryErrorKind::InvalidResponse,"FogHub history changed during reading");
             expected = page.totalItems;
             for (const auto& row : page.rows) {
                 if (!ids.insert(row.id).second) fail(RepositoryErrorKind::InvalidResponse,"Duplicate FogHub rental identifier");
-                HistoryEntry entry;
-                entry.id = {ProviderId::FogHub,row.id}; entry.computerId = {ProviderId::FogHub,row.computerId};
-                entry.computerName = row.computerName; entry.startedAt = row.startedAt;
-                entry.finishedAt = row.finishedAt; entry.durationMinutes = row.durationMinutes;
-                entry.amount = row.amount; entry.total = money(row.amount);
-                entry.status = row.state == HistoryState::Active ? HistoryStatus::Active :
-                    row.state == HistoryState::Finished ? HistoryStatus::Finished : HistoryStatus::Unknown;
-                result.push_back(std::move(entry));
+                // Validate amounts for both read-only and rental consumers.
+                money(row.amount);
+                result.rowPages.emplace(row.id,result.pages.size());
+                result.rows.push_back(row);
             }
+            result.pages.push_back(response.body);
             next = page.nextPath;
             if (!next.empty() && route(relativeLocation(next)) != "/session/list")
                 fail(RepositoryErrorKind::InvalidResponse,"Unexpected FogHub history pagination");
         }
-        if (!expected || result.size() != *expected) fail(RepositoryErrorKind::InvalidResponse,"Incomplete FogHub history");
+        if (!expected || result.rows.size() != *expected) fail(RepositoryErrorKind::InvalidResponse,"Incomplete FogHub history");
         persist(); return result;
     } catch (const RepositoryError& error) {
         if (error.kind() == RepositoryErrorKind::NotAuthenticated) invalidate(true);
         throw;
     }
+}
+std::vector<HistoryEntry> Session::history() {
+    const auto snapshot = ownHistory();
+    std::vector<HistoryEntry> result;
+    for (const auto& row : snapshot.rows) {
+        HistoryEntry entry;
+        entry.id = {ProviderId::FogHub,row.id}; entry.computerId = {ProviderId::FogHub,row.computerId};
+        entry.computerName = row.computerName; entry.startedAt = row.startedAt;
+        entry.finishedAt = row.finishedAt; entry.durationMinutes = row.durationMinutes;
+        entry.amount = row.amount; entry.total = money(row.amount);
+        entry.status = row.state == HistoryState::Active ? HistoryStatus::Active :
+            row.state == HistoryState::Finished ? HistoryStatus::Finished : HistoryStatus::Unknown;
+        result.push_back(std::move(entry));
+    }
+    return result;
+}
+std::string Session::readRentalPage(const std::string& path) {
+    if (!authenticated()) fail(RepositoryErrorKind::NotAuthenticated,"FogHub sign-in required");
+    // A rental page must correspond to this exact PC query. Do not let a
+    // same-route redirect silently change its identity or replay a command.
+    try {
+        const auto response = transportCall([&]{ return transport_.get(path); });
+        if ((response.status == 301 || response.status == 302 || response.status == 303 ||
+             response.status == 307 || response.status == 308) && route(relativeLocation(response.location)) == "/site/login")
+            fail(RepositoryErrorKind::NotAuthenticated,"FogHub sign-in required");
+        successful(response); htmlResponse(response); return response.body;
+    } catch (const RepositoryError& error) {
+        if (error.kind() == RepositoryErrorKind::NotAuthenticated) invalidate(true);
+        throw;
+    }
+}
+WebResponse Session::submitPairing(const std::string& computer,const Query& fields,bool freshPair) {
+    if (!authenticated()) fail(RepositoryErrorKind::NotAuthenticated,"FogHub sign-in required");
+    return transportCall([&]{ return transport_.submitPairing(computer,fields,freshPair); });
+}
+WebResponse Session::closeRental(const std::string& rental) {
+    if (!authenticated()) fail(RepositoryErrorKind::NotAuthenticated,"FogHub sign-in required");
+    return transportCall([&]{ return transport_.closeRental(rental); });
 }
 std::string Session::readPublic(const std::string& path) {
     const auto response = get(path,false); htmlResponse(response); return response.body;
@@ -315,8 +367,28 @@ Page<Computer> Catalog::computers(const ComputerQuery& query) {
     return result;
 }
 AutomaticComputers Catalog::recommend(const ComputerQuery&) { fail(RepositoryErrorKind::Unsupported,"FogHub recommendations are not available"); }
-std::vector<Computer> Catalog::playStationComputers(const CatalogProgress&,const CatalogCancellation&) {
-    fail(RepositoryErrorKind::Unsupported,"FogHub PlayStation catalog is not available");
+std::vector<Computer> Catalog::playStationComputers(const CatalogProgress& progress,const CatalogCancellation& cancelled) {
+    // The shared home-section API predates providers. FogHub supplies the
+    // explicitly selected ordinary PCs here; the UI labels its own section.
+    std::vector<Computer> result;
+    for (const auto* id : {"1838", "1836", "1233", "1232", "1231", "1235", "1237", "1230"}) {
+        if (cancelled && cancelled()) fail(RepositoryErrorKind::Unavailable,"FogHub catalog cancelled");
+        const auto row = parseComputerPreview(session_.readPublic(std::string("/pc/preview?id=")+id),id);
+        if (cancelled && cancelled()) fail(RepositoryErrorKind::Unavailable,"FogHub catalog cancelled");
+        Computer computer;
+        computer.id = {ProviderId::FogHub,row.id}; computer.name = row.name;
+        computer.listed = true;
+        computer.availability = row.busy ? Availability::Busy : row.online ? Availability::Online : Availability::Offline;
+        if (!row.pricePerHour.empty()) {
+            computer.hourlyPrice = money(row.pricePerHour);
+            if (computer.hourlyPrice->minorUnits <= 0) fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub hourly price");
+            computer.price = row.pricePerHour;
+        }
+        computer.launchable = row.fhAvailable && computer.hourlyPrice.has_value();
+        result.push_back(std::move(computer));
+        if (progress) progress(result);
+    }
+    return result;
 }
 ReadRepositories::ReadRepositories(const std::string& cookiePath) : transport_(makeWebTransport()),storage_(makeCookieStore(cookiePath)),
     session_(*transport_,*storage_),auth_(session_),account_(session_),catalog_(session_) {}
@@ -334,8 +406,9 @@ struct PublicCatalog {
     Catalog catalog{session};
 };
 }
-std::shared_ptr<CatalogRepository> ReadRepositories::publicCatalog() {
+std::shared_ptr<CatalogRepository> makePublicCatalog() {
     auto owner = std::make_shared<PublicCatalog>();
     return {owner,&owner->catalog};
 }
+std::shared_ptr<CatalogRepository> ReadRepositories::publicCatalog() { return makePublicCatalog(); }
 }

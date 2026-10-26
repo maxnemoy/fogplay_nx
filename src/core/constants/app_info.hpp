@@ -1,7 +1,7 @@
 #pragma once
 
 // Read by Makefile and package.py as well as the application.
-#define FOGPLAY_APP_VERSION "0.5.5"
+#define FOGPLAY_APP_VERSION "0.6.5"
 #define FOGPLAY_APP_NAME "FogPlay NX"
 #define FOGPLAY_APP_AUTHOR "maxnemoy"
 

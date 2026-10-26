@@ -1,0 +1,180 @@
+# Isolated Nintendo Switch Moonlight dependencies
+
+Run `tools/moonlight/build.sh` from WSL with devkitPro installed. This fetches
+only the required upstream submodules, prepares the GameStream HTTP client,
+builds four static libraries, and links a complete Switch smoke executable.
+It does not start a connection, build FogPlay, install software, or use rentals.
+Build the app's RTC dependencies first: both transports must share its exact
+mbedTLS version and `tools/rtc/mbedtls-user-config.h` ABI. The dependency cache
+checks archive hashes and this configuration before the main application build.
+
+The output prefix is the ignored `third_party/moonlight/switch/` directory.
+Link `gamestream`, `moonlight-common-c`, `enet`, `moonlight-curl`, `expat`, `mbedtls`,
+`mbedx509`, `mbedcrypto`, `z`, and `nx`, in that order. Include `include/`,
+`include/gamestream/`, and `include/crypto/` from that prefix. The build uses
+the installed devkitPro Switch portlibs, except for private curl 8.15.0 built
+with the app's bundled mbedTLS 3.6.4. System switch-curl uses libnx TLS, which cannot load the PEM
+client identity. No global portlib is replaced. The manifest records source
+revisions, tool hashes, compiler version,
+and portlib/library SHA256 hashes. It is a reproducible source recipe with
+an explicit installed-toolchain boundary; it does not provision portlibs.
+Static archives use deterministic member metadata (`ar D` and `ranlib -D`).
+
+The private curl archive exports only `fog_moonlight_`-prefixed symbols.
+`namespace-curl.py` derives an exact map from every external definition,
+including curl's internal `Curl_*` and `curlx_*` functions and data. It renames
+the matching definitions/references with devkitA64 `objcopy` and applies the
+same map to the GameStream archive after linking it. References to libc,
+mbedTLS and other shared dependencies retain their original names. New
+unexpected exports or unmapped curl references fail the build. The map and
+its hash are recorded in the output prefix and curl manifest.
+
+Applications can keep their existing portlibs `curl` for libnx TLS and cookies
+while linking the isolated Moonlight transport. Do not call private curl via
+the unmodified `curl/curl.h` headers; use the GameStream interface. Do not pass
+curl handles or call global cleanup across the two implementations. The build
+prefix includes private curl headers: compile existing app HTTP sources with
+the portlibs include directory before the Moonlight prefix, so they retain
+the header version matching their original curl archive. Only GameStream
+compilation puts the private curl headers first. The coexistence smoke
+explicitly follows this include order for its app-curl translation unit.
+The build
+also links `moonlight-curl-coexist-smoke.elf` with both archives and checks for
+both `curl_easy_init` implementations, the original cookie implementation,
+both TLS backends and no undefined symbols. The smoke executables are link
+proofs only and are never run by the build.
+The main Makefile names all four Moonlight archives by their full paths.
+In particular the forked `libenet.a` must never resolve to the portlibs ENet:
+the pinned core requires its extended address helpers. The coexistence smoke
+uses the main application's library search order while its exact CMake target
+references keep the Moonlight archives bound to the private prefix.
+
+## Sources
+
+| Repository | Commit | License |
+| --- | --- | --- |
+| [XITRIX/Moonlight-Switch](https://github.com/XITRIX/Moonlight-Switch) | `a75fee223914f36ec26b29739d95331307960fa3` | GPL-3.0; libgamestream headers GPL-3.0-or-later |
+| [XITRIX/moonlight-common-c](https://github.com/XITRIX/moonlight-common-c) | `206c79c240c342229555494a8cadda6c11cad479` | GPL-3.0 |
+| [cgutman/enet](https://github.com/cgutman/enet) | `e261d80db1de7ee92fe4fc45db67887df8b45314` | MIT |
+| [sleepybishop/nanors](https://github.com/sleepybishop/nanors) | `b1e3c22ca0cdc0bb83e3cd6ed1a2fc77869ed99a` | MIT |
+| [curl](https://curl.se/download/curl-8.15.0.tar.xz) | 8.15.0; SHA256 pinned in `build-curl.sh` | curl license |
+
+Copies of upstream license texts are in `licenses/moonlight/`. These libraries
+are linked by the FogPlay application and the separate local probe.
+Distributing either binary also requires the corresponding source, local
+transformations, and the licenses of its linked portlibs. The top-level
+FogPlay license is not a replacement for these component licenses.
+
+## Small application boundary
+
+`Settings.hpp` supplies only an identity directory and cancellation state.
+Call `Settings::instance().set_key_dir(path)` once, create that private
+directory, and then call `gs_init()`. It contains `client.pem` and `key.pem`.
+The stable client ID is derived from the public certificate. All GameStream
+operations and settings configuration run on one worker. The main thread may
+call `request_cancel()` concurrently. `reset_cancel()` starts a new operation
+series; `set_timeout_ms(5000)` sets an absolute deadline shared by subsequent
+requests. Reset only after joining an earlier active operation. HTTP requests
+check cancellation before connecting, clamp their libcurl timeout to the
+remaining deadline, and observe cancellation in the progress callback.
+
+`gs_init`, `gs_pair`, `gs_applist`, `gs_start_app`, and `gs_quit_app` retain the
+upstream signatures from `gamestream/client.h`. `SERVER_DATA` must remain at a
+stable address: `serverInfo` points into its strings. The caller frees app-list
+nodes and names with `free()`, and the launch `rtspSessionUrl` with `delete[]`
+after stopping the stream. Upstream's `gs_start_app()` resumes an active app;
+the wrapper must check ownership before launch/resume/cancel. It also sets
+`currentGame` before validating the launch reply, so a failure requires a
+status refresh before cancellation decisions.
+
+## Explicit transformations and limits
+
+`prepare.py` copies the pinned upstream HTTP/crypto sources into an ignored
+prepared directory. Every replacement checks its expected occurrence count:
+
+- Replace predictable, repeatedly seeded `rand()` with libnx OS-seeded RNG.
+- Implement the upstream TODO for server-secret RSA/SHA256 signature checking
+  and compare the authenticated pairing challenge with the received value.
+- Preserve actual error codes where upstream assigned boolean expressions.
+- Require explicit successful pairing, launch and cancellation acknowledgements.
+- Preserve the host's reported current app ID for ownership checks.
+- Derive a unique client ID from the probe certificate.
+- Remove verbose libcurl logging and omit formatted logger argument values.
+- Require the mbedTLS backend and check initialization; record only fixed
+  operation names, numeric HTTP/curl results and timing through `Diagnostics.hpp`.
+- Add thread-safe HTTP cancellation/deadlines and close curl handles on errors.
+- Preserve the original allocation if HTTP `realloc()` fails.
+- Replace the core's detached termination-callback thread with synchronous
+  delivery on the originating core thread, using an atomic one-shot guard.
+  Callbacks only publish state and never stop reentrantly; the owner joins
+  originating stream threads before unloading the NRO.
+
+## Production application adapter
+
+`src/features/streaming/infrastructure/moonlight/moonlight_session.hpp` exposes
+one `MoonlightSession` as `PairingClient`, secure `PairingPinGenerator`, and
+`StreamingClientFactory`. It owns the authenticated host across checkout and
+streaming. After successful checkout/reconnect, call `bindRental(exactRental)`;
+created clients reject a different rental. Never retain raw host metadata in
+the rental journal. The server rental guard owns paid-host stop; closing a
+Moonlight client only tears down Li transport and releases held input.
+
+Every `begin` creates a fresh OS-random identity directory below
+`sdmc:/switch/fogplay_nx/moonlight-identities`. Certificates/private keys stay
+there, separate from account credentials and settings, and never enter logs.
+The crypto cache and HTTP identity paths reload when the directory changes.
+An atomic process lease excludes concurrent GameStream contexts, whose upstream
+HTTP/crypto/core state is global. Pairing and Li start/stop run on joined workers.
+
+Pairing discovers the actual HTTPS port from HTTP `serverinfo` with an explicit
+provider base port; IPv6 URL authorities and raw Li addresses are distinct.
+`waitReady` waits at most 15 seconds for curl's outgoing `getservercert` header
+event, then settles 500 ms. That event proves local request dispatch only.
+Sunshine holds its response until the provider receives the PIN; there is no
+remote readiness ACK before that. The complete pairing series has a 60-second
+deadline. `submissionReady` rechecks it immediately before the paid POST and
+requires at least five seconds remaining. `cancelAndJoin` joins pairing but
+preserves a successfully authenticated host for streaming.
+
+Production HTTPS fails closed without a key pin. The PIN challenge and signed
+server secret authenticate the server certificate, whose SHA256 SPKI pin is
+installed **before** the final HTTPS pairing confirmation. All subsequent
+HTTPS requests use the same pin; there is no unsigned HTTP fallback after
+authentication. Sunshine's generated self-signed certificate has no useful
+hostname identity, so its exact public key authenticates TLS instead of PKI
+hostname/CA validation. The private LAN probe retains its separate opt-in
+unpinned policy. Debug payloads used for dispatch observation are discarded.
+
+The first production mode is 1280x720, 60fps, H.264, stereo Opus, with the saved
+bitrate applied before connection. It exposes the actual selected codec and
+fixed settings. RTC relay, adaptive quality, forced keyframe intervals,
+PlayStation emulation, touch and sensor reports are unsupported. Gamepad,
+absolute mouse, buttons, wheel, text and the app's Enter/Backspace/Tab/Escape
+keys use Li APIs under the input/teardown mutex. Desktop is preferred; hosts
+without it choose Playnite for gamepad, Playnite, then Steam. Equal-priority
+distinct applications are rejected, as are multiple unknown launchers. No
+arbitrary first-app choice and no `/cancel` request are made. An already active
+different application is never resumed or stopped.
+
+The worker copies complete video AUs while owning the Li pull-frame handle.
+Video is bounded to four AUs of at most 8 MiB each; overflow clears stale data,
+increments the decoder generation, and requests an IDR. Opus is a separate
+20-packet FIFO (at most 200 ms for the accepted 5/10 ms stereo formats).
+The app's existing Media path performs decoding/presentation.
+
+`tools/moonlight/test.sh` runs deterministic lifecycle/input/app-selection tests
+with ASan/UBSan for the worker harness. `tools/moonlight/host-tls-test.sh` builds
+the same private curl with the host RTC mbedTLS/configuration and starts only
+ephemeral loopback fixture servers. It verifies fail-closed unpinned HTTPS,
+mutual TLS, correct-key success, impostor-key rejection and certificate/cache
+rotation. Switch full links and host tests do not prove a paid FH session or
+on-device performance; those require an explicitly authorized device run.
+
+`signal-switch.c` handles the core's SIGPIPE-ignore request, since Horizon has
+no POSIX SIGPIPE delivery. Arbitrary signal requests return `ENOSYS`.
+
+The standalone LAN probe uses `set_production(false)` by default and therefore
+retains its explicitly trusted-local-network TLS policy. Production always
+enables pin enforcement. The Switch full-link check proves ABI/link completeness
+only; actual pairing, hardware decode/audio, controller delivery and cancellation
+latency require a device run.

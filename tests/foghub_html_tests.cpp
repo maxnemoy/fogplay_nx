@@ -43,6 +43,16 @@ std::string historyPager(const std::string& html) {
         "<ul class='pagination'><li class='active'><a href='/session/list?page=1&amp;per-page=2' data-page='0'>1</a></li>"
         "<li class='next'><a href='/session/list?page=2&amp;per-page=2' data-page='1'>Next</a></li></ul></main>");
 }
+std::string accountWithTabs(std::string html) {
+    // Synthetic full-page layout: the account tabs contain empty headings in
+    // the live template. All account values still come from the safe fixture.
+    html = replace(html, "<body>", "<body><header><nav>Fixture navigation</nav></header>");
+    html = replace(html, "<h1>Информация</h1>", "<div class='user-view'><h1>Информация</h1>");
+    return replace(html, "</main>", "<div class='tab-content'>"
+        "<div class='tab-pane' id='operations'><div class='operation-list'><h1></h1></div></div>"
+        "<div class='tab-pane' id='users'><div class='user-index'><h1> \n </h1></div></div>"
+        "</div></div></main><footer>Fixture footer</footer>");
+}
 void loginAndAccount() {
     const auto login = fixture("login");
     check(parseLogin(login).csrf == "fixture-csrf-placeholder");
@@ -54,6 +64,18 @@ void loginAndAccount() {
     const auto account = fixture("account");
     const auto profile = parseAccount(account);
     check(profile.accountId == "login:fixture-user" && profile.displayName == "fixture-user");
+    const auto tabbedAccount = accountWithTabs(account);
+    const auto tabbedProfile = parseAccount(tabbedAccount);
+    check(tabbedProfile.accountId == profile.accountId && tabbedProfile.displayName == profile.displayName);
+    rejects([&] { parseAccount(replace(tabbedAccount, "<h1>Информация</h1>", "<h1></h1>")); });
+    rejects([&] { parseAccount(replace(tabbedAccount, "<h1>Информация</h1>", "<h1>Ошибка</h1>")); });
+    rejects([&] { parseAccount(replace(tabbedAccount, "<h1></h1>", "<h1>Информация</h1>")); });
+    rejects([&] { parseAccount(replace(tabbedAccount, "<h1></h1>", "<h1>Ошибка</h1>")); });
+    rejects([&] { parseAccount(replace(tabbedAccount, "/site/logout", "/site/other")); });
+    rejects([&] { parseAccount(replace(tabbedAccount, "</table>", "<tr><th>Логин</th><td>another-user</td></tr></table>")); });
+    rejects([&] { parseAccount(replace(tabbedAccount, "<h1>Информация</h1>", "<h1 id='captcha'>Информация</h1>")); });
+    // Other pages retain the existing requirement for exactly one h1.
+    rejects([&] { parseLogin(replace(login, "</main>", "<h1></h1></main>")); });
     check(parseAccount(replace(account, "fixture-user", "fixture&amp;user")).accountId == "login:fixture&user");
     check(parseAccount(replace(account, "fixture-user", "  fixture  user  ")).accountId == "login:fixture  user");
     check(parseAccount(replace(account, "secret-not-captured", "<a href='/not-an-account-id'>ignored</a>")).accountId == profile.accountId);

@@ -7,14 +7,15 @@
 #include <vector>
 
 using Budget = fog::stream::PlaybackDrainBudget;
+using Policy = fog::stream::PlaybackDrainPolicy;
 static void check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 struct Packet { unsigned id; bool video; std::uint64_t costUs; };
 struct Result { std::vector<unsigned> order; unsigned cycles=0, audio=0, maxVideo=0; };
-static Result drain(std::deque<Packet> packets) {
+static Result drain(std::deque<Packet> packets, Policy policy = Policy::PresentationFirst, std::uint64_t oldestMs = 0) {
     Result result;
     while (!packets.empty()) {
         const auto queuedVideo = std::count_if(packets.begin(), packets.end(), [](const auto& p) { return p.video; });
-        Budget budget(queuedVideo);
+        Budget budget(queuedVideo,oldestMs,policy);
         std::uint64_t elapsed=0;
         while (!packets.empty() && budget.yield(elapsed) == Budget::Yield::None) {
             const auto packet=packets.front(); packets.pop_front();
@@ -46,6 +47,22 @@ int main() {
     check(catchup.yield(12000) == Budget::Yield::Time, "catchup work exceeded its budget");
     catchup.consumed(true);
     check(catchup.yield(0) == Budget::Yield::Video, "catchup batch must yield after two frames");
+    Budget boundedBurst(3,0,Policy::BoundedQueue);
+    check(boundedBurst.catchup() && boundedBurst.yield(100000) == Budget::Yield::None,
+          "bounded queue must catch up fresh bursts and always progress one atomic operation");
+    boundedBurst.consumed(true);
+    check(boundedBurst.yield(11999) == Budget::Yield::None, "fresh bounded burst yielded before second frame");
+    check(boundedBurst.yield(12000) == Budget::Yield::Time, "bounded catchup exceeded its time budget");
+    boundedBurst.consumed(true);
+    check(boundedBurst.yield(0) == Budget::Yield::Video, "bounded catchup decoded more than two frames");
+    Budget boundedFresh(2,15,Policy::BoundedQueue);
+    check(!boundedFresh.catchup(), "two fresh bounded frames must retain separate presentation turns");
+    boundedFresh.consumed(true);
+    check(boundedFresh.yield(0) == Budget::Yield::Video, "fresh bounded pair bypassed presentation");
+    Budget boundedAged(2,16,Policy::BoundedQueue);
+    check(boundedAged.catchup(), "bounded pair must catch up at one frame of queue age");
+    Budget boundedSingle(1,200,Policy::BoundedQueue);
+    check(!boundedSingle.catchup(), "a single aged bounded frame cannot catch up");
     Budget audio(0);
     for (unsigned i=0;i<12;++i) audio.consumed(false);
     check(audio.yield(0) == Budget::Yield::Packets, "audio-only backlog must yield to controls");
@@ -55,7 +72,16 @@ int main() {
     check(result.audio == 8 && result.order.size() == 24, "video backlog starved audio or lost media");
     for (unsigned i=0;i<24;++i) check(result.order[i] == i, "compressed references changed order");
     check(result.maxVideo == 1 && result.cycles >= 16 && result.cycles <= 18, "normal batching replaced frames before presentation");
+    const auto boundedResult=drain(mixed,Policy::BoundedQueue);
+    check(boundedResult.audio == 8 && boundedResult.order.size() == 24, "bounded catchup starved audio or lost media");
+    for (unsigned i=0;i<24;++i) check(boundedResult.order[i] == i, "bounded catchup changed compressed reference order");
+    check(boundedResult.maxVideo == 2 && boundedResult.cycles == 10, "fresh bounded backlog did not catch up in bounded batches");
+    const auto boundedPair=drain({{0,true,1000},{1,true,1000}},Policy::BoundedQueue,16);
+    check(boundedPair.cycles == 1 && boundedPair.maxVideo == 2, "aged bounded pair did not drain together");
     const auto expensive=drain({{0,true,200000},{1,false,100},{2,true,1000},{3,false,100}});
     check(expensive.cycles == 3 && expensive.audio == 2, "slow decoder operation must yield then resume audio");
-    std::cout << "Playback drain: one fresh video per presentation turn, aged bounded catchup, FIFO references and atomic overrun PASS\n";
+    const auto boundedExpensive=drain({{0,true,200000},{1,false,100},{2,true,1000},{3,true,1000},{4,false,100}},Policy::BoundedQueue);
+    check(boundedExpensive.cycles == 4 && boundedExpensive.audio == 2,
+          "bounded slow decoder operation must yield then resume FIFO audio and video");
+    std::cout << "Playback drain: unchanged presentation-first policy, bounded queue catchup, FIFO audio/video and atomic overrun PASS\n";
 }

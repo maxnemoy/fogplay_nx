@@ -22,14 +22,18 @@ PORTLIBS := $(DEVKITPRO)/portlibs/switch
 PC_ENV := PKG_CONFIG_LIBDIR=$(PORTLIBS)/lib/pkgconfig
 PACKAGES := libcurl libxml-2.0 SDL2_ttf SDL2_image sdl2 libavcodec libavutil libswscale opus
 RTC_PREFIX := $(CURDIR)/third_party/rtc/switch
+MOONLIGHT_PREFIX := $(CURDIR)/third_party/moonlight/switch
 FFMPEG_DIAG := $(CURDIR)/third_party/ffmpeg-diag/switch
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 INCLUDE := -I$(CURDIR)/src -I$(CURDIR)/third_party -isystem $(RTC_PREFIX)/include -isystem $(DEVKITPRO)/libnx/include -DRTC_STATIC -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1
+INCLUDE += -idirafter $(MOONLIGHT_PREFIX)/include -I$(MOONLIGHT_PREFIX)/include/gamestream -I$(MOONLIGHT_PREFIX)/include/crypto
 CFLAGS := -g -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections $(ARCH) -D__SWITCH__ $(INCLUDE) $(shell $(PC_ENV) pkg-config --cflags $(PACKAGES) 2>/dev/null)
 CXXFLAGS := $(CFLAGS) -std=c++17 -fexceptions -frtti -MD -MP
 LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,--gc-sections,-Map,$(CURDIR)/build/$(TARGET).map
 LIBPATHS := -L$(FFMPEG_DIAG)/lib -L$(RTC_PREFIX)/lib -L$(PORTLIBS)/lib -L$(DEVKITPRO)/libnx/lib
-LIBS := -Wl,--start-group -ldatachannel -lusrsctp -lsrtp2 -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -ljuice $(shell $(PC_ENV) pkg-config --static --libs $(PACKAGES) 2>/dev/null) -lnx -lm -Wl,--end-group
+LIBPATHS += -L$(MOONLIGHT_PREFIX)/lib
+MOONLIGHT_LIBS := $(addprefix $(MOONLIGHT_PREFIX)/lib/,libgamestream.a libmoonlight-common-c.a libmoonlight-curl.a libenet.a)
+LIBS := -Wl,--start-group -ldatachannel -lusrsctp -lsrtp2 -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -ljuice $(MOONLIGHT_LIBS) -lexpat $(shell $(PC_ENV) pkg-config --static --libs $(PACKAGES) 2>/dev/null) -lnx -lm -Wl,--end-group
 LD := $(CXX)
 CPPFILES := $(shell find src -name '*.cpp' | sort)
 OFILES := $(patsubst src/%.cpp,build/%.o,$(CPPFILES))
@@ -41,7 +45,7 @@ ROMFS_FILES := $(shell find romfs -type f 2>/dev/null)
 all: $(OUTPUT).nro
 
 $(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp $(ROMFS_FILES) $(APP_ICON)
-$(OUTPUT).elf: $(OFILES) build/.flags $(FFMPEG_DIAG)/lib/libavcodec.a $(wildcard $(RTC_PREFIX)/lib/*.a) | dist
+$(OUTPUT).elf: $(OFILES) build/.flags $(FFMPEG_DIAG)/lib/libavcodec.a $(wildcard $(RTC_PREFIX)/lib/*.a) $(wildcard $(MOONLIGHT_PREFIX)/lib/*.a) | dist
 $(OUTPUT).nacp: Makefile $(APP_INFO) | dist
 
 build/%.o: src/%.cpp build/.flags | build

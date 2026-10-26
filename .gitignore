@@ -6,6 +6,7 @@
 /third_party/rtc/host/
 /third_party/rtc/switch/
 /third_party/ffmpeg-diag/
+/third_party/moonlight/
 **/build/
 **/dist/
 **/__pycache__/
@@ -25,6 +26,8 @@
 .vscode/
 auth.json*
 foghub-auth.json*
+moonlight-test.json*
+moonlight-test-identity/
 device-id.txt*
 pending-order.json*
 pending-session.json*

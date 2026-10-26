@@ -234,5 +234,79 @@ void resizedPages() {
     s.web.responses.push_back({"/game/list?page=2&per-page=24",html(last)});
     error(RepositoryErrorKind::InvalidResponse,[&]{s.catalog.games({"",2,16,0});});
 }
+void curatedComputers() {
+    Setup s;
+    auto second=fixture("computer-preview-card-excerpt.html");
+    replace(second,"id=1838","id=1836"); replace(second,"id=1838","id=1836");
+    // All identity-bearing text on the page must agree with the selected card.
+    replace(second,"f4bX8","f4bX10"); replace(second,"f4bX8","f4bX10");
+    s.web.responses.push_back({"/pc/preview?id=1838",html(fixture("computer-preview-card-excerpt.html"))});
+    s.web.responses.push_back({"/pc/preview?id=1836",html(second)});
+    const std::vector<std::pair<std::string,std::string>> added{
+        {"1233","10623X9"},{"1232","10623X2"},{"1231","10623X3"},
+        {"1235","10623X7"},{"1237","10623X10"},{"1230","10623X4"}};
+    for (const auto& [id,name] : added) {
+        auto page=fixture("computer-preview-card-excerpt.html");
+        page=std::regex_replace(page,std::regex("1838"),id);
+        page=std::regex_replace(page,std::regex("f4bX8"),name);
+        s.web.responses.push_back({"/pc/preview?id="+id,html(page)});
+    }
+    unsigned updates=0;
+    const auto cards=s.catalog.playStationComputers([&](const std::vector<Computer>& rows) {
+        ++updates; assert(rows.size()==updates);
+    });
+    assert(cards.size()==8 && cards[0].id.value=="1838" && cards[1].id.value=="1836" && updates==8);
+    for (std::size_t i=0;i<added.size();++i)
+        assert(cards[i+2].id.value==added[i].first && cards[i+2].name==added[i].second);
+    for(const auto& card:cards) assert(card.launchable && card.hourlyPrice && card.hourlyPrice->minorUnits==2500);
+    assert(s.web.posts==0);
+    Setup cancelled;
+    error(RepositoryErrorKind::Unavailable,[&]{cancelled.catalog.playStationComputers({},[]{return true;});});
+    assert(cancelled.web.gets==0);
+    Setup busy;
+    auto offline=fixture("computer-preview-card-excerpt.html"); replace(offline,"Онлайн","Занят");
+    busy.web.responses.push_back({"/pc/preview?id=1838",html(offline)});
+    busy.web.responses.push_back({"/pc/preview?id=1836",html(second)});
+    for (const auto& [id,name] : added) {
+        auto page=fixture("computer-preview-card-excerpt.html");
+        page=std::regex_replace(page,std::regex("1838"),id);
+        page=std::regex_replace(page,std::regex("f4bX8"),name);
+        busy.web.responses.push_back({"/pc/preview?id="+id,html(page)});
+    }
+    const auto unavailable=busy.catalog.playStationComputers();
+    assert(!unavailable[0].launchable && unavailable[0].availability==Availability::Busy && unavailable[1].launchable);
 }
-int main(){loginAndProfile();restoreAndFailures();securityAndStorage();historyAndAmounts();catalogs();pagedHistory();resizedPages();std::cout<<"FogHub repository tests passed\n";}
+void publicCatalogWithoutAccountStorage() {
+    // The production composition must not construct FileCookieStore("") merely
+    // to obtain an anonymous catalog. Construction/cancel never makes a request.
+    auto first = makePublicCatalog();
+    auto second = makePublicCatalog();
+    assert(first && second && first.get() != second.get());
+    first->cancel();
+    second->cancel();
+}
+void authenticationPageDiagnostics() {
+    for (bool accountStage : {false, true}) {
+        Setup s;
+        s.web.responses.push_back({"/site/login",html(accountStage ? fixture("login.html") : "<main></main>")});
+        if (accountStage) s.web.responses.push_back({"/user/info",html("<main></main>")});
+        bool rejected = false;
+        try { s.auth.begin({"fixture-user","fixture-password"}); }
+        catch (const RepositoryError& e) {
+            rejected = true;
+            assert(e.kind() == RepositoryErrorKind::InvalidResponse);
+            assert(std::string(e.what()) == (accountStage
+                ? "FogHub page could not be verified (stage=account)"
+                : "FogHub page could not be verified (stage=login-form)"));
+        }
+        assert(rejected && !s.auth.authenticated() && !s.store.saved && s.web.jar.empty());
+        assert(s.web.posts == (accountStage ? 1U : 0U));
+    }
+    Setup expired;
+    expired.web.responses.push_back({"/site/login",html(fixture("login.html"))});
+    expired.web.responses.push_back({"/user/info",html(fixture("login.html"))});
+    error(RepositoryErrorKind::NotAuthenticated,[&]{expired.auth.begin({"fixture-user","fixture-password"});});
+    assert(!expired.auth.authenticated() && expired.web.jar.empty());
+}
+}
+int main(){loginAndProfile();restoreAndFailures();securityAndStorage();historyAndAmounts();catalogs();pagedHistory();resizedPages();curatedComputers();publicCatalogWithoutAccountStorage();authenticationPageDiagnostics();std::cout<<"FogHub repository tests passed\n";}

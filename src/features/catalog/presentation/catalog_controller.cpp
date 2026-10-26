@@ -6,6 +6,7 @@ namespace uiText = ::fog::constants::ui;
 namespace fogplay {
 
 void ApplicationController::loadHistory() {
+    loginProvider_ = fog::ProviderId::Mts;
     if (!auth_.authenticated()) { loginReturn_ = Screen::History; screen_ = Screen::Consent; return; }
     screen_ = Screen::History; selection_ = 0;
     start(Task::History,[this] { return account_.history(); });

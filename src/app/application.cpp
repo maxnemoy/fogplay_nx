@@ -8,12 +8,78 @@ namespace storagePaths = ::fog::constants::storage;
 
 namespace fogplay {
 
+std::unique_ptr<fog::PairedCheckoutJournal> Services::pairedJournal(const std::string&) { return {}; }
+Services* ApplicationController::providerServices(fog::ProviderId id) const { return services_->provider(id); }
+fog::AuthRepository& ApplicationController::loginAuth() {
+    if (auto* provider = providerServices(loginProvider_)) return provider->auth();
+    throw std::runtime_error("Selected provider unavailable");
+}
+fog::AccountRepository& ApplicationController::loginAccount() {
+    if (auto* provider = providerServices(loginProvider_)) return provider->account();
+    throw std::runtime_error("Selected provider unavailable");
+}
+void ApplicationController::openProfile() {
+    screen_ = Screen::Profile; sidebar_ = false; selection_ = pairedPending_ ? 1 : 0;
+    loginProvider_ = pairedPending_ ? fog::ProviderId::FogHub : fog::ProviderId::Mts;
+    status_.clear();
+}
+void ApplicationController::refreshProfile() {
+    const bool authenticated = loginAuth().authenticated();
+    diagnostic(std::string("Profile action: provider=") + (loginProvider_ == fog::ProviderId::FogHub ? "FH" : "MTS") +
+        (authenticated ? " action=refresh" : " action=login"));
+    if (!authenticated) {
+        loginReturn_ = Screen::Profile;
+        if (loginAuth().capabilities().method == fog::LoginMethod::Credentials) beginLogin();
+        else screen_ = Screen::Consent;
+        return;
+    }
+    start(Task::ProviderProfile,[this] { return loginAccount().profile(); });
+}
+
+RestoredProviders ApplicationController::restoreProviders() {
+    // Serialized worker only. Optional profile/balance traffic must never delay
+    // recovery of a potentially billable rental belonging to either provider.
+    RestoredProviders result;
+    const bool pendingPaired = paired_ && paired_->unresolved();
+    const bool pendingMts = checkout_.unresolved() || guard_.persistent() ||
+        !guard_.pendingRental().empty() || !guard_.journalError().empty();
+    const auto restoreMts = [this,&result,pendingMts] {
+        try {
+            result.mts = auth_.restore().restored;
+            if (result.mts && pendingMts) {
+                if (checkout_.unresolved()) checkout_.stop();
+                else if (guard_.ownsSession() || guard_.recoverMatchingSession()) guard_.finishAttempt();
+            }
+        } catch (...) { result.mtsFailed = true; }
+    };
+    const auto restorePaired = [this,&result,pendingPaired] {
+        if (!pairedServices_) return;
+        try {
+            result.foghub = pairedServices_->auth().restore().restored;
+            if (result.foghub && pendingPaired) {
+                paired_->bindAuthenticatedAccount();
+                paired_->stop();
+            }
+        } catch (...) { result.foghubFailed = true; }
+    };
+    if (pendingPaired) restorePaired();
+    restoreMts();
+    if (!pendingPaired) restorePaired();
+    if (result.mts) { try { result.mtsProfile = account_.profile(); } catch (...) {} }
+    if (result.foghub) { try { result.foghubProfile = pairedServices_->account().profile(); } catch (...) {} }
+    return result;
+}
+
 ApplicationController::ApplicationController(Runtime& runtime, std::unique_ptr<Services> services)
     : rt_(runtime), services_(std::move(services)), auth_(services_->auth()), account_(services_->account()),
       catalogRepository_(services_->catalog()), rentals_(services_->rentals()),
       guard_(rentals_, services_->sessionJournal(storagePaths::path(storagePaths::PendingSession))),
       checkout_(rentals_, guard_, services_->checkoutJournal(storagePaths::path(storagePaths::PendingOrder))),
       ui_(runtime.renderer, runtime.font, runtime.titleFont) {
+    pairedServices_ = providerServices(fog::ProviderId::FogHub);
+    if (pairedServices_ && pairedServices_->pairing() && pairedServices_->pins())
+        paired_ = std::make_unique<fog::PairedCheckoutGuard>(pairedServices_->rentals(),*pairedServices_->pairing(),
+            *pairedServices_->pins(),pairedServices_->pairedJournal(storagePaths::path(storagePaths::PendingPairedRental)));
     if (!recentGames_.load()) diagnostic("Recent games load unavailable; history will remain optional.");
     syncPending();
     try {
@@ -60,7 +126,7 @@ void ApplicationController::run() {
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
     screen_ = sessionPending_ ? Screen::Recovery : Screen::Games;
-    start(Task::RestoreAuth,[this] { return auth_.restore(); });
+    start(Task::RestoreAuth,[this] { return restoreProviders(); });
     status_ = uiText::Profile::ValidatingSavedAuth;
     for (;;) {
         fog::stream::LoopTiming::Scope loopScope(loopTiming_, fog::stream::LoopTiming::Stage::Loop,
@@ -104,15 +170,16 @@ void ApplicationController::run() {
             // completion cannot briefly open RTC/media instead of stopping the rental.
             if (sessionPending_ && !stopAfterTask_ && !focused) {
                 diagnostic("Stop trigger: lost application focus; state=" + std::to_string(static_cast<int>(appletGetFocusState())));
-                stopAfterTask_ = true; if (!pending_.valid()) beginFinish("focus-lost");
+                stopAfterTask_ = true; if (paired_) paired_->requestStop(); if (!pending_.valid()) beginFinish("focus-lost");
             }
+            if (stopAfterTask_ && paired_) paired_->requestStop();
             pollRecentSave();
             poll();
             pollCatalog();
             pollPlayStation();
             // The shutdown owner retries unresolved stops and provides an explicit escape.
             if (exitAfterStop_ && !pending_.valid()) break;
-            if (screen_ == Screen::Checkout && !pending_.valid() && auth_.authenticated() &&
+            if (screen_ == Screen::Checkout && !pending_.valid() && (pairedPending_ ? pairedServices_->auth().authenticated() : auth_.authenticated()) &&
                 checkoutAutoPoll_ && std::chrono::steady_clock::now() >= checkoutAt_) {
                 if (stopAfterTask_) beginFinish(); else pollCheckout(false);
             }
@@ -124,7 +191,7 @@ void ApplicationController::run() {
             fog::stream::LoopTiming::Scope inputScope(loopTiming_, fog::stream::LoopTiming::Stage::Input);
             if (!pending_.valid() && focused) input(uiDown);
             if (screen_ == Screen::Games && focused && (!sidebar_ || catalog_.items().empty())) requestCatalog();
-            if (screen_ == Screen::Stopping && !pending_.valid() && auth_.authenticated() &&
+            if (screen_ == Screen::Stopping && !pending_.valid() && !pairedPending_ && auth_.authenticated() &&
                 std::chrono::steady_clock::now() >= retryAt_) beginFinish();
         }
         catch (const std::exception& error) {
@@ -168,6 +235,20 @@ void ApplicationController::poll() {
             diagnostic("Saved authentication restore failed; credentials omitted.");
             return;
         }
+        if (kind == Task::PairedCreate || kind == Task::PairedPoll || kind == Task::PairedStop) {
+            syncPending(); screen_ = pairedPending_ ? Screen::Recovery : Screen::PlayStation;
+            checkoutAutoPoll_ = false;
+            if (!sessionPending_) { disarmExitHandling(); stopAfterTask_ = false; }
+            if (pairedPending_ && stopAfterTask_ && kind != Task::PairedStop) beginFinish("paired-worker-failed");
+            throw;
+        }
+        if ((kind == Task::Phone || kind == Task::Profile) &&
+            loginAuth().capabilities().method == fog::LoginMethod::Credentials) {
+            screen_ = Screen::Profile;
+            diagnostic("Login failed: provider=FH stage=request; details omitted.");
+            throw;
+        }
+        if (kind == Task::ProviderProfile || kind == Task::ProviderForget) { screen_ = Screen::Profile; throw; }
         if (kind == Task::Finish) { screen_ = Screen::Stopping; retryAt_ = std::chrono::steady_clock::now()+std::chrono::seconds(exitAfterStop_ ? 1 : 10); }
         if (kind == Task::Create || kind == Task::CheckoutPoll || kind == Task::CheckoutStop) {
             logCheckoutResult(kind);
@@ -182,19 +263,64 @@ void ApplicationController::poll() {
         throw;
     }
     if (kind == Task::RestoreAuth) {
-        if (std::get<fog::RestoreAuthResult>(data).restored) {
-            authSaveFailed_ = false;
-            diagnostic("Saved authentication validated; credentials omitted.");
-            if (sessionPending_) recoverSession(); else loadGames();
-        } else if (!auth_.storageError().empty()) {
-            screen_ = Screen::Consent; loginReturn_ = Screen::Games;
-            status_ = ui_.controllerHints(uiText::Profile::ValidationFailedHint);
-            diagnostic("Saved authentication rejected or unreadable; credentials omitted.");
-        } else if (sessionPending_) {
+        auto restored = std::get<RestoredProviders>(std::move(data));
+        mtsProfile_ = std::move(restored.mtsProfile); foghubProfile_ = std::move(restored.foghubProfile);
+        syncPending();
+        authSaveFailed_ = false;
+        if (pairedPending_) {
+            loginProvider_ = fog::ProviderId::FogHub;
             screen_ = Screen::Recovery;
-            status_ = ui_.controllerHints(uiText::Profile::PreviousRentalSignInHint);
-        } else loadGames();
+            status_ = "FogHub: войдите в исходный аккаунт аренды. A — проверить, Y — профиль.";
+            if (restored.foghub) handlePairedCheckout();
+        } else if (sessionPending_) {
+            loginProvider_ = fog::ProviderId::Mts;
+            if (restored.mts) recoverSession();
+            else { screen_ = Screen::Recovery; status_ = ui_.controllerHints(uiText::Profile::PreviousRentalSignInHint); }
+        } else if (!restored.mts && (restored.mtsFailed || !auth_.storageError().empty())) {
+            loginProvider_ = fog::ProviderId::Mts; loginReturn_ = Screen::Games; screen_ = Screen::Consent;
+            status_ = ui_.controllerHints(restored.mtsFailed ? uiText::Profile::RestoreFailedHint : uiText::Profile::ValidationFailedHint);
+        } else {
+            loadGames();
+            if (restored.foghubFailed) status_ = "FogHub: сохранённый вход не подтверждён. Откройте профиль (Y).";
+        }
         return;
+    }
+    if (kind == Task::ProviderForget) {
+        if (loginProvider_ == fog::ProviderId::FogHub) foghubProfile_.reset(); else mtsProfile_.reset();
+        screen_ = Screen::Profile; status_ = uiText::Profile::SignedOut; return;
+    }
+    if (kind == Task::ProviderProfile) {
+        const auto profile = std::get<fog::UserProfile>(std::move(data));
+        if (loginProvider_ == fog::ProviderId::FogHub) foghubProfile_ = profile; else mtsProfile_ = profile;
+        screen_ = Screen::Profile; status_.clear(); return;
+    }
+    if (kind == Task::PairedCreate && std::holds_alternative<VerifiedOffer>(data)) {
+        syncPending();
+        if (sessionPending_ || stopAfterTask_ || exitAfterStop_ || appletGetFocusState() != AppletFocusState_InFocus) {
+            if (sessionPending_) beginFinish("paired-preflight-journal");
+            else { disarmExitHandling(); stopAfterTask_ = false; screen_ = Screen::PlayStation; status_ = uiText::Server::ConnectionCancelled; }
+            return;
+        }
+        const auto order = std::get<VerifiedOffer>(data).request;
+        sessionPending_ = true; pairedPending_ = true;
+        checkoutStatus_ = "FogHub: подготовка и автоматическое сопряжение…";
+        diagnostic("Paired checkout request: provider=FH action=create");
+        start(Task::PairedCreate,[this,order] { paired_->create(order); return std::monostate{}; });
+        return;
+    }
+    if (kind == Task::PairedCreate && std::holds_alternative<ChangedOffer>(data)) {
+        syncPending();
+        if (sessionPending_) { beginFinish("paired-offer-change"); return; }
+        disarmExitHandling(); stopAfterTask_ = false;
+        auto fresh = std::move(std::get<ChangedOffer>(data).computers);
+        playStationComputers_.erase(std::remove_if(playStationComputers_.begin(),playStationComputers_.end(),
+            [](const fog::Computer& pc) { return pc.id.provider == fog::ProviderId::FogHub; }),playStationComputers_.end());
+        playStationComputers_.insert(playStationComputers_.end(),fresh.begin(),fresh.end());
+        playStationLoadedAt_ = std::chrono::steady_clock::now(); screen_ = Screen::PlayStation; selection_ = 0;
+        status_ = uiText::Server::TariffChanged; return;
+    }
+    if (kind == Task::PairedCreate || kind == Task::PairedPoll || kind == Task::PairedStop) {
+        handlePairedCheckout(); return;
     }
     if (kind == Task::Create && std::holds_alternative<VerifiedOffer>(data)) {
         // The public fetch can outlive Back, HOME or shutdown intent. Only the
@@ -275,11 +401,15 @@ void ApplicationController::poll() {
         status_.clear();
         diagnostic("Computers OK, count=" + std::to_string(computers_.size()));
     } else if (kind == Task::Profile) {
+        const auto profile = std::get<fog::UserProfile>(data);
+        if (loginProvider_ == fog::ProviderId::FogHub) foghubProfile_ = profile; else mtsProfile_ = profile;
         screen_ = loginReturn_;
-        status_ = auth_.storageError().empty() ? uiText::Profile::AuthSaved :
+        status_ = loginAuth().storageError().empty() ? uiText::Profile::AuthSaved :
             uiText::Profile::AuthSaveFailed;
         diagnostic("Authenticated profile OK; personal fields not logged.");
-        if (sessionPending_) recoverSession();
+        if (pairedPending_) {
+            start(Task::PairedStop,[this] { paired_->bindAuthenticatedAccount(); paired_->stop(); return std::monostate{}; });
+        } else if (sessionPending_) recoverSession();
         else if (screen_ == Screen::History) loadHistory();
         else if (screen_ == Screen::PlayStation) loadPlayStation();
         else if (screen_ == Screen::Games && catalog_.items().empty()) loadGames();
@@ -288,16 +418,19 @@ void ApplicationController::poll() {
         authStep_ = authResult.step;
         screen_ = Screen::Auth;
         if (authStep_ == fog::AuthStep::Success) {
-            authSaveFailed_ = !auth_.storageError().empty();
+            authSaveFailed_ = !loginAuth().storageError().empty();
             if (captcha_) { SDL_DestroyTexture(captcha_); captcha_ = nullptr; }
-            start(Task::Profile, [this] { return account_.profile(); });
+            start(Task::Profile, [this] { return loginAccount().profile(); });
         } else if (authStep_ == fog::AuthStep::Captcha) {
             setCaptcha(authResult);
             status_.clear();
         } else if (authStep_ == fog::AuthStep::Otp) {
             status_.clear();
         } else {
-            status_ = ui_.controllerHints(uiText::Profile::SignInIncompleteHint);
+            if (loginAuth().capabilities().method == fog::LoginMethod::Credentials) {
+                screen_ = Screen::Profile;
+                status_ = ui_.controllerHints("FogHub: вход не завершён. A — повторить вход.");
+            } else status_ = ui_.controllerHints(uiText::Profile::SignInIncompleteHint);
             diagnostic("Auth stopped at unsupported/restart response; body omitted.");
         }
     }

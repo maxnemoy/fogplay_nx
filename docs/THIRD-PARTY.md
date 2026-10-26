@@ -16,6 +16,10 @@
 | SDL2, SDL2_image, SDL2_ttf | [libsdl-org](https://github.com/libsdl-org), zlib; FreeType, HarfBuzz и декодеры изображений имеют собственные уведомления |
 | libnx | [switchbrew/libnx](https://github.com/switchbrew/libnx), ISC |
 | curl | [curl/curl](https://github.com/curl/curl), curl license |
+| GameStream / Moonlight-Switch | [XITRIX/Moonlight-Switch](https://github.com/XITRIX/Moonlight-Switch), GPL-3.0; используется HTTP/crypto-слой с локальными изменениями |
+| moonlight-common-c | [moonlight-stream/moonlight-common-c](https://github.com/moonlight-stream/moonlight-common-c), GPL-3.0; включает nanors, BSD |
+| ENet (вариант Moonlight) | Закреплённый submodule moonlight-common-c, MIT; отдельная статическая библиотека |
+| Expat | [libexpat/libexpat](https://github.com/libexpat/libexpat), MIT; Switch portlib |
 | libxml2 | [GNOME/libxml2](https://gitlab.gnome.org/GNOME/libxml2), MIT; уведомление сохранено в `licenses/libxml2-Copyright.txt` |
 | Opus | [xiph/opus](https://github.com/xiph/opus), BSD |
 | libpng, libjpeg-turbo, libwebp, FreeType, HarfBuzz, zlib, bzip2 | Статические зависимости Switch portlibs; сохраняются соответствующие upstream-лицензии |
@@ -26,6 +30,8 @@
 `tools/rtc/fetch.sh` получает libdatachannel commit `a02b751917ac8afc8c58dc6f4461d25ff9465d48` и Mbed TLS commit `c765c831e5c2a0971410692f92f7a81d6ec65ec2` вместе с закреплёнными submodules. `tools/rtc/patch-sources.py` и C-адаптеры применяют изменения для Switch. Файлы `.patch` сохранены как справочные снимки отдельных изменений и сборкой не применяются. Копии fetched-репозиториев и статических библиотек не входят в публикуемые исходники.
 
 `tools/ffmpeg/build-diag-overlay.py` проверяет SHA-256 FFmpeg 7.1 и двух devkitPro-патчей, применяет `nvdec-diagnostics.patch`, собирает только диагностический NVTEGRA-объект и проверяет неизменность остальных объектов установленного `libavcodec.a`. Точная конфигурация и контрольные суммы записываются в `third_party/ffmpeg-diag/switch/lib/manifest.json`. Исходные патчи и GPL-текст остаются в `tools/ffmpeg`.
+
+`tools/moonlight/fetch.sh` закрепляет ревизии Moonlight-Switch, moonlight-common-c и ENet; `prepare.py` применяет проверяемые изменения GameStream и транспорта. Отдельный curl 8.15.0 использует ту же Mbed TLS 3.6.4 и конфигурацию, что RTC; `namespace-curl.py` изолирует его символы от системного curl. Исходники, параметры и контрольные суммы фиксируются в манифестах сборки `third_party/moonlight/switch`. Лицензии Moonlight-компонентов находятся в `licenses/moonlight/`. При распространении общей сборки нужно учитывать GPL-3.0 этих компонентов; GPL-2.0-or-later собственного кода допускает выбор более поздней версии GPL.
 
 Для распространения собранного NRO нужны условия всех включённых компонентов, в том числе соответствующие исходники/изменения/конфигурация GPL-компонентов. Архив приложения содержит доступные лицензионные тексты и манифест декодера; он сам по себе не является архивом всех исходников статических библиотек. Публикация исходного клиента и распространение бинарной сборки — отдельные действия.
 

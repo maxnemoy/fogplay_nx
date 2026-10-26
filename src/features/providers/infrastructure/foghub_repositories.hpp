@@ -3,8 +3,10 @@
 #include "features/account/domain/account_repository.hpp"
 #include "features/auth/infrastructure/foghub_cookie_storage.hpp"
 #include "features/providers/infrastructure/foghub_transport.hpp"
+#include "features/providers/infrastructure/foghub_html.hpp"
 #include <atomic>
 #include <memory>
+#include <map>
 
 namespace fog::foghub {
 // One serialized worker owns the session, its repositories and cookie store.
@@ -23,6 +25,19 @@ public:
     std::string readPublic(const std::string& path);
     void cancel() noexcept { transport_.cancel(); }
 private:
+    friend class Rentals;
+    // Raw page evidence stays private to infrastructure. Rental commands use
+    // the same complete/account-verified history reader as the read adapter.
+    struct OwnHistory {
+        AuthData owner;
+        std::vector<HistoryRow> rows;
+        std::vector<std::string> pages;
+        std::map<std::string,std::size_t> rowPages;
+    };
+    OwnHistory ownHistory();
+    std::string readRentalPage(const std::string& path);
+    WebResponse submitPairing(const std::string& computer, const Query& fields, bool freshPair = false);
+    WebResponse closeRental(const std::string& rental);
     WebResponse get(const std::string& path, bool requiresAuth);
     UserProfile verifiedProfile();
     void invalidate(bool removeSaved);
@@ -71,7 +86,10 @@ private:
     Session& session_;
 };
 
-// Not a Services implementation: stage 2 deliberately has no rental/stream adapter.
+// Isolated public catalog with in-memory cookies and no account storage.
+std::shared_ptr<CatalogRepository> makePublicCatalog();
+
+// Owns the read adapters; composition attaches rental and streaming separately.
 class ReadRepositories {
 public:
     explicit ReadRepositories(const std::string& cookiePath);

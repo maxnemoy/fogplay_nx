@@ -11,6 +11,7 @@
 #include <atomic>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <string_view>
 
 namespace fog::foghub {
@@ -29,6 +30,7 @@ const char* errorMessage(TransportFailure kind) noexcept {
     case TransportFailure::Network: return "FogHub HTTPS request failed";
     case TransportFailure::ResponseTooLarge: return "FogHub response limit exceeded";
     case TransportFailure::Internal: return "Cannot initialize FogHub HTTPS transport";
+    case TransportFailure::Unsupported: return "FogHub transport operation is unsupported";
     }
     return "FogHub transport failed";
 }
@@ -97,6 +99,24 @@ bool validFieldName(std::string_view name) {
         std::all_of(name.begin(), name.end(), [](unsigned char c) {
             return unreserved(c) || c == '[' || c == ']';
         });
+}
+
+bool numericId(std::string_view value) {
+    return !value.empty() && value.size() <= 20 && value.front() != '0' &&
+        std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+}
+
+std::string formBody(const Query& fields) {
+    if (fields.empty() || fields.size() > 64) fail(TransportFailure::InvalidRequest);
+    std::string form;
+    for (const auto& field : fields) {
+        if (!validFieldName(field.first) || field.second.size() > maxRequestBytes / 2 ||
+            !validText(field.second)) fail(TransportFailure::InvalidRequest);
+        if (!form.empty()) form += '&';
+        form += encode(field.first) + '=' + encode(field.second);
+        if (form.size() > maxRequestBytes) fail(TransportFailure::InvalidRequest);
+    }
+    return form;
 }
 
 std::string lowerAscii(std::string_view value) {
@@ -180,17 +200,37 @@ public:
     }
 
     WebResponse submitLogin(const Query& fields) override {
-        if (fields.empty() || fields.size() > 64) fail(TransportFailure::InvalidRequest);
-        std::string form;
-        for (const auto& field : fields) {
-            if (!validFieldName(field.first) || field.second.size() > maxRequestBytes / 2 ||
-                !validText(field.second)) fail(TransportFailure::InvalidRequest);
-            if (!form.empty()) form += '&';
-            form += encode(field.first) + '=' + encode(field.second);
-            if (form.size() > maxRequestBytes) fail(TransportFailure::InvalidRequest);
-        }
+        const auto form = formBody(fields);
         std::lock_guard<std::mutex> lock(mutex_);
         return request("/site/login", &form);
+    }
+
+    WebResponse submitPairing(const std::string& computer, const Query& fields) override {
+        return submitPairing(computer,fields,false);
+    }
+    WebResponse submitPairing(const std::string& computer, const Query& fields, bool freshPair) override {
+        if (!numericId(computer) || fields.size() != 3) fail(TransportFailure::InvalidRequest);
+        std::set<std::string> names;
+        for (const auto& field : fields) {
+            if (!names.insert(field.first).second ||
+                (field.first != "_csrf" && field.first != "moonlight_url" && field.first != "Pc[pin]") ||
+                field.second.empty()) fail(TransportFailure::InvalidRequest);
+            if (field.first == "Pc[pin]" && (field.second.size() != 4 ||
+                !std::all_of(field.second.begin(), field.second.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })))
+                fail(TransportFailure::InvalidRequest);
+        }
+        const auto form = formBody(fields);
+        std::lock_guard<std::mutex> lock(mutex_);
+        return request("/pc/play?id=" + computer + (freshPair ? "&resume=0" : ""), &form);
+    }
+
+    WebResponse closeRental(const std::string& rental) override {
+        if (!numericId(rental)) fail(TransportFailure::InvalidRequest);
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Unknown GET-close outcomes are not safe to replay. Auth reset starts a
+        // new scope; the coordinator additionally persists its stop-attempt marker.
+        if (!closeAttempts_.insert(rental).second) fail(TransportFailure::InvalidRequest);
+        return request("/session/close?id=" + rental, nullptr);
     }
 
     std::vector<std::string> cookies() override {
@@ -214,6 +254,7 @@ public:
     void clearCookies() override {
         std::lock_guard<std::mutex> lock(mutex_);
         check(curl_easy_setopt(handle_.get(), CURLOPT_COOKIELIST, "ALL"));
+        closeAttempts_.clear();
     }
 
     void cancel() noexcept override { cancelled_.store(true, std::memory_order_relaxed); }
@@ -308,6 +349,7 @@ private:
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle_;
     std::atomic_bool cancelled_{false};
     std::mutex mutex_;
+    std::set<std::string> closeAttempts_;
 };
 }
 
@@ -322,6 +364,26 @@ std::string canonicalReadPath(const std::string& input) {
         fail(TransportFailure::InvalidRequest);
     const auto question = input.find('?');
     const auto path = input.substr(0, question);
+    // Unlike generic list filters, these authenticated routes accept only the
+    // exact observed PC query. No action/method aliases or extra fields.
+    if (path == "/pc/play" || path == "/pc/play-success") {
+        const auto prefix = path + "?id=";
+        if (input.rfind(prefix, 0) != 0) fail(TransportFailure::InvalidRequest);
+        auto id = input.substr(prefix.size());
+        if (path == "/pc/play") {
+            const std::string suffix = "&resume=0";
+            if (id.size() > suffix.size() && id.compare(id.size()-suffix.size(),suffix.size(),suffix) == 0)
+                id.resize(id.size()-suffix.size());
+        }
+        if (path == "/pc/play-success") {
+            const std::string suffix = "&withResume=0";
+            if (id.size() <= suffix.size() || id.compare(id.size()-suffix.size(),suffix.size(),suffix) != 0)
+                fail(TransportFailure::InvalidRequest);
+            id.resize(id.size()-suffix.size());
+        }
+        if (!numericId(id)) fail(TransportFailure::InvalidRequest);
+        return input;
+    }
     static constexpr std::array<std::string_view, 8> allowed = {
         "/site/login", "/user/info", "/user/balance", "/session/list",
         "/game/list", "/game/preview", "/pc/list", "/pc/preview"

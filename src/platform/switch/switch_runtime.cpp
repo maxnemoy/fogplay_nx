@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -185,8 +186,28 @@ Runtime::~Runtime() {
 }
 
 std::optional<std::string> keyboard(const char* title, const std::string& initial, int maximum, bool password) {
+    diagnostic(std::string("Keyboard open requested; password=") + (password ? "1" : "0"));
+    // App controls can map physical B to Confirm. The system applet uses the
+    // native layout, where B cancels; do not carry the activating press into it.
+    PadState launchPad;
+    padInitializeDefault(&launchPad);
+    const auto releasedBy = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    constexpr u64 activationButtons = HidNpadButton_A | HidNpadButton_B | HidNpadButton_X |
+        HidNpadButton_Y | HidNpadButton_Plus | HidNpadButton_Minus;
+    for (;;) {
+        padUpdate(&launchPad);
+        if (!(padGetButtons(&launchPad) & activationButtons)) break;
+        if (!appletMainLoop() || appletGetFocusState() != AppletFocusState_InFocus ||
+            std::chrono::steady_clock::now() >= releasedBy) {
+            diagnostic("Keyboard activation cancelled before applet launch");
+            return std::nullopt;
+        }
+        svcSleepThread(10000000);
+    }
     SwkbdConfig config{};
-    checkResult(swkbdCreate(&config, 0), "Software keyboard");
+    const Result created = swkbdCreate(&config, 0);
+    diagnostic("Keyboard create result=" + std::to_string(created));
+    checkResult(created, "Software keyboard creation");
     if (password) swkbdConfigMakePresetPassword(&config);
     else swkbdConfigMakePresetDefault(&config);
     swkbdConfigSetHeaderText(&config, title);
@@ -196,8 +217,14 @@ std::optional<std::string> keyboard(const char* title, const std::string& initia
     char result[512]{};
     const Result rc = swkbdShow(&config, result, sizeof(result));
     swkbdClose(&config);
-    if (R_FAILED(rc)) return std::nullopt;
-    return std::string(result);
+    diagnostic("Keyboard show result=" + std::to_string(rc));
+    // libnx uses this for a non-confirmed applet close as well as abnormal exit.
+    // Retain its numeric result for diagnosis; it is not proof of a user cancel.
+    if (rc == MAKERESULT(Module_Libnx, LibnxError_LibAppletBadExit)) return std::nullopt;
+    checkResult(rc, "Software keyboard display");
+    const std::string text(result);
+    if (password) for (volatile char& value : result) value = 0;
+    return text;
 }
 
 void fatalScreen(const std::string& message) {

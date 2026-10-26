@@ -27,6 +27,7 @@ namespace uiText = fog::constants::ui;
 #include <functional>
 #include <iostream>
 #include <optional>
+#include <memory>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 #include <variant>
@@ -60,12 +61,23 @@ constexpr int AppletFocusState_InFocus=1;
 int focusState=AppletFocusState_InFocus;
 int appletGetFocusState() { return focusState; }
 enum class Screen { Details, PlayStationDetails, PlayStation, Consent, Checkout };
-enum class Task { Create };
+enum class Task { Create, PairedCreate };
 struct ApplicationController {
     Screen screen_ = Screen::PlayStationDetails, loginReturn_ = Screen::Details;
     bool sessionPending_=false, selectedPlayStation_=false, stopAfterTask_=false, ownSteam_=true, exitAfterStop_=false;
     struct Auth { bool signedIn=true; bool authenticated() const { return signedIn; } } auth_;
     struct Catalog { auto playStationComputers() { return fog::fetchPlayStationComputers(); } } catalogRepository_;
+    struct Paired { int calls=0; void create(const fog::StartRentalRequest&) { ++calls; } };
+    std::shared_ptr<Paired> paired_=std::make_shared<Paired>();
+    struct Provider {
+        Auth auth_;
+        Catalog catalog_;
+        Auth& auth() { return auth_; }
+        Catalog& catalog() { return catalog_; }
+    };
+    std::shared_ptr<Provider> pairedServices_=std::make_shared<Provider>();
+    bool pairedPending_=false;
+    fog::ProviderId loginProvider_=fog::ProviderId::Mts;
     struct Checkout {
         int calls=0;
         fog::StartRentalRequest request{};
@@ -84,6 +96,8 @@ struct ApplicationController {
     bool storageChecked=false, armed=false;
     int refreshes=0;
     std::function<TaskResult()> worker;
+    std::vector<std::string> diagnostics;
+    void diagnostic(const std::string& message) { diagnostics.push_back(message); }
     void checkStorage() { storageChecked=true; }
     void armExitHandling() { armed=true; }
     void loadPlayStation() { ++refreshes; screen_=Screen::PlayStation; }
@@ -95,9 +109,12 @@ struct ApplicationController {
     void beginFinish(const char*) { ++finishRequests; }
     void acceptCreateResult(TaskResult data);
     void createSession();
+    void createPairedSession(const fog::Computer&);
+    void acceptPairedResult(TaskResult data);
 };
 '''
 harness += method((root/'src/features/session/presentation/rental_controller.cpp').read_text(), 'createSession')
+harness += method((root/'src/features/session/presentation/rental_controller.cpp').read_text(), 'createPairedSession')
 poll_source = (root/'src/app/application.cpp').read_text()
 harness += '\nvoid ApplicationController::acceptCreateResult(TaskResult data) { const auto kind=Task::Create;\n'
 for marker in ['VerifiedOffer','ChangedOffer']:
@@ -109,6 +126,17 @@ for marker in ['VerifiedOffer','ChangedOffer']:
         marker_end += 1
     harness += poll_source[marker_start:marker_end] + '\n'
 harness += '}\n'
+harness += '\nvoid ApplicationController::acceptPairedResult(TaskResult data) { const auto kind=Task::PairedCreate;\n'
+for marker in ['VerifiedOffer','ChangedOffer']:
+    marker_start = poll_source.index('    if (kind == Task::PairedCreate && std::holds_alternative<' + marker + '>(data)) {')
+    marker_brace = poll_source.index('{', marker_start)
+    marker_depth, marker_end = 1, marker_brace + 1
+    while marker_depth:
+        marker_depth += (poll_source[marker_end] == '{') - (poll_source[marker_end] == '}')
+        marker_end += 1
+    harness += poll_source[marker_start:marker_end] + '\n'
+harness += '}\n'
+
 
 harness += r'''
 fog::Computer offer(int id=11573) {
@@ -123,7 +151,56 @@ ApplicationController fixture(int id=11573) {
     fog::failFetch=false; fog::duringFetch={}; focusState=AppletFocusState_InFocus;
     return app;
 }
+ApplicationController foghubFixture() {
+    auto app=fixture();
+    auto& pc=app.playStationComputers_.front();
+    pc.id={fog::ProviderId::FogHub,"1838"}; pc.name="f4bX8"; pc.offerId={}; pc.availability=fog::Availability::Online;
+    fog::currentOffers=app.playStationComputers_;
+    return app;
+}
 int main() {
+    {
+        auto app=foghubFixture(); app.playStationLoadedAt_={}; app.createSession();
+        assert(app.armed && app.worker && app.sessionPending_ && !app.selectedPlayStation_);
+        const auto verified=app.worker(); app.worker={};
+        assert(std::holds_alternative<VerifiedOffer>(verified) && app.paired_->calls==0 && app.checkout_.calls==0);
+        app.acceptPairedResult(verified);
+        assert(app.worker && app.pairedPending_);
+        app.worker();
+        assert(app.paired_->calls==1 && app.checkout_.calls==0);
+        assert(app.diagnostics.size()==1 && app.diagnostics.front()=="Paired checkout request: provider=FH action=create");
+    }
+    for(int cancellation=0;cancellation<3;++cancellation) {
+        auto app=foghubFixture(); app.createSession(); const auto verified=app.worker(); app.worker={};
+        if(cancellation==0) app.stopAfterTask_=true;
+        if(cancellation==1) focusState=0;
+        if(cancellation==2) app.exitAfterStop_=true;
+        app.acceptPairedResult(verified);
+        assert(!app.worker && !app.sessionPending_ && app.disarmed && !app.stopAfterTask_);
+        assert(app.paired_->calls==0 && app.checkout_.calls==0);
+    }
+    for(int mutation=0;mutation<4;++mutation) {
+        auto app=foghubFixture(); app.createSession();
+        if(mutation==0) fog::currentOffers.front().availability=fog::Availability::Busy;
+        if(mutation==1) fog::currentOffers.front().price="55";
+        if(mutation==2) fog::currentOffers.front().hourlyPrice->minorUnits=5500;
+        if(mutation==3) fog::currentOffers.clear();
+        const auto changed=app.worker(); app.worker={};
+        assert(std::holds_alternative<ChangedOffer>(changed)); app.acceptPairedResult(changed);
+        assert(app.disarmed && !app.sessionPending_ && app.paired_->calls==0 && app.checkout_.calls==0);
+    }
+    {
+        auto app=foghubFixture(); app.pairedServices_->auth_.signedIn=false; app.createSession();
+        assert(app.screen_==Screen::Consent && app.loginProvider_==fog::ProviderId::FogHub && !app.worker);
+        assert(!app.armed && !app.sessionPending_ && app.checkout_.calls==0);
+    }
+    for(int invalid=0;invalid<3;++invalid) {
+        auto app=foghubFixture();
+        if(invalid==0) app.playStationComputers_.front().hourlyPrice.reset();
+        if(invalid==1) app.playStationComputers_.front().availability=fog::Availability::Busy;
+        if(invalid==2) app.playStationComputers_.front().launchable=false;
+        app.createSession(); assert(!app.worker && !app.armed && app.checkout_.calls==0 && app.paired_->calls==0);
+    }
     for (const int id : {11573,13025,7705,5632,5510}) {
         auto app=fixture(id); app.createSession();
         assert(app.armed && app.storageChecked && app.sessionPending_ && app.worker);
@@ -221,7 +298,7 @@ int main() {
         assert(app.sessionPending_ && app.finishRequests==1 && !app.disarmed);
         assert(app.playStationComputers_[0].hourlyPrice->minorUnits==4900 && app.checkout_.calls==0);
     }
-    std::cout << "PlayStation checkout: original/fourth PC fresh offer dispatch, Back/HOME/exit during fetch, tariff/price changes, stale/missing list, absent/invalid PC, fetch failure, auth, journal guard and normal-mode isolation PASS (actual glue; no paid requests)\n";
+    std::cout << "MTS/FH checkout routing: ordinary FH PC, credentials route, fresh offer dispatch, Back/HOME/exit during fetch, tariff/price changes, stale/missing list, absent/invalid PC, fetch failure, auth, journal guard and normal-mode isolation PASS (actual glue; no paid requests)\n";
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fog-playstation-checkout-') as directory:

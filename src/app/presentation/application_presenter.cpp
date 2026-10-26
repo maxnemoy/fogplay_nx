@@ -4,11 +4,19 @@
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 #include "features/playstation/presentation/catalog_view.hpp"
+#include <iomanip>
+#include <sstream>
 
 namespace uiText = ::fog::constants::ui;
 
 namespace fogplay {
 namespace {
+std::string profileBalance(const std::optional<fog::UserProfile>& profile) {
+    if (!profile || !profile->balance) return "Баланс не загружен";
+    std::ostringstream amount;
+    amount << std::fixed << std::setprecision(2) << static_cast<double>(profile->balance->minorUnits)/100.0;
+    return "Баланс: " + amount.str() + " " + profile->balance->currency;
+}
 bool routineStatus(const std::string& value) {
     // Explicitly known success/instruction copy only: unknown errors stay visible.
     for (const auto* routine : {uiText::Common::Ready, uiText::Profile::SessionHistory, uiText::Settings::LayoutSaved,
@@ -97,7 +105,7 @@ void ApplicationController::draw() {
     loopTiming_.suspendPresentation();
     fog::ui::Chrome chrome;
     chrome.sidebarExpanded = sidebar_; chrome.sidebarFocused = sidebar_;
-    chrome.account = auth_.authenticated() ? uiText::Profile::Connected : uiText::Profile::SignInAccount;
+    chrome.account = auth_.authenticated() || (pairedServices_ && pairedServices_->auth().authenticated()) ? "Профиль" : uiText::Profile::SignInAccount;
     chrome.title = uiText::Catalog::Title;
     chrome.section = fog::ui::Section::Games;
     if (screen_ == Screen::Computers || screen_ == Screen::Details || screen_ == Screen::GameDetail) { chrome.title = selectedGameName_; chrome.section = fog::ui::Section::Computers; }
@@ -105,6 +113,11 @@ void ApplicationController::draw() {
         chrome.title = "PLAYSTATION"; chrome.section = fog::ui::Section::PlayStation;
         chrome.subtitle = playStationPending_.valid() ? uiText::PlayStation::RefreshingServers : uiText::PlayStation::SourceStatus;
         chrome.hints = uiText::PlayStation::CatalogHints;
+    }
+    if (screen_ == Screen::Profile) {
+        chrome.title = "ПРОФИЛЬ";
+        chrome.hints = sessionPending_ ? "A — вход / обновить · R — проверить аренду · B — назад" :
+            selection_ ? "A — вход / обновить · X — выйти · B — назад" : "A — вход / обновить · X — выйти · R — аренды · B — назад";
     }
     if (screen_ == Screen::History) { chrome.title = uiText::Profile::HistoryTitle; chrome.section = fog::ui::Section::History; }
     if (screen_ == Screen::Settings || screen_ == Screen::ImageSettings || screen_ == Screen::ConnectionSettings) {
@@ -123,11 +136,23 @@ void ApplicationController::draw() {
     if (screen_ == Screen::Genres) { chrome.title = uiText::Catalog::GenresTitle; chrome.hints = uiText::Catalog::GenreHints; }
     if (screen_ == Screen::Computers) chrome.hints = uiText::Server::CatalogHints;
     if (screen_ == Screen::Details) chrome.hints = detailsFromAutomatic_ ? uiText::Server::ConnectHints : uiText::Server::RefreshPingHints;
-    if (sessionPending_) chrome.hints = uiText::Server::PendingSessionHints;
+    if (sessionPending_ && screen_ != Screen::Profile) chrome.hints = uiText::Server::PendingSessionHints;
     if (auth_.authenticated() && authSaveFailed_) chrome.subtitle.clear();
     ui_.frame(chrome);
     const auto area = ui_.content();
-    if (screen_ == Screen::Games) {
+    if (screen_ == Screen::Profile) {
+        for (std::size_t index=0; index<2; ++index) {
+            const auto provider = index ? fog::ProviderId::FogHub : fog::ProviderId::Mts;
+            auto* service = providerServices(provider);
+            const auto& profile = index ? foghubProfile_ : mtsProfile_;
+            const int top = 150+static_cast<int>(index)*190;
+            ui_.panel({area.x,top,area.w,165},selection_==index);
+            ui_.text(index ? "FogHub · PC / Moonlight" : "MTS FogPlay",area.x+20,top+14,area.w-40,white,true,1);
+            const bool authenticated = service && service->auth().authenticated();
+            ui_.text(authenticated ? (profile ? profile->displayName : "Вход подтверждён") : "Войти в аккаунт",area.x+20,top+65,area.w-40,accent);
+            ui_.text(authenticated ? profileBalance(profile) : (index ? "Логин и пароль · ввод на Switch" : "Номер телефона и SMS"),area.x+20,top+110,area.w-40,muted);
+        }
+    } else if (screen_ == Screen::Games) {
         std::vector<std::string> genreLabels;
         for (std::size_t i=0; i<5; ++i) genreLabels.emplace_back(fog::ui::genreLabel(fog::catalogGenres()[i]));
         genreLabels.emplace_back(selectedGenreIndex()>5 ? fog::ui::genreLabel(fog::catalogGenres()[selectedGenreIndex()-1]) : uiText::Catalog::AllGenres);
@@ -211,21 +236,24 @@ void ApplicationController::draw() {
         ui_.dialog({uiText::Server::AdoptRentalTitle,uiText::Server::AdoptRentalNotice,uiText::Common::Connect,uiText::Common::Back});
     } else if (screen_ == Screen::Checkout) {
         // Worker owns the coordinator while a request is running. Never read its mutable result here.
-        ui_.dialog({uiText::Server::ConnectingTitle, checkoutStatus_ + ui_.controllerHints(uiText::Server::ManualCheckHint),ui_.controllerHints(uiText::Server::CheckButtonHint),ui_.controllerHints(uiText::Server::FinishButtonHint)});
+        ui_.dialog({uiText::Server::ConnectingTitle, checkoutStatus_ + (pairedPending_ || task_ == Task::PairedCreate ? "\nНеопределённый результат сохраняется. Проверьте аренду в исходном аккаунте FogHub." : ui_.controllerHints(uiText::Server::ManualCheckHint)),ui_.controllerHints(uiText::Server::CheckButtonHint),ui_.controllerHints(uiText::Server::FinishButtonHint)});
     } else if (screen_ == Screen::ManualResolution) {
         ui_.dialog({uiText::Server::ManualResolutionTitle,uiText::Server::ManualResolutionNotice,uiText::Server::ManualResolutionConfirmed,uiText::Common::Back,true,true});
     } else if (screen_ == Screen::StopConfirm) {
         ui_.dialog({uiText::Server::FinishGameSessionTitle,uiText::Server::FinishRentalNotice,uiText::Server::FinishRental,uiText::Common::Continue,true,true});
     } else if (screen_ == Screen::Stopping || screen_ == Screen::Recovery) {
-        ui_.dialog({uiText::Server::TerminationUnconfirmed,ui_.controllerHints(uiText::Server::TerminationRecoveryHint),uiText::Common::Check,"",true,true});
+        ui_.dialog({uiText::Server::TerminationUnconfirmed,
+            pairedPending_ ? status_ : ui_.controllerHints(uiText::Server::TerminationRecoveryHint),uiText::Common::Check,"",true,true});
     } else if (screen_ == Screen::Streaming) {
         if (transportReconnect_.recovering())
             ui_.empty(uiText::Stream::Reconnecting,uiText::Stream::ReconnectNotice);
         else ui_.empty(uiText::Stream::ConnectingComputer,uiText::Stream::FirstFrameHint);
     } else if (screen_ == Screen::Consent) {
-        ui_.dialog({uiText::Profile::MtsSignInTitle,ui_.controllerHints(uiText::Profile::MtsSignInConsent),uiText::Profile::SignIn,uiText::Common::Back});
+        ui_.dialog({loginProvider_ == fog::ProviderId::FogHub ? "Вход в FogHub" : uiText::Profile::MtsSignInTitle,
+            loginProvider_ == fog::ProviderId::FogHub ? "Введите собственные логин и пароль FogHub на Switch. Сохранённый вход проверяется при запуске." :
+            ui_.controllerHints(uiText::Profile::MtsSignInConsent),uiText::Profile::SignIn,uiText::Common::Back});
     } else if (screen_ == Screen::Auth) {
-        ui_.dialog({uiText::Profile::SignInTitle,authStep_ == fog::AuthStep::Captcha ? ui_.controllerHints(uiText::Profile::CaptchaHint) : ui_.controllerHints(uiText::Profile::SmsHint),uiText::Profile::EnterCode,uiText::Common::Back,true,false,captcha_});
+        ui_.dialog({uiText::Profile::SignInTitle,loginProvider_ == fog::ProviderId::FogHub ? "FogHub: проверяем вход…" : authStep_ == fog::AuthStep::Captcha ? ui_.controllerHints(uiText::Profile::CaptchaHint) : ui_.controllerHints(uiText::Profile::SmsHint),uiText::Profile::EnterCode,uiText::Common::Back,true,false,captcha_});
     }
     if (auth_.authenticated() && authSaveFailed_ && screen_ != Screen::Games && screen_ != Screen::Genres)
         ui_.text(uiText::Profile::AuthNotSaved, area.x, 77, area.w-80);

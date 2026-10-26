@@ -193,7 +193,7 @@ inline constexpr char DefaultHints[] = "A Выбрать   B Назад   X По
 
 namespace PlayStation {
 inline constexpr char RefreshingServers[] = "Обновление серверов…";
-inline constexpr char SourceStatus[] = "PS5 · Статус из списка МТС Fog Play";
+inline constexpr char SourceStatus[] = "PS5 · MTS FogPlay  |  PC · FogHub";
 inline constexpr char CatalogHints[] = "A Подключиться   B Назад   X Обновить   Y Аккаунт";
 inline constexpr char Online[] = "Онлайн";
 inline constexpr char Offline[] = "Офлайн";
@@ -223,7 +223,7 @@ namespace Server {
 inline constexpr char CatalogHints[] = "A Подключиться   B Назад   X Обновить   L / R Страницы   ≈ оценка через МТС";
 inline constexpr char ConnectHints[] = "A Подключиться   B Назад";
 inline constexpr char RefreshPingHints[] = "A Подключиться   B Назад   X Обновить пинг";
-inline constexpr char PendingSessionHints[] = "A Проверить / выбрать   B Завершить аренду   Y Войти   Минус + Плюс: меню в игре";
+inline constexpr char PendingSessionHints[] = "A Проверить / выбрать   B Завершить аренду   Y Профиль   Минус + Плюс: меню в игре";
 inline constexpr char BestPrice[] = "Лучшая цена";
 inline constexpr char Balanced[] = "Оптимальный";
 inline constexpr char Powerful[] = "Мощный";

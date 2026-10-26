@@ -3,13 +3,20 @@
 #include <cstdint>
 
 namespace fog::stream {
+enum class PlaybackDrainPolicy { PresentationFirst, BoundedQueue };
+
 // Each atomic decoder operation may cross the time budget once. Leave the next
 // compressed frame queued, preserving its references and yielding to input/UI.
 class PlaybackDrainBudget {
 public:
     enum class Yield { None, Time, Video, Packets };
-    explicit PlaybackDrainBudget(std::size_t queuedVideo, std::uint64_t oldestMs = 0)
-        : catchup_(queuedVideo >= 3 && oldestMs >= 80) {}
+    explicit PlaybackDrainBudget(std::size_t queuedVideo, std::uint64_t oldestMs = 0,
+                                 PlaybackDrainPolicy policy = PlaybackDrainPolicy::PresentationFirst)
+        // A small bounded queue needs headroom before its oldest frame reaches
+        // the presentation-first age threshold. Decode references in order.
+        : catchup_(policy == PlaybackDrainPolicy::BoundedQueue
+            ? queuedVideo >= 3 || (queuedVideo >= 2 && oldestMs >= 16)
+            : queuedVideo >= 3 && oldestMs >= 80) {}
     Yield yield(std::uint64_t elapsedUs) const {
         if (!packets_) return Yield::None;
         if (elapsedUs >= (catchup_ ? 12000u : 8000u)) return Yield::Time;
