@@ -3,21 +3,21 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
-#include <nlohmann/json.hpp>
+#include "features/streaming/domain/remote_input.hpp"
 
 namespace fog::playstation {
 class NativeInput {
 public:
-    using Json=nlohmann::json;
-    using Emit=std::function<bool(const Json&)>;
+    using Emit=std::function<bool(const fog::remote::Input&)>;
     struct Counters { std::uint64_t down=0,move=0,up=0,accel=0,gyro=0,rejected=0,taps=0,suppressed=0,resetUpQueued=0,resetRejected=0; };
     static constexpr int Down=0x656, Move=0x657, Up=0x658;
     static constexpr float Gravity=9.80665f;
-    static Json touch(int type,int finger,float x,float y) {
-        return {{"id","gamepad_touch"},{"index",0},{"data",{{"type",type},{"finger",finger},{"x",x},{"y",y}}}};
+    static fog::remote::Input touch(int type,int finger,float x,float y) {
+        const auto phase=type==Down ? fog::remote::TouchPhase::Down : type==Move ? fog::remote::TouchPhase::Move : type==Up ? fog::remote::TouchPhase::Up : static_cast<fog::remote::TouchPhase>(-1);
+        return fog::remote::Touch{phase,finger,x,y};
     }
-    static Json sensor(int kind,const std::array<float,3>& xyz) {
-        return {{"id","gamepad_sensor"},{"index",0},{"data",{{"sensor",kind},{"x",xyz[0]},{"y",xyz[1]},{"z",xyz[2]}}}};
+    static fog::remote::Input sensor(int kind,const std::array<float,3>& xyz) {
+        return fog::remote::Sensor{kind==1 ? fog::remote::MotionSensor::Accelerometer : kind==2 ? fog::remote::MotionSensor::Gyroscope : static_cast<fog::remote::MotionSensor>(-1),xyz};
     }
     bool initializeContacts(const Emit& emit) {
         // The host defaults untouched DS4 slots to active (0,0).
@@ -95,7 +95,7 @@ public:
     const Counters& counters() const {return counters_;}
 private:
     struct Contact { bool active=false,tap=false;std::uint32_t id=0;int startX=0,startY=0,maxTravel=0;float x=0,y=0,observedX=0,observedY=0;std::uint64_t began=0,lastMove=0; };
-    bool send(const Json& json,const Emit& emit) { if (emit(json)) return true; ++counters_.rejected;return false; }
+    bool send(const fog::remote::Input& input,const Emit& emit) { if (emit(input)) return true; ++counters_.rejected;return false; }
     bool release(std::size_t finger,const Emit& emit) {
         auto& contact=contacts_[finger];
         if (!contact.active) return true;

@@ -1,3 +1,4 @@
+#include "features/streaming/infrastructure/stream.hpp"
 #include "features/streaming/infrastructure/stream_protocol.hpp"
 #include <cassert>
 #include <cmath>
@@ -152,7 +153,11 @@ int main() {
     assert(audio->payloadTypes() == std::vector<int>({103}));
     assert(video->reciprocate().direction() == rtc::Description::Direction::RecvOnly);
     // Smoke-check actual transport linkage/lifetime without opening a network connection.
-    stream::Client client;
+    static_assert(!std::is_abstract_v<stream::Client>);
+    stream::Client client("unused.pem", "abcde");
+    stream::StreamingClient& domainClient = client;
+    assert(!domainClient.start({{fog::ProviderId::FogHub, "foreign-rental"}}));
+    assert(!client.ready() && client.error().empty());
     assert(!client.start("bad\nhash", "abcde", "unused.pem"));
     assert(!client.ready() && !client.error().empty());
     client.close(); client.close();

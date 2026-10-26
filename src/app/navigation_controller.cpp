@@ -23,20 +23,20 @@ void ApplicationController::input(u64 keys) {
         return;
     }
     if (screen_ == Screen::ManualResolution) {
-        if (keys & HidNpadButton_A) start(Task::ManualResolution,[this] { checkout_.acknowledgeManualResolution(); return Json::object(); });
+        if (keys & HidNpadButton_A) start(Task::ManualResolution,[this] { checkout_.acknowledgeManualResolution(); return std::monostate{}; });
         else if (keys & HidNpadButton_B) screen_ = Screen::Checkout;
         return;
     }
     if (screen_ == Screen::Checkout) {
         if (keys & HidNpadButton_Y) screen_ = Screen::Consent;
         else if (keys & HidNpadButton_B) queueCheckoutStop();
-        else if ((keys & HidNpadButton_A) && api_.loggedIn()) pollCheckout(true);
-        else if ((keys & HidNpadButton_X) && !guard_.persistent() && guard_.pendingHash().empty()) screen_ = Screen::ManualResolution;
+        else if ((keys & HidNpadButton_A) && auth_.authenticated()) pollCheckout(true);
+        else if ((keys & HidNpadButton_X) && !guard_.persistent() && guard_.pendingRental().empty()) screen_ = Screen::ManualResolution;
         return;
     }
     if (screen_ == Screen::Stopping || screen_ == Screen::Recovery) {
         if (keys & HidNpadButton_Y) screen_ = Screen::Consent;
-        else if ((keys & HidNpadButton_A) && api_.loggedIn()) {
+        else if ((keys & HidNpadButton_A) && auth_.authenticated()) {
             if (guard_.ownsSession()) beginFinish(); else recoverSession();
         }
         return;
@@ -69,7 +69,7 @@ void ApplicationController::input(u64 keys) {
         if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) nav_ = (nav_ + 4) % 5;
         if (keys & (HidNpadButton_Down | HidNpadButton_StickLDown)) nav_ = (nav_ + 1) % 5;
         if (keys & (HidNpadButton_B | HidNpadButton_Right | HidNpadButton_StickLRight)) sidebar_ = false;
-        if (keys & HidNpadButton_Y) { sidebar_ = false; loginReturn_ = screen_; if (api_.loggedIn()) loadSessions(); else screen_ = Screen::Consent; }
+        if (keys & HidNpadButton_Y) { sidebar_ = false; loginReturn_ = screen_; if (auth_.authenticated()) loadSessions(); else screen_ = Screen::Consent; }
         if (keys & HidNpadButton_A) {
             sidebar_ = false; selection_ = 0;
             if (nav_ == 0) searchGames();
@@ -80,7 +80,7 @@ void ApplicationController::input(u64 keys) {
         }
         return;
     }
-    if (keys & HidNpadButton_Y) { loginReturn_ = screen_; if (api_.loggedIn()) loadSessions(); else screen_ = Screen::Consent; return; }
+    if (keys & HidNpadButton_Y) { loginReturn_ = screen_; if (auth_.authenticated()) loadSessions(); else screen_ = Screen::Consent; return; }
     if (keys & HidNpadButton_B) {
         if (screen_ == Screen::PlayStationDetails) screen_ = Screen::PlayStation;
         else if (screen_ == Screen::Details) {
@@ -116,7 +116,7 @@ void ApplicationController::input(u64 keys) {
         if (keys & HidNpadButton_X) loadPlayStation();
         else if ((keys & HidNpadButton_A) && selection_ < playStationComputers_.size()) {
             const auto& pc = playStationComputers_[selection_];
-            if (pc.value("listed",false) && pc.value("launchable",false)) screen_ = Screen::PlayStationDetails;
+            if (pc.listed && pc.launchable) screen_ = Screen::PlayStationDetails;
             else status_ = uiText::Server::TariffUnconfirmedRefreshHint;
         }
         return;
@@ -131,13 +131,12 @@ void ApplicationController::input(u64 keys) {
             if (!selection_) { ownSteam_ = !ownSteam_; loadGameDetail(); }
             else if (selection_ == 4) { computerPage_ = 1; loadComputers(); }
             else {
-                const auto key = std::array<const char*,3>{"min_price","optimum","max_power"}[selection_-1];
-                const auto found = autoComputers_.find(key);
-                if (found != autoComputers_.end() && found->is_array() && !found->empty()) {
-                    auto candidate = found->front();
-                    candidate["name"] = uiText::Server::NumberPrefix + field(candidate,"id");
+                const auto& found = autoComputers_.at(selection_-1);
+                if (!found.empty()) {
+                    auto candidate = found.front();
+                    candidate.name = uiText::Server::NumberPrefix + candidate.id.value;
                     detailsFromAutomatic_ = true; automaticSelection_ = selection_;
-                    computers_ = Json::array({candidate}); selection_ = 0; screen_ = Screen::Details; latency_.cancel();
+                    computers_ = {candidate}; selection_ = 0; screen_ = Screen::Details; latency_.cancel();
                 } else status_ = uiText::Server::NoCategoryOffer;
             }
         }
@@ -157,7 +156,7 @@ void ApplicationController::input(u64 keys) {
             }
             else if (selection_ == 2) { screen_ = Screen::ConnectionSettings; selection_ = 0; }
             else if (selection_ == 3) loadSessions();
-            else { api_.forgetAuth(); authSaveFailed_ = false; status_ = uiText::Profile::SignedOut; }
+            else { auth_.forget(); authSaveFailed_ = false; status_ = uiText::Profile::SignedOut; }
         }
         return;
     }

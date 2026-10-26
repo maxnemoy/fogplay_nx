@@ -2,10 +2,9 @@
 
 namespace fogplay {
 
-void ApplicationController::setCaptcha(const Json& response) {
+void ApplicationController::setCaptcha(const fog::AuthResult& response) {
     if (captcha_) { SDL_DestroyTexture(captcha_); captcha_ = nullptr; }
-    if (!response.contains("image") || !response["image"].is_string()) throw std::runtime_error("Captcha image missing.");
-    const auto image = fog::decodeCaptcha(response["image"].get<std::string>());
+    const auto& image = response.captchaImage;
     SDL_RWops* input = SDL_RWFromConstMem(image.data(), static_cast<int>(image.size()));
     if (!input) throw std::runtime_error("Cannot read captcha image.");
     SDL_Surface* surface = IMG_Load_RW(input, 1);
@@ -25,19 +24,20 @@ void ApplicationController::beginLogin() {
         if (!sessionPending_ && catalog_.items().empty()) loadGames();
         return;
     }
-    const auto normalized = fog::normalizePhone(*phone);
+    const auto enteredPhone = *phone;
+    auth_.validateLogin({enteredPhone,{}});
     screen_ = Screen::Auth;
     authStep_ = fog::AuthStep::Unknown;
-    start(Task::Phone, [this, normalized] { return api_.submitPhone(normalized); });
+    start(Task::Phone, [this, enteredPhone] { return auth_.begin({enteredPhone,{}}); });
 }
 
 void ApplicationController::enterCode() {
     if (authStep_ == fog::AuthStep::Captcha) {
         const auto code = keyboard("Text from captcha image", "", 32);
-        if (code && !code->empty()) start(Task::Captcha, [this, value=*code] { return api_.submitCaptcha(value); });
+        if (code && !code->empty()) start(Task::Captcha, [this, value=*code] { return auth_.answer({fog::AuthStep::Captcha,value}); });
     } else if (authStep_ == fog::AuthStep::Otp) {
         const auto code = keyboard("SMS code", "", 12, true);
-        if (code && !code->empty()) start(Task::Otp, [this, value=*code] { return api_.submitOtp(value); });
+        if (code && !code->empty()) start(Task::Otp, [this, value=*code] { return auth_.answer({fog::AuthStep::Otp,value}); });
     }
 }
 

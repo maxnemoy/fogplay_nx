@@ -30,7 +30,7 @@ void ApplicationController::shutdownSession() noexcept {
     closeStream();
     // Join any owner of checkout/guard before inspecting them. Do not permanently
     // cancel API requests yet: an unresolved order can still need its hash polled.
-    if (!sessionPending_ && task_ != Task::Create) api_.cancel();
+    if (!sessionPending_ && task_ != Task::Create) services_->cancel();
     if (pending_.valid()) {
         try { pending_.get(); } catch (...) {}
     }
@@ -52,7 +52,7 @@ void ApplicationController::shutdownSession() noexcept {
             }
             try {
                 if (checkout_.unresolved()) checkout_.stop();
-                else if (api_.loggedIn()) {
+                else if (auth_.authenticated()) {
                     if (!guard_.ownsSession()) guard_.recoverMatchingSession();
                     if (guard_.ownsSession()) guard_.finishAttempt();
                 }
@@ -85,13 +85,13 @@ void ApplicationController::shutdownSession() noexcept {
     }
     diagnostic(manualExit ? "Shutdown: explicit manual exit with unresolved rental; recovery records retained." :
         "Shutdown: no unresolved rental remains.");
-    api_.cancel();
+    services_->cancel();
     disarmExitHandling();
 }
 
 void ApplicationController::syncPending() {
     sessionPending_ = checkout_.unresolved() || guard_.persistent() ||
-        !guard_.pendingHash().empty() || !guard_.journalError().empty();
+        !guard_.pendingRental().empty() || !guard_.journalError().empty();
 }
 
 void ApplicationController::logCheckoutResult(Task phase) {
@@ -100,8 +100,8 @@ void ApplicationController::logCheckoutResult(Task phase) {
     diagnostic("Checkout phase=" + std::to_string(static_cast<int>(phase)) +
         " state=" + std::to_string(static_cast<int>(result.state)) +
         " serverStatus=" + std::to_string(result.serverStatus) +
-        " orderPresent=" + std::to_string(result.orderId > 0) +
-        " hashPresent=" + std::to_string(!result.hash.empty()) +
+        " orderPresent=" + std::to_string(!result.creationId.empty()) +
+        " hashPresent=" + std::to_string(!result.rentalId.value.empty()) +
         " serverHashPresent=" + std::to_string(result.serverHashPresent) +
         " stopRequested=" + std::to_string(result.stopRequested) +
         " stopQueued=" + std::to_string(stopAfterTask_) +
@@ -126,7 +126,7 @@ void ApplicationController::handleCheckout() {
     if (result.stopRequested) checkoutAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
     if (result.state == fog::CheckoutState::Ready && !stopAfterTask_ && !result.stopRequested) {
         streamPlayStation_ = selectedPlayStation_;
-        startStream(result.hash,!selectedPlayStation_); return;
+        startStream(result.rentalId,!selectedPlayStation_); return;
     }
     if (!sessionPending_) {
         disarmExitHandling(); stopAfterTask_ = false;
@@ -139,14 +139,14 @@ void ApplicationController::handleCheckout() {
     else if (result.state == fog::CheckoutState::RecoveryRequired) checkoutStatus_ = ui_.controllerHints(uiText::Server::OrderRecoveryHint);
     else if (result.pollCount >= 30) checkoutStatus_ = ui_.controllerHints(uiText::Server::AutoCheckPausedHint);
     else if (result.readyObservations > 0) checkoutStatus_ = uiText::Server::ReadyObservationsPrefix + std::to_string(result.readyObservations) + "/3)…";
-    else if (result.serverStatus == 2 && !result.serverHashPresent) checkoutStatus_ = uiText::Server::PaymentConfirmedWaitingAddress;
-    else if (result.serverStatus == 1) checkoutStatus_ = result.serverHashPresent ? uiText::Server::PreparingConnection : uiText::Server::WaitingAddress;
-    else if (result.serverStatus == 0) checkoutStatus_ = uiText::Server::OrderCreated;
+    else if (result.preparation == fog::PreparationState::PaymentConfirmed && !result.serverHashPresent) checkoutStatus_ = uiText::Server::PaymentConfirmedWaitingAddress;
+    else if (result.preparation == fog::PreparationState::Preparing) checkoutStatus_ = result.serverHashPresent ? uiText::Server::PreparingConnection : uiText::Server::WaitingAddress;
+    else if (result.preparation == fog::PreparationState::Pending) checkoutStatus_ = uiText::Server::OrderCreated;
     else if (result.state == fog::CheckoutState::PaymentRequired) checkoutStatus_ = uiText::Server::PaymentRequired;
     else checkoutStatus_ = uiText::Server::OrderRecorded;
     status_ = checkoutStatus_;
     if (!result.stopRequested && (stopAfterTask_ ||
-        (result.state == fog::CheckoutState::RecoveryRequired && !result.hash.empty()))) {
+        (result.state == fog::CheckoutState::RecoveryRequired && !result.rentalId.value.empty()))) {
         diagnostic("Stop trigger: checkout requires recovery after session identification.");
         beginFinish();
     }
@@ -154,7 +154,7 @@ void ApplicationController::handleCheckout() {
 
 void ApplicationController::pollCheckout(bool manual) {
     if (pending_.valid()) return;
-    start(Task::CheckoutPoll, [this, manual] { checkout_.poll(manual); return Json::object(); });
+    start(Task::CheckoutPoll, [this, manual] { checkout_.poll(manual); return std::monostate{}; });
 }
 
 void ApplicationController::createSession() {
@@ -169,69 +169,67 @@ void ApplicationController::createSession() {
     const auto& computers = playStation ? playStationComputers_ : computers_;
     if (sessionPending_ || selection_ >= computers.size()) return;
     const auto& pc = computers[selection_];
-    fog::CreateOrderRequest order;
-    order.computerId = std::stoi(field(pc,"id","0"));
-    order.tariffId = std::stoi(field(pc,"tariff_id","0"));
-    if (playStation && (!pc.value("listed",false) || !pc.value("launchable",false) ||
-        !fog::isPlayStationComputerId(order.computerId) || order.tariffId <= 0)) {
+    fog::StartRentalRequest order;
+    order.computerId = pc.id;
+    order.offerId = pc.offerId;
+    if (playStation && (!pc.listed || !pc.launchable ||
+        !fog::isPlayStationComputerId(order.computerId) || order.offerId.empty())) {
         status_ = uiText::PlayStation::TariffUnconfirmedHint;
         return;
     }
-    if (!api_.loggedIn()) {
+    if (!auth_.authenticated()) {
         loginReturn_ = playStation ? Screen::PlayStationDetails : Screen::Details;
         screen_ = Screen::Consent; return;
     }
     // Verify the same SD replacement path before any billable request.
     checkStorage();
     selectedPlayStation_ = playStation;
-    order.gameId = playStation ? 0 : selectedGameId_;
-    order.ownSteamAccount = playStation ? false : ownSteam_;
+    order.gameId = playStation ? fog::EntityId{} : selectedGameId_;
+    order.ownAccount = playStation ? false : ownSteam_;
     recentLaunch_.prepare(playStation ? std::nullopt : selectedRecentGame_);
     // Lock focus/exit before the worker can send a billable create request.
     armExitHandling(); sessionPending_ = true; stopAfterTask_ = false;
     screen_ = Screen::Checkout;
     checkoutStatus_ = playStation ? uiText::PlayStation::CheckingTariff : uiText::Server::CreatingOrder;
-    start(Task::Create, [this, order, playStation, offeredPrice = pc.value("price",Json{})] {
+    start(Task::Create, [this, order, playStation, offeredComputer = pc]() -> TaskResult {
         if (playStation) {
-            auto current = fog::fetchPlayStationComputers();
-            const auto offer = std::find_if(current.begin(),current.end(),[&order](const Json& candidate) {
-                return candidate.value("id",0) == order.computerId;
+            auto current = catalogRepository_.playStationComputers();
+            const auto offer = std::find_if(current.begin(),current.end(),[&order](const fog::Computer& candidate) {
+                return candidate.id == order.computerId;
             });
-            if (offer == current.end() || !offer->value("listed",false) || !offer->value("launchable",false) ||
-                offer->value("tariff_id",0) != order.tariffId || !offer->contains("price") ||
-                offer->at("price") != offeredPrice) {
-                return Json{{"playstation_offer_changed",true},{"computers",std::move(current)}};
+            if (offer == current.end() || !offer->listed || !offer->launchable ||
+                !fog::sameOffer(*offer,offeredComputer)) {
+                return ChangedOffer{std::move(current)};
             }
             // Main-thread lifecycle checks must accept this result before billing.
-            return Json{{"playstation_offer_verified",true},
-                {"computer_id",order.computerId},{"tariff_id",order.tariffId}};
+            return VerifiedOffer{order};
         }
         checkout_.create(order);
-        return Json::object();
+        return std::monostate{};
     });
 }
 
 void ApplicationController::loadSessions() {
-    if (!api_.loggedIn()) { screen_ = Screen::Consent; return; }
+    if (!auth_.authenticated()) { screen_ = Screen::Consent; return; }
     if (sessionPending_) { recoverSession(); return; }
-    screen_ = Screen::Sessions; selection_ = 0; sessions_ = Json::array();
-    start(Task::Sessions, [this] { return api_.activeSessions(); });
+    screen_ = Screen::Sessions; selection_ = 0; sessions_.clear();
+    start(Task::Sessions, [this] { return rentals_.activeSessions(); });
 }
 
 void ApplicationController::recoverSession() {
     if (pending_.valid()) return;
     screen_ = Screen::Recovery;
     if (checkout_.unresolved()) { armExitHandling(); stopAfterTask_ = true; beginFinish(); return; }
-    start(Task::Recovery, [this] { return Json{{"matched", guard_.recoverMatchingSession()}}; });
+    start(Task::Recovery, [this] { return RecoveryResult{guard_.recoverMatchingSession()}; });
 }
 
 void ApplicationController::connectSession() {
     if (selection_ >= sessions_.size() || sessionPending_) return;
-    const auto hash = sessions_[selection_].at("hash").get<std::string>();
+    const auto rental = sessions_[selection_].id;
     // Durable ownership must succeed before any signaling / media operation.
-    try { guard_.adopt(hash); }
+    try { guard_.adopt(rental); }
     catch (...) {
-        sessionPending_ = !guard_.pendingHash().empty() || guard_.persistent() || !guard_.journalError().empty();
+        sessionPending_ = !guard_.pendingRental().empty() || guard_.persistent() || !guard_.journalError().empty();
         if (sessionPending_) {
             screen_ = Screen::Recovery;
             if (guard_.ownsSession()) beginFinish();
@@ -241,10 +239,8 @@ void ApplicationController::connectSession() {
     // Only an exact known computer identity selects the PlayStation protocol.
     // Missing/unknown identity keeps the ordinary stream mode.
     const auto& session = sessions_[selection_];
-    const auto id = session.find("computer_id");
-    streamPlayStation_ = id != session.end() && id->is_number_integer() &&
-        fog::isPlayStationComputerId(id->get<int>());
-    startStream(hash,false);
+    streamPlayStation_ = session.computerId && fog::isPlayStationComputerId(*session.computerId);
+    startStream(rental,false);
 }
 
 void ApplicationController::beginFinish(const char* reason) {
@@ -256,14 +252,14 @@ void ApplicationController::beginFinish(const char* reason) {
     try {
         if (checkout_.unresolved()) {
             screen_ = Screen::Checkout;
-            start(Task::CheckoutStop,[this] { checkout_.stop(); return Json::object(); });
+            start(Task::CheckoutStop,[this] { checkout_.stop(); return std::monostate{}; });
             checkoutStatus_ = status_ = uiText::Server::RequestingStop;
         } else {
             screen_ = Screen::Stopping;
             retryAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
             start(Task::Finish, [this] {
                 const auto result = guard_.finishAttempt();
-                return Json{{"terminated",result.terminated},{"cleared",result.journalCleared},{"message",result.message}};
+                return result;
             });
             status_ = uiText::Server::Stopping;
         }

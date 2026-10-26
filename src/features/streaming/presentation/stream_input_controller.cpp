@@ -13,15 +13,15 @@ SDL_Rect ApplicationController::videoRect() const {
     return {(1280-width)/2,(720-height)/2,width,height};
 }
 
-bool ApplicationController::sendRemote(const Json& command) {
-    return !transportReconnect_.recovering() && stream_ && stream_->ready() && stream_->sendControl(command.dump());
+bool ApplicationController::sendRemote(const fog::remote::Input& command) {
+    return !transportReconnect_.recovering() && stream_ && stream_->ready() && stream_->sendInput(command);
 }
 
 void ApplicationController::releaseMouse() noexcept {
     try {
         if (stream_) {
-            if (mouseLeft_) stream_->sendControl(fog::remote::mouseButton(false,0).dump());
-            if (mouseRight_) stream_->sendControl(fog::remote::mouseButton(false,2).dump());
+            if (mouseLeft_) stream_->sendInput(fog::remote::mouseButton(false,0));
+            if (mouseRight_) stream_->sendInput(fog::remote::mouseButton(false,2));
         }
     } catch (...) { /* Best effort before the transport itself is closed. */ }
     mouseLeft_ = mouseRight_ = touchDrag_ = false;

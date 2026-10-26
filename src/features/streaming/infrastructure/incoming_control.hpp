@@ -1,5 +1,5 @@
 #pragma once
-#include "features/streaming/domain/auto_quality.hpp"
+#include "features/streaming/infrastructure/quality_telemetry.hpp"
 #include <array>
 #include <cstdint>
 #include <string>
@@ -41,7 +41,7 @@ public:
         if (!firstPending_) firstPending_ = now;
         if (message.kind == Kind::Stats) {
             if (statsPending_) ++statsCoalesced_;
-            telemetry_.read(message.data, now);
+            quality::readTelemetry(telemetry_, message.data, now);
             statsPending_ = true;
         }
     }

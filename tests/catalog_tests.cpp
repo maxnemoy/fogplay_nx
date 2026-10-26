@@ -9,10 +9,10 @@ void require(bool condition, const char* label) {
     ++assertions;
     if (!condition) throw std::runtime_error(label);
 }
-nlohmann::json page(int first, int count = fog::Catalog::PageSize) {
-    auto result = nlohmann::json::array();
+fog::Page<fog::Game> page(int first, int count = fog::Catalog::PageSize) {
+    fog::Page<fog::Game> result;
     for (int id = first; id < first + count; ++id)
-        result.push_back({{"id", id}, {"name", "Game " + std::to_string(id)}, {"images", {"public-cover"}}});
+        result.items.push_back({{fog::ProviderId::Mts,std::to_string(id)},"Game "+std::to_string(id),{},{},{"public-cover"}});
     return result;
 }
 fog::Catalog::Request begin(fog::Catalog& catalog, bool manual = false) {
@@ -21,7 +21,7 @@ fog::Catalog::Request begin(fog::Catalog& catalog, bool manual = false) {
     return request.value();
 }
 void expectMalformed(fog::Catalog& catalog, const fog::Catalog::Request& request,
-                     const nlohmann::json& response) {
+                     const fog::Page<fog::Game>& response) {
     bool rejected = false;
     try { catalog.complete(request, response); } catch (const std::exception&) { rejected = true; }
     require(rejected, "malformed page rejected");
@@ -39,7 +39,7 @@ int main() {
         require(!catalog.begin() && catalog.busy(), "one request while loading");
         require(catalog.complete(first, page(1)), "initial completion");
         require(catalog.items().size() == 16 && !catalog.ended(), "full first page can continue");
-        require(catalog.items().front().at("images").at(0) == "public-cover", "keep cover fields verbatim");
+        require(catalog.items().front().artworkUrls.at(0) == "public-cover", "keep cover fields verbatim");
         catalog.focus(7);
         require(catalog.first() == 0 && !catalog.begin(), "no prefetch before third row including last column");
         catalog.move(Direction::Down);
@@ -115,7 +115,7 @@ int main() {
         catalog.reset("spider");
         newer = begin(catalog);
         require(!catalog.complete(old, page(1)) && catalog.busy(), "generation guards queries that later repeat");
-        require(catalog.complete(newer, nlohmann::json::array()) && catalog.ended(), "zero matches terminate without repeat requests");
+        require(catalog.complete(newer, fog::Page<fog::Game>{}) && catalog.ended(), "zero matches terminate without repeat requests");
         require(!catalog.begin(), "empty catalog does not loop loading");
 
         catalog.reset("");
@@ -125,7 +125,7 @@ int main() {
         second = begin(catalog);
         require(catalog.complete(second, page(9)), "overlapping page accepted");
         require(catalog.items().size() == 24 && !catalog.ended(), "duplicates suppressed while new IDs continue");
-        for (int i = 0; i < 24; ++i) require(catalog.items().at(i).at("id") == i + 1, "original order remains stable");
+        for (int i = 0; i < 24; ++i) require(catalog.items().at(i).id.value == std::to_string(i+1), "original order remains stable");
         catalog.focus(16);
         third = begin(catalog);
         require(catalog.complete(third, page(9)) && catalog.ended() && catalog.items().size() == 24,
@@ -134,15 +134,14 @@ int main() {
         catalog.reset("");
         first = begin(catalog);
         auto duplicatePage = page(1);
-        duplicatePage.at(15) = duplicatePage.at(0);
+        duplicatePage.items.at(15) = duplicatePage.items.at(0);
         require(catalog.complete(first, duplicatePage) && catalog.items().size() == 15, "deduplicate within one page");
         catalog.focus(8);
         second = begin(catalog);
         const auto size = catalog.items().size();
         expectMalformed(catalog, second, page(16, 17));
-        expectMalformed(catalog, second, nlohmann::json::object());
         auto bad = page(16);
-        bad.at(15).at("id") = "invalid";
+        bad.items.at(15).id = {};
         expectMalformed(catalog, second, bad);
         require(catalog.items().size() == size && catalog.busy(), "malformed page cannot partially append");
         require(catalog.fail(second, "malformed") && catalog.retry(), "malformed page uses same retry path");

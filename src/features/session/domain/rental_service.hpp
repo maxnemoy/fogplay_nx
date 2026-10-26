@@ -1,18 +1,18 @@
 #pragma once
 #include "features/session/domain/service_models.hpp"
-#include <cstdint>
+#include "features/auth/domain/auth_repository.hpp"
+#include <vector>
 
 namespace fog {
-// Serial worker access; authentication changes invalidate adopted session ownership.
-class RentalService {
+// Serial worker access; authentication changes invalidate adopted rental ownership.
+class RentalRepository {
 public:
-    virtual ~RentalService() = default;
-    virtual bool loggedIn() const noexcept = 0;
-    virtual std::uint64_t authGeneration() const noexcept = 0;
-    virtual const std::string& accountIdentity() const noexcept = 0;
-    virtual Json activeSessions(bool shutdown = false) = 0;
-    virtual bool finishSession(const std::string& hash) = 0;
-    virtual Json createOrder(const CreateOrderRequest& order) = 0;
-    virtual Json orderStatus(std::int64_t orderId) = 0;
+    virtual ~RentalRepository() = default;
+    virtual AuthData auth() const = 0;
+    virtual std::vector<Rental> activeSessions(bool shutdown = false) = 0;
+    // Command acknowledgement only. Fresh absence is verified separately by SessionGuard.
+    virtual bool finishSession(const RentalId& rental) = 0;
+    virtual CreationReceipt createOrder(const StartRentalRequest& request) = 0;
+    virtual RentalPreparation orderStatus(const CreationId& creation) = 0;
 };
 }

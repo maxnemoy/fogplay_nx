@@ -1,5 +1,5 @@
 #pragma once
-#include <nlohmann/json.hpp>
+#include "features/catalog/domain/models.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -31,7 +31,7 @@ public:
     void cancel() noexcept;
     void stop() noexcept;
     bool busy() const;
-    std::optional<int> estimate(const nlohmann::json& computer) const;
+    std::optional<int> estimate(const Computer& computer) const;
     static bool validEndpoint(const std::string& endpoint);
     static std::optional<int> connectionMilliseconds(double lookupSeconds, double connectSeconds);
     static std::string routeKey(const std::string& endpoint);

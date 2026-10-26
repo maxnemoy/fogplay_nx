@@ -1,3 +1,4 @@
+#include "features/streaming/infrastructure/input_protocol.hpp"
 // Local-only STOMP / ICE / DTLS / SRTP / SCTP fixture. Never calls FogPlay.
 #include "features/streaming/infrastructure/stream.hpp"
 #include "features/streaming/infrastructure/stream_protocol.hpp"
@@ -508,7 +509,7 @@ int main(int argc, char** argv) {
         assert(messages.size() == 1 && messages.front() == compound);
         std::cout << "Compound RR/REMB fixture parser passed\n";
     }
-    const std::vector<Json> remoteInputs{
+    const std::vector<fog::remote::Input> remoteInputs{
         fog::remote::absoluteMouse(640, 360, 1280, 720, 1920, 1080),
         fog::remote::mouseButton(true, 0), fog::remote::mouseButton(false, 0),
         fog::remote::mouseButton(true, 2), fog::remote::mouseButton(false, 2),
@@ -613,7 +614,7 @@ int main(int argc, char** argv) {
             if (client.ready() && !sent) {
                 stream::Gamepad pad; pad.buttons[0] = 1; pad.axes[0] = 0.5f;
                 assert(client.sendGamepad(pad));
-                for (const auto& input : remoteInputs) assert(client.sendControl(input.dump()));
+                for (const auto& input : remoteInputs) assert(client.sendInput(input));
                 client.elapseForTesting(1);
                 assert(client.requestVideoKeyframe());
                 sent = true;
@@ -790,7 +791,7 @@ int main(int argc, char** argv) {
             client.blockControlForTesting(false);
             settleIce();
             assert(!client.ready() && client.error().empty());
-            assert(!client.sendGamepad(stream::Gamepad{}) && !client.sendControl(remoteInputs.front().dump()));
+            assert(!client.sendGamepad(stream::Gamepad{}) && !client.sendInput(remoteInputs.front()));
             assert(!client.requestVideoKeyframe());
             stream::Packet withheld; assert(!client.poll(withheld));
             client.addCandidateProofForTesting("decoy 1 UDP 1 192.0.2.11 50000 typ relay");
@@ -853,7 +854,7 @@ int main(int argc, char** argv) {
             stream::Gamepad pad; pad.buttons[0] = 1;
             for (unsigned n=0; n<1000; ++n) assert(client.sendGamepad(pad));
             assert(client.sendGamepad(stream::Gamepad{})); // Latest state must release a held button.
-            for (const auto& input : remoteInputs) assert(client.sendControl(input.dump()));
+            for (const auto& input : remoteInputs) assert(client.sendInput(input));
             client.pump();
             assert(client.ready() && client.error().empty());
             assert(client.diagnostics().find("controlPending=11 ") != std::string::npos);
@@ -1037,10 +1038,10 @@ int main(int argc, char** argv) {
                 assert(client.videoDiagnostics().find("serverPreset=LOW") != std::string::npos);
                 // A public input send can fail before pump sees terminal signaling.
                 client.blockControlForTesting(true);
-                assert(client.sendControl(fog::remote::key(false,"Enter").dump()));
+                assert(client.sendInput(fog::remote::key(false,"Enter")));
                 client.advanceControlForTesting(15001);
                 assert(!client.sendGamepad(stream::Gamepad{}));
-                assert(!client.sendControl(fog::remote::key(false,"Enter").dump()));
+                assert(!client.sendInput(fog::remote::key(false,"Enter")));
                 assert(client.error().empty() && client.ready());
                 client.failThenReceiveForTesting(stream::protocol::frame("MESSAGE",{},R"({"id":"close"})"),true);
                 client.pump();
@@ -1057,7 +1058,7 @@ int main(int argc, char** argv) {
             }
             assert(fixture.neutral);
             client.blockControlForTesting(true);
-            assert(client.sendControl(fog::remote::key(false,"Enter").dump()));
+            assert(client.sendInput(fog::remote::key(false,"Enter")));
             client.advanceControlForTesting(15001);
             client.pump();
             assert(client.error() == "Control channel stalled" && !client.ready() && !client.retryableError());
@@ -1363,17 +1364,17 @@ int main(int argc, char** argv) {
             sample.motion.sampleNumber = 1;
             sample.motion.psAccelerationG = {0, 1, 0};
             sample.motion.psGyroRadiansPerSecond = {1, 2, 3};
-            const auto emit = [&](const Json& command) { return client.sendControl(command.dump()); };
+            const auto emit = [&](const fog::remote::Input& command) { return client.sendInput(command); };
             // Both initial UP commands must survive the real outbox without
             // any preceding DOWN, before held touch and motion are forwarded.
             client.blockControlSendForTesting(true);
             native.update(sample, 100, true, emit);
             const Json expected = Json::array({
-                fog::playstation::NativeInput::touch(0x658, 0, 0, 0),
-                fog::playstation::NativeInput::touch(0x658, 1, 0, 0),
-                fog::playstation::NativeInput::touch(0x656, 0, 1, 1),
-                fog::playstation::NativeInput::sensor(1, {0, fog::playstation::NativeInput::Gravity, 0}),
-                fog::playstation::NativeInput::sensor(2, {1, 2, 3})});
+                stream::protocol::remoteInput(fog::playstation::NativeInput::touch(0x658, 0, 0, 0)),
+                stream::protocol::remoteInput(fog::playstation::NativeInput::touch(0x658, 1, 0, 0)),
+                stream::protocol::remoteInput(fog::playstation::NativeInput::touch(0x656, 0, 1, 1)),
+                stream::protocol::remoteInput(fog::playstation::NativeInput::sensor(1, {0, fog::playstation::NativeInput::Gravity, 0})),
+                stream::protocol::remoteInput(fog::playstation::NativeInput::sensor(2, {1, 2, 3}))});
             assert(native.contactsInitialized() && native.counters().resetUpQueued == 2 &&
                 native.counters().up == 0 && native.counters().down == 1 && native.counters().rejected == 0);
             native.update(sample, 140, true, emit);
@@ -1490,7 +1491,7 @@ int main(int argc, char** argv) {
         while (client.diagnostics().find("controlInFlight=1 ") == std::string::npos && Clock::now() - blockedAt < std::chrono::seconds(2))
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         assert(client.diagnostics().find("controlInFlight=1 ") != std::string::npos);
-        assert(client.sendControl(fog::remote::key(true, "Enter").dump()));
+        assert(client.sendInput(fog::remote::key(true, "Enter")));
         const auto failedAt = Clock::now();
         if (transportFailure) {
             client.failThenReceiveForTesting("{}", false); client.pump();

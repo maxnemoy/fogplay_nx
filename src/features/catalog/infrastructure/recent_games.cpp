@@ -7,7 +7,9 @@
 #include <fcntl.h>
 #include <stdexcept>
 #include <sys/stat.h>
-#include <unordered_set>
+#include <set>
+#include <charconv>
+#include <nlohmann/json.hpp>
 #include <unistd.h>
 
 namespace fog {
@@ -20,43 +22,41 @@ bool validName(const std::string& name) {
     try { Json(name).dump(); return true; } catch (...) { return false; }
 }
 bool validGame(const RecentGame& game) {
-    return game.id > 0 && validName(game.name) && (game.artwork.empty() || validArtworkUrl(game.artwork)) &&
+    const bool validId=!game.id.empty() && game.id.value.size()<=256 &&
+        std::none_of(game.id.value.begin(),game.id.value.end(),[](unsigned char c){ return c<=32 || c==127; });
+    int numeric=0;
+    const auto parsed=std::from_chars(game.id.value.data(),game.id.value.data()+game.id.value.size(),numeric);
+    const bool providerValid=game.id.provider!=ProviderId::Mts ||
+        (parsed.ec==std::errc{} && parsed.ptr==game.id.value.data()+game.id.value.size() && numeric>0);
+    return validId && providerValid && validName(game.name) && (game.artwork.empty() || validArtworkUrl(game.artwork)) &&
         game.alternateArtwork.size() < maxArtworkCandidates &&
         (game.alternateArtwork.empty() || !game.artwork.empty()) &&
         std::all_of(game.alternateArtwork.begin(), game.alternateArtwork.end(), validArtworkUrl);
 }
-std::optional<RecentGame> parse(const Json& item, bool persisted) {
-    if (!item.is_object() || !item.contains("id") || !item.at("id").is_number_integer() ||
-        item.at("id") <= 0 || item.at("id") > 2147483647 || !item.contains("name") || !item.at("name").is_string()) return std::nullopt;
-    RecentGame game{item.at("id").get<int>(), item.at("name").get<std::string>(), {}};
-    if (persisted) {
-        if ((item.size() != 3 && item.size() != 4) || !item.contains("artwork") || !item.at("artwork").is_string()) return std::nullopt;
-        if (item.size() == 4) {
-            const auto alternates = item.find("alternateArtwork");
-            if (alternates == item.end() || !alternates->is_array() || alternates->size() >= maxArtworkCandidates)
-                return std::nullopt;
-            for (const auto& url : *alternates) {
-                if (!url.is_string()) return std::nullopt;
-                game.alternateArtwork.push_back(url.get<std::string>());
-            }
-        }
-        game.artwork = item.at("artwork").get<std::string>();
+std::optional<RecentGame> parse(const Json& item, int version) {
+    if (!item.is_object() || !item.contains("id") || !item.contains("name") || !item.at("name").is_string()) return {};
+    EntityId id;
+    if (version==1) {
+        if (!item.at("id").is_number_integer() || item.at("id")<=0 || item.at("id")>2147483647) return {};
+        id={ProviderId::Mts,std::to_string(item.at("id").get<int>())};
     } else {
-        const auto images = item.find("images");
-        if (images != item.end() && images->is_array()) {
-            // Catalog image order remains authoritative; invalid entries never block alternatives.
-            std::size_t inspected = 0;
-            for (const auto& entry : *images) {
-                if (++inspected > 16 || game.alternateArtwork.size() + !game.artwork.empty() >= maxArtworkCandidates) break;
-                if (!entry.is_string()) continue;
-                auto url = entry.get<std::string>();
-                if (!validArtworkUrl(url)) continue;
-                if (game.artwork.empty()) game.artwork = std::move(url);
-                else if (url != game.artwork && std::find(game.alternateArtwork.begin(), game.alternateArtwork.end(), url) == game.alternateArtwork.end())
-                    game.alternateArtwork.push_back(std::move(url));
-            }
+        if (!item.at("id").is_string() || !item.contains("provider") || !item.at("provider").is_string()) return {};
+        const auto provider=item.at("provider").get<std::string>();
+        if (provider!="mts" && provider!="foghub") return {};
+        id={provider=="mts" ? ProviderId::Mts : ProviderId::FogHub,item.at("id").get<std::string>()};
+    }
+    RecentGame game{id,item.at("name").get<std::string>(),{}, {}};
+    const auto fields=version==1 ? 3u : 4u;
+    if ((item.size()!=fields && item.size()!=fields+1) || !item.contains("artwork") || !item.at("artwork").is_string()) return {};
+    if (item.size()==fields+1) {
+        const auto alternates=item.find("alternateArtwork");
+        if (alternates==item.end() || !alternates->is_array() || alternates->size()>=maxArtworkCandidates) return {};
+        for (const auto& url:*alternates) {
+            if (!url.is_string()) return {};
+            game.alternateArtwork.push_back(url.get<std::string>());
         }
     }
+    game.artwork=item.at("artwork").get<std::string>();
     return validGame(game) ? std::optional<RecentGame>(std::move(game)) : std::nullopt;
 }
 std::string readFile(const std::string& path, bool& missing) {
@@ -93,15 +93,22 @@ std::string readFile(const std::string& path, bool& missing) {
     return bytes;
 }
 }
-std::optional<RecentGame> RecentGame::fromCatalog(const nlohmann::json& game) { return parse(game, false); }
+std::optional<RecentGame> RecentGame::fromCatalog(const Game& game) {
+    RecentGame result{game.id,game.name,{}, {}};
+    for (const auto& url:game.artworkUrls) {
+        if (result.alternateArtwork.size()+!result.artwork.empty()>=maxArtworkCandidates) break;
+        if (!validArtworkUrl(url)) continue;
+        if (result.artwork.empty()) result.artwork=url;
+        else if (url!=result.artwork && std::find(result.alternateArtwork.begin(),result.alternateArtwork.end(),url)==result.alternateArtwork.end()) result.alternateArtwork.push_back(url);
+    }
+    return validGame(result) ? std::optional<RecentGame>(std::move(result)) : std::nullopt;
+}
 std::vector<std::string> RecentGame::artworkCandidates() const {
     auto result = alternateArtwork;
     if (!artwork.empty()) result.insert(result.begin(), artwork);
     return result;
 }
-nlohmann::json RecentGame::catalogItem() const {
-    return {{"id", id}, {"name", name}, {"images", artworkCandidates()}};
-}
+Game RecentGame::catalogItem() const { return {id,name,{},{},artworkCandidates()}; }
 bool RecentGames::load() {
     try {
         recoverStorage(path_);
@@ -110,13 +117,13 @@ bool RecentGames::load() {
         if (missing) { items_.clear(); error_.clear(); return true; }
         const auto data = Json::parse(bytes, nullptr, false);
         if (!data.is_object() || data.size() != 2 || !data.contains("version") ||
-            !data.at("version").is_number_integer() || data.at("version") != 1 ||
+            !data.at("version").is_number_integer() || (data.at("version") != 1 && data.at("version") != 2) ||
             !data.contains("games") || !data.at("games").is_array() || data.at("games").size() > Limit)
             throw std::runtime_error(fog::constants::error::Catalog::InvalidRecentGamesFile);
         std::vector<RecentGame> next;
-        std::unordered_set<int> ids;
+        std::set<EntityId> ids;
         for (const auto& item : data.at("games")) {
-            auto game = parse(item, true);
+            auto game = parse(item,data.at("version").get<int>());
             if (!game || !ids.insert(game->id).second) throw std::runtime_error(fog::constants::error::Catalog::InvalidRecentGamesEntry);
             next.push_back(std::move(*game));
         }
@@ -136,13 +143,21 @@ bool RecentGames::update(const RecentGame& game) {
 }
 bool RecentGames::save() {
     try {
+        const bool providerIds=std::any_of(items_.begin(),items_.end(),[](const auto& game){return game.id.provider!=ProviderId::Mts;});
         Json games = Json::array();
         for (const auto& item : items_) {
-            Json entry{{"id",item.id},{"name",item.name},{"artwork",item.artwork}};
+            int numeric=0; const auto parsed=std::from_chars(item.id.value.data(),item.id.value.data()+item.id.value.size(),numeric);
+            if (item.id.provider==ProviderId::Mts && (parsed.ec!=std::errc{} || parsed.ptr!=item.id.value.data()+item.id.value.size() || numeric<=0))
+                throw std::runtime_error("Invalid recent-game persistent identity");
+            Json entry{{"name",item.name},{"artwork",item.artwork}};
+            if (providerIds) {
+                entry["id"]=item.id.value;
+                entry["provider"]=item.id.provider==ProviderId::Mts ? "mts" : "foghub";
+            } else entry["id"]=numeric;
             if (!item.alternateArtwork.empty()) entry["alternateArtwork"] = item.alternateArtwork;
             games.push_back(std::move(entry));
         }
-        const auto bytes = Json{{"version",1},{"games",std::move(games)}}.dump() + "\n";
+        const auto bytes = Json{{"version",providerIds ? 2 : 1},{"games",std::move(games)}}.dump() + "\n";
         if (bytes.size() > MaxBytes) throw std::runtime_error(fog::constants::error::Catalog::RecentGamesLimitExceeded);
         replaceStorage(path_, bytes); error_.clear(); return true;
     } catch (...) { error_ = "Recent games not saved; available for this run only"; return false; }

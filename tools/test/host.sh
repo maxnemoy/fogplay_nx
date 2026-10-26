@@ -6,10 +6,10 @@ g++ -std=c++17 -Wall -Wextra -Werror -pthread -Isrc -Ithird_party \
     src/features/session/infrastructure/api.cpp src/core/network/http.cpp src/features/auth/infrastructure/auth_storage.cpp src/core/storage/storage.cpp tests/no_replace_rename.cpp tests/api_tests.cpp -Wl,--wrap=rename -lcurl -o work/api_tests
 ./work/api_tests | tee work/logs/api-tests.log
 g++ -std=c++17 -Wall -Wextra -Werror -pthread -Isrc -Ithird_party \
-    src/features/session/infrastructure/api.cpp src/core/network/http.cpp src/features/auth/infrastructure/auth_storage.cpp src/core/storage/storage.cpp src/features/session/application/session.cpp tests/no_replace_rename.cpp tests/session_tests.cpp -Wl,--wrap=rename -lcurl -o work/session_tests
+    src/features/session/infrastructure/api.cpp src/core/network/http.cpp src/features/auth/infrastructure/auth_storage.cpp src/core/storage/storage.cpp src/features/session/application/session.cpp src/features/session/infrastructure/mts_rental_repository.cpp src/features/session/infrastructure/rental_journal_storage.cpp tests/no_replace_rename.cpp tests/session_tests.cpp -Wl,--wrap=rename -lcurl -o work/session_tests
 ./work/session_tests | tee work/logs/session-tests.log
 g++ -std=c++17 -Wall -Wextra -Werror -pthread -Isrc -Ithird_party \
-    src/features/session/infrastructure/api.cpp src/core/network/http.cpp src/features/auth/infrastructure/auth_storage.cpp src/core/storage/storage.cpp src/features/session/application/session.cpp src/features/session/application/checkout.cpp tests/no_replace_rename.cpp tests/checkout_tests.cpp -Wl,--wrap=rename -lcurl -o work/checkout_tests
+    src/features/session/infrastructure/api.cpp src/core/network/http.cpp src/features/auth/infrastructure/auth_storage.cpp src/core/storage/storage.cpp src/features/session/application/session.cpp src/features/session/application/checkout.cpp src/features/session/infrastructure/mts_rental_repository.cpp src/features/session/infrastructure/rental_journal_storage.cpp tests/no_replace_rename.cpp tests/checkout_tests.cpp -Wl,--wrap=rename -lcurl -o work/checkout_tests
 ./work/checkout_tests | tee work/logs/checkout-tests.log
 g++ -std=c++17 -Wall -Wextra -Werror -pthread -Isrc -Ithird_party \
     src/features/session/infrastructure/api.cpp src/core/network/http.cpp src/features/auth/infrastructure/auth_storage.cpp src/core/storage/storage.cpp tests/no_replace_rename.cpp tests/auth_storage_tests.cpp -Wl,--wrap=rename -lcurl -o work/auth_storage_tests
@@ -36,7 +36,7 @@ g++ -std=c++17 -Wall -Wextra -Werror -Isrc -Ithird_party \
     -Wl,--wrap=rename -o work/video_settings_tests
 ./work/video_settings_tests | tee work/logs/video-settings-tests.log
 g++ -std=c++17 -Wall -Wextra -Werror -pthread -Isrc -Ithird_party \
-    src/features/catalog/infrastructure/latency.cpp src/core/network/http.cpp tests/latency_tests.cpp -lcurl -o work/latency_tests
+    src/features/catalog/infrastructure/latency.cpp src/features/catalog/infrastructure/mts_catalog_mapper.cpp src/core/network/http.cpp tests/latency_tests.cpp -lcurl -o work/latency_tests
 ./work/latency_tests | tee work/logs/latency-tests.log
 if [[ "${1:-}" == "--live" ]]; then
     g++ -std=c++17 -Wall -Wextra -Werror -pthread -Isrc -Ithird_party \
@@ -48,7 +48,7 @@ bash tools/test/controller-layout.sh
 
 g++ -std=c++17 -Wall -Wextra -Werror -Isrc -Ithird_party \
     src/features/session/application/session.cpp src/features/session/application/checkout.cpp \
-    src/core/storage/storage.cpp tests/rental_service_tests.cpp -o work/rental_service_tests
+    src/core/storage/storage.cpp src/features/session/infrastructure/rental_journal_storage.cpp tests/rental_service_tests.cpp -o work/rental_service_tests
 ./work/rental_service_tests | tee work/logs/rental-service-tests.log
 
 bash tools/test/connection-settings.sh

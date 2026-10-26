@@ -1,4 +1,5 @@
 #include "features/playstation/infrastructure/native_input.hpp"
+#include "features/streaming/infrastructure/input_protocol.hpp"
 #include "features/playstation/domain/touch_trace.hpp"
 #include <cassert>
 #include <iostream>
@@ -12,13 +13,13 @@ PsSensorSnapshot touch(unsigned id,int x,int y) {
 }
 NativeInput initializedInput() {
     NativeInput input;
-    assert(input.initializeContacts([](const J&){return true;}));
+    assert(input.initializeContacts([](const fog::remote::Input&){return true;}));
     return input;
 }
 int main() {
     std::vector<J> out;
     bool accept=true;
-    auto emit=[&](const J& v){if(accept)out.push_back(v);return accept;};
+    auto emit=[&](const fog::remote::Input& v){if(accept)out.push_back(stream::protocol::remoteInput(v));return accept;};
     NativeInput input=initializedInput();auto sample=touch(12,0,0);
     input.update(sample,100,true,emit);
     assert(out.size()==1 && out[0]["id"]=="gamepad_touch" && out[0]["index"]==0);
@@ -91,25 +92,25 @@ int main() {
     input.update(sample,100,false,emit);assert(out.empty() && !input.contactsInitialized());
     input.update(sample,120,true,emit);
     assert(input.contactsInitialized() && out.size()==2 && !input.click(120));
-    for (int i=0;i<2;++i) assert(out[i]==NativeInput::touch(NativeInput::Up,i,0,0));
+    for (int i=0;i<2;++i) assert(out[i]==stream::protocol::remoteInput(NativeInput::touch(NativeInput::Up,i,0,0)));
     input.update(sample,140,true,emit);input.suspend(emit);input.update(sample,160,true,emit);
     assert(out.size()==2 && input.counters().resetUpQueued==2);
     // A rejected second reset blocks held touch and sensors; retry only that slot.
     input=NativeInput{};out.clear();sample=touch(1,100,100);
     sample.motion.valid=true;sample.motion.sampleNumber=1;sample.motion.psAccelerationG={0,1,0};
     unsigned attempts=0;
-    auto partial=[&](const J& value){++attempts;if(attempts==2)return false;out.push_back(value);return true;};
+    auto partial=[&](const fog::remote::Input& value){++attempts;if(attempts==2)return false;out.push_back(stream::protocol::remoteInput(value));return true;};
     input.update(sample,200,true,partial);
     assert(!input.contactsInitialized() && out.size()==1 && input.counters().resetRejected==1);
     assert(input.counters().down==0 && input.counters().gyro==0);
     input.update(sample,240,true,emit);
     assert(input.contactsInitialized() && out.size()==5);
-    assert(out[0]==NativeInput::touch(NativeInput::Up,0,0,0));
-    assert(out[1]==NativeInput::touch(NativeInput::Up,1,0,0));
+    assert(out[0]==stream::protocol::remoteInput(NativeInput::touch(NativeInput::Up,0,0,0)));
+    assert(out[1]==stream::protocol::remoteInput(NativeInput::touch(NativeInput::Up,1,0,0)));
     assert(out[2]["data"]["type"]==NativeInput::Down && out[3]["id"]=="gamepad_sensor");
     // New transport resets both contacts again before replaying held input.
     input=NativeInput{};out.clear();input.update(sample,300,true,emit);
-    assert(out.size()==5 && out[0]==NativeInput::touch(NativeInput::Up,0,0,0) && out[1]==NativeInput::touch(NativeInput::Up,1,0,0));
+    assert(out.size()==5 && out[0]==stream::protocol::remoteInput(NativeInput::touch(NativeInput::Up,0,0,0)) && out[1]==stream::protocol::remoteInput(NativeInput::touch(NativeInput::Up,1,0,0)));
         TouchTrace trace;sample=touch(15,0,0);trace.observe(sample,1,false);
     sample.touches[0].screenX=200;trace.observe(sample,60,false);
     sample.touches={};sample.touchCount=0;trace.observe(sample,100,true);

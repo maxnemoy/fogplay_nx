@@ -110,7 +110,7 @@ bool ApplicationController::closeTransport(bool final) noexcept {
 void ApplicationController::closeStream() noexcept {
     transportReconnect_.cancel();
     closeTransport(true);
-    streamHash_.clear();
+    streamRental_ = {};
     streamPlayStation_ = false;
     relaySelection_.reset();
     transportReconnect_.reset();
@@ -127,7 +127,7 @@ bool ApplicationController::startTransport() {
     loopTiming_.resetPresentationCounter();
     videoWorkUs_ = videoDecodeErrors_ = lastVideoGeneration_ = 0;
     media_ = std::make_unique<fog::Media>(rt_.renderer,stream::VideoCodec::H264,true);
-    stream_ = std::make_unique<stream::Client>();
+    stream_ = services_->stream();
     if (!stream_->configurePlayStation(streamPlayStation_))
         throw std::runtime_error("Invalid controller configuration; stopping rental");
     if (streamPlayStation_) {
@@ -145,10 +145,7 @@ bool ApplicationController::startTransport() {
     overlay_.setVideoSettings(videoSettings_);
     overlay_.setSaveStatus(videoSaveStatus_);
     lastStreamState_.clear(); lastStreamDiagnostics_.clear();
-    std::array<unsigned char,5> random{}; randomGet(random.data(),random.size());
-    std::string suffix;
-    for (auto value : random) suffix += "0123456789abcdefghijklmnopqrstuvwxyz"[value % 36];
-    const bool started = stream_->start(streamHash_, suffix, fog::constants::resources::CertificateBundle);
+    const bool started = stream_->start({streamRental_});
     streamStarted_ = lastVideo_ = lastMediaLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
     return started;
 }
@@ -159,7 +156,7 @@ void ApplicationController::retryTransport(const char* reason) {
         diagnostic("Transport break recorded; recentBreaks=" + std::to_string(relaySelection_.breaks()));
     if (!wasRelay && relaySelection_.relay()) diagnostic("Auto TURN selected after two breaks in 120s; retained until rental closes.");
     if (screen_ != Screen::Streaming || !sessionPending_ || stopAfterTask_ ||
-        exitAfterStop_ || streamHash_.empty() || pending_.valid() ||
+        exitAfterStop_ || streamRental_.empty() || pending_.valid() ||
         !transportReconnect_.retry(std::chrono::steady_clock::now())) {
         beginFinish("transport-reconnect-exhausted");
         return;
@@ -173,7 +170,7 @@ void ApplicationController::retryTransport(const char* reason) {
         " attemptsIn120s=" + std::to_string(transportReconnect_.attempts()) + " limit=3 rollingWindow=120s recoveryDeadline=90s");
 }
 
-void ApplicationController::startStream(const std::string& hash, bool createdFromCatalog) {
+void ApplicationController::startStream(const fog::RentalId& rental, bool createdFromCatalog) {
     latency_.cancel();
     recentLaunch_.stream(createdFromCatalog);
     relaySelection_.reset(connectionSettings_);
@@ -188,7 +185,7 @@ void ApplicationController::startStream(const std::string& hash, bool createdFro
     lastSlowPlaybackLog_ = {};
     ++sessionSequence_;
     diagnostic("Stream session=" + std::to_string(sessionSequence_) +
-        (createdFromCatalog ? " origin=catalog catalogGameId=" + std::to_string(selectedGameId_) +
+        (createdFromCatalog ? " origin=catalog catalogGameId=" + safeText(selectedGameId_.value) +
          " catalogGame=" + safeText(selectedGameName_) : " origin=existing-rental catalogGame=unknown"));
     screen_ = Screen::Streaming;
     overlay_.close(); streamInputGate_.reset(); streamInputGate_.overlayTransition(); touchWasDown_ = touchDrag_ = false;
@@ -201,7 +198,7 @@ void ApplicationController::startStream(const std::string& hash, bool createdFro
             " capMbps=" + std::to_string(videoSettings_.bitrateMbps) + " quality=" + std::to_string(videoSettings_.quality) +
             " pliSeconds=" + std::to_string(videoSettings_.keyframeSeconds));
         armExitHandling();
-        streamHash_ = hash;
+        streamRental_ = rental;
         if (!startTransport()) {
             if (stream_->retryableError()) { retryTransport("initial-start"); return; }
             throw std::runtime_error("Signaling startup failed; stopping rental");
@@ -266,7 +263,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     const bool wasRecovering = transportReconnect_.recovering();
     if (wasRecovering && screen_ == Screen::Streaming) {
         overlayHandled = handleStreamOverlay(pad, held, down);
-        if (screen_ != Screen::Streaming || stopAfterTask_ || streamHash_.empty()) return;
+        if (screen_ != Screen::Streaming || stopAfterTask_ || streamRental_.empty()) return;
     }
     const auto pumpAt = std::chrono::steady_clock::now();
     std::uint64_t pumpGapUs = 0;

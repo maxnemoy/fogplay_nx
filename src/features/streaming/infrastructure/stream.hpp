@@ -1,5 +1,5 @@
 #pragma once
-#include "features/settings/domain/video_settings.hpp"
+#include "features/streaming/domain/streaming_client.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -8,81 +8,65 @@
 #include <vector>
 
 namespace stream {
-enum class Kind { Video, Audio };
-struct Packet {
-    Kind kind = Kind::Video;
-    std::vector<std::byte> data;
-    std::uint32_t timestamp = 0; // RTP clock: video 90 kHz, audio 48 kHz.
-    std::int64_t firstSequence = 0, lastSequence = 0; // Video extended RTP range.
-    std::uint64_t enqueueMs = 0; // Local steady clock, never a remote timestamp.
-    std::uint64_t videoGeneration = 0; // Reset decoder when the next video AU changes generation.
-};
-struct PlaybackObservation {
-    std::uint64_t presentedFrames = 0, decodedFrames = 0, supersededFrames = 0;
-    std::uint64_t workUs = 0, errors = 0, audioUnderruns = 0, audioResets = 0;
-    bool recovering = false;
-    int width = 0, height = 0;
-};
-struct Gamepad {
-    std::array<int, 18> buttons{};
-    std::array<float, 4> axes{};
-    float rightTrigger = 0;
-    float leftTrigger = 0;
-};
 // Application-thread controller. Callbacks store bounded data; a serialized worker
 // sends input and pongs. Public enqueue/pump calls never send data-channel traffic.
 // Call pump every frame, then drain poll. The owner chooses bounded transport retry or session finish after an error.
-class Client {
+class Client final : public StreamingClient {
 public:
     Client();
-    ~Client();
+    Client(std::string caPath, std::string random5suffix);
+    ~Client() override;
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
+    bool start(const StreamConnection& connection) override;
+    // Explicit MTS transport arguments are limited to this adapter and protocol fixtures.
     bool start(const std::string& sessionHash, const std::string& random5suffix,
                const std::string& caPath);
     // Preferences are retained across start(); codec changes require a new connection.
-    bool configureVideo(const fog::video::Settings& settings);
+    bool configureVideo(const fog::video::Settings& settings) override;
     // Pre-start transport preference, retained across start(). Relay never falls back to direct.
-    bool configureRelay(bool relay);
+    bool configureRelay(bool relay) override;
     // Pre-start controller mode, retained across start(). Defaults to ordinary gamepad.
-    bool configurePlayStation(bool enabled);
-    bool updateVideoSettings(const fog::video::Settings& settings);
-    VideoCodec selectedVideoCodec() const;
-    std::string qualityStatus() const;
-    void pump();
+    bool configurePlayStation(bool enabled) override;
+    bool updateVideoSettings(const fog::video::Settings& settings) override;
+    VideoCodec selectedVideoCodec() const override;
+    std::string qualityStatus() const override;
+    void pump() override;
     // Application thread, once per frame after draining packets. Counters are cumulative per session.
-    void observePlayback(const PlaybackObservation& observation);
-    bool poll(Packet& packet);
-    bool pollAudio(Packet& packet); // Audio FIFO, independent of queued compressed video.
-    std::uint64_t queuedVideoAgeMs() const;
-    std::size_t queuedVideoPackets() const;
-    bool ready() const;
-    std::string status() const;
-    std::string error() const;
-    bool retryableError() const; // Fixed transport failures/timeouts only; persists after teardown.
-    bool disconnected() const; // Live peer or ICE Disconnected; application applies its grace period.
-    bool disconnectForRetry(); // False if pending terminal evidence forbids retry; otherwise release transports.
+    void observePlayback(const PlaybackObservation& observation) override;
+    bool poll(Packet& packet) override;
+    bool pollAudio(Packet& packet) override; // Audio FIFO, independent of queued compressed video.
+    std::uint64_t queuedVideoAgeMs() const override;
+    std::size_t queuedVideoPackets() const override;
+    bool ready() const override;
+    std::string status() const override;
+    std::string error() const override;
+    bool retryableError() const override; // Fixed transport failures/timeouts only; persists after teardown.
+    bool disconnected() const override; // Live peer or ICE Disconnected; application applies its grace period.
+    bool disconnectForRetry() override; // False if pending terminal evidence forbids retry; otherwise release transports.
     // Fixed operation names and counters only; no remote fields or identifiers.
-    std::string diagnostics() const;
+    std::string diagnostics() const override;
     // Application-thread lifetime stages; nested scopes are not additive.
-    std::string transportTimings() const;
-    std::string videoDiagnostics() const;
-    std::string gapDiagnostics() const;
-    std::string queueDiagnostics() const;
-    std::string mutexDiagnostics() const;
-    std::string dtlsDiagnostics() const;
-    std::string rtcpDiagnostics() const;
+    std::string transportTimings() const override;
+    std::string videoDiagnostics() const override;
+    std::string gapDiagnostics() const override;
+    std::string queueDiagnostics() const override;
+    std::string mutexDiagnostics() const override;
+    std::string dtlsDiagnostics() const override;
+    std::string rtcpDiagnostics() const override;
     // Local queue/RTC acceptance, scoped to this transport generation. No remote input ACK exists.
-    std::string inputDiagnostics() const;
-    bool pollVideoDiagnostic(std::string& event);
-    bool waitingForVideoKeyframe() const;
-    bool requestVideoKeyframe(); // Best effort PLI on open video tracks; no transport reset.
+    std::string inputDiagnostics() const override;
+    bool pollVideoDiagnostic(std::string& event) override;
+    bool waitingForVideoKeyframe() const override;
+    bool requestVideoKeyframe() override; // Best effort PLI on open video tracks; no transport reset.
     // Decoder recovery is independent of transport assembly and quality mode.
     // Keep requesting IDR until the owner successfully prepares decoded output.
-    void setDecoderWaitingForKeyframe(bool waiting);
-    bool sendGamepad(const Gamepad& state);
+    void setDecoderWaitingForKeyframe(bool waiting) override;
+    bool sendGamepad(const Gamepad& state) override;
+    bool sendInput(const fog::remote::Input& input) override;
+    // MTS wire entry point. Kept on the concrete adapter for protocol validation tests.
     bool sendControl(const std::string& json);
-    void close();
+    void close() override;
     // After destroying all Clients, before shutting down the platform socket runtime.
     static void cleanupRuntime();
 #ifdef FOG_STREAM_TESTING
@@ -113,5 +97,6 @@ private:
                        const std::string& caPath, const std::string& url);
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::string caPath_, random5suffix_;
 };
 }

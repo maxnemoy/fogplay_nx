@@ -1,5 +1,6 @@
 #pragma once
 #include "features/session/domain/rental_service.hpp"
+#include "features/session/application/rental_journal.hpp"
 #include <string>
 
 namespace fog {
@@ -13,14 +14,17 @@ struct FinishResult {
 // Never connect the live stream until adopt() succeeds.
 class SessionGuard {
 public:
-    SessionGuard(RentalService& api, std::string journalPath);
-    const std::string& pendingHash() const noexcept { return pendingHash_; }
+    SessionGuard(RentalRepository& api, std::unique_ptr<SessionJournal> journal);
     const std::string& journalError() const noexcept { return journalError_; }
-    bool ownsSession() const noexcept { return owned_ && authGeneration_ == api_.authGeneration(); }
+    const RentalId& pendingRental() const noexcept { return pendingRental_; }
+    bool ownsSession() const {
+        const auto auth = api_.auth();
+        return owned_ && auth.authenticated() && authGeneration_ == auth.generation && ownedAccount_ == auth.account;
+    }
     bool persistent() const noexcept { return persistent_; }
     // observedActive requires a fresh authenticated active-list match, not an
     // order-status hash: the latter may exist while the rental is still preparing.
-    void adopt(const std::string& hash, bool observedActive = false);
+    void adopt(const RentalId& rental, bool observedActive = false);
     // On restart, absence cannot establish account ownership or termination.
     bool recoverMatchingSession();
     FinishResult finishAttempt();
@@ -28,9 +32,10 @@ private:
     void loadJournal();
     void writeJournal();
     void clearJournal();
-    RentalService& api_;
-    std::string journalPath_;
-    std::string pendingHash_;
+    RentalRepository& api_;
+    std::unique_ptr<SessionJournal> journal_;
+    RentalId pendingRental_;
+    AccountId ownedAccount_;
     std::string journalError_;
     bool owned_ = false;
     bool persistent_ = false;

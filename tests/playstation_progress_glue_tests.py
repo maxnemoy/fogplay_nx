@@ -15,7 +15,7 @@ def method(name):
     return source[start:end]
 
 harness = r'''
-#include "features/playstation/infrastructure/catalog_progress.hpp"
+#include "features/playstation/application/catalog_progress.hpp"
 #include "features/playstation/domain/computer.hpp"
 #include <cassert>
 #include <chrono>
@@ -23,21 +23,31 @@ harness = r'''
 #include <iostream>
 #include <memory>
 #include <thread>
-using fog::Json;
 namespace fog {
-struct HttpClient {
-    std::atomic_bool wasCancelled{false};
-    void cancel() {wasCancelled=true;}
-};
-Json playStationComputerPlaceholders() {
-    Json result=Json::array();
-    for(const auto& pc:PlayStationComputers) result.push_back({{"id",pc.id},{"name",pc.name},{"price",nullptr},{"listed",false},{"launchable",false},{"availability","unknown"}});
+std::vector<Computer> playStationComputerPlaceholders() {
+    std::vector<Computer> result;
+    for(const auto& pc:PlayStationComputers) {
+        Computer value; value.id={ProviderId::Mts,std::to_string(pc.id)}; value.name=pc.name;
+        result.push_back(std::move(value));
+    }
     return result;
 }
-std::function<Json(HttpClient&,const PlayStationCatalogProgress&,const PlayStationCancellation&)> loader;
-Json fetchPlayStationComputers(HttpClient& http,const PlayStationCatalogProgress& progress,const PlayStationCancellation& cancelled) {
-    return loader(http,progress,cancelled);
-}
+struct FakeRepository;
+std::function<std::vector<Computer>(FakeRepository&,const CatalogProgress&,const CatalogCancellation&)> loader;
+struct FakeRepository final : CatalogRepository {
+    std::atomic_bool wasCancelled{false};
+    Page<Game> games(const GameQuery&) override {return {};}
+    Game game(const EntityId&) override {return {};}
+    Page<Computer> computers(const ComputerQuery&) override {return {};}
+    AutomaticComputers recommend(const ComputerQuery&) override {return {};}
+    std::vector<Computer> playStationComputers(const CatalogProgress& progress,const CatalogCancellation& cancelled) override {
+        return loader(*this,progress,cancelled);
+    }
+    void cancel() noexcept override {wasCancelled=true;}
+};
+struct FakeServices {
+    std::shared_ptr<CatalogRepository> publicCatalog() {return std::make_shared<FakeRepository>();}
+};
 }
 std::string safeText(const std::string& value) {return value;}
 void diagnostic(const std::string&) {}
@@ -46,15 +56,16 @@ enum class Screen {PlayStation,PlayStationDetails,Games,Checkout};
 struct ApplicationController {
     Screen screen_=Screen::Games;
     bool sessionPending_=false;
-    std::future<Json> pending_;
+    std::future<int> pending_;
     struct Latency {void cancel() {}} latency_;
     int nav_=0;
     std::size_t selection_=0;
-    Json playStationComputers_=Json::array();
+    std::vector<fog::Computer> playStationComputers_;
+    std::unique_ptr<fog::FakeServices> services_=std::make_unique<fog::FakeServices>();
     std::chrono::steady_clock::time_point playStationLoadedAt_{};
     std::string playStationError_,status_;
-    std::future<Json> playStationPending_;
-    std::shared_ptr<fog::HttpClient> playStationHttp_;
+    std::future<std::vector<fog::Computer>> playStationPending_;
+    std::shared_ptr<fog::CatalogRepository> playStationRepository_;
     std::shared_ptr<fog::PlayStationCatalogProgressChannel> playStationUpdates_;
     void loadPlayStation();
     void pollPlayStation();
@@ -72,10 +83,10 @@ int main() {
         std::promise<void> published,finish;
         auto finishGate=finish.get_future().share();
         auto batch=fog::playStationComputerPlaceholders();
-        for(auto& pc:batch) {pc["listed"]=true;pc["launchable"]=true;pc["price"]=35;}
+        for(auto& pc:batch) {pc.listed=true;pc.launchable=true;pc.price="35";}
         std::swap(batch[0],batch[6]);
-        auto final=batch; final[0]["price"]=40;
-        fog::loader=[&,finishGate](fog::HttpClient&,const fog::PlayStationCatalogProgress& progress,const fog::PlayStationCancellation&) {
+        auto final=batch; final[0].price="40";
+        fog::loader=[&,finishGate](fog::FakeRepository&,const fog::PlayStationCatalogProgress& progress,const fog::PlayStationCancellation&) {
             progress(batch);published.set_value();finishGate.wait();
             if(scenario==3) throw std::runtime_error("synthetic total outage after progress");
             return final;
@@ -87,34 +98,34 @@ int main() {
         app.selection_=6;
         published.get_future().wait();
         if(scenario==1 || scenario==4) {app.screen_=scenario==1?Screen::Games:Screen::Checkout;app.selection_=92;app.status_="other page status";}
-        if(scenario==2) {app.cancelPlayStation();assert(app.playStationHttp_->wasCancelled && app.playStationUpdates_->cancelled());}
+        if(scenario==2) {app.cancelPlayStation();assert(std::static_pointer_cast<fog::FakeRepository>(app.playStationRepository_)->wasCancelled && app.playStationUpdates_->cancelled());}
         app.pollPlayStation();
         assert(app.playStationPending_.valid());
-        if(scenario==0 || scenario==3) assert(app.selection_==0 && app.playStationComputers_[0]["id"]==5510 && app.playStationComputers_[0]["price"]==35);
+        if(scenario==0 || scenario==3) assert(app.selection_==0 && app.playStationComputers_[0].id.value=="5510" && app.playStationComputers_[0].price=="35");
         if(scenario==1 || scenario==4) assert(app.selection_==92 && app.status_=="other page status");
         if(scenario==0) {
             auto channel=app.playStationUpdates_;
             app.loadPlayStation();assert(app.playStationUpdates_==channel && app.selection_==0);
-            app.pending_=std::async(std::launch::deferred,[]{return Json::object();});
+            app.pending_=std::async(std::launch::deferred,[]{return 0;});
             app.pollPlayStation();assert(app.selection_==0 && app.pending_.valid());app.pending_.get();
         }
         finish.set_value();app.playStationPending_.wait();app.pollPlayStation();
-        assert(!app.playStationPending_.valid() && !app.playStationUpdates_ && !app.playStationHttp_);
-        if(scenario==0) assert(app.playStationLoadedAt_!=std::chrono::steady_clock::time_point{} && app.playStationComputers_[0]["price"]==40 && app.selection_==0);
+        assert(!app.playStationPending_.valid() && !app.playStationUpdates_ && !app.playStationRepository_);
+        if(scenario==0) assert(app.playStationLoadedAt_!=std::chrono::steady_clock::time_point{} && app.playStationComputers_[0].price=="40" && app.selection_==0);
         if(scenario==1 || scenario==4) assert(app.selection_==92 && app.status_=="other page status" && app.screen_==(scenario==1?Screen::Games:Screen::Checkout));
-        if(scenario==2) assert(app.playStationLoadedAt_==std::chrono::steady_clock::time_point{} && app.playStationComputers_[0]["price"].is_null());
-        if(scenario==3) assert(app.playStationLoadedAt_==std::chrono::steady_clock::time_point{} && !app.playStationError_.empty() && app.playStationComputers_[0]["price"]==35);
+        if(scenario==2) assert(app.playStationLoadedAt_==std::chrono::steady_clock::time_point{} && app.playStationComputers_[0].price.empty());
+        if(scenario==3) assert(app.playStationLoadedAt_==std::chrono::steady_clock::time_point{} && !app.playStationError_.empty() && app.playStationComputers_[0].price=="35");
     }
     {
-        fog::loader=[](fog::HttpClient&,const fog::PlayStationCatalogProgress&,const fog::PlayStationCancellation&)->Json {throw std::runtime_error("all merchants failed");};
+        fog::loader=[](fog::FakeRepository&,const fog::PlayStationCatalogProgress&,const fog::PlayStationCancellation&)->std::vector<fog::Computer> {throw std::runtime_error("all merchants failed");};
         ApplicationController app;app.loadPlayStation();app.playStationPending_.wait();app.pollPlayStation();
         assert(app.playStationComputers_.size()==7 && !app.playStationError_.empty() && app.playStationLoadedAt_==std::chrono::steady_clock::time_point{});
     }
     {
         std::promise<void> started;
-        fog::loader=[&](fog::HttpClient&,const fog::PlayStationCatalogProgress& progress,const fog::PlayStationCancellation& cancelled) {
+        fog::loader=[&](fog::FakeRepository&,const fog::PlayStationCatalogProgress& progress,const fog::PlayStationCancellation& cancelled) {
             started.set_value();while(!cancelled()) std::this_thread::yield();
-            progress(fog::playStationComputerPlaceholders());return Json::array();
+            progress(fog::playStationComputerPlaceholders());return std::vector<fog::Computer>{};
         };
         std::weak_ptr<fog::PlayStationCatalogProgressChannel> weak;
         {ApplicationController app;app.loadPlayStation();weak=app.playStationUpdates_;started.get_future().wait();}

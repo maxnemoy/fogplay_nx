@@ -1,9 +1,10 @@
 #pragma once
 #include "core/constants/storage_paths.hpp"
 #include "core/constants/ui_text.hpp"
-#include "features/session/infrastructure/api.hpp"
-#include "features/playstation/infrastructure/catalog.hpp"
-#include "core/network/http.hpp"
+#include "app/services.hpp"
+#include "features/playstation/domain/computer.hpp"
+#include "features/playstation/application/catalog_progress.hpp"
+
 #include "features/catalog/domain/catalog.hpp"
 #include "features/settings/domain/controller_layout.hpp"
 #include "features/settings/infrastructure/controller_layout_storage.hpp"
@@ -22,7 +23,7 @@
 #include "features/streaming/domain/stream_input_gate.hpp"
 #include "features/streaming/domain/loop_timing.hpp"
 #include "core/logging/run_log.hpp"
-#include "features/streaming/infrastructure/stream.hpp"
+#include "features/streaming/domain/streaming_client.hpp"
 #include "features/session/application/checkout.hpp"
 #include "core/storage/storage.hpp"
 #include "app/presentation/ui.hpp"
@@ -43,6 +44,7 @@
 #include <functional>
 #include <fstream>
 #include <future>
+#include <variant>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -61,7 +63,7 @@ namespace uiText = ::fog::constants::ui;
 namespace storagePaths = ::fog::constants::storage;
 
 namespace fogplay {
-using fog::Json;
+
 using platform::Runtime;
 using platform::checkResult;
 using platform::checkStorage;
@@ -80,10 +82,17 @@ inline constexpr SDL_Color accent{107, 216, 190, 255};
 enum class Screen { Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails };
 enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation };
 
+struct RecoveryResult { bool matched = false; };
+struct VerifiedOffer { fog::StartRentalRequest request; };
+struct ChangedOffer { std::vector<fog::Computer> computers; };
+using TaskResult = std::variant<std::monostate, fog::RestoreAuthResult, fog::AuthResult,
+    fog::UserProfile, fog::GameDetail, fog::Page<fog::Computer>, std::vector<fog::HistoryEntry>,
+    std::vector<fog::Rental>, fog::FinishResult, RecoveryResult, VerifiedOffer, ChangedOffer>;
+
 // Main-thread presentation coordinator. Workers are joined before their state is read.
 class ApplicationController {
 public:
-    ApplicationController(Runtime& runtime, const std::string& id);
+    ApplicationController(Runtime& runtime, std::unique_ptr<Services> services);
     ~ApplicationController();
     void run();
 private:
@@ -111,7 +120,7 @@ private:
     void loadSessions();
     void recoverSession();
     void connectSession();
-    void startStream(const std::string& hash, bool createdFromCatalog = true);
+    void startStream(const fog::RentalId& rental, bool createdFromCatalog = true);
     void rememberDecodedGame() noexcept;
     void beginFinish(const char* reason = "rental-guard");
     void recoverVideoError(const fog::VideoDecodeError& error, const stream::Packet* packet);
@@ -119,7 +128,7 @@ private:
     void feedStreamAudio(const stream::Packet& packet);
     void drainStreamAudio();
     SDL_Rect videoRect() const;
-    bool sendRemote(const Json& command);
+    bool sendRemote(const fog::remote::Input& command);
     void releaseMouse() noexcept;
     void neutralizeStreamInput();
     void suspendVideoInput();
@@ -136,35 +145,38 @@ private:
     static float axis(int value);
     void text(const std::string& value, int x, int y, SDL_Color color = white, int width = 1190, bool title = false);
     void box(int x, int y, int w, int h, SDL_Color color);
-    void start(Task kind, std::function<Json()> work);
+    void start(Task kind, std::function<TaskResult()> work);
     void loadGames();
     void requestCatalog(bool manual = false);
     void pollCatalog();
     void retryCatalog();
     void moveCatalog(u64 keys);
-    void selectCatalogGame(const Json& game);
+    void selectCatalogGame(const fog::Game& game);
     void loadComputers();
     void loadPlayStation();
     void pollPlayStation();
     void cancelPlayStation();
-    void setCaptcha(const Json& response);
+    void setCaptcha(const fog::AuthResult& response);
     void poll();
     void beginLogin();
     void enterCode();
     void moveGrid(u64 keys, std::size_t count, std::size_t columns = 4);
     void searchGames();
-    std::string latencyText(const Json& computer) const;
+    std::string latencyText(const fog::Computer& computer) const;
     std::size_t selectedGenreIndex() const;
     std::size_t selectedGenreChip() const;
     void chooseGenre(int id);
     void inputGenres(u64 keys);
     void inputGenreBar(u64 keys);
     void input(u64 keys);
-    SDL_Texture* cover(const Json& game);
+    SDL_Texture* cover(const fog::Game& game);
     void draw();
     Runtime& rt_;
-    fog::Api api_;
-    const std::string catalogDeviceId_;
+    std::unique_ptr<Services> services_;
+    fog::AuthRepository& auth_;
+    fog::AccountRepository& account_;
+    fog::CatalogRepository& catalogRepository_;
+    fog::RentalRepository& rentals_;
     fog::Catalog catalog_;
     fog::LatencyService latency_;
     int genreId_ = 0;
@@ -177,15 +189,17 @@ private:
     bool recentSavePending_ = false;
     void pollRecentSave() noexcept;
     std::optional<fog::RecentGame> selectedRecentGame_;
-    std::shared_ptr<fog::Api> catalogApi_;
-    std::future<Json> catalogPending_;
+    std::shared_ptr<fog::CatalogRepository> catalogApi_;
+    std::future<fog::Page<fog::Game>> catalogPending_;
     fog::Catalog::Request catalogRequest_{0, 1, {}};
     fog::SessionGuard guard_;
     fog::CheckoutGuard checkout_;
     fog::ui::Ui ui_;
     fog::ArtworkCache artwork_;
     fog::SteamArtworkResolver steamArtwork_;
-    Json history_ = Json::array(), detail_ = Json::object(), autoComputers_ = Json::object();
+    std::vector<fog::HistoryEntry> history_;
+    fog::Game detail_;
+    fog::AutomaticComputers autoComputers_;
     bool detailsFromAutomatic_ = false;
     bool selectedPlayStation_ = false, streamPlayStation_ = false;
     platform::PsSensors psSensors_;
@@ -195,9 +209,9 @@ private:
     float psGyroPeak_ = 0, psAccelPeak_ = 0;
     std::uint64_t psMotionMovedFrames_ = 0;
     std::uint64_t psLogAtMs_ = 0, psGamepadAccepted_ = 0, psGamepadRejected_ = 0;
-    Json playStationComputers_ = Json::array();
-    std::future<Json> playStationPending_;
-    std::shared_ptr<fog::HttpClient> playStationHttp_;
+    std::vector<fog::Computer> playStationComputers_;
+    std::future<std::vector<fog::Computer>> playStationPending_;
+    std::shared_ptr<fog::CatalogRepository> playStationRepository_;
     std::shared_ptr<fog::PlayStationCatalogProgressChannel> playStationUpdates_;
     std::string playStationError_;
     std::chrono::steady_clock::time_point playStationLoadedAt_{};
@@ -207,7 +221,7 @@ private:
     int nav_ = 1;
     Screen loginReturn_ = Screen::Games;
     std::chrono::steady_clock::time_point checkoutAt_{};
-    std::unique_ptr<stream::Client> stream_;
+    std::unique_ptr<stream::StreamingClient> stream_;
     fog::stream::Overlay overlay_;
     fog::video::Settings videoSettings_;
     fog::connection::Settings connectionSettings_;
@@ -227,7 +241,7 @@ private:
     fog::VideoRecovery videoRecovery_;
     fog::stream::TransportReconnect transportReconnect_;
     // Private rental identity, retained only until final close; never logged.
-    std::string streamHash_;
+    fog::RentalId streamRental_;
     std::uint64_t videoWorkUs_ = 0, videoDecodeErrors_ = 0, lastVideoGeneration_ = 0;
     PlaybackTiming drainTiming_, presentTiming_;
     fog::stream::LoopTiming loopTiming_;
@@ -243,16 +257,17 @@ private:
     bool videoLossWaiting_ = false;
     std::chrono::steady_clock::time_point lastVideoEventLog_{};
     unsigned sessionSequence_ = 0;
-    Json sessions_ = Json::array();
+    std::vector<fog::Rental> sessions_;
     bool sessionPending_ = false, exitLocked_ = false, exitAfterStop_ = false, shutdownDone_ = false;
     bool stopStartedOnExit_ = false;
     std::chrono::steady_clock::time_point streamStarted_{}, lastVideo_{}, lastInput_{}, retryAt_{}, lastMediaLog_{};
-    std::future<Json> pending_;
+    std::future<TaskResult> pending_;
     Task task_ = Task::RestoreAuth;
     Screen screen_ = Screen::Games;
-    Json computers_ = Json::array();
+    std::vector<fog::Computer> computers_;
     std::size_t selection_ = 0;
-    int computerPage_ = 1, selectedGameId_ = 0;
+    int computerPage_ = 1;
+    fog::EntityId selectedGameId_;
     std::string search_, selectedGameName_, status_;
     std::string checkoutStatus_ = uiText::Server::WaitingReady;
     fog::AuthStep authStep_ = fog::AuthStep::Unknown;

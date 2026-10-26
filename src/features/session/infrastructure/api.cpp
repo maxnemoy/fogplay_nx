@@ -1,5 +1,6 @@
 #include "core/constants/error_text.hpp"
 #include "features/session/infrastructure/api.hpp"
+#include "core/domain/repository_error.hpp"
 #include "features/auth/infrastructure/auth_storage.hpp"
 #include <algorithm>
 #include <array>
@@ -64,9 +65,9 @@ std::string stringField(const Json& object, const char* key) {
 }
 Json responseJson(const HttpResponse& response) {
     if (response.status < 200 || response.status >= 300)
-        throw std::runtime_error("HTTP " + std::to_string(response.status) + fog::constants::error::Connection::RequestRejected);
+        throw RepositoryError(response.status == 401 || response.status == 403 ? RepositoryErrorKind::NotAuthenticated : RepositoryErrorKind::Unavailable, "HTTP " + std::to_string(response.status) + fog::constants::error::Connection::RequestRejected);
     auto data = Json::parse(response.body, nullptr, false);
-    if (data.is_discarded()) throw std::runtime_error(fog::constants::error::Connection::ServerResponseIsNotValidJSON);
+    if (data.is_discarded()) throw RepositoryError(RepositoryErrorKind::InvalidResponse, fog::constants::error::Connection::ServerResponseIsNotValidJSON);
     return data;
 }
 void validatePage(int page, int pageSize) {
@@ -177,9 +178,12 @@ HttpResponse Api::request(const std::string& method, const std::string& path,
         const Query& query, const std::string& body, const std::string& token, bool shutdown, bool creation) {
     const RequestOptions options = creation ? RequestOptions{30000, 15000} :
         shutdown ? RequestOptions{4000, 4000} : RequestOptions{};
-    if (optionsTransport_) return optionsTransport_(method, path, query, body, token, options);
-    if (transport_) return transport_(method, path, query, body, token);
-    return (shutdown ? shutdownHttp_ : http_).request(method, path, query, body, token, options);
+    try {
+        if (optionsTransport_) return optionsTransport_(method, path, query, body, token, options);
+        if (transport_) return transport_(method, path, query, body, token);
+        return (shutdown ? shutdownHttp_ : http_).request(method, path, query, body, token, options);
+    } catch (const RepositoryError&) { throw; }
+    catch (const std::runtime_error& error) { throw RepositoryError(RepositoryErrorKind::NetworkFailure,error.what()); }
 }
 Json Api::games(std::string search, int page, int pageSize, int genreId) {
     validatePage(page, pageSize);

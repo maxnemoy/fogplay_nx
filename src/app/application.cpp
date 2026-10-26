@@ -8,11 +8,12 @@ namespace storagePaths = ::fog::constants::storage;
 
 namespace fogplay {
 
-ApplicationController::ApplicationController(Runtime& runtime, const std::string& id)
-    : rt_(runtime), api_(id), catalogDeviceId_(id), guard_(api_, storagePaths::path(storagePaths::PendingSession)),
-      checkout_(api_, guard_, storagePaths::path(storagePaths::PendingOrder)),
+ApplicationController::ApplicationController(Runtime& runtime, std::unique_ptr<Services> services)
+    : rt_(runtime), services_(std::move(services)), auth_(services_->auth()), account_(services_->account()),
+      catalogRepository_(services_->catalog()), rentals_(services_->rentals()),
+      guard_(rentals_, services_->sessionJournal(storagePaths::path(storagePaths::PendingSession))),
+      checkout_(rentals_, guard_, services_->checkoutJournal(storagePaths::path(storagePaths::PendingOrder))),
       ui_(runtime.renderer, runtime.font, runtime.titleFont) {
-    api_.configureAuthStorage(storagePaths::path(storagePaths::Auth));
     if (!recentGames_.load()) diagnostic("Recent games load unavailable; history will remain optional.");
     syncPending();
     try {
@@ -44,7 +45,7 @@ ApplicationController::~ApplicationController() {
     if (catalogApi_) catalogApi_->cancel();
     // Last attempt precedes permanent cancellation and networking teardown.
     shutdownSession();
-    api_.cancel();
+    services_->cancel();
     if (pending_.valid()) pending_.wait();
     if (catalogPending_.valid()) catalogPending_.wait();
     latency_.stop();
@@ -59,7 +60,7 @@ void ApplicationController::run() {
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
     screen_ = sessionPending_ ? Screen::Recovery : Screen::Games;
-    start(Task::RestoreAuth,[this] { return Json{{"restored",api_.restoreAuth()}}; });
+    start(Task::RestoreAuth,[this] { return auth_.restore(); });
     status_ = uiText::Profile::ValidatingSavedAuth;
     for (;;) {
         fog::stream::LoopTiming::Scope loopScope(loopTiming_, fog::stream::LoopTiming::Stage::Loop,
@@ -111,7 +112,7 @@ void ApplicationController::run() {
             pollPlayStation();
             // The shutdown owner retries unresolved stops and provides an explicit escape.
             if (exitAfterStop_ && !pending_.valid()) break;
-            if (screen_ == Screen::Checkout && !pending_.valid() && api_.loggedIn() &&
+            if (screen_ == Screen::Checkout && !pending_.valid() && auth_.authenticated() &&
                 checkoutAutoPoll_ && std::chrono::steady_clock::now() >= checkoutAt_) {
                 if (stopAfterTask_) beginFinish(); else pollCheckout(false);
             }
@@ -123,13 +124,13 @@ void ApplicationController::run() {
             fog::stream::LoopTiming::Scope inputScope(loopTiming_, fog::stream::LoopTiming::Stage::Input);
             if (!pending_.valid() && focused) input(uiDown);
             if (screen_ == Screen::Games && focused && (!sidebar_ || catalog_.items().empty())) requestCatalog();
-            if (screen_ == Screen::Stopping && !pending_.valid() && api_.loggedIn() &&
+            if (screen_ == Screen::Stopping && !pending_.valid() && auth_.authenticated() &&
                 std::chrono::steady_clock::now() >= retryAt_) beginFinish();
         }
         catch (const std::exception& error) {
             status_ = safeText(error.what()); diagnostic(status_);
             if (screen_ == Screen::Checkout && !pending_.valid()) checkoutStatus_ = status_;
-            if (sessionPending_ && (stream_ || !streamHash_.empty() || transportReconnect_.recovering())) beginFinish("stream-exception");
+            if (sessionPending_ && (stream_ || !streamRental_.empty() || transportReconnect_.recovering())) beginFinish("stream-exception");
         }
         if (exitAfterStop_ && !sessionPending_ && !pending_.valid()) break;
         try {
@@ -143,12 +144,12 @@ void ApplicationController::run() {
     }
     cancelPlayStation();
     shutdownSession();
-    api_.cancel();
+    services_->cancel();
     if (catalogApi_) catalogApi_->cancel();
     diagnostic("Exit requested; cancelling pending request.");
 }
 
-void ApplicationController::start(Task kind, std::function<Json()> work) {
+void ApplicationController::start(Task kind, std::function<TaskResult()> work) {
     if (pending_.valid()) return;
     task_ = kind;
     status_ = uiText::Profile::ConnectingService;
@@ -158,7 +159,7 @@ void ApplicationController::start(Task kind, std::function<Json()> work) {
 void ApplicationController::poll() {
     if (!pending_.valid() || pending_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
     const auto kind = task_;
-    Json data;
+    TaskResult data;
     try { data = pending_.get(); }
     catch (...) {
         if (kind == Task::RestoreAuth) {
@@ -181,11 +182,11 @@ void ApplicationController::poll() {
         throw;
     }
     if (kind == Task::RestoreAuth) {
-        if (data.value("restored",false)) {
+        if (std::get<fog::RestoreAuthResult>(data).restored) {
             authSaveFailed_ = false;
             diagnostic("Saved authentication validated; credentials omitted.");
             if (sessionPending_) recoverSession(); else loadGames();
-        } else if (!api_.authStorageError().empty()) {
+        } else if (!auth_.storageError().empty()) {
             screen_ = Screen::Consent; loginReturn_ = Screen::Games;
             status_ = ui_.controllerHints(uiText::Profile::ValidationFailedHint);
             diagnostic("Saved authentication rejected or unreadable; credentials omitted.");
@@ -195,7 +196,7 @@ void ApplicationController::poll() {
         } else loadGames();
         return;
     }
-    if (kind == Task::Create && data.value("playstation_offer_verified",false)) {
+    if (kind == Task::Create && std::holds_alternative<VerifiedOffer>(data)) {
         // The public fetch can outlive Back, HOME or shutdown intent. Only the
         // main thread reads these flags and authorizes the separate paid worker.
         syncPending();
@@ -206,12 +207,9 @@ void ApplicationController::poll() {
             status_ = uiText::Server::ConnectionCancelled;
             return;
         }
-        fog::CreateOrderRequest order;
-        order.computerId = data.at("computer_id").get<int>();
-        order.tariffId = data.at("tariff_id").get<int>();
-        order.gameId = 0; order.ownSteamAccount = false;
-        if (!selectedPlayStation_ || !api_.loggedIn() ||
-            !fog::isPlayStationComputerId(order.computerId) || order.tariffId <= 0) {
+        const auto order = std::get<VerifiedOffer>(data).request;
+        if (!selectedPlayStation_ || !auth_.authenticated() ||
+            !fog::isPlayStationComputerId(order.computerId) || order.offerId.empty()) {
             disarmExitHandling();
             screen_ = Screen::PlayStation;
             status_ = uiText::Server::ConnectionNotConfirmed;
@@ -219,14 +217,14 @@ void ApplicationController::poll() {
         }
         sessionPending_ = true;
         checkoutStatus_ = uiText::Server::CreatingOrder;
-        start(Task::Create,[this,order] { checkout_.create(order); return Json::object(); });
+        start(Task::Create,[this,order] { checkout_.create(order); return std::monostate{}; });
         return;
     }
-    if (kind == Task::Create && data.value("playstation_offer_changed",false)) {
+    if (kind == Task::Create && std::holds_alternative<ChangedOffer>(data)) {
         syncPending();
         if (sessionPending_) { beginFinish("playstation-offer-change"); return; }
         disarmExitHandling(); stopAfterTask_ = false;
-        playStationComputers_ = std::move(data.at("computers"));
+        playStationComputers_ = std::move(std::get<ChangedOffer>(data).computers);
         playStationLoadedAt_ = std::chrono::steady_clock::now();
         screen_ = Screen::PlayStation; selection_ = 0;
         status_ = uiText::Server::TariffChanged;
@@ -241,14 +239,15 @@ void ApplicationController::poll() {
     if (stopAfterTask_ && sessionPending_ && kind != Task::Finish && kind != Task::Recovery && kind != Task::Profile && kind != Task::Phone && kind != Task::Captcha && kind != Task::Otp) {
         beginFinish(); return;
     }
-    if (kind == Task::History) { history_ = std::move(data); status_.clear(); return; }
+    if (kind == Task::History) { history_ = std::move(std::get<std::vector<fog::HistoryEntry>>(data)); status_.clear(); return; }
     if (kind == Task::GameDetail) {
-        detail_ = std::move(data.at("game")); autoComputers_ = std::move(data.at("auto"));
+        auto result = std::get<fog::GameDetail>(std::move(data));
+        detail_ = std::move(result.game); autoComputers_ = std::move(result.recommendations);
         status_.clear(); return;
     }
     if (kind == Task::Finish) {
-        if (data.value("terminated",false) && data.value("cleared",false)) {
-            sessionPending_ = false; stopAfterTask_ = false; screen_ = Screen::Sessions; sessions_ = Json::array(); selection_ = 0;
+        if (std::get<fog::FinishResult>(data).terminated && std::get<fog::FinishResult>(data).journalCleared) {
+            sessionPending_ = false; stopAfterTask_ = false; screen_ = Screen::Sessions; sessions_.clear(); selection_ = 0;
             status_ = uiText::Server::TerminationConfirmed;
             diagnostic("Session finish confirmed; active-session absence checked; journal cleared.");
             disarmExitHandling();
@@ -261,23 +260,23 @@ void ApplicationController::poll() {
         return;
     }
     if (kind == Task::Recovery) {
-        if (data.value("matched",false)) { armExitHandling(); beginFinish(); }
+        if (std::get<RecoveryResult>(data).matched) { armExitHandling(); beginFinish(); }
         else { screen_ = Screen::Recovery; status_ = uiText::Server::PreviousRentalNotMatched; }
         return;
     }
     if (kind == Task::Sessions) {
-        sessions_ = std::move(data); screen_ = Screen::Sessions; selection_ = 0;
+        sessions_ = std::move(std::get<std::vector<fog::Rental>>(data)); screen_ = Screen::Sessions; selection_ = 0;
         status_.clear();
         diagnostic("Active sessions loaded; identifiers omitted.");
         return;
     }
     if (kind == Task::Computers) {
-        computers_ = std::move(data.at("computers")); selection_ = 0;
+        computers_ = std::move(std::get<fog::Page<fog::Computer>>(data).items); selection_ = 0;
         status_.clear();
         diagnostic("Computers OK, count=" + std::to_string(computers_.size()));
     } else if (kind == Task::Profile) {
         screen_ = loginReturn_;
-        status_ = api_.authStorageError().empty() ? uiText::Profile::AuthSaved :
+        status_ = auth_.storageError().empty() ? uiText::Profile::AuthSaved :
             uiText::Profile::AuthSaveFailed;
         diagnostic("Authenticated profile OK; personal fields not logged.");
         if (sessionPending_) recoverSession();
@@ -285,14 +284,15 @@ void ApplicationController::poll() {
         else if (screen_ == Screen::PlayStation) loadPlayStation();
         else if (screen_ == Screen::Games && catalog_.items().empty()) loadGames();
     } else {
-        authStep_ = fog::authStep(data);
+        const auto& authResult = std::get<fog::AuthResult>(data);
+        authStep_ = authResult.step;
         screen_ = Screen::Auth;
         if (authStep_ == fog::AuthStep::Success) {
-            authSaveFailed_ = !api_.authStorageError().empty();
+            authSaveFailed_ = !auth_.storageError().empty();
             if (captcha_) { SDL_DestroyTexture(captcha_); captcha_ = nullptr; }
-            start(Task::Profile, [this] { return api_.userInfo(); });
+            start(Task::Profile, [this] { return account_.profile(); });
         } else if (authStep_ == fog::AuthStep::Captcha) {
-            setCaptcha(data);
+            setCaptcha(authResult);
             status_.clear();
         } else if (authStep_ == fog::AuthStep::Otp) {
             status_.clear();
@@ -303,8 +303,8 @@ void ApplicationController::poll() {
     }
 }
 
-Application::Application(platform::Runtime& runtime, const std::string& deviceId)
-    : controller_(std::make_unique<ApplicationController>(runtime, deviceId)) {}
+Application::Application(platform::Runtime& runtime, std::unique_ptr<Services> services)
+    : controller_(std::make_unique<ApplicationController>(runtime, std::move(services))) {}
 Application::~Application() = default;
 void Application::run() { controller_->run(); }
 

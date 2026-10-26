@@ -1,5 +1,6 @@
 #include "core/constants/resources.hpp"
 #include "features/catalog/infrastructure/latency.hpp"
+#include <nlohmann/json.hpp>
 #include "core/network/http.hpp"
 #include <curl/curl.h>
 #include <algorithm>
@@ -157,22 +158,17 @@ bool LatencyService::busy() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return busy_;
 }
-std::optional<int> LatencyService::estimate(const nlohmann::json& computer) const {
-    if (!computer.is_object()) return {};
-    const auto routes=computer.find("ping");
-    if (routes==computer.end() || !routes->is_object()) return {};
+std::optional<int> LatencyService::estimate(const Computer& computer) const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::optional<int> best;
     const auto now=nowMs();
     for (const auto& entry:samples_) {
         if (entry.second.milliseconds<=0 || now<entry.second.at || now-entry.second.at>sampleLifetimeMs) continue;
-        const auto value=routes->find(entry.first);
-        if (value==routes->end() || !value->is_number_integer()) continue;
-        if (value->is_number_unsigned() && value->get<std::uint64_t>()>3000) continue;
-        const auto part=value->get<std::int64_t>();
-        if (part<0 || part>3000) continue; // 32767 is unavailable, never a zero-ms route.
-        const auto combined=entry.second.milliseconds+static_cast<int>(part);
-        if (!best || combined<*best) best=combined;
+        for (const auto& route:computer.latencyRoutes) {
+            if (route.routeKey!=entry.first || route.serverToNodeMs<0 || route.serverToNodeMs>3000) continue;
+            const auto combined=entry.second.milliseconds+route.serverToNodeMs;
+            if (!best || combined<*best) best=combined;
+        }
     }
     return best;
 }

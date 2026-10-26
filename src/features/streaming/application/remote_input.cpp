@@ -10,15 +10,10 @@ void validateDimension(int value) {
     if (value < 1 || value > 8192)
         throw std::invalid_argument(fog::constants::error::Stream::RemoteInputDimensionMustBeBetween1And8192);
 }
-void appendUtf16Unit(std::string& output, std::uint32_t unit) {
-    output += static_cast<char>(unit & 0xff);
-    output += static_cast<char>((unit >> 8) & 0xff);
 }
-std::string utf16le(const std::string& input) {
+void validateText(const std::string& input) {
     if (input.size() > 512)
         throw std::invalid_argument(fog::constants::error::Stream::RemoteTextExceeds512UTF8Bytes);
-    std::string output;
-    output.reserve(input.size() * 2);
     for (std::size_t i = 0; i < input.size();) {
         const auto lead = static_cast<unsigned char>(input[i]);
         std::uint32_t scalar, minimum;
@@ -38,57 +33,29 @@ std::string utf16le(const std::string& input) {
         }
         if (scalar < minimum || scalar > 0x10ffff || (scalar >= 0xd800 && scalar <= 0xdfff))
             throw std::invalid_argument(fog::constants::error::Stream::InvalidUTF8RemoteText);
-        if (scalar <= 0xffff) appendUtf16Unit(output, scalar);
-        else {
-            scalar -= 0x10000;
-            appendUtf16Unit(output, 0xd800 | (scalar >> 10));
-            appendUtf16Unit(output, 0xdc00 | (scalar & 0x3ff));
-        }
         i += count;
     }
-    return output;
 }
-std::string base64(const std::string& bytes) {
-    static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string output;
-    output.reserve(((bytes.size() + 2) / 3) * 4);
-    for (std::size_t i = 0; i < bytes.size(); i += 3) {
-        const unsigned a = static_cast<unsigned char>(bytes[i]);
-        const unsigned b = i + 1 < bytes.size() ? static_cast<unsigned char>(bytes[i + 1]) : 0;
-        const unsigned c = i + 2 < bytes.size() ? static_cast<unsigned char>(bytes[i + 2]) : 0;
-        output += alphabet[a >> 2];
-        output += alphabet[((a & 3) << 4) | (b >> 4)];
-        output += i + 1 < bytes.size() ? alphabet[((b & 15) << 2) | (c >> 6)] : '=';
-        output += i + 2 < bytes.size() ? alphabet[c & 63] : '=';
-    }
-    return output;
-}
-}
-Json absoluteMouse(int x, int y, int width, int height, int frameWidth, int frameHeight) {
+Input absoluteMouse(int x, int y, int width, int height, int frameWidth, int frameHeight) {
     validateDimension(width);
     validateDimension(height);
     validateDimension(frameWidth);
     validateDimension(frameHeight);
-    return {{"id", "mousemove"}, {"data", {{"width", width}, {"height", height},
-            {"frameWidth", frameWidth}, {"frameHeight", frameHeight},
-            {"x", std::clamp(x, 0, width - 1)}, {"y", std::clamp(y, 0, height - 1)},
-            {"controls_type", "default"}}}};
+    return AbsoluteMouse{std::clamp(x, 0, width - 1), std::clamp(y, 0, height - 1), width, height, frameWidth, frameHeight};
 }
-Json mouseButton(bool down, int button) {
+Input mouseButton(bool down, int button) {
     if (button != 0 && button != 2)
         throw std::invalid_argument(fog::constants::error::Stream::UnsupportedRemoteMouseButton);
-    return {{"id", down ? "mousedown" : "mouseup"}, {"data", {{"button", button}}}};
+    return MouseButton{down, button};
 }
-Json wheel(int dy) {
-    return {{"id", "mousewheel"}, {"data", {{"dy", dy}}}};
-}
-Json key(bool down, const std::string& code) {
+Input wheel(int dy) { return Wheel{dy}; }
+Input key(bool down, const std::string& code) {
     if (code != "Enter" && code != "Backspace" && code != "Tab" && code != "Escape")
         throw std::invalid_argument(fog::constants::error::Stream::UnsupportedRemoteKeyCode);
-    return {{"id", down ? "keydown" : "keyup"}, {"data", {{"code", code},
-            {"ctrlKey", false}, {"shiftKey", false}, {"altKey", false}}}};
+    return Key{down, code};
 }
-Json unicodeText(const std::string& utf8) {
-    return {{"id", "unicode_input"}, {"data", {{"input", base64(utf16le(utf8))}}}};
+Input unicodeText(const std::string& utf8) {
+    validateText(utf8);
+    return UnicodeText{utf8};
 }
 }

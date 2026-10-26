@@ -3,6 +3,7 @@
 #include "core/constants/app_info.hpp"
 #include "core/constants/error_text.hpp"
 #include "features/catalog/infrastructure/steam_artwork.hpp"
+#include <charconv>
 #include "core/network/http.hpp"
 #include "core/storage/storage.hpp"
 #include <nlohmann/json.hpp>
@@ -396,6 +397,16 @@ struct SteamArtworkResolver::Impl {
 SteamArtworkResolver::SteamArtworkResolver(Downloader downloader, SteamArtworkOptions options)
     : impl_(std::make_unique<Impl>(std::move(downloader), std::move(options))) {}
 SteamArtworkResolver::~SteamArtworkResolver() { stop(); }
+namespace {
+int artworkIdentity(const EntityId& id) {
+    if (id.provider!=ProviderId::Mts) return 0;
+    int result=0;
+    const auto parsed=std::from_chars(id.value.data(),id.value.data()+id.value.size(),result);
+    return parsed.ec==std::errc{} && parsed.ptr==id.value.data()+id.value.size() && result>0 ? result : 0;
+}
+}
+bool SteamArtworkResolver::request(const EntityId& id, const std::string& title) { return request(artworkIdentity(id),title); }
+std::string SteamArtworkResolver::get(const EntityId& id, const std::string& title) const { return get(artworkIdentity(id),title); }
 bool SteamArtworkResolver::request(int mtsId, const std::string& title) {
     if (mtsId <= 0 || !validTitle(title)) return false;
     std::lock_guard<std::mutex> lock(impl_->mutex);

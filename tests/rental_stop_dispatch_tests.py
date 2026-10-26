@@ -16,7 +16,8 @@ def method(source, name):
 
 harness = r'''
 #include "core/constants/ui_text.hpp"
-#include <nlohmann/json.hpp>
+#include <variant>
+#include "features/session/application/session.hpp"
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -28,7 +29,7 @@ harness = r'''
 #include <stdexcept>
 #include <string>
 #include <thread>
-using Json = nlohmann::json;
+using TaskResult = std::variant<std::monostate,fog::FinishResult>;
 namespace uiText = fog::constants::ui;
 using namespace std::chrono_literals;
 struct ApplicationController {
@@ -42,10 +43,10 @@ struct ApplicationController {
     } checkout_{this};
     struct Guard {
         ApplicationController* owner;
-        struct Result { bool terminated, journalCleared; std::string message; };
+        using Result = fog::FinishResult;
         Result finishAttempt() { owner->apiCalled = true; return {true,true,"done"}; }
     } guard_{this};
-    std::future<Json> pending_;
+    std::future<TaskResult> pending_;
     Task task_ = Task::None;
     Screen screen_ = Screen::Streaming;
     bool sessionPending_ = true, stopAfterTask_ = false, exitAfterStop_ = false;
@@ -63,7 +64,7 @@ struct ApplicationController {
         condition.wait(lock,[this]{return unblock;});
         closeExited = true;
     }
-    void start(Task kind, std::function<Json()> work);
+    void start(Task kind, std::function<TaskResult()> work);
     void beginFinish(const char* reason);
 };
 '''

@@ -1,6 +1,7 @@
 #include "core/constants/error_text.hpp"
 #include "features/playstation/infrastructure/availability.hpp"
 #include "core/network/http.hpp"
+#include "features/catalog/infrastructure/mts_catalog_mapper.hpp"
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 
 namespace fog {
+using Json = nlohmann::json;
 namespace {
 int computerId(const Json& value) {
     if (value.is_number_integer()) {
@@ -26,13 +28,13 @@ int computerId(const Json& value) {
     return parsed.ec == std::errc{} && parsed.ptr == text.data()+text.size() && id > 0 ? id : 0;
 }
 }
-void updatePlayStationAvailability(Json& computers, const PlayStationAvailabilityLoader& load,
+void updatePlayStationAvailability(std::vector<Computer>& computers, const PlayStationAvailabilityLoader& load,
                                   int pageSize, int maxPages, const PlayStationCatalogProgress& progress,
                                   const PlayStationCancellation& cancelled) {
     if (pageSize < 1 || pageSize > 100 || maxPages < 1) throw std::invalid_argument(fog::constants::error::PlayStation::InvalidCatalogBounds);
     std::set<int> seen;
     bool complete = false, consistent = true;
-    for (auto& computer : computers) computer["availability"] = "unknown";
+    for (auto& computer : computers) computer.availability = Availability::Unknown;
     for (int page = 1; page <= maxPages; ++page) {
         checkPlayStationCancellation(cancelled);
         try {
@@ -50,7 +52,7 @@ void updatePlayStationAvailability(Json& computers, const PlayStationAvailabilit
             for (const auto id : pageIds)
                 if (!seen.insert(id).second) consistent = false;
             for (auto& computer : computers)
-                if (seen.count(computerId(computer.at("id")))) computer["availability"] = "online";
+                if (seen.count(mtsNumericId(computer.id))) computer.availability = Availability::Online;
             if (progress) progress(computers);
             if (items.size() < static_cast<std::size_t>(pageSize)) {
                 complete = consistent;
@@ -58,18 +60,18 @@ void updatePlayStationAvailability(Json& computers, const PlayStationAvailabilit
             }
             bool allFound = !computers.empty();
             for (const auto& computer : computers)
-                if (!seen.count(computerId(computer.at("id")))) allFound = false;
+                if (!seen.count(mtsNumericId(computer.id))) allFound = false;
             if (allFound) break;
         } catch (const std::exception&) { checkPlayStationCancellation(cancelled); break; }
     }
     checkPlayStationCancellation(cancelled);
     for (auto& computer : computers) {
-        const int id = computerId(computer.at("id"));
-        computer["availability"] = seen.count(id) ? "online" : complete ? "offline" : "unknown";
+        const int id = mtsNumericId(computer.id);
+        computer.availability = seen.count(id) ? Availability::Online : complete ? Availability::Offline : Availability::Unknown;
     }
     if (progress) progress(computers);
 }
-void updatePlayStationAvailability(Json& computers, HttpClient& http,
+void updatePlayStationAvailability(std::vector<Computer>& computers, HttpClient& http,
                                   const PlayStationCatalogProgress& progress,
                                   const PlayStationCancellation& cancelled) {
     const auto deadline = std::chrono::steady_clock::now()+std::chrono::seconds(20);
@@ -86,7 +88,7 @@ void updatePlayStationAvailability(Json& computers, HttpClient& http,
         return Json::parse(response.body);
     },100,50,progress,cancelled);
 }
-void updatePlayStationAvailability(Json& computers) {
+void updatePlayStationAvailability(std::vector<Computer>& computers) {
     HttpClient http;
     updatePlayStationAvailability(computers,http);
 }

@@ -1,4 +1,5 @@
 #include "features/catalog/infrastructure/latency.hpp"
+#include "features/catalog/infrastructure/mts_catalog_mapper.hpp"
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -36,16 +37,16 @@ int main() {
                 if(endpoint.find("msk")!=std::string::npos)return {};
                 return endpoint.find("nsk")!=std::string::npos ? 40:80;
             });
-        const nlohmann::json computer{{"id","1"},{"ping",{{"turn-nsk1_remoteplay_mts_ru",20},{"turn-msk1_remoteplay_mts_ru",1},{"turn-spb1_remoteplay_mts_ru",4}}}};
+        const auto computer=fog::mapMtsComputer(nlohmann::json{{"id","1"},{"ping",{{"turn-nsk1_remoteplay_mts_ru",20},{"turn-msk1_remoteplay_mts_ru",1},{"turn-spb1_remoteplay_mts_ru",4}}}});
         require(!service.estimate(computer),"unmeasured is unknown");
         service.request();wait([&]{return !service.busy();},"samples complete");
         require(service.estimate(computer)==60,"best matching measured route plus PC segment");
         require(calls==9 && maximum<=3,"deduplicate nodes and bounded concurrency three attempts");
         service.request();wait([&]{return !service.busy();},"cached refresh complete");
         require(calls==9,"fresh samples reused");
-        require(!service.estimate(nlohmann::json{{"ping",{{"turn-nsk1_remoteplay_mts_ru",32767}}}}),"unreachable sentinel never treated as zero");
+        require(!service.estimate(fog::mapMtsComputer(nlohmann::json{{"id",1},{"ping",{{"turn-nsk1_remoteplay_mts_ru",32767}}}})),"unreachable sentinel never treated as zero");
         for(const auto& malformed:{nlohmann::json(),nlohmann::json{{"ping",nullptr}},nlohmann::json{{"ping",{{"turn-nsk1_remoteplay_mts_ru",-1}}}},nlohmann::json{{"ping",{{"turn-nsk1_remoteplay_mts_ru","2"}}}},nlohmann::json{{"ping",{{"turn-nsk1_remoteplay_mts_ru",18446744073709551615ull}}}}})
-            require(!service.estimate(malformed),"invalid published metric unknown");
+            require(!service.estimate(fog::mapMtsComputer(nlohmann::json{{"id",1},{"ping",malformed.is_object() && malformed.contains("ping") ? malformed.at("ping") : nlohmann::json{}}})),"invalid published metric unknown");
         service.stop();service.request();require(!service.busy(),"stopped cannot restart");
 
         std::atomic_int entered{0};

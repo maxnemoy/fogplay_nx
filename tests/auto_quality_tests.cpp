@@ -1,4 +1,4 @@
-#include "features/streaming/domain/auto_quality.hpp"
+#include "features/streaming/infrastructure/quality_telemetry.hpp"
 #include <cassert>
 #include <iostream>
 #include <limits>
@@ -17,7 +17,7 @@ struct Harness {
     unsigned audioDroppedPerTick = 0, audioUnderrunsPerTick = 0;
     Harness() {
         sample.width = 1920; sample.height = 1080;
-        server.read(Json{{"preset", "LOW"}, {"fps", 30}}, now);
+        readTelemetry(server,Json{{"preset", "LOW"}, {"fps", 30}}, now);
         controller.enable(true, now);
         controller.observe(now, sample, server);
     }
@@ -42,7 +42,7 @@ struct Harness {
                 sample.workUs += overload ? 100000 : decodedPerTick * 3000;
             }
             sample.audioDropped += audioDroppedPerTick; sample.audioUnderruns += audioUnderrunsPerTick;
-            if (refresh && now % 2000 == 0) server.read(Json{{"preset", wireProfile(profile)}, {"fps", 30}}, now);
+            if (refresh && now % 2000 == 0) readTelemetry(server,Json{{"preset", wireProfile(profile)}, {"fps", 30}}, now);
             const auto action = controller.observe(now, sample, server);
             if (action != Action::None) {
                 actions.push_back(action);
@@ -59,35 +59,35 @@ struct Harness {
 int main() {
     {
         Telemetry actualWire;
-        actualWire.read(Json{{"preset","LOW"},{"fps",30}}, 100);
-        actualWire.read(Json{{"preset","MID"},{"target_bitrate",3732000},{"fps",30}}, 200);
+        readTelemetry(actualWire,Json{{"preset","LOW"},{"fps",30}}, 100);
+        readTelemetry(actualWire,Json{{"preset","MID"},{"target_bitrate",3732000},{"fps",30}}, 200);
         assert(actualWire.profile.value == Profile::Middle);
         assert(std::string(name(actualWire.profile.value)) == "MID");
         assert(actualWire.profile.revision == 2 && actualWire.targetMbps.value == 3.732);
-        actualWire.read(Json{{"preset","MID"}}, 7000);
+        readTelemetry(actualWire,Json{{"preset","MID"}}, 7000);
         assert(actualWire.profile.revision == 3 && actualWire.profile.fresh(7000));
         assert(actualWire.profile.age(7000) == 0);
-        actualWire.read(Json{{"preset","MIDDLE"}}, 13001);
+        readTelemetry(actualWire,Json{{"preset","MIDDLE"}}, 13001);
         assert(actualWire.profile.revision == 3 && !actualWire.profile.fresh(13001));
-        actualWire.read(Json{{"preset","HIGH"}}, 14000);
+        readTelemetry(actualWire,Json{{"preset","HIGH"}}, 14000);
         assert(actualWire.profile.value == Profile::High && actualWire.profile.revision == 4);
     }
     Telemetry telemetry;
-    telemetry.read(Json{{"preset","MID"},{"target_bitrate",2488000},{"fps",30},{"autoquality",true},{"server_codec","HEVC"}}, 100);
+    readTelemetry(telemetry,Json{{"preset","MID"},{"target_bitrate",2488000},{"fps",30},{"autoquality",true},{"server_codec","HEVC"}}, 100);
     assert(telemetry.profile.value == Profile::Middle && telemetry.targetMbps.value == 2.488);
     assert(telemetry.automatic.value && telemetry.codec.value == "H265" && telemetry.count == 1);
     const auto revision = telemetry.profile.revision;
-    telemetry.read(Json{{"preset",3},{"target_bitrate","private-credential"},{"fps",Json::array({"secret"})},
+    readTelemetry(telemetry,Json{{"preset",3},{"target_bitrate","private-credential"},{"fps",Json::array({"secret"})},
                         {"autoquality",42},{"server_codec","private-sdp"}}, 6000);
-    telemetry.read(Json{{"preset","LOW\nprivate"},{"target_bitrate",-1},{"fps",1e9},{"server_codec",7}}, 6500);
-    telemetry.read(Json{{"unrelated","secret"}}, 7000);
+    readTelemetry(telemetry,Json{{"preset","LOW\nprivate"},{"target_bitrate",-1},{"fps",1e9},{"server_codec",7}}, 6500);
+    readTelemetry(telemetry,Json{{"unrelated","secret"}}, 7000);
     assert(telemetry.profile.revision == revision && telemetry.profile.age(7000) == 6900);
     assert(!telemetry.profile.fresh(7000) && !telemetry.targetMbps.fresh(7000));
     assert(telemetry.targetMbps.age(7000) == 6900 && telemetry.count == 4 && telemetry.at == 7000);
     assert(telemetry.codec.value == "H265" && telemetry.fps.value == 30);
-    telemetry.read(Json{{"target_bitrate",std::numeric_limits<double>::infinity()},{"fps",false},{"preset",nullptr}}, 8000);
+    readTelemetry(telemetry,Json{{"target_bitrate",std::numeric_limits<double>::infinity()},{"fps",false},{"preset",nullptr}}, 8000);
     assert(telemetry.targetMbps.revision == 1 && telemetry.fps.revision == 1);
-    telemetry.read(Json::array(), 9000); assert(telemetry.count == 5);
+    readTelemetry(telemetry,Json::array(), 9000); assert(telemetry.count == 5);
     {
         Harness h; h.advance(31); assert(h.actions.empty()); h.advance(1);
         assert(h.actions == std::vector<Action>{Action::Enhance} && h.controller.pending());
@@ -163,14 +163,14 @@ int main() {
     {
         Harness h; h.server.fps.known = false; h.refresh = false;
         for (unsigned i=0;i<45;++i) {
-            h.server.read(Json{{"preset","LOW"}},h.now); h.advance(2);
+            readTelemetry(h.server,Json{{"preset","LOW"}},h.now); h.advance(2);
         }
         assert(h.actions.empty()); // Fresh profile alone cannot refresh missing FPS.
     }
     {
         Harness h; h.refresh = false;
         for (unsigned i=0;i<45;++i) {
-            h.server.read(Json{{"fps",30},{"preset","private"}},h.now); h.advance(2);
+            readTelemetry(h.server,Json{{"fps",30},{"preset","private"}},h.now); h.advance(2);
         }
         assert(h.actions.empty() && h.server.profile.age(h.now) == 90000);
     }
@@ -187,7 +187,7 @@ int main() {
         // Exactly one boundary sample must belong to one window, even when
         // the following sample immediately reports an empty drained queue.
         h.now += 900; h.sample.frames += 27; h.sample.decodedFrames += 27; h.sample.workUs += 81000;
-        h.server.read(Json{{"preset","MID"},{"fps",30}},h.now);
+        readTelemetry(h.server,Json{{"preset","MID"},{"fps",30}},h.now);
         h.controller.observe(h.now,h.sample,h.server);
         h.now += 100; h.sample.frames += 3; h.sample.decodedFrames += 3; h.sample.workUs += 9000; h.sample.queuedVideo = 4;
         const auto action = h.controller.observe(h.now,h.sample,h.server);
@@ -202,7 +202,7 @@ int main() {
     {
         Harness h; h.refresh = false;
         for (unsigned i=0;i<20;++i) {
-            if (h.now % 8000 == 0) h.server.read(Json{{"preset","LOW"},{"fps",30}},h.now);
+            if (h.now % 8000 == 0) readTelemetry(h.server,Json{{"preset","LOW"},{"fps",30}},h.now);
             h.advance(2);
         }
         assert(h.actions.empty()); // Updates at 8s boundaries cannot hide intermediate stale periods.
@@ -419,7 +419,7 @@ int main() {
             h.audioDroppedPerTick = audio ? 1 : 0;
             h.ticks(19); assert(h.now == 7900 && h.actions.empty());
             h.profile = Profile::Middle;
-            h.server.read(Json{{"preset", "MID"}, {"fps", 30}}, h.now);
+            readTelemetry(h.server,Json{{"preset", "MID"}, {"fps", 30}}, h.now);
             assert(h.controller.observe(h.now, h.sample, h.server) == Action::None);
             h.ticks(21); assert(h.now == 10000 && h.actions.empty());
             h.ticks(18); assert(h.now == 11800 && h.actions.empty());

@@ -1,12 +1,17 @@
 #pragma once
 #include "core/network/http.hpp"
-#include "features/session/domain/rental_service.hpp"
+#include "features/session/infrastructure/mts_auth_protocol.hpp"
+#include "features/session/domain/service_models.hpp"
 #include <atomic>
 #include <functional>
 #include <string>
 
 namespace fog {
-class Api : public RentalService {
+struct CreateOrderRequest {
+    int computerId = 0, tariffId = 0, gameId = 0;
+    bool ownSteamAccount = false;
+};
+class Api {
 public:
     using Transport = std::function<HttpResponse(const std::string&, const std::string&,
         const Query&, const std::string&, const std::string&)>;
@@ -14,7 +19,7 @@ public:
         const Query&, const std::string&, const std::string&, RequestOptions)>;
     explicit Api(std::string deviceId);
     Api(std::string deviceId, Transport transport, OptionsTransport optionsTransport = {});
-    ~Api() override;
+    ~Api();
     Api(const Api&) = delete;
     Api& operator=(const Api&) = delete;
 
@@ -23,18 +28,18 @@ public:
     Json computerAuto(int gameId, bool ownSteamAccount = false);
     Json gameDetail(int gameId);
     Json orderHistory();
-    Json createOrder(const CreateOrderRequest& order) override;
-    Json orderStatus(std::int64_t orderId) override;
-    const std::string& accountIdentity() const noexcept override { return accountIdentity_; }
+    Json createOrder(const CreateOrderRequest& order);
+    Json orderStatus(std::int64_t orderId);
+    const std::string& accountIdentity() const noexcept { return accountIdentity_; }
     // Called by the UI only after the user accepts the service terms / SMS request.
     Json submitPhone(std::string phone);
     Json submitCaptcha(std::string code);
     Json submitOtp(std::string code);
     Json userInfo();
-    Json activeSessions(bool shutdown = false) override;
-    bool finishSession(const std::string& hash) override;
-    bool loggedIn() const noexcept override;
-    std::uint64_t authGeneration() const noexcept override { return authGeneration_.load(std::memory_order_acquire); }
+    Json activeSessions(bool shutdown = false);
+    bool finishSession(const std::string& hash);
+    bool loggedIn() const noexcept;
+    std::uint64_t authGeneration() const noexcept { return authGeneration_.load(std::memory_order_acquire); }
     // Worker-only. Configure before login/restore; parent directory must exist.
     void configureAuthStorage(std::string path);
     bool restoreAuth();

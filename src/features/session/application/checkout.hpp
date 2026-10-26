@@ -8,12 +8,13 @@ namespace fog {
 enum class CheckoutState { Idle, Pending, PaymentRequired, Ready, Rejected, RecoveryRequired };
 struct CheckoutResult {
     CheckoutState state = CheckoutState::Idle;
-    std::int64_t orderId = 0;
-    std::string hash;
+    CreationId creationId;
+    RentalId rentalId;
     std::string paymentUrl;
     std::string paymentAmount;
     std::string message;
     bool stopRequested = false;
+    PreparationState preparation = PreparationState::Unknown;
     int serverStatus = -1;
     bool serverHashPresent = false;
     unsigned pollCount = 0;
@@ -24,15 +25,15 @@ struct CheckoutResult {
 inline bool checkoutNeedsAutomaticCheck(const CheckoutResult& result) {
     return ((result.state == CheckoutState::Pending || result.state == CheckoutState::PaymentRequired) &&
         result.pollCount < 30) ||
-        (result.stopRequested && (result.orderId > 0 || !result.hash.empty()));
+        (result.stopRequested && (!result.creationId.empty() || !result.rentalId.empty()));
 }
 // Serial API worker only. No destructor requests and no automatic create retry.
 class CheckoutGuard {
 public:
-    CheckoutGuard(RentalService& api, SessionGuard& sessions, std::string journalPath);
+    CheckoutGuard(RentalRepository& api, SessionGuard& sessions, std::unique_ptr<CheckoutJournal> journal);
     const CheckoutResult& result() const noexcept { return result_; }
     bool unresolved() const noexcept { return pending_; }
-    CheckoutResult create(const CreateOrderRequest& order);
+    CheckoutResult create(const StartRentalRequest& order);
     // One bounded GET. UI schedules at least 2 seconds apart; max 30 automatic polls.
     CheckoutResult poll(bool manualRetry = false);
     // Persist stop intent. If hash is unknown, keep polling; this is NOT cancellation.
@@ -49,12 +50,12 @@ private:
     CheckoutResult waiting(const std::string& message);
     CheckoutResult finishReady();
     CheckoutResult finishKnown();
-    RentalService& api_;
+    RentalRepository& api_;
     SessionGuard& sessions_;
-    std::string journalPath_;
-    std::string account_;
-    CreateOrderRequest selection_;
-    std::vector<std::string> before_;
+    std::unique_ptr<CheckoutJournal> journal_;
+    AccountId account_;
+    StartRentalRequest selection_;
+    std::vector<RentalId> before_;
     CheckoutResult result_;
     bool pending_ = false;
     bool invalid_ = false;

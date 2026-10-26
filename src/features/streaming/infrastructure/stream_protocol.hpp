@@ -1,5 +1,5 @@
 #pragma once
-#include "features/streaming/infrastructure/stream.hpp"
+#include "features/streaming/domain/streaming_client.hpp"
 #include "features/streaming/domain/video_codec.hpp"
 #include "features/streaming/domain/rtp_repair.hpp"
 #include <map>

@@ -5,6 +5,7 @@
 #include <SDL.h>
 #include <SDL_image.h>
 #include <nlohmann/json.hpp>
+#include "features/catalog/infrastructure/mts_catalog_mapper.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -72,7 +73,7 @@ Json game() { return {{"id", 91001}, {"name", title}}; }
 fog::SteamSearchResponse match(const std::string& name) {
     return {200, Json{{"items", Json::array({{{"id", 123}, {"name", name}, {"type", "app"}}})}}.dump()};
 }
-SDL_Texture* awaitCover(const Json& item, fog::ArtworkCache& artwork,
+SDL_Texture* awaitCover(const fog::Game& item, fog::ArtworkCache& artwork,
                         fog::SteamArtworkResolver& steam, SDL_Renderer* renderer) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -81,6 +82,10 @@ SDL_Texture* awaitCover(const Json& item, fog::ArtworkCache& artwork,
         std::this_thread::sleep_for(1ms);
     }
     throw std::runtime_error("Catalog cover never became available");
+}
+SDL_Texture* awaitCover(const Json& item, fog::ArtworkCache& artwork,
+                        fog::SteamArtworkResolver& steam, SDL_Renderer* renderer) {
+    return awaitCover(fog::mapMtsGame(item),artwork,steam,renderer);
 }
 void idle(fog::SteamArtworkResolver& steam, const std::atomic_int& searches) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
@@ -104,7 +109,7 @@ void mtsSuccess(SDL_Renderer* renderer) {
     });
     auto item = game(); item["images"] = Json::array({mts});
     require(awaitCover(item, artwork, steam, renderer) == artwork.get(mts), "Wrong MTS texture returned");
-    for (int i = 0; i < 30; ++i) require(fog::catalogArtwork(item, artwork, steam) != nullptr, "MTS cover disappeared");
+    for (int i = 0; i < 30; ++i) require(fog::catalogArtwork(fog::mapMtsGame(item), artwork, steam) != nullptr, "MTS cover disappeared");
     const auto state = steam.stats();
     require(searches == 0 && state.pending == 0 && state.records == 0 && downloads == 1,
         "MTS success triggered Steam or duplicate image work");
@@ -183,19 +188,19 @@ void noExactMatch(SDL_Renderer* renderer) {
     fog::ArtworkCache artwork([&](const auto&, const auto&) -> std::vector<std::uint8_t> {
         ++downloads; throw std::runtime_error("Nonexact Steam result must not download");
     });
-    require(fog::catalogArtwork(game(), artwork, steam) == nullptr, "Missing cover did not start with placeholder");
+    require(fog::catalogArtwork(fog::mapMtsGame(game()), artwork, steam) == nullptr, "Missing cover did not start with placeholder");
     idle(steam, searches);
     for (int i = 0; i < 30; ++i) {
         artwork.update(renderer);
-        require(fog::catalogArtwork(game(), artwork, steam) == nullptr, "Nonexact match produced a cover");
+        require(fog::catalogArtwork(fog::mapMtsGame(game()), artwork, steam) == nullptr, "Nonexact match produced a cover");
     }
     require(searches == 1 && downloads == 0, "Nonexact result retried or downloaded an unrelated cover");
 }
 void recentWithoutArtwork(SDL_Renderer* renderer) {
-    const auto recent = fog::RecentGame::fromCatalog(game());
+    const auto recent = fog::RecentGame::fromCatalog(fog::mapMtsGame(game()));
     require(recent.has_value() && recent->artwork.empty(), "Missing-artwork recent game was rejected");
     const auto item = recent->catalogItem();
-    require(item.at("images").empty(), "Recent catalog conversion invented artwork");
+    require(item.artworkUrls.empty(), "Recent catalog conversion invented artwork");
     std::atomic_int searches{0}, downloads{0};
     const auto bytes = jpeg();
     fog::SteamArtworkResolver steam([&](const auto& name, const auto&) { ++searches; return match(name); });
@@ -232,12 +237,12 @@ void cachedSteamStillRetriesMtsAndRefreshes(SDL_Renderer* renderer) {
     require(fallback == artwork.get(steamUrl) && searches == 1 && steamDownloads == 1,
         "Cannot preload cached Steam cover");
     auto withMts = game(); withMts["images"] = Json::array({mts});
-    require(fog::catalogArtwork(withMts, artwork, steam) == fallback,
+    require(fog::catalogArtwork(fog::mapMtsGame(withMts), artwork, steam) == fallback,
         "Cached Steam cover not served while MTS starts");
     auto deadline = std::chrono::steady_clock::now() + 3s;
     while (mtsDownloads == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
     require(mtsDownloads == 1, "Cached Steam texture prevented an MTS request");
-    require(fog::catalogArtwork(withMts, artwork, steam) == fallback,
+    require(fog::catalogArtwork(fog::mapMtsGame(withMts), artwork, steam) == fallback,
         "Steam cover disappeared while MTS download was pending");
     releaseMts = true;
     SDL_Texture* authoritative = nullptr;
@@ -245,28 +250,28 @@ void cachedSteamStillRetriesMtsAndRefreshes(SDL_Renderer* renderer) {
     while (std::chrono::steady_clock::now() < deadline) {
         artwork.update(renderer);
         authoritative = artwork.get(mts);
-        if (authoritative && fog::catalogArtwork(withMts, artwork, steam) == authoritative) break;
+        if (authoritative && fog::catalogArtwork(fog::mapMtsGame(withMts), artwork, steam) == authoritative) break;
         std::this_thread::sleep_for(1ms);
     }
     require(authoritative && authoritative != fallback &&
-        fog::catalogArtwork(withMts, artwork, steam) == authoritative,
+        fog::catalogArtwork(fog::mapMtsGame(withMts), artwork, steam) == authoritative,
         "Recovered MTS cover did not take priority over cached Steam");
     require(searches == 1 && mtsDownloads == 1 && steamDownloads == 1, "Recovery repeated fresh mapping/image work");
     // The missing-images view still uses the same positive mapping and cached
     // Steam texture, so a 30-day refresh must start before returning that texture.
     time += 30 * 24 * 60 * 60;
-    require(fog::catalogArtwork(game(), artwork, steam) == fallback,
+    require(fog::catalogArtwork(fog::mapMtsGame(game()), artwork, steam) == fallback,
         "Expired mapping interrupted its cached Steam cover");
     deadline = std::chrono::steady_clock::now() + 3s;
     while (searches < 2 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
     require(searches == 2 && steam.stats().pending == 1,
         "Cached Steam texture prevented the 30-day mapping refresh");
-    require(fog::catalogArtwork(game(), artwork, steam) == fallback,
+    require(fog::catalogArtwork(fog::mapMtsGame(game()), artwork, steam) == fallback,
         "Cached Steam cover unavailable during mapping refresh");
     releaseRefresh = true;
     idle(steam, searches);
     require(searches == 2 && steamDownloads == 1 &&
-        fog::catalogArtwork(game(), artwork, steam) == fallback,
+        fog::catalogArtwork(fog::mapMtsGame(game()), artwork, steam) == fallback,
         "Mapping refresh unnecessarily reloaded its cached texture");
 }
 void pendingAndFullQueue(SDL_Renderer* renderer) {
@@ -286,7 +291,7 @@ void pendingAndFullQueue(SDL_Renderer* renderer) {
     require(entered == 1, "Blocked image worker did not start");
     auto queued = game(); queued["images"] = Json::array({target});
     for (int i = 0; i < 30; ++i)
-        require(fog::catalogArtwork(queued, artwork, steam) == nullptr, "Queued image unexpectedly ready");
+        require(fog::catalogArtwork(fog::mapMtsGame(queued), artwork, steam) == nullptr, "Queued image unexpectedly ready");
     // One running + target + thirty queued requests fills the existing bound.
     for (int i = 0; i < 30; ++i)
         require(artwork.request(mtsPrefix + "fill-" + std::to_string(i) + ".jpg"), "Cannot fill artwork queue");
@@ -294,7 +299,7 @@ void pendingAndFullQueue(SDL_Renderer* renderer) {
     require(!artwork.request(overflow), "Artwork queue did not saturate");
     auto full = game(); full["id"] = 91002; full["images"] = Json::array({overflow});
     for (int i = 0; i < 30; ++i)
-        require(fog::catalogArtwork(full, artwork, steam) == nullptr, "Queue-full image unexpectedly ready");
+        require(fog::catalogArtwork(fog::mapMtsGame(full), artwork, steam) == nullptr, "Queue-full image unexpectedly ready");
     const auto state = steam.stats();
     require(!artwork.exhausted({target}) && !artwork.exhausted({overflow}) && searches == 0 &&
         state.pending == 0 && state.records == 0,

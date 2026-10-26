@@ -1,5 +1,5 @@
 #pragma once
-#include <nlohmann/json.hpp>
+#include "features/catalog/domain/models.hpp"
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -8,12 +8,12 @@
 
 namespace fog {
 struct RecentGame {
-    int id = 0;
+    EntityId id;
     std::string name, artwork;
     std::vector<std::string> alternateArtwork{};
     std::vector<std::string> artworkCandidates() const;
-    static std::optional<RecentGame> fromCatalog(const nlohmann::json& game);
-    nlohmann::json catalogItem() const;
+    static std::optional<RecentGame> fromCatalog(const Game& game);
+    Game catalogItem() const;
 };
 // Public game metadata only. No account, session, order, token or launch arguments.
 // Main-thread store; failures remain observable and never affect rental ownership.

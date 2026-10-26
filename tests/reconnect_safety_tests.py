@@ -28,8 +28,8 @@ for glue in (transport, retry, pump, close):
     for forbidden in ('guard_.adopt', 'checkout_.create', 'startStream(', 'disarmExitHandling(',
                       'transportReconnect_.reset()', 'sessionPending_ = false', 'recentLaunch_.close()'):
         assert forbidden not in glue, forbidden
-assert 'stream_->start(streamHash_,' in transport
-assert 'streamHash_ = hash;' in method(playback, 'startStream')
+assert 'stream_->start({streamRental_})' in transport
+assert 'streamRental_ = rental;' in method(playback, 'startStream')
 assert 'if (final) stream_->close();' in close
 assert 'else if (!stream_->disconnectForRetry()) {\n                retryAllowed = false;' in close
 assert 'catch (...) { retryAllowed = false; }' in close
@@ -38,9 +38,9 @@ assert close.index('if (!final && !retryAllowed) return false;') < close.index('
 for site in (retry, pump):
     assert 'if (!closeTransport(false)) {' in site
     assert 'beginFinish("transport-retry-terminal"); return;' in site
-assert 'streamHash_.clear();' in final and 'transportReconnect_.cancel();' in final
+assert 'streamRental_ = {};' in final and 'transportReconnect_.cancel();' in final
 assert 'stream_ || transportReconnect_.recovering()' in app
-assert 'stream_ || !streamHash_.empty() || transportReconnect_.recovering()' in app
+assert 'stream_ || !streamRental_.empty() || transportReconnect_.recovering()' in app
 assert pump.index('handleStreamOverlay(') < pump.index('transportReconnect_.poll(')
 assert pump.index('stream_->pump();') < pump.index('transportReconnect_.poll(')
 assert pump.index('stream_->retryableError()') < pump.index('transportReconnect_.poll(')

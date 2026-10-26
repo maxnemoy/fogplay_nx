@@ -1,3 +1,4 @@
+#include "features/streaming/infrastructure/input_protocol.hpp"
 #include "core/constants/error_text.hpp"
 #include "features/streaming/infrastructure/stream.hpp"
 #include "features/streaming/infrastructure/dtls_diagnostics.hpp"
@@ -1222,6 +1223,12 @@ struct Client::Impl {
 };
 
 Client::Client() : impl_(std::make_unique<Impl>()) {}
+Client::Client(std::string caPath, std::string random5suffix)
+    : impl_(std::make_unique<Impl>()), caPath_(std::move(caPath)), random5suffix_(std::move(random5suffix)) {}
+bool Client::start(const StreamConnection& connection) {
+    if (connection.rental.provider != fog::ProviderId::Mts) return false;
+    return start(connection.rental.value, random5suffix_, caPath_);
+}
 Client::~Client() { close(); }
 bool Client::start(const std::string& hash, const std::string& suffix, const std::string& caPath) {
     return startEndpoint(hash, suffix, caPath, "wss://remoteplay.mts.ru/ws/");
@@ -1767,6 +1774,10 @@ bool Client::sendGamepad(const Gamepad& state) {
         } else impl_->fail(error.what());
         return false;
     } catch (const std::exception&) { impl_->fail(fog::constants::error::Stream::ControlSendFailed); return false; }
+}
+bool Client::sendInput(const fog::remote::Input& input) {
+    try { return sendControl(protocol::remoteInput(input).dump()); }
+    catch (const std::exception&) { return false; }
 }
 bool Client::sendControl(const std::string& json) {
     if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed() || json.size() > 64 * 1024) return false;

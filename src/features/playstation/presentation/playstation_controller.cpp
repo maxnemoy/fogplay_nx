@@ -13,12 +13,12 @@ void ApplicationController::loadPlayStation() {
     playStationError_.clear();
     status_.clear();
     auto updates = std::make_shared<fog::PlayStationCatalogProgressChannel>();
-    auto http = std::make_shared<fog::HttpClient>();
+    auto repository = services_->publicCatalog();
     playStationUpdates_ = updates;
-    playStationHttp_ = http;
-    playStationPending_ = std::async(std::launch::async,[updates,http] {
-        return fog::fetchPlayStationComputers(*http,
-            [updates](const Json& snapshot) { updates->publish(snapshot); },
+    playStationRepository_ = repository;
+    playStationPending_ = std::async(std::launch::async,[updates,repository] {
+        return repository->playStationComputers(
+            [updates](const std::vector<fog::Computer>& snapshot) { updates->publish(snapshot); },
             [updates] { return updates->cancelled(); });
     });
 }
@@ -35,7 +35,7 @@ void ApplicationController::pollPlayStation() {
     try {
         auto snapshot = playStationPending_.get();
         if (playStationUpdates_ && playStationUpdates_->cancelled()) {
-            playStationUpdates_.reset(); playStationHttp_.reset(); return;
+            playStationUpdates_.reset(); playStationRepository_.reset(); return;
         }
         if (viewing) fog::applyPlayStationCatalogSnapshot(playStationComputers_,selection_,std::move(snapshot));
         else playStationComputers_ = std::move(snapshot);
@@ -47,10 +47,10 @@ void ApplicationController::pollPlayStation() {
         }
     }
     playStationUpdates_.reset();
-    playStationHttp_.reset();
+    playStationRepository_.reset();
 }
 void ApplicationController::cancelPlayStation() {
     if (playStationUpdates_) playStationUpdates_->cancel();
-    if (playStationHttp_) playStationHttp_->cancel();
+    if (playStationRepository_) playStationRepository_->cancel();
 }
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include "core/constants/storage_paths.hpp"
+#include "features/catalog/infrastructure/artwork_url.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -15,9 +16,7 @@ struct SDL_Texture;
 namespace fog {
 constexpr std::size_t maxArtworkBytes = 4 * 1024 * 1024;
 constexpr std::size_t maxArtworkPixels = 1024 * 1024;
-constexpr std::size_t maxArtworkCandidates = 4;
 // Only anonymous public FogPlay previews and canonical Steam header images are permitted.
-bool validArtworkUrl(const std::string& url) noexcept;
 struct ArtworkPixels {
     int width = 0;
     int height = 0;

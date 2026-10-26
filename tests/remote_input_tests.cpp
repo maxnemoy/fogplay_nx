@@ -1,4 +1,5 @@
 #include "features/streaming/application/remote_input.hpp"
+#include "features/streaming/infrastructure/input_protocol.hpp"
 #include <cassert>
 #include <initializer_list>
 #include <iostream>
@@ -9,6 +10,12 @@
 #include <vector>
 
 namespace {
+using Json=nlohmann::json;
+Json absoluteMouse(int x,int y,int w,int h,int fw,int fh) { return stream::protocol::remoteInput(fog::remote::absoluteMouse(x,y,w,h,fw,fh)); }
+Json mouseButton(bool down,int button) { return stream::protocol::remoteInput(fog::remote::mouseButton(down,button)); }
+Json wheel(int dy) { return stream::protocol::remoteInput(fog::remote::wheel(dy)); }
+Json key(bool down,const std::string& code) { return stream::protocol::remoteInput(fog::remote::key(down,code)); }
+Json unicodeText(const std::string& text) { return stream::protocol::remoteInput(fog::remote::unicodeText(text)); }
 template<class F> void rejects(F fn) {
     bool rejected = false;
     try { fn(); } catch (const std::invalid_argument&) { rejected = true; }
@@ -21,7 +28,9 @@ std::string bytes(std::initializer_list<unsigned> input) {
 }
 }
 int main() {
-    using namespace fog::remote;
+    static_assert(std::is_same_v<decltype(fog::remote::wheel(1)),fog::remote::Input>);
+    assert(std::get<fog::remote::Wheel>(fog::remote::wheel(12)).dy==12);
+    assert(std::get<fog::remote::UnicodeText>(fog::remote::unicodeText(u8"Привет")).utf8==u8"Привет");
     assert(absoluteMouse(640, 360, 1280, 720, 1920, 1080) == Json({
         {"id", "mousemove"}, {"data", {{"width", 1280}, {"height", 720},
         {"frameWidth", 1920}, {"frameHeight", 1080}, {"x", 640}, {"y", 360},

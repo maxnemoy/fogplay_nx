@@ -1,4 +1,6 @@
 #include "features/session/infrastructure/api.hpp"
+#include "features/session/infrastructure/mts_rental_repository.hpp"
+#include "features/session/infrastructure/rental_journal_storage.hpp"
 #include "features/session/application/checkout.hpp"
 #include <cstdio>
 #include <fstream>
@@ -9,6 +11,7 @@
 
 namespace {
 int assertions = 0;
+fog::EntityId mts(std::string value) { return {fog::ProviderId::Mts, std::move(value)}; }
 void require(bool value, const char* message) {
     ++assertions;
     if (!value) throw std::runtime_error(message);
@@ -31,6 +34,7 @@ struct Fixture {
     bool createTimeout = false, statusTimeout = false, activeTimeout = false, finishTimeout = false, rejectedFinish = false, finishActive = false;
     int creates = 0, checks = 0, finishes = 0;
     fog::Api api;
+    fog::MtsRentalRepository rentals{api};
     Fixture() : api("11111111111141118111111111111111", {},
         [this](const std::string& method, const std::string& path, const fog::Query& query,
             const std::string& body, const std::string& token, fog::RequestOptions options) {
@@ -98,7 +102,7 @@ struct Fixture {
     }
     void login(const std::string& phone = "89991234567") { api.submitPhone(phone); api.submitOtp("1111"); }
     void makeActive() { active = fog::Json::array({{{"hash", "fixture-session"}, {"computer_name", "Fixture PC"}}}); }
-    fog::CreateOrderRequest selection() { return {3587, 41199, 175, true}; }
+    fog::StartRentalRequest selection() { return {mts("3587"), mts("41199"), mts("175"), true}; }
     fog::CheckoutResult settle(fog::CheckoutGuard& checkout) {
         require(checkout.poll().state == fog::CheckoutState::Pending, "first readiness observation remains pending");
         require(checkout.poll().state == fog::CheckoutState::Pending, "second readiness observation remains pending");
@@ -111,12 +115,28 @@ int main() {
         using fog::CheckoutState;
         {
             Fixture f;
+            auto invalid = f.selection(); invalid.computerId = mts("not-a-numeric-id");
+            try { f.rentals.createOrder(invalid); require(false, "invalid MTS selection rejected"); }
+            catch (const fog::RepositoryError& error) {
+                require(error.kind() == fog::RepositoryErrorKind::InvalidRequest && f.creates == 0,
+                    "invalid MTS identifiers cannot reach paid mutation");
+            }
+            std::ofstream(f.checkoutPath) << R"({"orderId":0})";
+            f.createTimeout = true;
+            try { f.rentals.createOrder(f.selection()); require(false, "create timeout rejected"); }
+            catch (const fog::RepositoryError& error) {
+                require(error.kind() == fog::RepositoryErrorKind::OutcomeUnknown && f.creates == 1,
+                    "timed-out paid mutation has typed unknown outcome without retry");
+            }
+        }
+        {
+            Fixture f;
             require(f.api.accountIdentity() == "aaa3a8d51bbd45911d65744e547c0b7094464669438951c04b8a86c56e1ce8db", "SHA256 normalized phone identity");
             require(f.api.gameDetail(175).at("id") == 175, "game detail response");
             require(f.api.computerAuto(175, true).at("min_price").size() == 1, "computer auto response");
             require(f.api.orderHistory().empty(), "history response");
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             require(checkout.create(f.selection()).state == CheckoutState::Pending, "create recorded");
             rejects([&] { checkout.create(f.selection()); }, "duplicate creation blocked");
             f.makeActive();
@@ -128,11 +148,11 @@ int main() {
         }
         {
             Fixture f; f.createTimeout = true;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             require(checkout.create(f.selection()).state == CheckoutState::RecoveryRequired, "timeout ambiguous");
             require(checkout.result().message.find("PRIVATE") == std::string::npos, "private transport detail suppressed");
-            fog::CheckoutGuard recovered(f.api, sessions, f.checkoutPath);
+            fog::CheckoutGuard recovered(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             rejects([&] { recovered.create(f.selection()); }, "restart ambiguous outcome blocks POST");
             recovered.stop(); recovered.poll(true);
             require(f.creates == 1 && f.checks == 0 && f.finishes == 0, "no retry or arbitrary stop without order ID");
@@ -140,20 +160,20 @@ int main() {
         }
         {
             Fixture f; f.created = {{"orderId", 42}, {"paymentUrl", "https://payment.example.test/pay"}, {"paymentAmount", "199"}};
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             require(checkout.create(f.selection()).state == CheckoutState::PaymentRequired, "typed external payment action");
             f.status = {{"id", 42}, {"status", 1}};
             require(checkout.stop().state == CheckoutState::PaymentRequired && checkout.result().stopRequested, "unknown hash stop remains pending");
-            fog::CheckoutGuard recovered(f.api, sessions, f.checkoutPath);
+            fog::CheckoutGuard recovered(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             require(recovered.result().stopRequested, "stop intent survives restart");
             f.status = {{"id", 42}, {"status", 2}, {"hash", "fixture-session"}}; f.makeActive();
             require(recovered.poll(true).state == CheckoutState::Idle && f.finishes == 1, "late paid hash stopped after restart");
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.login("89991234568");
             require(checkout.poll(true).state == CheckoutState::RecoveryRequired && f.checks == 0, "other account cannot recover order");
             rejects([&] { checkout.acknowledgeManualResolution(); }, "other account cannot clear marker");
@@ -162,24 +182,24 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.status = {{"id", 43}, {"status", 2}, {"hash", "fixture-session"}};
-            require(checkout.poll().state == CheckoutState::RecoveryRequired && sessions.pendingHash().empty(), "mismatched ID cannot adopt");
+            require(checkout.poll().state == CheckoutState::RecoveryRequired && sessions.pendingRental().value.empty(), "mismatched ID cannot adopt");
             f.status = {{"id", 42}, {"status", 3}};
             require(checkout.stop().state == CheckoutState::RecoveryRequired && checkout.unresolved(), "not paid is not cancellation");
         }
         {
             Fixture f; f.makeActive();
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection());
             require(checkout.poll().state == CheckoutState::RecoveryRequired && !sessions.ownsSession(), "pre-existing hash never adopted as new rental");
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.status = {{"id", 42}, {"status", 0}};
             for (int i = 0; i < 30; ++i) checkout.poll();
             require(checkout.poll().state == CheckoutState::Pending && f.checks == 30 &&
@@ -189,8 +209,8 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive(); checkout.poll(); f.rejectedFinish = true;
             require(checkout.stop().state == CheckoutState::RecoveryRequired && checkout.unresolved() && sessions.persistent(), "rejected stop retains both journals");
             f.rejectedFinish = false; f.finishActive = true;
@@ -200,37 +220,37 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.directory + "/missing/checkout.json");
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.directory + "/missing/checkout.json"));
             require(checkout.create(f.selection()).state == CheckoutState::RecoveryRequired && f.creates == 0, "journal failure prevents POST");
         }
         {
             Fixture f;
             std::ofstream(f.checkoutPath) << "PRIVATE corrupted marker";
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             rejects([&] { checkout.create(f.selection()); }, "invalid existing marker blocks checkout");
             require(checkout.stop().state == CheckoutState::RecoveryRequired && f.creates == 0, "invalid marker retained on stop");
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive(); checkout.poll();
             require(symlink("/missing/fog-test-target", (f.checkoutPath + ".tmp").c_str()) == 0, "simulate journal write failure");
             require(checkout.stop().state == CheckoutState::Idle && f.finishes == 1, "owned rental stoppable with failed stop-intent write");
         }
         {
             Fixture f; f.created = {{"error", "PRIVATE server rejection"}};
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             require(checkout.create(f.selection()).state == CheckoutState::RecoveryRequired && checkout.unresolved(), "explicit rejection without order ID retains uncertain intent");
             require(checkout.result().message.find("PRIVATE") == std::string::npos, "private server error suppressed");
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.directory + "/missing/session.json");
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.directory + "/missing/session.json"));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive();
             require(f.settle(checkout).state == CheckoutState::RecoveryRequired, "failed adopt journal blocks first connection");
             require(sessions.ownsSession() && !sessions.persistent() && !sessions.journalError().empty(), "failed adopt retains stop authority without durability");
@@ -240,16 +260,16 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.directory + "/missing/session.json");
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.directory + "/missing/session.json"));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive();
             require(symlink("/missing/fog-test-target", (f.checkoutPath + ".tmp").c_str()) == 0, "simulate pending-order journal write failure");
             require(checkout.stop().state == CheckoutState::Idle && f.finishes == 1, "stop exact order despite failed checkout and session journal writes");
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             const auto created = checkout.create(f.selection());
             require(created.serverStatus == -1 && !created.serverHashPresent && created.pollCount == 0 &&
                 created.readyObservations == 0, "diagnostics start without server evidence");
@@ -260,7 +280,7 @@ int main() {
             require(checkout.poll().state == CheckoutState::Pending && checkout.result().readyObservations == 1,
                 "HOLD hash starts stabilization");
             require(checkout.result().serverStatus == 1 && checkout.result().serverHashPresent &&
-                checkout.result().pollCount == 2 && sessions.pendingHash().empty(), "redacted readiness diagnostics");
+                checkout.result().pollCount == 2 && sessions.pendingRental().value.empty(), "redacted readiness diagnostics");
             std::ifstream marker(f.checkoutPath);
             const auto saved = fog::Json::parse(marker);
             require(saved.at("hash") == "fixture-session", "first exact hash is persisted before Ready");
@@ -271,8 +291,8 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive(); f.status["status"] = 1;
             require(checkout.poll().state == CheckoutState::Pending, "HOLD first observation");
             f.status["status"] = 2;
@@ -282,8 +302,8 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive();
             checkout.poll(); checkout.poll();
             f.status["hash"] = "   ";
@@ -299,8 +319,8 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive(); checkout.poll(); checkout.poll();
             f.status["found_cancel"] = true;
             require(checkout.poll().state == CheckoutState::RecoveryRequired && checkout.result().readyObservations == 0 &&
@@ -310,12 +330,12 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive(); checkout.poll(); checkout.poll();
             f.status["hash"] = "different-session";
             require(checkout.poll().state == CheckoutState::RecoveryRequired && checkout.result().readyObservations == 0 &&
-                checkout.result().hash == "fixture-session" && !sessions.ownsSession(), "changed hash cannot replace attribution or connect");
+                checkout.result().rentalId == mts("fixture-session") && !sessions.ownsSession(), "changed hash cannot replace attribution or connect");
             f.statusTimeout = true;
             const int checks = f.checks;
             require(checkout.stop().state == CheckoutState::Idle && f.finishes == 1 && f.checks == checks,
@@ -323,8 +343,8 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive(); f.status["status"] = 1;
             checkout.poll();
             f.statusTimeout = true;
@@ -334,11 +354,11 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive(); checkout.poll(); checkout.poll();
-            fog::CheckoutGuard recovered(f.api, sessions, f.checkoutPath);
-            require(recovered.result().readyObservations == 0 && recovered.result().hash == "fixture-session",
+            fog::CheckoutGuard recovered(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+            require(recovered.result().readyObservations == 0 && recovered.result().rentalId == mts("fixture-session"),
                 "restart retains attribution but resets observations");
             f.status["hash"] = "different-session";
             require(recovered.poll().state == CheckoutState::RecoveryRequired && !sessions.ownsSession(),
@@ -348,8 +368,8 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive(); checkout.poll(); checkout.poll();
             f.statusTimeout = true;
             require(checkout.poll().state == CheckoutState::Pending && fog::checkoutNeedsAutomaticCheck(checkout.result()) &&
@@ -363,51 +383,51 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
-            require(checkout.create(f.selection()).orderId == 42 && f.creates == 1,
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+            require(checkout.create(f.selection()).creationId == mts("42") && f.creates == 1,
                 "create ID replaces initial intent under non-overwriting rename");
             require(std::rename(f.checkoutPath.c_str(), (f.checkoutPath + ".bak").c_str()) == 0,
                 "interrupted checkout swap fixture");
-            fog::CheckoutGuard restored(f.api, sessions, f.checkoutPath);
-            require(restored.unresolved() && restored.result().orderId == 42,
+            fog::CheckoutGuard restored(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+            require(restored.unresolved() && restored.result().creationId == mts("42"),
                 "checkout restart restores order ID from sole backup");
             rejects([&] { restored.create(f.selection()); }, "restored backup prevents repeated billable create");
             require(f.creates == 1, "recovery never sends duplicate create");
             f.makeActive(); restored.poll();
-            require(restored.result().hash == "fixture-session", "hash replaces restored checkout record");
+            require(restored.result().rentalId == mts("fixture-session"), "hash replaces restored checkout record");
             require(std::rename(f.checkoutPath.c_str(), (f.checkoutPath + ".bak").c_str()) == 0,
                 "interrupted hash persistence fixture");
-            fog::CheckoutGuard hashRestored(f.api, sessions, f.checkoutPath);
-            require(hashRestored.result().hash == "fixture-session" && hashRestored.result().readyObservations == 0,
+            fog::CheckoutGuard hashRestored(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+            require(hashRestored.result().rentalId == mts("fixture-session") && hashRestored.result().readyObservations == 0,
                 "restart retains backed-up hash and requires fresh readiness");
             require(hashRestored.stop().state == CheckoutState::Idle && f.finishes == 1,
                 "restored checkout marker retains targeted stop authority");
-            fog::CheckoutGuard cleared(f.api, sessions, f.checkoutPath);
+            fog::CheckoutGuard cleared(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             require(!cleared.unresolved(), "stopped rental is not resurrected by backup");
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection());
             require(chmod(f.directory.c_str(), 0300) == 0, "checkout clear commit failure fixture");
             rejects([&] { checkout.acknowledgeManualResolution(); }, "failed clear commit reported");
             require(chmod(f.directory.c_str(), 0700) == 0, "restore checkout directory permissions");
-            fog::CheckoutGuard recovered(f.api, sessions, f.checkoutPath);
-            require(checkout.unresolved() && recovered.unresolved() && recovered.result().orderId == 42,
+            fog::CheckoutGuard recovered(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+            require(checkout.unresolved() && recovered.unresolved() && recovered.result().creationId == mts("42"),
                 "clear commit failure retains pending order in memory and on disk");
             rejects([&] { recovered.create(f.selection()); }, "failed clear cannot authorize repeated create");
             require(f.creates == 1, "uncertain clear never repeats creation");
             recovered.acknowledgeManualResolution();
-            fog::CheckoutGuard cleared(f.api, sessions, f.checkoutPath);
+            fog::CheckoutGuard cleared(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             require(!cleared.unresolved(), "manual clear retry succeeds after commit recovers");
         }
         {
             Fixture f;
             std::ofstream(f.checkoutPath + ".bak") << "PRIVATE-malformed";
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             require(checkout.unresolved() && checkout.poll().state == CheckoutState::RecoveryRequired,
                 "malformed sole checkout backup blocks rental creation");
             rejects([&] { checkout.create(f.selection()); }, "malformed restored backup cannot be overwritten");
@@ -416,12 +436,12 @@ int main() {
         {
             Fixture f;
             f.status = {{"id",42},{"status",0}};
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection());
             f.statusTimeout = true;
             const auto interrupted = checkout.stop();
-            require(interrupted.state == CheckoutState::Pending && interrupted.hash.empty(),
+            require(interrupted.state == CheckoutState::Pending && interrupted.rentalId.empty(),
                 "stop status failure before session hash is known");
             require(fog::checkoutNeedsAutomaticCheck(interrupted),
                 "scheduler continues recorded stop after transient status failure");
@@ -438,13 +458,13 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection());
             f.finishTimeout = true;
             const auto stopped = checkout.stop();
             require(stopped.state == CheckoutState::RecoveryRequired && checkout.unresolved() &&
-                sessions.persistent() && !sessions.pendingHash().empty(),
+                sessions.persistent() && !sessions.pendingRental().value.empty(),
                 "stop timeout before activation retains both recovery journals");
             f.makeActive();
             require(checkout.stop().state == CheckoutState::RecoveryRequired && checkout.unresolved(),
@@ -455,8 +475,8 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection());
             f.statusTimeout = true;
             require(checkout.poll().state == CheckoutState::Pending && fog::checkoutNeedsAutomaticCheck(checkout.result()),
@@ -474,13 +494,13 @@ int main() {
         }
         {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection());
             for (int i = 0; i < 31; ++i) checkout.poll();
-            require(checkout.result().state == CheckoutState::Pending && !checkout.result().hash.empty() &&
+            require(checkout.result().state == CheckoutState::Pending && !checkout.result().rentalId.empty() &&
                 !fog::checkoutNeedsAutomaticCheck(checkout.result()) && f.checks == 30 && f.finishes == 0 &&
-                sessions.pendingHash().empty() && checkout.unresolved(),
+                sessions.pendingRental().value.empty() && checkout.unresolved(),
                 "unobserved active rental pauses at retry limit without connecting or stopping");
             f.makeActive();
             require(checkout.poll(true).state == CheckoutState::Ready && f.creates == 1,
@@ -488,8 +508,8 @@ int main() {
         }
         for (const auto& invalid : {fog::Json(1), fog::Json("1"), fog::Json(nullptr)}) {
             Fixture f;
-            fog::SessionGuard sessions(f.api, f.sessionPath);
-            fog::CheckoutGuard checkout(f.api, sessions, f.checkoutPath);
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
             checkout.create(f.selection()); f.makeActive();
             f.status["found_cancel"] = invalid;
             require(checkout.poll().state == CheckoutState::RecoveryRequired && !sessions.ownsSession(),

@@ -2,6 +2,8 @@
 #include "features/playstation/infrastructure/catalog.hpp"
 #include "features/playstation/infrastructure/availability.hpp"
 #include "core/network/http.hpp"
+#include "features/catalog/infrastructure/mts_catalog_mapper.hpp"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -13,6 +15,7 @@
 #include <vector>
 
 namespace fog {
+using Json = nlohmann::json;
 namespace {
 struct Tag {
     std::size_t start = 0, end = 0;
@@ -227,7 +230,7 @@ Json price(std::string_view card) {
     return value;
 }
 }
-Json parsePlayStationComputers(std::string_view html, std::string_view promoSlug) {
+std::vector<Computer> parsePlayStationComputers(std::string_view html, std::string_view promoSlug) {
     if (html.size() > 8 * 1024 * 1024) throw std::runtime_error(fog::constants::error::PlayStation::PlayStationCatalogResponseIsTooLarge);
     Json result = Json::array();
     for (const auto& known : PlayStationComputers) {
@@ -254,14 +257,16 @@ Json parsePlayStationComputers(std::string_view html, std::string_view promoSlug
         if (duplicate) computer["launchable"] = false;
         result.push_back(std::move(computer));
     }
-    return result;
+    std::vector<Computer> mapped;
+    for (const auto& item:result) mapped.push_back(mapMtsComputer(item));
+    return mapped;
 }
-Json playStationComputerPlaceholders() {
-    Json result = Json::array();
+std::vector<Computer> playStationComputerPlaceholders() {
+    std::vector<Computer> result;
     for (const auto& known : PlayStationComputers) {
         auto source = parsePlayStationComputers({},known.promoSlug);
         for (auto& computer : source)
-            if (computer.at("id") == known.id) result.push_back(std::move(computer));
+            if (computer.id == mtsEntityId(known.id)) result.push_back(std::move(computer));
     }
     return result;
 }
@@ -284,21 +289,21 @@ std::string loadPlayStationPromoPages(std::string_view promoSlug, const PlayStat
         if (progress) progress(computers);
         bool allFound = !computers.empty();
         for (const auto& computer : computers)
-            if (!computer.at("listed").get<bool>()) allFound = false;
+            if (!computer.listed) allFound = false;
         if (allFound || !hasNextPage(html,page)) break;
     }
     return combined;
 }
 namespace {
 using PagedCatalogLoader = std::function<std::string(std::string_view,const PlayStationCatalogProgress&)>;
-void mergeOffers(Json& computers, const Json& offers) {
+void mergeOffers(std::vector<Computer>& computers, const std::vector<Computer>& offers) {
     for (auto& computer : computers)
         for (const auto& offer : offers)
-            if (computer.at("id") == offer.at("id")) { computer = offer; break; }
+            if (computer.id == offer.id) { computer = offer; break; }
 }
-Json fetchCatalog(const PagedCatalogLoader& load, const PlayStationCatalogProgress& progress,
+std::vector<Computer> fetchCatalog(const PagedCatalogLoader& load, const PlayStationCatalogProgress& progress,
                   const PlayStationCancellation& cancelled) {
-    Json result = playStationComputerPlaceholders();
+    auto result = playStationComputerPlaceholders();
     std::vector<std::string_view> loadedSources;
     bool anyLoaded = false;
     for (const auto& known : PlayStationComputers) {
@@ -306,9 +311,9 @@ Json fetchCatalog(const PagedCatalogLoader& load, const PlayStationCatalogProgre
         const std::string_view slug = known.promoSlug;
         if (std::find(loadedSources.begin(),loadedSources.end(),slug) != loadedSources.end()) continue;
         loadedSources.push_back(slug);
-        Json computers;
+        std::vector<Computer> computers;
         try {
-            const auto html = load(slug,[&](const Json& offers) {
+            const auto html = load(slug,[&](const std::vector<Computer>& offers) {
                 checkPlayStationCancellation(cancelled);
                 mergeOffers(result,offers);
                 if (progress) progress(result);
@@ -327,13 +332,13 @@ Json fetchCatalog(const PagedCatalogLoader& load, const PlayStationCatalogProgre
     return result;
 }
 }
-Json fetchPlayStationComputers(const PlayStationCatalogLoader& load,
+std::vector<Computer> fetchPlayStationComputers(const PlayStationCatalogLoader& load,
     const PlayStationCatalogProgress& progress, const PlayStationCancellation& cancelled) {
     return fetchCatalog([&load](std::string_view slug,const PlayStationCatalogProgress&) {
         return load(slug);
     },progress,cancelled);
 }
-Json fetchPlayStationComputers(HttpClient& http, const PlayStationCatalogProgress& progress,
+std::vector<Computer> fetchPlayStationComputers(HttpClient& http, const PlayStationCatalogProgress& progress,
     const PlayStationCancellation& cancelled) {
     auto computers = fetchCatalog([&http,&cancelled](std::string_view promoSlug,const PlayStationCatalogProgress& sourceProgress) {
         const std::string slug(promoSlug);
@@ -353,7 +358,11 @@ Json fetchPlayStationComputers(HttpClient& http, const PlayStationCatalogProgres
     updatePlayStationAvailability(computers,http,progress,cancelled);
     return computers;
 }
-Json fetchPlayStationComputers() {
+std::vector<Computer> fetchPlayStationComputers(const PlayStationCatalogProgress& progress, const PlayStationCancellation& cancelled) {
+    HttpClient http;
+    return fetchPlayStationComputers(http,progress,cancelled);
+}
+std::vector<Computer> fetchPlayStationComputers() {
     HttpClient http;
     return fetchPlayStationComputers(http);
 }

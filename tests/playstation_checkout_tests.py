@@ -28,12 +28,29 @@ namespace uiText = fog::constants::ui;
 #include <iostream>
 #include <optional>
 #include <stdexcept>
-using fog::Json;
+#include <nlohmann/json.hpp>
+#include <variant>
+using Json = nlohmann::json;
+struct VerifiedOffer { fog::StartRentalRequest request; };
+struct ChangedOffer { std::vector<fog::Computer> computers; };
+using TaskResult = std::variant<std::monostate,VerifiedOffer,ChangedOffer>;
+fog::EntityId identity(int id) { return {fog::ProviderId::Mts,std::to_string(id)}; }
+void mutate(fog::Computer& pc,const Json& values) {
+    if(values.contains("listed")) pc.listed=values["listed"].get<bool>();
+    if(values.contains("launchable")) pc.launchable=values["launchable"].get<bool>();
+    if(values.contains("id")) pc.id=identity(values["id"].get<int>());
+    if(values.contains("tariff_id")) pc.offerId=values["tariff_id"]==0 ? fog::EntityId{} : identity(values["tariff_id"].get<int>());
+    if(values.contains("price")) {
+        if(values["price"].is_null()) { pc.hourlyPrice.reset(); pc.price.clear(); }
+        else { pc.hourlyPrice=fog::Money{static_cast<int64_t>(values["price"].get<double>()*100),"RUB"}; pc.price=values["price"].dump(); }
+    }
+}
+
 namespace fog {
-Json currentOffers;
+std::vector<Computer> currentOffers;
 bool failFetch = false;
 std::function<void()> duringFetch;
-Json fetchPlayStationComputers() {
+std::vector<Computer> fetchPlayStationComputers() {
     if (duringFetch) duringFetch();
     if (failFetch) throw std::runtime_error("fixture fetch failure");
     return currentOffers;
@@ -44,50 +61,47 @@ int focusState=AppletFocusState_InFocus;
 int appletGetFocusState() { return focusState; }
 enum class Screen { Details, PlayStationDetails, PlayStation, Consent, Checkout };
 enum class Task { Create };
-std::string field(const Json& object,const char* key,const std::string& fallback) {
-    if (!object.contains(key) || object[key].is_null()) return fallback;
-    return object[key].is_string() ? object[key].get<std::string>() : object[key].dump();
-}
 struct ApplicationController {
     Screen screen_ = Screen::PlayStationDetails, loginReturn_ = Screen::Details;
     bool sessionPending_=false, selectedPlayStation_=false, stopAfterTask_=false, ownSteam_=true, exitAfterStop_=false;
-    struct Api { bool authenticated=true; bool loggedIn() const { return authenticated; } } api_;
+    struct Auth { bool signedIn=true; bool authenticated() const { return signedIn; } } auth_;
+    struct Catalog { auto playStationComputers() { return fog::fetchPlayStationComputers(); } } catalogRepository_;
     struct Checkout {
         int calls=0;
-        fog::CreateOrderRequest request{};
-        void create(const fog::CreateOrderRequest& order) { ++calls; request=order; }
+        fog::StartRentalRequest request{};
+        void create(const fog::StartRentalRequest& order) { ++calls; request=order; }
     } checkout_;
     struct Recent {
         std::optional<int> value;
         void prepare(std::optional<int> input) { value=input; }
     } recentLaunch_;
-    Json playStationComputers_=Json::array(), computers_=Json::array();
+    std::vector<fog::Computer> playStationComputers_, computers_;
     std::chrono::steady_clock::time_point playStationLoadedAt_=std::chrono::steady_clock::now();
     std::size_t selection_=0;
-    int selectedGameId_=987;
+    fog::EntityId selectedGameId_=identity(987);
     std::optional<int> selectedRecentGame_=987;
     std::string status_, checkoutStatus_;
     bool storageChecked=false, armed=false;
     int refreshes=0;
-    std::function<Json()> worker;
+    std::function<TaskResult()> worker;
     void checkStorage() { storageChecked=true; }
     void armExitHandling() { armed=true; }
     void loadPlayStation() { ++refreshes; screen_=Screen::PlayStation; }
-    void start(Task,std::function<Json()> work) { worker=std::move(work); }
+    void start(Task,std::function<TaskResult()> work) { worker=std::move(work); }
     bool hasJournal=false, disarmed=false;
     int finishRequests=0;
     void syncPending() { sessionPending_=hasJournal; }
     void disarmExitHandling() { disarmed=true; armed=false; }
     void beginFinish(const char*) { ++finishRequests; }
-    void acceptCreateResult(Json data);
+    void acceptCreateResult(TaskResult data);
     void createSession();
 };
 '''
 harness += method((root/'src/features/session/presentation/rental_controller.cpp').read_text(), 'createSession')
 poll_source = (root/'src/app/application.cpp').read_text()
-harness += '\nvoid ApplicationController::acceptCreateResult(Json data) { const auto kind=Task::Create;\n'
-for marker in ['playstation_offer_verified','playstation_offer_changed']:
-    marker_start = poll_source.index('    if (kind == Task::Create && data.value("' + marker + '",false)) {')
+harness += '\nvoid ApplicationController::acceptCreateResult(TaskResult data) { const auto kind=Task::Create;\n'
+for marker in ['VerifiedOffer','ChangedOffer']:
+    marker_start = poll_source.index('    if (kind == Task::Create && std::holds_alternative<' + marker + '>(data)) {')
     marker_brace = poll_source.index('{', marker_start)
     marker_depth, marker_end = 1, marker_brace + 1
     while marker_depth:
@@ -97,8 +111,10 @@ for marker in ['playstation_offer_verified','playstation_offer_changed']:
 harness += '}\n'
 
 harness += r'''
-Json offer(int id=11573) {
-    return {{"id",id},{"name",id==13025 ? "F4BX8" : "3A7X47"},{"listed",true},{"launchable",true},{"tariff_id",57229},{"price",49.0}};
+fog::Computer offer(int id=11573) {
+    fog::Computer pc;pc.id=identity(id);pc.name=id==13025?"F4BX8":"3A7X47";
+    pc.listed=pc.launchable=true;pc.offerId=identity(57229);pc.hourlyPrice=fog::Money{4900,"RUB"};pc.price="49.0";
+    return pc;
 }
 ApplicationController fixture(int id=11573) {
     ApplicationController app;
@@ -113,12 +129,12 @@ int main() {
         assert(app.armed && app.storageChecked && app.sessionPending_ && app.worker);
         assert(app.screen_==Screen::Checkout && app.selectedPlayStation_);
         const auto result=app.worker();
-        assert(result.value("playstation_offer_verified",false) && app.checkout_.calls==0);
+        assert(std::holds_alternative<VerifiedOffer>(result) && app.checkout_.calls==0);
         app.acceptCreateResult(result);
         assert(app.worker && app.sessionPending_ && app.armed && !app.disarmed);
-        assert(app.worker().empty() && app.checkout_.calls==1);
-        assert(app.checkout_.request.computerId==id && app.checkout_.request.tariffId==57229);
-        assert(app.checkout_.request.gameId==0 && !app.checkout_.request.ownSteamAccount);
+        assert(std::holds_alternative<std::monostate>(app.worker()) && app.checkout_.calls==1);
+        assert(app.checkout_.request.computerId==identity(id) && app.checkout_.request.offerId==identity(57229));
+        assert(app.checkout_.request.gameId.empty() && !app.checkout_.request.ownAccount);
         assert(!app.recentLaunch_.value);
     }
     for (int cancellation=0; cancellation<3; ++cancellation) {
@@ -129,7 +145,7 @@ int main() {
             if (cancellation==2) app.exitAfterStop_=true;
         };
         const auto result=app.worker();
-        assert(result.value("playstation_offer_verified",false) && app.checkout_.calls==0);
+        assert(std::holds_alternative<VerifiedOffer>(result) && app.checkout_.calls==0);
         app.worker={};
         app.acceptCreateResult(result);
         assert(!app.worker && app.checkout_.calls==0 && !app.sessionPending_ && app.disarmed);
@@ -143,7 +159,7 @@ int main() {
     }
     for (const auto& mutation : {Json{{"listed",false}},Json{{"launchable",false}},
                                 Json{{"id",42}},Json{{"tariff_id",0}}}) {
-        auto app=fixture(); app.playStationComputers_[0].update(mutation); app.createSession();
+        auto app=fixture(); mutate(app.playStationComputers_[0],mutation); app.createSession();
         assert(!app.worker && !app.armed && !app.sessionPending_ && app.checkout_.calls==0);
     }
     for (const bool missingTimestamp : {false,true}) {
@@ -157,14 +173,14 @@ int main() {
     for (const auto& mutation : {Json{{"listed",false}},Json{{"launchable",false}},
                                 Json{{"tariff_id",57230}},Json{{"price",50.0}},Json{{"price",nullptr}}}) {
         auto app=fixture(); app.createSession();
-        fog::currentOffers[0].update(mutation);
+        mutate(fog::currentOffers[0],mutation);
         const auto result=app.worker();
-        assert(result.value("playstation_offer_changed",false) && app.checkout_.calls==0);
-        assert(result.at("computers")==fog::currentOffers);
+        assert(std::holds_alternative<ChangedOffer>(result) && app.checkout_.calls==0);
+        assert(std::get<ChangedOffer>(result).computers.size()==fog::currentOffers.size());
     }
     {
-        auto app=fixture(); app.createSession(); fog::currentOffers=Json::array();
-        assert(app.worker().value("playstation_offer_changed",false) && app.checkout_.calls==0);
+        auto app=fixture(); app.createSession(); fog::currentOffers.clear();
+        assert(std::holds_alternative<ChangedOffer>(app.worker()) && app.checkout_.calls==0);
     }
     {
         auto app=fixture(); app.createSession(); fog::failFetch=true;
@@ -172,7 +188,7 @@ int main() {
         assert(failed && app.checkout_.calls==0); fog::failFetch=false;
     }
     {
-        auto app=fixture(); app.api_.authenticated=false; app.createSession();
+        auto app=fixture(); app.auth_.signedIn=false; app.createSession();
         assert(app.screen_==Screen::Consent && app.loginReturn_==Screen::PlayStationDetails);
         assert(!app.worker && !app.armed && !app.sessionPending_);
     }
@@ -181,7 +197,7 @@ int main() {
         app.selectedPlayStation_=true; app.createSession();
         assert(!app.selectedPlayStation_ && app.worker);
         app.worker();
-        assert(app.checkout_.calls==1 && app.checkout_.request.gameId==987 && app.checkout_.request.ownSteamAccount);
+        assert(app.checkout_.calls==1 && app.checkout_.request.gameId==identity(987) && app.checkout_.request.ownAccount);
         assert(app.recentLaunch_.value==987);
     }
     {
@@ -190,20 +206,20 @@ int main() {
     }
     for (const bool stopQueued : {false,true}) {
         auto app=fixture(); app.createSession(); app.stopAfterTask_=stopQueued;
-        fog::currentOffers[0]["price"]=55.0;
+        mutate(fog::currentOffers[0],Json{{"price",55.0}});
         auto result=app.worker();
         app.acceptCreateResult(std::move(result));
         assert(!app.sessionPending_ && app.disarmed && !app.armed && !app.stopAfterTask_);
-        assert(app.screen_==Screen::PlayStation && app.playStationComputers_[0]["price"]==55.0);
+        assert(app.screen_==Screen::PlayStation && app.playStationComputers_[0].hourlyPrice->minorUnits==5500);
         assert(app.checkout_.calls==0 && app.finishRequests==0);
         assert(app.playStationLoadedAt_!=std::chrono::steady_clock::time_point{});
     }
     {
         auto app=fixture(); app.createSession(); app.hasJournal=true;
-        fog::currentOffers[0]["price"]=55.0;
+        mutate(fog::currentOffers[0],Json{{"price",55.0}});
         app.acceptCreateResult(app.worker());
         assert(app.sessionPending_ && app.finishRequests==1 && !app.disarmed);
-        assert(app.playStationComputers_[0]["price"]==49.0 && app.checkout_.calls==0);
+        assert(app.playStationComputers_[0].hourlyPrice->minorUnits==4900 && app.checkout_.calls==0);
     }
     std::cout << "PlayStation checkout: original/fourth PC fresh offer dispatch, Back/HOME/exit during fetch, tariff/price changes, stale/missing list, absent/invalid PC, fetch failure, auth, journal guard and normal-mode isolation PASS (actual glue; no paid requests)\n";
 }

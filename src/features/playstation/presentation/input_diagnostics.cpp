@@ -34,15 +34,15 @@ void ApplicationController::samplePlayStationInput(PadState& pad) {
 void ApplicationController::dispatchPlayStationInput(bool allowed) {
     if (!streamPlayStation_) return;
     const bool wasInitialized=psNativeInput_.contactsInitialized();
-    psNativeInput_.update(psSensors_.snapshot(),clockMs(),allowed,[this](const Json& command) {
-        return stream_ && stream_->sendControl(command.dump());
+    psNativeInput_.update(psSensors_.snapshot(),clockMs(),allowed,[this](const fog::remote::Input& command) {
+        return stream_ && stream_->sendInput(command);
     });
     if (!wasInitialized && psNativeInput_.contactsInitialized())
         diagnostic("PS touch reset: both contacts UP queued before native input; scope=transport ack=unavailable");
 }
 void ApplicationController::releasePlayStationInput() {
     if (!streamPlayStation_) return;
-    psNativeInput_.suspend([this](const Json& command) { return stream_ && stream_->sendControl(command.dump()); });
+    psNativeInput_.suspend([this](const fog::remote::Input& command) { return stream_ && stream_->sendInput(command); });
 }
 void ApplicationController::logPlayStationInput(bool final) {
     if (!streamPlayStation_) return;

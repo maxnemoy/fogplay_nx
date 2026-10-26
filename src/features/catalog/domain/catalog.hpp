@@ -1,5 +1,6 @@
 #pragma once
-#include <nlohmann/json.hpp>
+#include "features/catalog/domain/models.hpp"
+#include <set>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -43,7 +44,7 @@ public:
         initialized_ = true;
         ++generation_;
         query_ = std::move(query);
-        items_ = nlohmann::json::array();
+        items_.clear();
         ids_.clear();
         selected_ = first_ = 0;
         nextPage_ = 1;
@@ -81,22 +82,20 @@ public:
         busy_ = true;
         return Request{generation_, nextPage_, query_, genreId_};
     }
-    bool complete(const Request& request, const nlohmann::json& page) {
+    bool complete(const Request& request, const Page<Game>& page) {
         if (!current(request)) return false;
-        if (!page.is_array() || page.size() > PageSize)
+        if (page.items.size() > PageSize)
             throw std::runtime_error("Unexpected catalog page format");
         auto ids = ids_;
         auto items = items_;
-        for (const auto& item : page) {
-            if (!item.is_object() || !item.contains("id") || !item.at("id").is_number_integer())
-                throw std::runtime_error("Unexpected catalog game ID");
-            const auto id = item.at("id").get<std::int64_t>();
-            if (id <= 0 || id > 2147483647) throw std::runtime_error("Unexpected catalog game ID");
+        for (const auto& item : page.items) {
+            if (item.id.empty()) throw std::runtime_error("Unexpected catalog game ID");
+            const auto& id = item.id;
             if (ids.insert(id).second) items.push_back(item);
         }
         // A full repeated page is terminal too: do not poll an API that ignores
         // page numbers indefinitely. Overlapping pages with new IDs continue.
-        ended_ = page.size() < PageSize || items.size() == items_.size() || nextPage_ >= 1000000;
+        ended_ = page.items.size() < PageSize || items.size() == items_.size() || nextPage_ >= 1000000;
         items_ = std::move(items);
         ids_ = std::move(ids);
         ++nextPage_;
@@ -114,7 +113,7 @@ public:
         error_.clear();
         return true;
     }
-    const nlohmann::json& items() const { return items_; }
+    const std::vector<Game>& items() const { return items_; }
     const std::string& query() const { return query_; }
     int genreId() const { return genreId_; }
     const std::string& error() const { return error_; }
@@ -126,8 +125,8 @@ private:
     bool current(const Request& request) const {
         return busy_ && request.generation == generation_ && request.page == nextPage_ && request.query == query_ && request.genreId == genreId_;
     }
-    nlohmann::json items_ = nlohmann::json::array();
-    std::unordered_set<std::int64_t> ids_;
+    std::vector<Game> items_;
+    std::set<EntityId> ids_;
     std::string query_, error_;
     std::uint64_t generation_ = 0;
     std::size_t selected_ = 0, first_ = 0;

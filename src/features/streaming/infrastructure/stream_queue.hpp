@@ -1,5 +1,5 @@
 #pragma once
-#include "features/streaming/infrastructure/stream.hpp"
+#include "features/streaming/domain/streaming_client.hpp"
 #include <algorithm>
 #include <deque>
 namespace stream {

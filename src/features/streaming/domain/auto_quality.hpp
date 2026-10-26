@@ -1,6 +1,6 @@
 #pragma once
 // Deterministic application-thread Auto policy. Monotonic milliseconds; no RTC or platform dependencies.
-#include <nlohmann/json.hpp>
+#include <optional>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -27,43 +27,28 @@ template<class T> struct Field {
     bool fresh(std::uint64_t now) const { return known && now >= at && now - at <= 6000; }
     std::int64_t age(std::uint64_t now) const { return known && now >= at ? static_cast<std::int64_t>(now - at) : -1; }
 };
+struct TelemetryUpdate {
+    std::optional<Profile> profile;
+    std::optional<double> targetMbps, fps;
+    std::optional<bool> automatic;
+    std::optional<std::string> codec;
+};
 struct Telemetry {
     Field<Profile> profile;
     Field<double> targetMbps, fps;
     Field<bool> automatic;
     Field<std::string> codec;
     std::uint64_t count = 0, at = 0;
-    void read(const nlohmann::json& data, std::uint64_t now) {
-        if (!data.is_object()) return;
+    void apply(const TelemetryUpdate& update, std::uint64_t now) {
         ++count; at = now;
-        const auto p = data.find("preset");
-        if (p != data.end() && p->is_string()) {
-            // Official preset enum: LOW / MID / HIGH / ULTRA.
-            // Never preserve/log arbitrary remote strings.
-            if (*p == "LOW") profile.set(Profile::Low, now);
-            else if (*p == "MID") profile.set(Profile::Middle, now);
-            else if (*p == "HIGH") profile.set(Profile::High, now);
-            else if (*p == "ULTRA") profile.set(Profile::Ultra, now);
-        }
-        readNumber(data, "target_bitrate", 0, 1000000000.0, targetMbps, now, 1000000.0);
-        readNumber(data, "fps", 1, 240, fps, now);
-        const auto a = data.find("autoquality");
-        if (a != data.end() && a->is_boolean()) automatic.set(a->get<bool>(), now);
-        const auto c = data.find("server_codec");
-        if (c != data.end() && c->is_string()) {
-            if (*c == "H264" || *c == "H.264" || *c == "h264") codec.set("H264", now);
-            else if (*c == "H265" || *c == "H.265" || *c == "h265" || *c == "HEVC" || *c == "hevc") codec.set("H265", now);
-        }
-    }
-private:
-    static void readNumber(const nlohmann::json& data, const char* key, double low, double high,
-                           Field<double>& field, std::uint64_t now, double divisor = 1) {
-        const auto it = data.find(key);
-        if (it == data.end() || !it->is_number()) return;
-        const double value = it->get<double>();
-        if (std::isfinite(value) && value >= low && value <= high) field.set(value / divisor, now);
+        if (update.profile) profile.set(*update.profile, now);
+        if (update.targetMbps) targetMbps.set(*update.targetMbps, now);
+        if (update.fps) fps.set(*update.fps, now);
+        if (update.automatic) automatic.set(*update.automatic, now);
+        if (update.codec) codec.set(*update.codec, now);
     }
 };
+
 struct Sample {
     // Session totals: frames counts only new frames successfully presented.
     // Decoder work belongs to decodedFrames, including frames superseded before presentation.

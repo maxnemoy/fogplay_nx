@@ -1,5 +1,6 @@
 #pragma once
 #include "core/constants/storage_paths.hpp"
+#include "core/domain/identity.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -40,9 +41,11 @@ public:
     // Bounded CPU/mutex work only: disk and network run exclusively on the worker.
     // True means the lookup is cached, pending, or accepted; false means rejected/full/stopped.
     bool request(int mtsId, const std::string& title);
+    bool request(const EntityId& id, const std::string& title);
     // Returns a generated Steam header URL or empty. Stale positive mappings remain
     // usable during offline refresh; request() initiates refresh after 30 days.
     std::string get(int mtsId, const std::string& title) const;
+    std::string get(const EntityId& id, const std::string& title) const;
     SteamArtworkStats stats() const;
     // Cancels network work, drops queued requests, and joins the worker.
     void stop() noexcept;

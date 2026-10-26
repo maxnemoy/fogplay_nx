@@ -6,19 +6,19 @@ namespace uiText = ::fog::constants::ui;
 namespace fogplay {
 
 void ApplicationController::loadHistory() {
-    if (!api_.loggedIn()) { loginReturn_ = Screen::History; screen_ = Screen::Consent; return; }
+    if (!auth_.authenticated()) { loginReturn_ = Screen::History; screen_ = Screen::Consent; return; }
     screen_ = Screen::History; selection_ = 0;
-    start(Task::History,[this] { return api_.orderHistory(); });
+    start(Task::History,[this] { return account_.history(); });
 }
 
 void ApplicationController::loadGameDetail() {
     latency_.cancel();
     screen_ = Screen::GameDetail; selection_ = 0;
     start(Task::GameDetail,[this] {
-        auto game = api_.gameDetail(selectedGameId_);
-        Json choices = Json::object();
-        try { choices = api_.computerAuto(selectedGameId_,ownSteam_); } catch (...) {}
-        return Json{{"game",std::move(game)},{"auto",std::move(choices)}};
+        auto game = catalogRepository_.game(selectedGameId_);
+        fog::AutomaticComputers choices;
+        try { choices = catalogRepository_.recommend({selectedGameId_,1,5,ownSteam_}); } catch (...) {}
+        return fog::GameDetail{std::move(game),std::move(choices)};
     });
 }
 
@@ -41,10 +41,10 @@ void ApplicationController::requestCatalog(bool manual) {
     try {
         // Public catalog has its own API instance. Auth/session state remains
         // exclusive to the original worker, as required by Api's contract.
-        catalogApi_ = std::make_shared<fog::Api>(catalogDeviceId_);
+        catalogApi_ = services_->publicCatalog();
         catalogRequest_ = *request;
         catalogPending_ = std::async(std::launch::async, [api=catalogApi_, request=*request] {
-            return api->games(request.query, request.page, fog::Catalog::PageSize, request.genreId);
+            return api->games({request.query, request.page, fog::Catalog::PageSize, request.genreId});
         });
     } catch (const std::exception& error) {
         catalog_.fail(*request, safeText(error.what()));
@@ -90,21 +90,22 @@ void ApplicationController::moveCatalog(u64 keys) {
     selection_ = catalog_.selected();
 }
 
-void ApplicationController::selectCatalogGame(const Json& game) {
+void ApplicationController::selectCatalogGame(const fog::Game& game) {
     // Detail responses may omit or replace catalog artwork/name metadata.
     selectedRecentGame_ = fog::RecentGame::fromCatalog(game);
-    autoComputers_ = Json::object(); computers_ = Json::array();
+    autoComputers_ = {}; computers_.clear();
     detail_ = game;
-    selectedGameId_ = detail_.at("id").get<int>(); selectedGameName_ = field(detail_,"name");
+    selectedGameId_ = detail_.id; selectedGameName_ = display(detail_.name);
     ownSteam_ = false; loadGameDetail();
 }
 
 void ApplicationController::loadComputers() {
     latency_.request();
     screen_ = Screen::Computers;
-    computers_ = Json::array(); selection_ = 0;
-    const int id = selectedGameId_, page = computerPage_;
-    start(Task::Computers, [this, id, page] { return api_.computers(id, page, 8, ownSteam_); });
+    computers_.clear(); selection_ = 0;
+    const auto id = selectedGameId_;
+    const auto page = computerPage_;
+    start(Task::Computers, [this, id, page] { return catalogRepository_.computers({id, page, 8, ownSteam_}); });
 }
 
 void ApplicationController::searchGames() {
@@ -112,7 +113,7 @@ void ApplicationController::searchGames() {
     if (query) { search_ = *query; sidebar_ = false; genreBarFocused_ = false; loadGames(); }
 }
 
-std::string ApplicationController::latencyText(const Json& computer) const {
+std::string ApplicationController::latencyText(const fog::Computer& computer) const {
     if (const auto ping = latency_.estimate(computer)) return "≈ " + std::to_string(*ping) + uiText::Common::MillisecondsSuffix;
     return latency_.busy() ? uiText::Server::MeasuringPing : uiText::Server::PingUnknown;
 }

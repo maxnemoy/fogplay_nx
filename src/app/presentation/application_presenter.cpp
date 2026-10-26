@@ -59,7 +59,7 @@ void ApplicationController::box(int x, int y, int w, int h, SDL_Color color) {
     SDL_Rect rect{x,y,w,h}; SDL_RenderFillRect(rt_.renderer, &rect);
 }
 
-SDL_Texture* ApplicationController::cover(const Json& game) {
+SDL_Texture* ApplicationController::cover(const fog::Game& game) {
     return fog::catalogArtwork(game,artwork_,steamArtwork_);
 }
 
@@ -97,7 +97,7 @@ void ApplicationController::draw() {
     loopTiming_.suspendPresentation();
     fog::ui::Chrome chrome;
     chrome.sidebarExpanded = sidebar_; chrome.sidebarFocused = sidebar_;
-    chrome.account = api_.loggedIn() ? uiText::Profile::Connected : uiText::Profile::SignInAccount;
+    chrome.account = auth_.authenticated() ? uiText::Profile::Connected : uiText::Profile::SignInAccount;
     chrome.title = uiText::Catalog::Title;
     chrome.section = fog::ui::Section::Games;
     if (screen_ == Screen::Computers || screen_ == Screen::Details || screen_ == Screen::GameDetail) { chrome.title = selectedGameName_; chrome.section = fog::ui::Section::Computers; }
@@ -124,7 +124,7 @@ void ApplicationController::draw() {
     if (screen_ == Screen::Computers) chrome.hints = uiText::Server::CatalogHints;
     if (screen_ == Screen::Details) chrome.hints = detailsFromAutomatic_ ? uiText::Server::ConnectHints : uiText::Server::RefreshPingHints;
     if (sessionPending_) chrome.hints = uiText::Server::PendingSessionHints;
-    if (api_.loggedIn() && authSaveFailed_) chrome.subtitle.clear();
+    if (auth_.authenticated() && authSaveFailed_) chrome.subtitle.clear();
     ui_.frame(chrome);
     const auto area = ui_.content();
     if (screen_ == Screen::Games) {
@@ -154,7 +154,7 @@ void ApplicationController::draw() {
         cards.reserve(last - first);
         for (auto index = first; index < last; ++index) {
             const auto& game = catalog_.items().at(index);
-            cards.push_back({field(game,"name"),"","",cover(game)});
+            cards.push_back({display(game.name),"","",cover(game)});
         }
         if (!cards.empty()) ui_.games(cards,sidebar_ || genreBarFocused_ || recentFocused ? cards.size() : catalog_.selected()-first,0,"",strip ? 386 : 154,strip ? 1 : 2);
         else if (strip) {
@@ -174,28 +174,27 @@ void ApplicationController::draw() {
         ui_.genreDialog(labels,genreDialogSelection_,first,selectedGenreIndex());
     } else if (screen_ == Screen::GameDetail) {
         fog::ui::GameDetail detail;
-        detail.name = selectedGameName_; detail.description = field(detail_,"description","");
-        detail.rating = field(detail_,"metacritic_score",""); detail.ownSteamAccount = ownSteam_;
-        const std::array<const char*,3> keys{"min_price","optimum","max_power"};
+        detail.name = selectedGameName_; detail.description = display(detail_.description,"");
+        detail.rating = display(detail_.rating,""); detail.ownSteamAccount = ownSteam_;
         const std::array<const char*,3> names{uiText::Server::BestPrice,uiText::Server::Balanced,uiText::Server::Powerful};
-        for (std::size_t i=0; i<keys.size(); ++i) {
-            const auto found = autoComputers_.find(keys[i]);
-            const bool available = found != autoComputers_.end() && found->is_array() && !found->empty();
-            detail.choices.push_back({names[i],"",available ? field(found->front(),"price")+uiText::Common::RublesPerHourSuffix : uiText::Server::None,available});
+        for (std::size_t i=0; i<names.size(); ++i) {
+            const auto& found = autoComputers_.at(i);
+            const bool available = !found.empty();
+            detail.choices.push_back({names[i],"",available ? display(found.front().price)+uiText::Common::RublesPerHourSuffix : uiText::Server::None,available});
         }
         ui_.gameDetail(detail,selection_ < 4 ? int(selection_) : -1);
         ui_.button(uiText::Server::All,{area.x,535,area.w,56},selection_ == 4);
     } else if (screen_ == Screen::Computers) {
         std::vector<fog::ui::ComputerCard> cards;
-        for (const auto& pc : computers_) cards.push_back({field(pc,"name"),field(pc,"gpu"),field(pc,"cpu"),field(pc,"price")+uiText::Common::RublesPerHourSuffix,"Steam",ownSteam_ ? uiText::Profile::OwnAccount : uiText::Profile::ServerAccount,latencyText(pc),true});
+        for (const auto& pc : computers_) cards.push_back({display(pc.name),display(pc.gpu),display(pc.cpu),display(pc.price)+uiText::Common::RublesPerHourSuffix,"Steam",ownSteam_ ? uiText::Profile::OwnAccount : uiText::Profile::ServerAccount,latencyText(pc),true});
         ui_.computers(cards,selection_);
         if (computers_.empty() && !pending_.valid()) ui_.empty(uiText::Server::NoSuitableServers, ui_.controllerHints(uiText::Server::RefreshPagesHints));
     } else if (screen_ == Screen::Details && selection_ < computers_.size()) {
         const auto& pc = computers_[selection_];
-        ui_.dialog({uiText::Server::ConnectPrefix + field(pc,"name") + "?", field(pc,"gpu") + " • " + field(pc,"cpu") + "\n" + field(pc,"price") + uiText::Server::HourlyPriceSentenceSuffix + (ownSteam_ ? uiText::Profile::OwnSteamSentence : uiText::Profile::ServerAccountSentence) + (detailsFromAutomatic_ ? "" : "\n" + latencyText(pc) + uiText::Server::PingEstimateSuffix) + uiText::Server::PaidRentalNotice, uiText::Common::Connect, uiText::Common::Back});
+        ui_.dialog({uiText::Server::ConnectPrefix + display(pc.name) + "?", display(pc.gpu) + " • " + display(pc.cpu) + "\n" + display(pc.price) + uiText::Server::HourlyPriceSentenceSuffix + (ownSteam_ ? uiText::Profile::OwnSteamSentence : uiText::Profile::ServerAccountSentence) + (detailsFromAutomatic_ ? "" : "\n" + latencyText(pc) + uiText::Server::PingEstimateSuffix) + uiText::Server::PaidRentalNotice, uiText::Common::Connect, uiText::Common::Back});
     } else if (screen_ == Screen::History) {
         std::vector<fog::ui::HistoryCard> cards;
-        for (const auto& item : history_) cards.push_back({field(item,"comp_name"),field(item,"created"),field(item,"finished"),field(item,"duration_minutes")+uiText::Common::MinutesSuffix,field(item,"sum")+uiText::Common::RublesSuffix,""});
+        for (const auto& item : history_) cards.push_back({display(item.computerName),display(item.startedAt),display(item.finishedAt),display(item.durationMinutes)+uiText::Common::MinutesSuffix,display(item.amount)+uiText::Common::RublesSuffix,""});
         ui_.history(cards,selection_,selection_/fog::ui::HistoryColumns*fog::ui::HistoryColumns);
         if (cards.empty() && !pending_.valid()) ui_.empty(uiText::Profile::NoSessions, uiText::Profile::HistoryExplanation);
     } else if (screen_ == Screen::Settings) {
@@ -206,7 +205,7 @@ void ApplicationController::draw() {
         drawConnectionSettings();
     } else if (screen_ == Screen::Sessions) {
         for (std::size_t i = selection_/5*5; i < sessions_.size() && i < selection_/5*5+5; ++i)
-            ui_.button(field(sessions_[i],"computer_name"),{area.x,170+int(i%5)*75,area.w,65},i==selection_);
+            ui_.button(display(sessions_[i].computerName),{area.x,170+int(i%5)*75,area.w,65},i==selection_);
         if (sessions_.empty() && !pending_.valid()) ui_.empty(uiText::Profile::NoActiveSessions, uiText::Profile::StartRentalHint);
     } else if (screen_ == Screen::ConnectConsent) {
         ui_.dialog({uiText::Server::AdoptRentalTitle,uiText::Server::AdoptRentalNotice,uiText::Common::Connect,uiText::Common::Back});
@@ -228,11 +227,11 @@ void ApplicationController::draw() {
     } else if (screen_ == Screen::Auth) {
         ui_.dialog({uiText::Profile::SignInTitle,authStep_ == fog::AuthStep::Captcha ? ui_.controllerHints(uiText::Profile::CaptchaHint) : ui_.controllerHints(uiText::Profile::SmsHint),uiText::Profile::EnterCode,uiText::Common::Back,true,false,captcha_});
     }
-    if (api_.loggedIn() && authSaveFailed_ && screen_ != Screen::Games && screen_ != Screen::Genres)
+    if (auth_.authenticated() && authSaveFailed_ && screen_ != Screen::Games && screen_ != Screen::Genres)
         ui_.text(uiText::Profile::AuthNotSaved, area.x, 77, area.w-80);
     if (screen_ == Screen::Checkout) ui_.status(checkoutStatus_, pending_.valid());
     else if (screen_ == Screen::Games) {
-        if (api_.loggedIn() && authSaveFailed_) ui_.status(uiText::Profile::AuthNotSaved,false,true);
+        if (auth_.authenticated() && authSaveFailed_) ui_.status(uiText::Profile::AuthNotSaved,false,true);
         else if (pending_.valid()) ui_.status(uiText::Common::Loading, true);
         else if (!catalog_.error().empty()) ui_.status(uiText::Catalog::LoadFailedPrefix + catalog_.error(), false, true);
         else if (catalog_.busy() || catalogPending_.valid()) ui_.status(catalog_.items().empty() ? uiText::Catalog::LoadingStatus : uiText::Catalog::LoadMoreStatus, true);

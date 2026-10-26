@@ -1,6 +1,7 @@
 #include "core/constants/ui_text.hpp"
 #include "core/constants/error_text.hpp"
 #include "app/application.hpp"
+#include "composition/mts_services.hpp"
 #include "app/app_diagnostics.hpp"
 #include "platform/switch/switch_runtime.hpp"
 #include <exception>
@@ -31,7 +32,7 @@ int main(int, char**) {
         std::unique_ptr<fogplay::Application> app;
         {
             fogplay::diagnostics::StartupStage stage("application_setup");
-            app = std::make_unique<fogplay::Application>(runtime, id);
+            app = std::make_unique<fogplay::Application>(runtime, fogplay::makeMtsServices(id));
         }
         fogplay::diagnostics::diagnostic("Startup entering_ui_loop");
         app->run();

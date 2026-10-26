@@ -1,4 +1,6 @@
 #include "features/session/infrastructure/api.hpp"
+#include "features/session/infrastructure/mts_rental_repository.hpp"
+#include "features/session/infrastructure/rental_journal_storage.hpp"
 #include "features/session/application/session.hpp"
 #include <filesystem>
 #include <fstream>
@@ -11,6 +13,7 @@
 
 namespace {
 int assertions = 0;
+fog::EntityId mts(std::string value) { return {fog::ProviderId::Mts, std::move(value)}; }
 void require(bool condition, const char* label) {
     ++assertions;
     if (!condition) throw std::runtime_error(label);
@@ -81,7 +84,12 @@ int main() {
         Fake fake;
         fog::Api api("11111111111141118111111111111111", {},
             [&fake](auto&&... args) { return fake.call(args...); });
+        fog::MtsRentalRepository rentals(api);
         rejects([&] { api.activeSessions(); }, "sessions require authentication");
+        try { rentals.activeSessions(); require(false, "repository requires authentication"); }
+        catch (const fog::RepositoryError& error) {
+            require(error.kind() == fog::RepositoryErrorKind::NotAuthenticated, "typed unauthenticated repository result");
+        }
         rejects([&] { api.finishSession("owned"); }, "finish requires authentication");
         api.submitPhone("89991234567");
         fake.sessions({"hash:with+/punctuation=", "unrelated"});
@@ -95,10 +103,20 @@ int main() {
             R"([{"hash":5,"computer_name":"x"}])", R"([{"hash":"owned","computer_name":1}])"}) {
             fake.active.body = malformed;
             rejects([&] { api.activeSessions(); }, "invalid active session schema");
+            try { rentals.activeSessions(); require(false, "repository rejects malformed active list"); }
+            catch (const fog::RepositoryError& error) {
+                require(error.kind() == fog::RepositoryErrorKind::InvalidResponse, "invalid active list cannot become absence");
+            }
         }
         fake.active.body = R"([{"hash":"owned","computer_name":null},{"hash":"other"}])";
         require(api.activeSessions().at(0).at("computer_name") == "" &&
             api.activeSessions().at(1).at("computer_name") == "", "nullable and missing display names do not hide sessions");
+        fake.active.body = R"([{"hash":"owned","computer_id":314}])";
+        require(rentals.activeSessions().front().computerId == mts("314"), "active rental maps optional computer identity");
+        fake.active.body = R"([{"hash":"owned","computer_id":"314"}])";
+        require(rentals.activeSessions().front().computerId == mts("314"), "active rental maps decimal-string computer identity");
+        fake.active.body = R"([{"hash":"owned","computer_id":null}])";
+        require(!rentals.activeSessions().front().computerId, "absent computer metadata never invents identity");
         fake.sessions({});
         fake.finish.body = R"({"ok":"true","token":"PRIVATE"})";
         rejects([&] { api.finishSession("owned"); }, "finish requires boolean ok");
@@ -107,14 +125,14 @@ int main() {
         fake.finish = {200, R"({"ok":true,"url":"ignored"})"};
 
         const auto path = (root / "pending.json").string();
-        fog::SessionGuard guard(api, path);
-        require(guard.pendingHash().empty() && !guard.persistent(), "no initial journal");
+        fog::SessionGuard guard(rentals, fog::makeMtsSessionJournal(path));
+        require(guard.pendingRental().value.empty() && !guard.persistent(), "no initial journal");
         const std::string hash = "hash:with+/punctuation=";
-        guard.adopt(hash);
+        guard.adopt(mts(hash));
         require(guard.ownsSession() && guard.persistent() && fs::exists(path), "adopt durable before connect");
         require(fog::Json::parse(readFile(path)).at("hash") == hash, "opaque hash survives journal");
         require(readFile(path).find("PRIVATE") == std::string::npos, "token never journaled");
-        rejects([&] { guard.adopt("unrelated"); }, "cannot overwrite pending session");
+        rejects([&] { guard.adopt(mts("unrelated")); }, "cannot overwrite pending session");
         fake.sessions({hash, "unrelated"});
         api.cancel();
         auto result = guard.finishAttempt();
@@ -129,11 +147,11 @@ int main() {
         require(fake.requests.back().options.timeoutMs == 4000, "fresh verification bounded shutdown transport");
         fake.sessions({"unrelated"});
         result = guard.finishAttempt();
-        require(result.terminated && result.journalCleared && !fs::exists(path) && guard.pendingHash().empty(),
+        require(result.terminated && result.journalCleared && !fs::exists(path) && guard.pendingRental().value.empty(),
             "ack plus fresh absence clears durable marker");
 
         // An attributed but not-yet-active rental must survive timeout + absence.
-        guard.adopt("still-preparing");
+        guard.adopt(mts("still-preparing"));
         fake.finishTimeout = true;
         fake.sessions({});
         result = guard.finishAttempt();
@@ -143,7 +161,7 @@ int main() {
         require(guard.finishAttempt().terminated, "acknowledged stop plus absence resolves preparation");
 
         // A prior active observation makes subsequent fresh absence meaningful.
-        guard.adopt("timed-out");
+        guard.adopt(mts("timed-out"));
         fake.finishTimeout = true;
         fake.activeTimeout = true;
         result = guard.finishAttempt();
@@ -157,14 +175,14 @@ int main() {
         require(result.terminated && result.journalCleared, "timeout reconciled by fresh absence");
         fake.finishTimeout = false;
 
-        guard.adopt("unidentified-entry");
+        guard.adopt(mts("unidentified-entry"));
         fake.active.body = R"([{"hash":null,"computer_name":"Fixture"}])";
         require(!guard.finishAttempt().terminated && guard.persistent(),
             "malformed identity cannot prove session absence even after acknowledged finish");
         fake.sessions({});
         require(guard.finishAttempt().terminated, "valid fresh absence resolves acknowledged finish");
 
-        guard.adopt("rejected");
+        guard.adopt(mts("rejected"));
         fake.finish = {200, R"({"ok":false})"};
         result = guard.finishAttempt();
         require(!result.terminated && fs::exists(path), "explicit rejection and absence not arbitrary termination proof");
@@ -176,9 +194,9 @@ int main() {
         fake.activeTimeout = false;
         require(guard.finishAttempt().terminated, "retry confirms prior acknowledged finish");
 
-        guard.adopt("recovery-hash");
-        fog::SessionGuard recovered(api, path);
-        require(recovered.pendingHash() == "recovery-hash" && recovered.persistent() && !recovered.ownsSession(),
+        guard.adopt(mts("recovery-hash"));
+        fog::SessionGuard recovered(rentals, fog::makeMtsSessionJournal(path));
+        require(recovered.pendingRental().value == "recovery-hash" && recovered.persistent() && !recovered.ownsSession(),
             "restart loads marker but no account ownership");
         auto before = fake.finishCount();
         require(!recovered.finishAttempt().terminated && fake.finishCount() == before, "restart cannot finish without match");
@@ -191,8 +209,8 @@ int main() {
         require(recovered.finishAttempt().terminated, "recovery stops saved hash only");
         require(fake.requests[fake.requests.size()-2].query[0].second == "recovery-hash", "recovery targeted hash");
 
-        fog::SessionGuard accountSwitch(api, (root / "switch.json").string());
-        accountSwitch.adopt("old-account");
+        fog::SessionGuard accountSwitch(rentals, fog::makeMtsSessionJournal((root / "switch.json").string()));
+        accountSwitch.adopt(mts("old-account"));
         before = fake.finishCount();
         fake.token = "PRIVATE_DIFFERENT_ACCOUNT";
         api.submitPhone("89991234567");
@@ -203,19 +221,19 @@ int main() {
 
         const auto malformedPath = (root / "malformed.json").string();
         writeFile(malformedPath, "PRIVATE_MALFORMED");
-        fog::SessionGuard malformed(api, malformedPath);
+        fog::SessionGuard malformed(rentals, fog::makeMtsSessionJournal(malformedPath));
         require(!malformed.journalError().empty() && malformed.persistent(), "malformed journal blocks connection visibly");
-        rejects([&] { malformed.adopt("new"); }, "malformed journal cannot be overwritten");
+        rejects([&] { malformed.adopt(mts("new")); }, "malformed journal cannot be overwritten");
         require(!malformed.finishAttempt().terminated && readFile(malformedPath) == "PRIVATE_MALFORMED", "malformed journal not silently removed");
         require(malformed.journalError().find("PRIVATE") == std::string::npos, "journal errors sanitized");
         const auto directoryPath = (root / "directory.json").string();
         fs::create_directory(directoryPath);
-        fog::SessionGuard unreadable(api, directoryPath);
+        fog::SessionGuard unreadable(rentals, fog::makeMtsSessionJournal(directoryPath));
         require(!unreadable.journalError().empty() && unreadable.persistent(), "nonregular journal preserved");
-        rejects([&] { unreadable.adopt("new"); }, "unreadable journal cannot be overwritten");
+        rejects([&] { unreadable.adopt(mts("new")); }, "unreadable journal cannot be overwritten");
 
-        fog::SessionGuard failedWrite(api, (root / "missing" / "pending.json").string());
-        rejects([&] { failedWrite.adopt("cannot-connect"); }, "failed write blocks live connect");
+        fog::SessionGuard failedWrite(rentals, fog::makeMtsSessionJournal((root / "missing" / "pending.json").string()));
+        rejects([&] { failedWrite.adopt(mts("cannot-connect")); }, "failed write blocks live connect");
         require(failedWrite.ownsSession() && !failedWrite.journalError().empty(), "failed durable write blocks media but retains stop authority");
         before = fake.finishCount();
         result = failedWrite.finishAttempt();
@@ -223,24 +241,24 @@ int main() {
             "selected rental can be stopped even when journal creation failed");
 
         const auto clearPath = (root / "clear.json").string();
-        fog::SessionGuard failedClear(api, clearPath);
-        failedClear.adopt("clear-failure");
+        fog::SessionGuard failedClear(rentals, fog::makeMtsSessionJournal(clearPath));
+        failedClear.adopt(mts("clear-failure"));
         fs::remove(clearPath);
         fs::create_directory(clearPath);
         result = failedClear.finishAttempt();
-        require(result.terminated && !result.journalCleared && !failedClear.pendingHash().empty(),
+        require(result.terminated && !result.journalCleared && !failedClear.pendingRental().value.empty(),
             "journal clear failure reported separately from verified termination");
         require(fs::is_directory(clearPath), "unexpected journal directory not removed");
 
         const auto commitPath = (root / "commit-failure.json").string();
-        fog::SessionGuard failedCommit(api, commitPath);
-        failedCommit.adopt("commit-failure");
+        fog::SessionGuard failedCommit(rentals, fog::makeMtsSessionJournal(commitPath));
+        failedCommit.adopt(mts("commit-failure"));
         fake.sessions({});
         require(chmod(root.c_str(), 0300) == 0, "session clear commit failure fixture");
         const auto commitResult = failedCommit.finishAttempt();
         require(chmod(root.c_str(), 0700) == 0, "restore session directory permissions");
         require(commitResult.terminated && !commitResult.journalCleared && failedCommit.ownsSession() &&
-            failedCommit.pendingHash() == "commit-failure", "clear commit failure retains in-memory stop ownership");
+            failedCommit.pendingRental().value == "commit-failure", "clear commit failure retains in-memory stop ownership");
         require(fs::exists(commitPath) && readFile(commitPath).find("commit-failure") != std::string::npos,
             "clear commit failure restores conservative disk marker");
         require(failedCommit.finishAttempt().journalCleared && !fs::exists(commitPath),
@@ -248,20 +266,20 @@ int main() {
         const auto backupPath = (root / "backup.json").string();
         writeFile(backupPath + ".bak", fog::Json{{"version", 1}, {"hash", "backup-session"}}.dump());
         writeFile(backupPath + ".tmp", "PRIVATE-interrupted-write");
-        fog::SessionGuard backupRecovered(api, backupPath);
-        require(backupRecovered.pendingHash() == "backup-session" && backupRecovered.persistent() &&
+        fog::SessionGuard backupRecovered(rentals, fog::makeMtsSessionJournal(backupPath));
+        require(backupRecovered.pendingRental().value == "backup-session" && backupRecovered.persistent() &&
             !backupRecovered.ownsSession(), "sole backup restores session marker without inferring account ownership");
         fake.sessions({"backup-session"});
         require(backupRecovered.recoverMatchingSession(), "backup session requires fresh exact account match");
         fake.sessions({});
         require(backupRecovered.finishAttempt().journalCleared, "restored backup can be stopped and cleared");
-        fog::SessionGuard backupCleared(api, backupPath);
-        require(backupCleared.pendingHash().empty() && !fs::exists(backupPath + ".bak") &&
+        fog::SessionGuard backupCleared(rentals, fog::makeMtsSessionJournal(backupPath));
+        require(backupCleared.pendingRental().value.empty() && !fs::exists(backupPath + ".bak") &&
             !fs::exists(backupPath + ".tmp"), "clear removes auxiliaries without resurrecting rental");
         writeFile(backupPath + ".bak", "PRIVATE-malformed");
-        fog::SessionGuard badBackup(api, backupPath);
+        fog::SessionGuard badBackup(rentals, fog::makeMtsSessionJournal(backupPath));
         require(!badBackup.journalError().empty() && badBackup.persistent(), "malformed restored backup blocks connection");
-        rejects([&] { badBackup.adopt("other"); }, "malformed backup retained for recovery");
+        rejects([&] { badBackup.adopt(mts("other")); }, "malformed backup retained for recovery");
         require(readFile(backupPath) == "PRIVATE-malformed", "malformed backup is preserved unchanged");
         fs::remove_all(root);
         std::cout << "Session offline tests passed: " << assertions << " assertions. No network, SMS or paid requests.\n";
