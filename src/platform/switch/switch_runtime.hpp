@@ -17,7 +17,9 @@ struct Runtime {
     Runtime() = default;
     Runtime(const Runtime&) = delete;
     Runtime& operator=(const Runtime&) = delete;
-    void init();
+    void initGraphics();
+    void initServices();
+    void showStartup(const char* message);
     ~Runtime();
     bool romfs = false, sockets = false, nifm = false, pl = false, sdl = false, ttf = false, image = false;
     SDL_Window* window = nullptr;

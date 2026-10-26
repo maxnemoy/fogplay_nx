@@ -31,6 +31,110 @@ struct Fake {
 };
 int main() {
     {
+        Fake fake;
+        Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
+        sender.block(true); sender.allow(true);
+        assert(sender.enqueueNative("finger0-down", Mode::Ordered, "touch:0", "finger0-up", 1));
+        assert(sender.enqueueNative("finger1-down", Mode::Ordered, "touch:1", "finger1-up", 1));
+        for (unsigned n = 0; n < 100; ++n) {
+            assert(sender.enqueueNative("finger0-move-" + std::to_string(n), Mode::TouchMove, "touch:0", "finger0-up", 2));
+            assert(sender.enqueueNative("finger1-move-" + std::to_string(n), Mode::TouchMove, "touch:1", "finger1-up", 2));
+            assert(sender.enqueueNative("accel-" + std::to_string(n), Mode::Motion, "sensor:1", "accel-neutral", 4));
+            assert(sender.enqueueNative("gyro-" + std::to_string(n), Mode::Motion, "sensor:2", "gyro-zero", 5));
+        }
+        assert(sender.enqueueNative("finger0-up", Mode::Release, "touch:0", {}, 3));
+        assert(sender.enqueueNative("finger1-up", Mode::Release, "touch:1", {}, 3));
+        assert(sender.snapshot().pending == 8);
+        const auto queued = sender.snapshot();
+        assert(queued.nativeQueued[1] == 2 && queued.nativeQueued[2] == 200 && queued.nativeQueued[4] == 100);
+        assert(queued.nativeCoalesced[2] == 198 && queued.nativeCoalesced[4] == 99 && queued.nativeCoalesced[5] == 99);
+        sender.block(false); fake.awaitSize(8); sender.stop();
+        assert((fake.sent == std::vector<std::string>{"finger0-down", "finger1-down", "finger0-move-99", "finger1-move-99", "accel-99", "gyro-99", "finger0-up", "finger1-up", "accel-neutral", "gyro-zero"}));
+        const auto sent = sender.snapshot();
+        assert(sent.nativeSent[1] == 2 && sent.nativeSent[2] == 2 && sent.nativeSent[3] == 2);
+        assert(sent.nativeSent[4] == 2 && sent.nativeSent[5] == 2 && sent.nativeFailed[4] == 0);
+    }
+    {
+        // Moves after a lift/new press must not erase the preceding gesture.
+        Fake fake;
+        Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
+        sender.block(true); sender.allow(true);
+        assert(sender.enqueueNative("down1", Mode::Ordered, "touch:0", "up1", 1));
+        assert(sender.enqueueNative("move1", Mode::TouchMove, "touch:0", "up1", 2));
+        assert(sender.enqueueNative("up1", Mode::Release, "touch:0", {}, 3));
+        assert(sender.enqueueNative("down2", Mode::Ordered, "touch:0", "up2", 1));
+        assert(sender.enqueueNative("move2", Mode::TouchMove, "touch:0", "up2", 2));
+        assert(sender.snapshot().pending == 5);
+        sender.block(false); fake.awaitSize(5); sender.stop();
+        assert((fake.sent == std::vector<std::string>{"down1", "move1", "up1", "down2", "move2", "up2"}));
+        assert(sender.snapshot().nativeSent[3] == 2); // Explicit first lift plus final shutdown lift.
+    }
+    {
+        Sender sender([] { return true; }, [](const auto&) { throw std::runtime_error("transport failure"); });
+        sender.allow(true); assert(sender.enqueueNative("gyro", Mode::Motion, "sensor:2", "gyro-zero", 5));
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (sender.snapshot().failure == Sender::Failure::None && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        sender.stop();
+        const auto failed = sender.snapshot();
+        assert(failed.nativeQueued[5] == 1 && failed.nativeAttempt[5] == 1 && failed.nativeFailed[5] == 1 && failed.nativeSent[5] == 0);
+    }
+    {
+        Fake fake;
+        Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
+        sender.block(true); sender.allow(true);
+        assert(sender.enqueueGamepad("touch-down", true));
+        for (unsigned n = 0; n < 100; ++n) assert(sender.enqueueGamepad("held-" + std::to_string(n), true));
+        assert(sender.enqueueGamepad("touch-up", false));
+        for (unsigned n = 0; n < 100; ++n) assert(sender.enqueueGamepad("released-" + std::to_string(n), false));
+        assert(sender.enqueueGamepad("short-down", true));
+        assert(sender.enqueueGamepad("short-up", false));
+        const auto queued = sender.snapshot();
+        assert(queued.pending == 6 && queued.psAccepted == 204 && queued.psRejected == 0);
+        assert(queued.touchQueuedDown == 2 && queued.touchQueuedUp == 2 && queued.gamepadCoalesced == 198);
+        assert(queued.touchAttemptDown == 0 && queued.touchAttemptUp == 0);
+        sender.block(false); fake.awaitSize(6); sender.stop();
+        assert((fake.sent == std::vector<std::string>{"touch-down", "held-99", "touch-up", "released-99", "short-down", "short-up"}));
+        const auto sent = sender.snapshot();
+        assert(sent.touchAttemptDown == 2 && sent.touchAttemptUp == 2);
+        assert(sent.touchSentDown == 2 && sent.touchSentUp == 2 && sent.touchFailedDown == 0 && sent.touchDropped == 0);
+        assert(sent.lastQueuedSeq == 204 && sent.lastSentSeq == 204);
+    }
+    {
+        // Reserve release capacity even if commands fill the ordinary budget.
+        Fake fake;
+        Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
+        sender.block(true); sender.allow(true);
+        assert(sender.enqueueGamepad("touch-down", true));
+        for (unsigned n = 0; n < 46; ++n) assert(sender.enqueue("command"));
+        assert(!sender.enqueue("full"));
+        assert(sender.enqueueGamepad("touch-up", false));
+        assert(!sender.enqueueGamepad("rejected-down", true));
+        const auto queued = sender.snapshot();
+        assert(queued.touchQueuedDown == 1 && queued.touchQueuedUp == 1 && queued.touchRejectedDown == 1);
+        assert(queued.psAccepted == 2 && queued.psRejected == 1 && queued.pending == 48);
+        sender.stop();
+        assert(sender.snapshot().touchDropped == 2 && fake.sent.empty());
+    }
+    {
+        Fake fake;
+        Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
+        sender.allow(true); assert(sender.enqueueGamepad("touch-down", true)); fake.awaitSize(1);
+        sender.stop("neutral");
+        assert((fake.sent == std::vector<std::string>{"touch-down", "neutral"}));
+        const auto sent = sender.snapshot();
+        assert(sent.touchSentDown == 1 && sent.touchSentUp == 1 && sent.lastSentSeq == 2);
+    }
+    {
+        Sender sender([] { return true; }, [](const auto&) { throw std::runtime_error("transport failure"); });
+        sender.allow(true); assert(sender.enqueueGamepad("touch-down", true));
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (sender.snapshot().failure == Sender::Failure::None && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        sender.stop();
+        const auto failed = sender.snapshot();
+        assert(failed.touchAttemptDown == 1 && failed.touchFailedDown == 1 && failed.touchSentDown == 0);
+        assert(failed.psAccepted == 1 && failed.lastQueuedSeq == 1 && failed.lastAttemptSeq == 1 && failed.lastSentSeq == 0);
+    }
+    {
         Fake fake; fake.block = true;
         Sender sender([] { return true; }, [&fake](const auto& s) { fake.send(s); });
         sender.allow(true);

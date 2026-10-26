@@ -170,11 +170,11 @@ std::string base64Decode(const std::string& input) {
     }
     return out;
 }
-Json gamepad(const Gamepad& state) {
+Json gamepad(const Gamepad& state, bool playStation) {
     Json buttons = Json::array(), axes = Json::array();
     for (const auto b : state.buttons) buttons.push_back(b ? 1 : 0);
     for (const auto a : state.axes) axes.push_back(axis(a));
-    return {{"id", "gamepad"}, {"index", 0}, {"isPS", false},
+    return {{"id", "gamepad"}, {"index", 0}, {"isPS", playStation},
             {"state", {{"buttons", buttons}, {"axes", axes},
                        {"rightTrigger", trigger(state.rightTrigger)}, {"leftTrigger", trigger(state.leftTrigger)}}}};
 }

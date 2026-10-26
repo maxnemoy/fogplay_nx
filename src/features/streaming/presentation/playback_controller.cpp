@@ -1,5 +1,6 @@
 #include "app/application_controller.hpp"
 #include "features/streaming/domain/playback_drain.hpp"
+#include "features/playstation/domain/controller.hpp"
 
 namespace fogplay {
 
@@ -52,6 +53,11 @@ void ApplicationController::logOutputTimings(bool final) {
 
 bool ApplicationController::closeTransport(bool final) noexcept {
     bool retryAllowed = true;
+    if (streamPlayStation_) {
+        try { releasePlayStationInput(); } catch (...) {}
+        psSensors_.stop();
+        try { logPlayStationInput(true); } catch (...) {}
+    }
     if (final) releaseMouse();
     else mouseLeft_ = mouseRight_ = touchDrag_ = touchWasDown_ = false;
     videoRecovery_.reset();
@@ -82,6 +88,7 @@ bool ApplicationController::closeTransport(bool final) noexcept {
         } catch (...) { retryAllowed = false; }
         try {
             diagnostic("Stream transport closed: " + stream_->transportTimings(),4096);
+            if (streamPlayStation_) diagnostic("PS transport input closed: " + stream_->inputDiagnostics(),3072);
             diagnostic("Video gaps final: " + stream_->gapDiagnostics(),4096);
             diagnostic("Stream DTLS final: " + stream_->dtlsDiagnostics(),8192);
             diagnostic("Stream RTCP final: " + stream_->rtcpDiagnostics(),4096);
@@ -100,6 +107,7 @@ void ApplicationController::closeStream() noexcept {
     transportReconnect_.cancel();
     closeTransport(true);
     streamHash_.clear();
+    streamPlayStation_ = false;
     relaySelection_.reset();
     transportReconnect_.reset();
     recentLaunch_.close();
@@ -116,6 +124,15 @@ bool ApplicationController::startTransport() {
     videoWorkUs_ = videoDecodeErrors_ = lastVideoGeneration_ = 0;
     media_ = std::make_unique<fog::Media>(rt_.renderer,stream::VideoCodec::H264,true);
     stream_ = std::make_unique<stream::Client>();
+    if (!stream_->configurePlayStation(streamPlayStation_))
+        throw std::runtime_error("Invalid controller configuration; stopping rental");
+    if (streamPlayStation_) {
+        psSensors_.start(); psTouchTrace_ = {}; psNativeInput_ = {}; psTouchLastSubmitted_ = false;
+        psLogAtMs_ = psGamepadAccepted_ = psGamepadRejected_ = 0;
+        psGyroPeak_ = psAccelPeak_ = 0; psMotionMovedFrames_ = 0;
+        diagnostic("PS touch reset: pending both contacts UP for new transport");
+    }
+    diagnostic(std::string("Controller mode: ") + (streamPlayStation_ ? "PlayStation (isPS=1); native gamepad_touch/gamepad_sensor enabled; tap=button17; ack=unavailable" : "standard (isPS=0)"));
     if (!stream_->configureRelay(relaySelection_.relay()))
         throw std::runtime_error("Invalid connection configuration; stopping rental");
     diagnostic(std::string("Transport ICE policy: ") + (relaySelection_.relay() ? "relay" : "all"));
@@ -239,6 +256,7 @@ void ApplicationController::drainStreamAudio() {
     }
 }
 void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
+    samplePlayStationInput(pad);
     // Menu/finish intent wins over a due retry, including backoff with no Client.
     bool overlayHandled = false;
     const bool wasRecovering = transportReconnect_.recovering();
@@ -509,19 +527,34 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     }
     if (screen_ != Screen::Streaming) return;
     if (!wasRecovering) overlayHandled = handleStreamOverlay(pad, held, down);
-    if (!streamInputGate_.gamepadAllowed(overlayHandled)) return;
-    if (transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || now-lastInput_ < std::chrono::milliseconds(30) || !stream_->ready()) return;
+    const bool inputAllowed = streamInputGate_.gamepadAllowed(overlayHandled);
+    dispatchPlayStationInput(inputAllowed && !transportReconnect_.recovering() && !videoRecovery_.active() &&
+        !videoLossWaiting_ && stream_->ready());
+    if (!inputAllowed || (streamPlayStation_ && !psNativeInput_.contactsInitialized())) return;
+    const auto inputNowMs=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+    const bool psTouching = streamPlayStation_ && psNativeInput_.click(inputNowMs,psTouchLastSubmitted_);
+    const bool psTouchEdge = streamPlayStation_ && psTouching != psTouchLastSubmitted_;
+    if (transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ ||
+        (!psTouchEdge && now-lastInput_ < std::chrono::milliseconds(30)) || !stream_->ready()) return;
     stream::Gamepad gamepad;
     const std::array<u64,16> buttons{HidNpadButton_B,HidNpadButton_A,HidNpadButton_Y,HidNpadButton_X,
         HidNpadButton_L,HidNpadButton_R,HidNpadButton_ZL,HidNpadButton_ZR,HidNpadButton_Minus,HidNpadButton_Plus,
         HidNpadButton_StickL,HidNpadButton_StickR,HidNpadButton_Up,HidNpadButton_Down,HidNpadButton_Left,HidNpadButton_Right};
-    const auto remoteHeld = fog::controller::mapStreamButtons(held,controllerSettings_,faceMasks);
+    const auto remoteHeld = streamPlayStation_ ? held : fog::controller::mapStreamButtons(held,controllerSettings_,faceMasks);
     for (std::size_t i=0; i<buttons.size(); ++i) gamepad.buttons[i] = (remoteHeld & buttons[i]) ? 1 : 0;
+    if (streamPlayStation_) {
+        fog::playstation::applyExtraButtons(gamepad.buttons,psTouching);
+    }
     const auto left = padGetStickPos(&pad,0), right = padGetStickPos(&pad,1);
     gamepad.axes = {axis(left.x),-axis(left.y),axis(right.x),-axis(right.y)};
     gamepad.leftTrigger = (held & HidNpadButton_ZL) ? 1.0f : 0.0f;
     gamepad.rightTrigger = (held & HidNpadButton_ZR) ? 1.0f : 0.0f;
-    stream_->sendGamepad(gamepad); lastInput_ = now;
+    const bool accepted = stream_->sendGamepad(gamepad);
+    if (streamPlayStation_) {
+        if (accepted) { ++psGamepadAccepted_; psTouchLastSubmitted_ = psTouching; }
+        else ++psGamepadRejected_;
+    }
+    lastInput_ = now;
 }
 
 }

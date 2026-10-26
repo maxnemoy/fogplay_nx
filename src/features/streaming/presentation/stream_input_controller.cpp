@@ -25,6 +25,8 @@ void ApplicationController::releaseMouse() noexcept {
 }
 
 void ApplicationController::neutralizeStreamInput() {
+    releasePlayStationInput();
+    psTouchLastSubmitted_ = false;
     releaseMouse();
     if (stream_) stream_->sendGamepad(stream::Gamepad{});
     touchWasDown_ = false;

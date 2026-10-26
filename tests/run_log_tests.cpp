@@ -14,9 +14,11 @@
 
 extern "C" ssize_t __real_write(int, const void*, std::size_t);
 extern "C" int __real_fsync(int);
+extern "C" int __real_rename(const char*, const char*);
 namespace {
 int assertions = 0;
 std::atomic<int> writeCalls{0}, failWriteCall{0}, fileSyncCalls{0}, failFileSyncCall{0};
+std::atomic<int> renameCalls{0}, failRenameCall{0};
 std::atomic<bool> failDirectorySync{false}, interruptWrite{false};
 std::atomic<std::size_t> partialWrite{0};
 std::mutex gateMutex;
@@ -31,6 +33,7 @@ struct ReleaseWriter {
 void resetFaults() {
     writeCalls = 0; failWriteCall = 0; fileSyncCalls = 0; failFileSyncCall = 0;
     partialWrite = 0; interruptWrite = false;
+    renameCalls = 0; failRenameCall = 0;
     failDirectorySync = false;
 }
 void require(bool condition, const char* label) {
@@ -75,7 +78,9 @@ void collisionAndMirror() {
     fog::RunLog second;
     require(second.start(fixture.root.string(), 123), "same epoch restart");
     require(second.archivePath() == fixture.path("logs/run-123-2.log"), "restart never overwrites");
-    require(readFile(fixture.path("logs/legacy-last-123-0.log")) == contents, "previous mirror preserved");
+    require(!std::filesystem::exists(fixture.root / "logs/legacy-last-123-0.log"), "clean mirror reuses existing archive");
+    require(second.stats().startupReusedBytes == contents.size(), "reuse counted");
+    require(second.stats().startupRenamedBytes == 0, "no redundant mirror archive");
     require(second.append("new run"), "new run append");
     require(second.flush(), "flush restarted run");
     require(readFile(firstPath) == contents, "earlier archive untouched");
@@ -95,7 +100,7 @@ void legacyMigration() {
     require(log.start(fixture.root.string(), 10), "migration succeeds");
     require(readFile(fixture.path("logs/legacy-previous-10-0.log")) == "previous\n", "previous archived");
     require(readFile(fixture.path("logs/legacy-last-10-0.log")) == "last\n", "last archived");
-    require(readFile(fixture.path("previous-run.log")) == "previous\n", "original previous remains");
+    require(!std::filesystem::exists(fixture.root / "previous-run.log"), "legacy previous moved once");
     require(readFile(fixture.path("last-run.log")).empty(), "mirror reset after preservation");
 }
 void missingSources() {
@@ -109,28 +114,168 @@ void missingSources() {
     require(log.flush(), "explicit durability barrier");
     require(readFile(log.archivePath()) == "persisted\n", "flushed persisted line");
 }
-void migrationWriteFailure() {
+void markerWriteFailure() {
     Fixture fixture;
-    writeFile(fixture.path("previous-run.log"), "previous-private-payload\n");
-    writeFile(fixture.path("last-run.log"), "old-last\n");
-    failWriteCall = 1;
     fog::RunLog log;
-    require(!log.start(fixture.root.string(), 5), "copy failure reported");
-    require(log.archiveHealthy() && log.mirrorHealthy(), "copy failure leaves logging active");
-    require(readFile(fixture.path("last-run.log")) == "old-last\n", "failed copy prevents truncate");
-    require(readFile(fixture.path("previous-run.log")) == "previous-private-payload\n", "source retained");
-    require(log.error().find("preserve-previous") != std::string::npos, "fixed operation diagnostic");
+    require(log.start(fixture.root.string(), 5), "marker failure start");
+    require(log.append("private-payload"), "marker failure payload queued");
+    require(log.flush(), "payload synced before marker failure");
+    const auto archive = log.archivePath();
+    resetFaults(); failWriteCall = 1;
+    log.close();
+    require(log.error().find("track-archive") != std::string::npos, "marker failure reported");
     require(log.error().find("private-payload") == std::string::npos && log.error().find("/tmp/") == std::string::npos,
         "no payload path diagnostic");
+    require(readFile(fixture.path("last-run.log")) == "private-payload\n", "marker failure never truncates mirror");
+    require(readFile(archive) == "private-payload\n", "marker failure keeps archive");
     resetFaults();
-    require(log.append("current"), "continue after migration failure");
-    log.flush();
-    require(readFile(fixture.path("last-run.log")) == "old-last\ncurrent\n", "mirror safely appends");
-    require(readFile(log.archivePath()) == "current\n", "new archive useful");
-    log.close();
     fog::RunLog retry;
-    require(retry.start(fixture.root.string(), 5), "copy retry succeeds");
-    require(readFile(fixture.path("logs/legacy-previous-5-1.log")) == "previous-private-payload\n", "retry exclusive copy");
+    require(retry.start(fixture.root.string(), 5), "marker failure restart succeeds");
+    require(readFile(fixture.path("logs/legacy-last-5-0.log")) == "private-payload\n", "untracked mirror conservatively renamed");
+    require(retry.stats().startupRenamedBytes == 16, "fallback rename bytes counted");
+}
+void migrationRenameFailure() {
+    Fixture fixture;
+    writeFile(fixture.path("last-run.log"), "unarchived-private-payload\n");
+    failRenameCall = 1;
+    fog::RunLog log;
+    require(!log.start(fixture.root.string(), 18), "migration rename failure reported");
+    require(log.error().find("preserve-last") != std::string::npos, "rename error operation sanitized");
+    require(log.error().find("private-payload") == std::string::npos, "rename error omits content");
+    require(log.archiveHealthy() && log.mirrorHealthy(), "rename failure leaves both sinks active");
+    require(readFile(fixture.path("last-run.log")) == "unarchived-private-payload\n", "failed rename prevents mirror truncation");
+    resetFaults();
+    require(log.append("new"), "logging after rename failure");
+    require(!log.flush(), "preservation failure remains visible");
+    require(readFile(fixture.path("last-run.log")) == "unarchived-private-payload\nnew\n", "failed preservation appends safely");
+    log.close();
+    require(!std::filesystem::exists(fixture.root / ".last-run-archive"), "failed run does not publish reuse marker");
+    require(log.start(fixture.root.string(), 19), "failed rename next startup recovers");
+    require(readFile(fixture.path("logs/legacy-last-19-0.log")) == "unarchived-private-payload\nnew\n", "recovery retains entire mixed mirror");
+}
+void markerSyncAndRotationFailures() {
+    Fixture fixture;
+    fog::RunLog log;
+    require(log.start(fixture.root.string(), 40), "marker rotation first start");
+    require(log.append("first") && log.flush(), "marker rotation initial data");
+    log.close();
+    require(log.error().empty(), "first close commits marker");
+    require(log.start(fixture.root.string(), 41), "marker rotation second start");
+    require(log.append("second") && log.flush(), "marker rotation next data");
+    log.close();
+    require(log.error().empty(), "marker rotation compatible with no-replace rename");
+    require(readFile(fixture.path(".last-run-archive")) == "run-41-0.log", "marker updated to exact next archive");
+    require(log.start(fixture.root.string(), 42), "marker sync failure start");
+    require(log.append("third") && log.flush(), "marker sync failure data");
+    resetFaults(); failFileSyncCall = 1;
+    log.close();
+    require(log.error().find("track-archive") != std::string::npos, "marker fsync failure reported");
+    require(readFile(fixture.path(".last-run-archive")) == "run-41-0.log", "failed marker sync keeps previous durable hint");
+    resetFaults();
+    require(log.start(fixture.root.string(), 43), "stale marker recovery start");
+    require(readFile(fixture.path("logs/legacy-last-43-0.log")) == "third\n", "stale marker fallback preserves newer data");
+    require(log.append("fourth") && log.flush(), "marker rename failure data");
+    resetFaults(); failRenameCall = 1;
+    log.close();
+    require(log.error().find("track-archive") != std::string::npos, "marker rename failure reported");
+    require(!std::filesystem::exists(fixture.root / ".last-run-archive"), "failed marker rotation leaves conservative missing hint");
+    resetFaults();
+    require(log.start(fixture.root.string(), 44), "missing marker rotation recovery");
+    require(readFile(fixture.path("logs/legacy-last-44-0.log")) == "fourth\n", "marker rename failure never loses mirror");
+}
+void renamedLegacyIsNotRepeated() {
+    Fixture fixture;
+    std::filesystem::create_directory(fixture.root / "logs");
+    writeFile(fixture.path("logs/legacy-previous-20-0.log"), "collision");
+    writeFile(fixture.path("previous-run.log"), "old previous");
+    writeFile(fixture.path("last-run.log"), "old last");
+    fog::RunLog log;
+    require(log.start(fixture.root.string(), 20), "legacy collisions migrate");
+    require(writeCalls == 0, "migration writes no payload bytes");
+    require(readFile(fixture.path("logs/legacy-previous-20-0.log")) == "collision", "legacy collision retained");
+    require(readFile(fixture.path("logs/legacy-previous-20-1.log")) == "old previous", "unique previous rename");
+    require(log.stats().startupRenamedBytes == 20 && log.stats().startupPreservedBytes == 20, "legacy byte totals");
+    log.close(); resetFaults();
+    require(log.start(fixture.root.string(), 20), "second legacy startup");
+    require(!std::filesystem::exists(fixture.root / "logs/legacy-previous-20-2.log"), "legacy previous migrated once");
+    require(log.stats().startupRenamedBytes == 0 && writeCalls == 0, "second startup no redundant writes");
+}
+void trackedMirrorMismatchAndRecovery() {
+    Fixture fixture;
+    fog::RunLog log;
+    require(log.start(fixture.root.string(), 21), "tracked initial start");
+    require(log.append("original"), "tracked initial content");
+    require(log.flush(), "tracked content durable");
+    const auto archive = log.archivePath();
+    log.close();
+    // Same length cannot establish equality, including on FAT's coarse mtime.
+    writeFile(fixture.path("last-run.log"), "modified\n");
+    resetFaults();
+    require(log.start(fixture.root.string(), 22), "same-size modification restart");
+    require(readFile(archive) == "original\n", "tracked archive never replaced");
+    require(readFile(fixture.path("logs/legacy-last-22-0.log")) == "modified\n", "same-size unique mirror retained");
+    require(log.stats().startupReusedBytes == 0 && log.stats().startupRenamedBytes == 9, "mismatch not falsely reused");
+    require(log.stats().startupComparedBytes == 18 && writeCalls == 0, "comparison reads both files without writes");
+    require(log.append("next run"), "next tracked content");
+    log.close();
+    // Interrupted run: archive may be ahead of the mirror, or the mirror may
+    // contain unique bytes after the archive sink failed. Both use rename.
+    writeFile(fixture.path("last-run.log"), "next");
+    require(log.start(fixture.root.string(), 23), "partial mirror restart");
+    require(readFile(fixture.path("logs/legacy-last-23-0.log")) == "next", "partial mirror retained");
+    require(log.stats().startupComparedBytes == 0, "size mismatch avoids payload reads");
+    log.close();
+    writeFile(fixture.path("last-run.log"), "crashed unique mirror");
+    writeFile(fixture.path(".last-run-archive"), "../outside.log");
+    require(log.start(fixture.root.string(), 24), "malformed marker restart");
+    require(readFile(fixture.path("logs/legacy-last-24-0.log")) == "crashed unique mirror", "malformed marker cannot discard history");
+    require(log.stats().startupComparedBytes == 0, "malformed marker never opens arbitrary archive");
+    log.close();
+    writeFile(fixture.path("last-run.log"), "missing archive mirror");
+    writeFile(fixture.path(".last-run-archive"), "run-999-0.log");
+    require(log.start(fixture.root.string(), 25), "missing tracked archive restart");
+    require(readFile(fixture.path("logs/legacy-last-25-0.log")) == "missing archive mirror", "missing archive fallback retained");
+}
+void linkedMirrorIsNeverTruncatedThroughArchive() {
+    Fixture fixture;
+    std::filesystem::create_directory(fixture.root / "logs");
+    writeFile(fixture.path("logs/run-26-0.log"), "hard-linked history");
+    std::filesystem::create_hard_link(fixture.root / "logs/run-26-0.log", fixture.root / "last-run.log");
+    writeFile(fixture.path(".last-run-archive"), "run-26-0.log");
+    fog::RunLog log;
+    require(log.start(fixture.root.string(), 27), "linked mirror start");
+    require(readFile(fixture.path("logs/run-26-0.log")) == "hard-linked history", "linked original archive retained");
+    require(readFile(fixture.path("logs/legacy-last-27-0.log")) == "hard-linked history", "linked mirror renamed before reset");
+    require(log.stats().startupReusedBytes == 0, "shared inode never truncated in place");
+    require(log.append("new") && log.flush(), "new linked-mirror run logging");
+    require(readFile(fixture.path("logs/run-26-0.log")) == "hard-linked history", "new mirror writes do not change prior archive");
+}
+void largeHistoryStartup() {
+    Fixture fixture;
+    const std::string payload(8 * 1024 * 1024, 'h');
+    std::filesystem::create_directory(fixture.root / "logs");
+    writeFile(fixture.path("logs/run-30-0.log"), payload);
+    writeFile(fixture.path("last-run.log"), payload);
+    writeFile(fixture.path(".last-run-archive"), "run-30-0.log");
+    fog::RunLog log;
+    require(log.start(fixture.root.string(), 31), "large clean mirror startup");
+    const auto stats = log.stats();
+    require(writeCalls == 0 && stats.startupRenamedBytes == 0, "large startup has zero payload writes");
+    require(stats.startupReusedBytes == payload.size() && stats.startupComparedBytes == payload.size() * 2,
+        "large exact comparison bounded to tracked archive");
+    require(readFile(fixture.path("logs/run-30-0.log")) == payload, "large archive intact");
+    std::cout << "large clean startup: " << stats.startupUs << " us, compared " << stats.startupComparedBytes
+        << " bytes, payload writes " << writeCalls << "\n";
+    log.close();
+    writeFile(fixture.path("last-run.log"), payload);
+    std::filesystem::remove(fixture.root / ".last-run-archive");
+    resetFaults();
+    require(log.start(fixture.root.string(), 32), "large untracked mirror startup");
+    require(log.stats().startupRenamedBytes == payload.size() && log.stats().startupComparedBytes == 0 && writeCalls == 0,
+        "large untracked rename requires no payload reads or writes");
+    require(readFile(fixture.path("logs/legacy-last-32-0.log")) == payload, "large untracked history retained");
+    std::cout << "large untracked startup: " << log.stats().startupUs << " us, renamed "
+        << log.stats().startupRenamedBytes << " bytes, payload writes " << writeCalls << "\n";
 }
 void failedArchiveDirectory() {
     Fixture fixture;
@@ -150,18 +295,19 @@ void syncFailures() {
     failDirectorySync = true;
     fog::RunLog log;
     require(!log.start(fixture.root.string(), 1), "directory sync failure reported");
-    require(readFile(fixture.path("last-run.log")) == "old\n", "uncommitted copies prevent truncation");
+    require(readFile(fixture.path("logs/legacy-last-1-0.log")) == "old\n", "uncommitted rename keeps old content");
+    require(readFile(fixture.path("last-run.log")).empty(), "fresh mirror after preserved rename");
     resetFaults();
     failFileSyncCall = 1;
     require(log.append("first"), "archive batch accepted before I/O");
     require(!log.flush(), "archive sync failure reported at barrier");
     require(!log.archiveHealthy() && log.mirrorHealthy(), "mirror survives archive sync failure");
-    require(readFile(fixture.path("last-run.log")) == "old\nfirst\n", "mirror persisted after archive failure");
+    require(readFile(fixture.path("last-run.log")) == "first\n", "mirror persisted after archive failure");
     const auto firstError = log.error();
     resetFaults();
     require(!log.append("second"), "disabled archive returns false");
     require(!log.flush(), "sticky archive failure at next barrier");
-    require(readFile(fixture.path("last-run.log")) == "old\nfirst\nsecond\n", "mirror writes continue");
+    require(readFile(fixture.path("last-run.log")) == "first\nsecond\n", "mirror writes continue");
     require(log.error() == firstError, "first diagnostic sticky");
 }
 void mirrorFailure() {
@@ -185,15 +331,34 @@ void invalidLegacyAndCommit() {
     writeFile(fixture.path("last-run.log"), "old\n");
     fog::RunLog log;
     require(!log.start(fixture.root.string(), 1), "nonregular legacy rejected");
-    require(readFile(fixture.path("last-run.log")) == "old\n", "invalid previous prevents truncation");
+    require(readFile(fixture.path("logs/legacy-last-1-0.log")) == "old\n", "invalid previous retains moved last history");
     require(log.append("new"), "logging after invalid legacy");
     log.close();
     std::filesystem::remove(fixture.root / "previous-run.log");
     require(!log.start(fixture.root.string(), 1, rejectCommit), "platform commit failure reported");
     require(log.error().find("commit-device") != std::string::npos, "commit diagnostic fixed");
     require(!log.flush(), "missing archive visible at barrier");
-    require(readFile(fixture.path("last-run.log")) == "old\nnew\n", "failed commit prevents truncation");
+    require(readFile(fixture.path("logs/legacy-last-1-0.log")) == "old\n", "older legacy history retained");
+    require(readFile(fixture.path("logs/legacy-last-1-1.log")) == "new\n", "failed commit retains renamed unique mirror");
     require(log.append("after commit failure"), "continue after platform commit failure");
+}
+void reuseCommitFailureRetainsMirror() {
+    Fixture fixture;
+    fog::RunLog log;
+    require(log.start(fixture.root.string(), 50), "commit reuse original start");
+    require(log.append("old") && log.flush(), "commit reuse original content");
+    const auto archive = log.archivePath();
+    log.close();
+    require(!log.start(fixture.root.string(), 51, rejectCommit), "reuse startup commit failure reported");
+    require(log.stats().startupReusedBytes == 4, "reuse identified before rejected commit");
+    require(readFile(fixture.path("last-run.log")) == "old\n", "failed reuse commit prevents truncation");
+    require(log.append("new"), "failed reuse commit keeps both sinks active");
+    require(!log.flush(), "failed reuse commit remains observable");
+    require(readFile(fixture.path("last-run.log")) == "old\nnew\n", "failed commit mirror safely appends");
+    log.close();
+    require(log.start(fixture.root.string(), 52), "failed reuse commit recovery");
+    require(readFile(fixture.path("logs/legacy-last-52-0.log")) == "old\nnew\n", "mixed mirror preserved after commit recovery");
+    require(readFile(archive) == "old\n", "original archive untouched by failed commit");
 }
 void queuedBatchAndShutdown() {
     Fixture fixture;
@@ -204,7 +369,7 @@ void queuedBatchAndShutdown() {
     log.close();
     const auto stats = log.stats();
     require(stats.acceptedLines == 100 && stats.writtenLines == 100, "shutdown drains every accepted line");
-    require(stats.batches <= 4 && fileSyncCalls <= 8, "ordinary lines batched instead of per-line sync");
+    require(stats.batches <= 4 && static_cast<std::uint64_t>(fileSyncCalls.load()) == stats.batches * 2 + 1, "ordinary lines batched instead of per-line sync");
     std::string expected;
     for (int i = 0; i < 100; ++i) expected += "line " + std::to_string(i) + "\n";
     require(readFile(log.archivePath()) == expected, "shutdown preserves FIFO order");
@@ -343,10 +508,19 @@ extern "C" int __wrap_fsync(int fd) {
     }
     return __real_fsync(fd);
 }
+extern "C" int __wrap_rename(const char* from, const char* to) {
+    if (++renameCalls == failRenameCall) { errno = EACCES; return -1; }
+    // Match libnx: rename cannot replace an existing destination.
+    struct stat info{};
+    if (lstat(to, &info) == 0) { errno = EEXIST; return -1; }
+    return __real_rename(from, to);
+}
 int main() {
     try {
-        collisionAndMirror(); legacyMigration(); missingSources(); migrationWriteFailure();
-        failedArchiveDirectory(); syncFailures(); mirrorFailure(); invalidLegacyAndCommit();
+        collisionAndMirror(); legacyMigration(); missingSources(); markerWriteFailure();
+        migrationRenameFailure(); markerSyncAndRotationFailures();
+        renamedLegacyIsNotRepeated(); trackedMirrorMismatchAndRecovery(); linkedMirrorIsNeverTruncatedThroughArchive(); largeHistoryStartup();
+        failedArchiveDirectory(); syncFailures(); mirrorFailure(); invalidLegacyAndCommit(); reuseCommitFailureRetainsMirror();
         queuedBatchAndShutdown(); queueBoundsAndNoIoOnCaller(); byteBoundAndShutdownFailure(); partialAndInterruptedWrites(); backgroundFailureAndConcurrency();
         std::cout << "run_log_tests: " << assertions << " assertions passed\n";
         return 0;

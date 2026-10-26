@@ -1,5 +1,7 @@
 #pragma once
 #include "features/session/infrastructure/api.hpp"
+#include "features/playstation/infrastructure/catalog.hpp"
+#include "core/network/http.hpp"
 #include "features/catalog/domain/catalog.hpp"
 #include "features/settings/domain/controller_layout.hpp"
 #include "features/settings/infrastructure/controller_layout_storage.hpp"
@@ -47,6 +49,9 @@
 #include <unistd.h>
 
 #include "platform/switch/switch_runtime.hpp"
+#include "platform/switch/ps_sensors.hpp"
+#include "features/playstation/domain/touch_trace.hpp"
+#include "features/playstation/infrastructure/native_input.hpp"
 #include "app/app_diagnostics.hpp"
 #include "app/presentation/presentation_text.hpp"
 
@@ -67,8 +72,8 @@ inline constexpr SDL_Color white{234, 238, 245, 255};
 inline constexpr SDL_Color muted{163, 178, 200, 255};
 inline constexpr SDL_Color accent{107, 216, 190, 255};
 
-enum class Screen { Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres };
-enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth };
+enum class Screen { Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails };
+enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation };
 
 // Main-thread presentation coordinator. Workers are joined before their state is read.
 class ApplicationController {
@@ -82,6 +87,10 @@ private:
     std::string playbackTimings() const;
     void logOutputTimings(bool final);
     void closeStream() noexcept;
+    void samplePlayStationInput(PadState& pad);
+    void logPlayStationInput(bool final);
+    void dispatchPlayStationInput(bool allowed);
+    void releasePlayStationInput();
     bool closeTransport(bool final) noexcept;
     bool startTransport();
     void retryTransport(const char* reason);
@@ -130,6 +139,9 @@ private:
     void moveCatalog(u64 keys);
     void selectCatalogGame(const Json& game);
     void loadComputers();
+    void loadPlayStation();
+    void pollPlayStation();
+    void cancelPlayStation();
     void setCaptcha(const Json& response);
     void poll();
     void beginLogin();
@@ -170,6 +182,20 @@ private:
     fog::SteamArtworkResolver steamArtwork_;
     Json history_ = Json::array(), detail_ = Json::object(), autoComputers_ = Json::object();
     bool detailsFromAutomatic_ = false;
+    bool selectedPlayStation_ = false, streamPlayStation_ = false;
+    platform::PsSensors psSensors_;
+    fog::playstation::TouchTrace psTouchTrace_;
+    fog::playstation::NativeInput psNativeInput_;
+    bool psTouchLastSubmitted_ = false;
+    float psGyroPeak_ = 0, psAccelPeak_ = 0;
+    std::uint64_t psMotionMovedFrames_ = 0;
+    std::uint64_t psLogAtMs_ = 0, psGamepadAccepted_ = 0, psGamepadRejected_ = 0;
+    Json playStationComputers_ = Json::array();
+    std::future<Json> playStationPending_;
+    std::shared_ptr<fog::HttpClient> playStationHttp_;
+    std::shared_ptr<fog::PlayStationCatalogProgressChannel> playStationUpdates_;
+    std::string playStationError_;
+    std::chrono::steady_clock::time_point playStationLoadedAt_{};
     std::size_t automaticSelection_ = 1;
     bool ownSteam_ = false, sidebar_ = false, checkoutAutoPoll_ = false, stopAfterTask_ = false;
     bool authSaveFailed_ = false;
@@ -222,7 +248,7 @@ private:
     Json computers_ = Json::array();
     std::size_t selection_ = 0;
     int computerPage_ = 1, selectedGameId_ = 0;
-    std::string search_, selectedGameName_, status_ = "Готово";
+    std::string search_, selectedGameName_, status_;
     std::string checkoutStatus_ = "Ожидаем готовность сервера…";
     fog::AuthStep authStep_ = fog::AuthStep::Unknown;
     SDL_Texture* captcha_ = nullptr;

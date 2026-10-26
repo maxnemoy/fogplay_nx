@@ -122,11 +122,12 @@ void ApplicationController::handleCheckout() {
     checkoutAutoPoll_ = fog::checkoutNeedsAutomaticCheck(result);
     if (result.stopRequested) checkoutAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
     if (result.state == fog::CheckoutState::Ready && !stopAfterTask_ && !result.stopRequested) {
-        startStream(result.hash); return;
+        streamPlayStation_ = selectedPlayStation_;
+        startStream(result.hash,!selectedPlayStation_); return;
     }
     if (!sessionPending_) {
         disarmExitHandling(); stopAfterTask_ = false;
-        screen_ = Screen::Games;
+        screen_ = selectedPlayStation_ ? Screen::PlayStation : Screen::Games;
         status_ = result.state == fog::CheckoutState::Rejected ? "Сервер отклонил заказ. Обновите список ПК." : "Аренда завершена.";
         return;
     }
@@ -154,21 +155,57 @@ void ApplicationController::pollCheckout(bool manual) {
 }
 
 void ApplicationController::createSession() {
-    if (sessionPending_ || selection_ >= computers_.size()) return;
-    if (!api_.loggedIn()) { loginReturn_ = Screen::Details; screen_ = Screen::Consent; return; }
-    // Verify the same SD replacement path before any billable request.
-    checkStorage();
-    const auto& pc = computers_[selection_];
+    const bool playStation = screen_ == Screen::PlayStationDetails;
+    if (screen_ != Screen::Details && !playStation) return;
+    if (playStation && (playStationLoadedAt_ == std::chrono::steady_clock::time_point{} ||
+        std::chrono::steady_clock::now()-playStationLoadedAt_ > std::chrono::seconds(60))) {
+        loadPlayStation();
+        status_ = "Список устарел. Обновляем тариф: подтвердите новую цену перед подключением.";
+        return;
+    }
+    const auto& computers = playStation ? playStationComputers_ : computers_;
+    if (sessionPending_ || selection_ >= computers.size()) return;
+    const auto& pc = computers[selection_];
     fog::CreateOrderRequest order;
     order.computerId = std::stoi(field(pc,"id","0"));
     order.tariffId = std::stoi(field(pc,"tariff_id","0"));
-    order.gameId = selectedGameId_; order.ownSteamAccount = ownSteam_;
-    recentLaunch_.prepare(selectedRecentGame_);
+    if (playStation && (!pc.value("listed",false) || !pc.value("launchable",false) ||
+        !fog::isPlayStationComputerId(order.computerId) || order.tariffId <= 0)) {
+        status_ = "Тариф PlayStation не подтверждён. Вернитесь к списку и нажмите X.";
+        return;
+    }
+    if (!api_.loggedIn()) {
+        loginReturn_ = playStation ? Screen::PlayStationDetails : Screen::Details;
+        screen_ = Screen::Consent; return;
+    }
+    // Verify the same SD replacement path before any billable request.
+    checkStorage();
+    selectedPlayStation_ = playStation;
+    order.gameId = playStation ? 0 : selectedGameId_;
+    order.ownSteamAccount = playStation ? false : ownSteam_;
+    recentLaunch_.prepare(playStation ? std::nullopt : selectedRecentGame_);
     // Lock focus/exit before the worker can send a billable create request.
     armExitHandling(); sessionPending_ = true; stopAfterTask_ = false;
     screen_ = Screen::Checkout;
-    checkoutStatus_ = "Создаём заказ. Ожидаем ответ Fog Play…";
-    start(Task::Create, [this, order] { checkout_.create(order); return Json::object(); });
+    checkoutStatus_ = playStation ? "Проверяем актуальность тарифа PlayStation…" : "Создаём заказ. Ожидаем ответ Fog Play…";
+    start(Task::Create, [this, order, playStation, offeredPrice = pc.value("price",Json{})] {
+        if (playStation) {
+            auto current = fog::fetchPlayStationComputers();
+            const auto offer = std::find_if(current.begin(),current.end(),[&order](const Json& candidate) {
+                return candidate.value("id",0) == order.computerId;
+            });
+            if (offer == current.end() || !offer->value("listed",false) || !offer->value("launchable",false) ||
+                offer->value("tariff_id",0) != order.tariffId || !offer->contains("price") ||
+                offer->at("price") != offeredPrice) {
+                return Json{{"playstation_offer_changed",true},{"computers",std::move(current)}};
+            }
+            // Main-thread lifecycle checks must accept this result before billing.
+            return Json{{"playstation_offer_verified",true},
+                {"computer_id",order.computerId},{"tariff_id",order.tariffId}};
+        }
+        checkout_.create(order);
+        return Json::object();
+    });
 }
 
 void ApplicationController::loadSessions() {
@@ -198,6 +235,12 @@ void ApplicationController::connectSession() {
         }
         throw;
     }
+    // Only an exact known computer identity selects the PlayStation protocol.
+    // Missing/unknown identity keeps the ordinary stream mode.
+    const auto& session = sessions_[selection_];
+    const auto id = session.find("computer_id");
+    streamPlayStation_ = id != session.end() && id->is_number_integer() &&
+        fog::isPlayStationComputerId(id->get<int>());
     startStream(hash,false);
 }
 

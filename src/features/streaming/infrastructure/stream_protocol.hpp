@@ -31,7 +31,7 @@ std::string frame(const std::string& command,
                   const std::string& body = {});
 std::string base64Encode(const std::string& bytes);
 std::string base64Decode(const std::string& encoded);
-Json gamepad(const Gamepad& state);
+Json gamepad(const Gamepad& state, bool playStation = false);
 struct IceServer { std::string url, username, credential; };
 std::vector<IceServer> iceServers(const Json& initMessage);
 // Keep one video codec per track, preferring HEVC only when explicitly selected.

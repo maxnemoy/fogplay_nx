@@ -29,7 +29,7 @@ g++ -std=c++17 -Wall -Wextra -Werror -Isrc -Ithird_party $(pkg-config --cflags s
 ./work/stream_overlay_tests | tee work/logs/stream-overlay-tests.log
 g++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/video_recovery_tests.cpp -o work/video_recovery_tests
 ./work/video_recovery_tests | tee work/logs/video-recovery-tests.log
-g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -Isrc src/core/logging/run_log.cpp tests/run_log_tests.cpp -Wl,--wrap=write -Wl,--wrap=fsync -o work/run_log_tests
+g++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread -Isrc src/core/logging/run_log.cpp tests/run_log_tests.cpp -Wl,--wrap=write -Wl,--wrap=fsync -Wl,--wrap=rename -o work/run_log_tests
 ./work/run_log_tests | tee work/logs/run-log-tests.log
 g++ -std=c++17 -Wall -Wextra -Werror -Isrc -Ithird_party \
     src/core/storage/storage.cpp src/features/settings/infrastructure/video_settings_storage.cpp tests/video_settings_tests.cpp tests/no_replace_rename.cpp \

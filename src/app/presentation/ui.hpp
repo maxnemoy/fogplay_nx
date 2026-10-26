@@ -10,7 +10,7 @@ namespace fog::ui {
 inline constexpr std::size_t HistoryColumns = 4;
 constexpr int Width = 1280;
 constexpr int Height = 720;
-enum class Section { Search, Games, Computers, History, Settings };
+enum class Section { Search, Games, Computers, History, Settings, PlayStation };
 struct Chrome {
     Section section = Section::Games;
     bool sidebarExpanded = false;

@@ -23,10 +23,25 @@ struct PlaybackTiming {
 extern fog::RunLog runLog;
 extern PlaybackTiming diagnosticTiming;
 void diagnostic(const std::string& text, std::size_t maximum = 512);
+void firstUiFramePresented();
+class StartupStage {
+public:
+    explicit StartupStage(const char* name);
+    ~StartupStage() noexcept;
+    StartupStage(const StartupStage&) = delete;
+    StartupStage& operator=(const StartupStage&) = delete;
+private:
+    const char* name_;
+    std::chrono::steady_clock::time_point began_;
+    int exceptions_;
+};
 struct LogSession {
     LogSession();
+    void start();
     ~LogSession();
     LogSession(const LogSession&) = delete;
     LogSession& operator=(const LogSession&) = delete;
+private:
+    bool started_ = false;
 };
 }

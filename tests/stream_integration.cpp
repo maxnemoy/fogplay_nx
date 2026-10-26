@@ -2,6 +2,7 @@
 #include "features/streaming/infrastructure/stream.hpp"
 #include "features/streaming/infrastructure/stream_protocol.hpp"
 #include "features/streaming/application/remote_input.hpp"
+#include "features/playstation/infrastructure/native_input.hpp"
 #include <rtc/rtc.hpp>
 #include <juice/juice.h>
 #include <atomic>
@@ -240,6 +241,7 @@ struct Fixture {
     }
     bool initializePeer;
     bool expectRelay;
+    bool expectPlayStation;
     bool rejectWebrtc = false;
     juice_server_t* turn = nullptr;
     std::string turnAddress;
@@ -248,8 +250,10 @@ struct Fixture {
     bool advertiseRtx = true;
     std::string fixtureClientHash;
     explicit Fixture(std::string serverHeartbeat = "4000,4000", bool initialize = true, bool useHevc = false,
-                     std::string clientSuffix = "abcde", bool useTurn = false, bool requestedRelay = false)
-        : heartbeat(std::move(serverHeartbeat)), initializePeer(initialize), expectRelay(requestedRelay), hevc(useHevc),
+                     std::string clientSuffix = "abcde", bool useTurn = false, bool requestedRelay = false,
+                     bool playStation = false)
+        : heartbeat(std::move(serverHeartbeat)), initializePeer(initialize), expectRelay(requestedRelay),
+          expectPlayStation(playStation), hevc(useHevc),
           fixtureClientHash("fixture" + std::move(clientSuffix)) {
         if (useTurn) {
             juice_server_credentials_t credentials{"fixture-user", "fixture-password", 4};
@@ -360,6 +364,7 @@ struct Fixture {
             if (initializePeer) signal({{"id", "init"}, {"data", Json::array({"[]"}).dump()}});
         } else if (id == "init_webrtc") {
             assert(j.at("iceTransportPolicy") == (expectRelay ? "relay" : "all"));
+            assert(j.at("isPS") == expectPlayStation);
             if (rejectWebrtc) { signal({{"id", "init_webrtc_error"}}); return; }
             assert(enabled && j.at("limit_fps") == 30 && j.at("gamepad") == true && j.at("control_only") == false);
             // Provider-style empty marker arrives before an offer. The old client
@@ -445,10 +450,11 @@ struct Fixture {
                     }
                 }
                 else if (id == "gamepad") {
+                    assert(j.at("isPS") == expectPlayStation);
                     assert(j.at("state").at("buttons").size() == 18 && j.at("state").at("axes").size() == 4);
                     if (j.at("state").at("buttons")[0] == 1) pressed = true;
                     else if (pressed) neutral = true;
-                } else if (id == "mousemove" || id == "mousedown" || id == "mouseup" ||
+                } else if (id == "gamepad_touch" || id == "gamepad_sensor" || id == "mousemove" || id == "mousedown" || id == "mouseup" ||
                            id == "mousewheel" || id == "keydown" || id == "keyup" || id == "unicode_input") {
                     remoteControls.push_back(j);
                 }
@@ -1220,14 +1226,16 @@ int main(int argc, char** argv) {
         std::cout << "Local transport error/cleanup passed with sanitized diagnostics\n";
     }
     stream::Client::cleanupRuntime();
-    {
+    for (const bool playStation : {false, true}) {
         // Reuse one Client and rental hash, changing only its connection suffix.
         // Old callbacks must not contaminate the replacement RTC generation.
         stream::Client client;
+        assert(client.configurePlayStation(playStation));
         for (unsigned attempt=0; attempt<2; ++attempt) {
             const std::string suffix = attempt == 0 ? "abcde" : "abcdf";
-            Fixture fixture("4000,4000",true,false,suffix);
+            Fixture fixture("4000,4000",true,false,suffix,false,false,playStation);
             assert(client.startForTesting("fixture",suffix,"ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+            assert(!client.configurePlayStation(!playStation));
             // Callback ping before sender publication must survive in a bounded
             // slot and transfer to the worker only after route authorization.
             client.receiveControlForTesting(R"({"id":"ping","ts":42})");
@@ -1243,19 +1251,153 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             assert(gotFrame && client.ready() && fixture.controlReady && fixture.pong);
+            assert(client.inputDiagnostics().find("nativeDownQueued=0 ") != std::string::npos);
+            const Json touch{{"id", "gamepad_touch"}, {"index", 0},
+                {"data", {{"type", 0x656}, {"finger", 0}, {"x", 0.25}, {"y", 0.75}}}};
+            if (playStation) {
+                for (const auto invalid : {"index", "finger", "x", "type"}) {
+                    auto bad = touch;
+                    if (std::string(invalid) == "index") bad["index"] = 1;
+                    else bad["data"][invalid] = std::string(invalid) == "x" ? -0.1 : 9;
+                    assert(!client.sendControl(bad.dump()));
+                }
+                assert(client.sendControl(touch.dump()));
+                auto move = touch; move["data"]["type"] = 0x657; move["data"]["x"] = 0.9;
+                assert(client.sendControl(move.dump()));
+                auto up = move; up["data"]["type"] = 0x658; assert(client.sendControl(up.dump()));
+                for (const auto sensor : {1, 2}) {
+                    const Json motion{{"id", "gamepad_sensor"}, {"index", 0},
+                        {"data", {{"sensor", sensor}, {"x", 0.1}, {"y", 0.2}, {"z", 0.3}}}};
+                    auto bad = motion; bad["data"]["sensor"] = 3; assert(!client.sendControl(bad.dump()));
+                    assert(client.sendControl(motion.dump()));
+                }
+                const auto nativeAt = Clock::now();
+                while (fixture.remoteControls.size() < 5 && Clock::now() - nativeAt < std::chrono::seconds(1)) {
+                    fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                assert(fixture.remoteControls.size() == 5 && fixture.remoteControls[1]["data"]["x"] == 0.9);
+                const auto native = client.inputDiagnostics();
+                assert(native.find("nativeDownSent=1 ") != std::string::npos && native.find("nativeMoveSent=1 ") != std::string::npos);
+                assert(native.find("nativeUpSent=1 ") != std::string::npos && native.find("gyroSent=1 ") != std::string::npos);
+                assert(native.find("invalidNative=6 ") != std::string::npos);
+            } else assert(!client.sendControl(touch.dump()));
             assert(client.diagnostics().find("incomingIgnored=0 ") != std::string::npos);
+            assert(!client.configurePlayStation(!playStation));
+            stream::Gamepad pad; pad.buttons[0] = 1; pad.buttons[17] = 1;
+            pad.axes[0] = 0.5f; pad.leftTrigger = 0.25f; pad.rightTrigger = 0.75f;
+            assert(!client.sendControl(stream::protocol::gamepad(pad, !playStation).dump()));
+            auto missingMode = stream::protocol::gamepad(pad, playStation);
+            missingMode.erase("isPS");
+            assert(!client.sendControl(missingMode.dump()));
+            assert(client.sendGamepad(pad));
+            const auto pressedAt = Clock::now();
+            while (!fixture.pressed && Clock::now() - pressedAt < std::chrono::seconds(1)) {
+                fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(fixture.pressed);
+            if (playStation) {
+                const auto input = client.inputDiagnostics();
+                assert(input.find("touchQueuedDown=1 ") != std::string::npos);
+                assert(input.find("touchSentDown=1 ") != std::string::npos);
+                assert(input.find("ack=unsupported") != std::string::npos);
+            }
             if (attempt == 0) {
+                assert(client.sendGamepad(stream::Gamepad{}));
+                const auto neutralAt = Clock::now();
+                while (!fixture.neutral && Clock::now() - neutralAt < std::chrono::seconds(1)) {
+                    fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                assert(fixture.neutral);
                 assert(client.disconnectForRetry());
                 assert(client.error().empty() && !client.ready() && !client.disconnected());
-            } else client.close();
+            } else {
+                client.receiveControlForTesting(R"({"id":"close"})");
+                client.pump();
+                assert(!client.error().empty());
+                // Failed transports still own their final neutral until close.
+                assert(!client.configurePlayStation(!playStation));
+                client.close();
+            }
             for (unsigned tick=0; tick<20; ++tick) {
                 fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             assert(fixture.closed == (attempt == 1));
+            assert(fixture.neutral); // Final close releases with the negotiated controller type.
+            if (playStation) {
+                const auto input = client.inputDiagnostics();
+                assert(input.find("touchSentDown=1 ") != std::string::npos);
+                assert(input.find("touchSentUp=1 ") != std::string::npos);
+                assert(input.find("touchFailedDown=0 ") != std::string::npos);
+                const std::string sensorSent = attempt == 0 ? "1 " : "2 ";
+                assert(input.find("accelSent=" + sensorSent) != std::string::npos && input.find("gyroSent=" + sensorSent) != std::string::npos);
+            }
         }
     }
     stream::Client::cleanupRuntime();
-    std::cout << "Same Client/rental hash reinit with fresh suffix, real frames/ping, retry no-close/final-close passed\n";
+    std::cout << "Both controller modes: same Client reinit, mode lock, matching init/input/neutral, retry no-close/final-close passed\n";
+    {
+        stream::Client client;
+        assert(client.configurePlayStation(true));
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            const std::string suffix = attempt == 0 ? "abcde" : "abcdf";
+            Fixture fixture("4000,4000", true, false, suffix, false, false, true);
+            assert(client.startForTesting("fixture", suffix,
+                "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+            const auto begin = Clock::now();
+            while (Clock::now() - begin < std::chrono::seconds(5)) {
+                fixture.pump(); client.pump(); fixture.sendMedia();
+                stream::Packet packet; while (client.poll(packet)) {}
+                assert(client.error().empty());
+                if (client.ready() && fixture.controlReady && fixture.pong) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(client.ready() && fixture.controlReady && fixture.pong && fixture.remoteControls.empty());
+            // Application transport startup creates a new NativeInput, even
+            // when the same Client reconnects while a finger remains held.
+            fog::playstation::NativeInput native;
+            fog::playstation::PsSensorSnapshot sample;
+            sample.enabled = sample.touchValid = sample.touchFresh = true;
+            sample.touchCount = 1;
+            sample.touches[0] = {true, 42, 1279, 719, 0, 0};
+            sample.motion.valid = true;
+            sample.motion.sampleNumber = 1;
+            sample.motion.psAccelerationG = {0, 1, 0};
+            sample.motion.psGyroRadiansPerSecond = {1, 2, 3};
+            const auto emit = [&](const Json& command) { return client.sendControl(command.dump()); };
+            // Both initial UP commands must survive the real outbox without
+            // any preceding DOWN, before held touch and motion are forwarded.
+            client.blockControlSendForTesting(true);
+            native.update(sample, 100, true, emit);
+            const Json expected = Json::array({
+                fog::playstation::NativeInput::touch(0x658, 0, 0, 0),
+                fog::playstation::NativeInput::touch(0x658, 1, 0, 0),
+                fog::playstation::NativeInput::touch(0x656, 0, 1, 1),
+                fog::playstation::NativeInput::sensor(1, {0, fog::playstation::NativeInput::Gravity, 0}),
+                fog::playstation::NativeInput::sensor(2, {1, 2, 3})});
+            assert(native.contactsInitialized() && native.counters().resetUpQueued == 2 &&
+                native.counters().up == 0 && native.counters().down == 1 && native.counters().rejected == 0);
+            native.update(sample, 140, true, emit);
+            assert(native.counters().resetUpQueued == 2 && native.counters().up == 0 && native.counters().down == 1 &&
+                native.counters().accel == 1 && native.counters().gyro == 1);
+            client.blockControlSendForTesting(false);
+            const auto inputAt = Clock::now();
+            while (fixture.remoteControls.size() < expected.size() &&
+                   Clock::now() - inputAt < std::chrono::seconds(1)) {
+                fixture.pump(); client.pump();
+                assert(client.error().empty());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(fixture.remoteControls == expected);
+            const auto input = client.inputDiagnostics();
+            assert(input.find("nativeUpSent=2 ") != std::string::npos &&
+                input.find("nativeDownSent=1 ") != std::string::npos &&
+                input.find("accelSent=1 ") != std::string::npos && input.find("gyroSent=1 ") != std::string::npos);
+            if (attempt == 0) assert(client.disconnectForRetry());
+            else client.close();
+        }
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "PS native transport reset: two initial UPs before held DOWN/sensors, once per generation, same Client reconnect passed\n";
     // Failure before any control channel exists must retain the ICE owner too.
     {
         Fixture fixture("4000,4000", false);

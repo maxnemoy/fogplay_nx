@@ -10,13 +10,18 @@
 
 namespace fog {
 // Ordinary, already-sanitized diagnostics only. Rental/auth journals use separate
-// synchronous storage. start/close are owner-thread lifecycle operations.
+// synchronous storage. start/close are owner-thread lifecycle operations; only
+// one RunLog may own a data directory at a time.
 class RunLog {
 public:
     struct Stats {
         std::uint64_t acceptedLines = 0, writtenLines = 0, droppedLines = 0, batches = 0;
         std::size_t queuedLines = 0, queuedBytes = 0, highWaterBytes = 0;
         std::uint64_t lastBatchUs = 0, maxBatchUs = 0;
+        // Startup preservation never copies payload bytes. Compared bytes include
+        // reads from both the mirror and its tracked archive.
+        std::uint64_t startupPreservedBytes = 0, startupRenamedBytes = 0;
+        std::uint64_t startupReusedBytes = 0, startupComparedBytes = 0, startupUs = 0;
     };
     static constexpr std::size_t maxQueuedLines = 512;
     static constexpr std::size_t maxQueuedBytes = 256 * 1024;
@@ -25,7 +30,7 @@ public:
     ~RunLog();
     RunLog(const RunLog&) = delete;
     RunLog& operator=(const RunLog&) = delete;
-    // Commit executes during start and on the writer thread after each batch.
+    // Commit executes during start, clean close, and on the writer thread after each batch.
     // The callback must be thread-safe and must not re-enter this RunLog.
     bool start(const std::string& dataDir, std::time_t timestamp = std::time(nullptr), bool (*commit)() = nullptr) noexcept;
     // Nonblocking bounded enqueue. true means accepted with both sinks healthy,
@@ -49,7 +54,7 @@ private:
     void writer() noexcept;
     int archiveFd_ = -1, mirrorFd_ = -1;
     std::atomic<bool> archiveHealthy_{false}, mirrorHealthy_{false};
-    std::string archivePath_;
+    std::string archivePath_, dataDir_;
     mutable std::mutex mutex_;
     std::condition_variable ready_, drained_;
     std::thread worker_;

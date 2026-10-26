@@ -10,7 +10,7 @@ endif
 include $(DEVKITPRO)/libnx/switch_rules
 endif
 
-APP_VERSION := 0.4.28
+APP_VERSION := 0.5.5
 APP_TITLE := FogPlay NX $(APP_VERSION)
 APP_AUTHOR := maxnemoy
 TARGET := fogplay_nx

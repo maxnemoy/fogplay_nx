@@ -61,22 +61,24 @@ void ApplicationController::input(u64 keys) {
     if (screen_ == Screen::ConnectionSettings) { inputConnectionSettings(keys); return; }
     if (screen_ == Screen::Genres) { inputGenres(keys); return; }
     if (sidebar_) {
-        if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) nav_ = (nav_ + 3) % 4;
-        if (keys & (HidNpadButton_Down | HidNpadButton_StickLDown)) nav_ = (nav_ + 1) % 4;
-        if (keys & (HidNpadButton_B | HidNpadButton_Right)) sidebar_ = false;
+        if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) nav_ = (nav_ + 4) % 5;
+        if (keys & (HidNpadButton_Down | HidNpadButton_StickLDown)) nav_ = (nav_ + 1) % 5;
+        if (keys & (HidNpadButton_B | HidNpadButton_Right | HidNpadButton_StickLRight)) sidebar_ = false;
         if (keys & HidNpadButton_Y) { sidebar_ = false; loginReturn_ = screen_; if (api_.loggedIn()) loadSessions(); else screen_ = Screen::Consent; }
         if (keys & HidNpadButton_A) {
             sidebar_ = false; selection_ = 0;
             if (nav_ == 0) searchGames();
             else if (nav_ == 1) { search_.clear(); genreId_ = 0; genreBarFocused_ = false; loadGames(); }
-            else if (nav_ == 2) loadHistory();
+            else if (nav_ == 2) loadPlayStation();
+            else if (nav_ == 3) loadHistory();
             else screen_ = Screen::Settings;
         }
         return;
     }
     if (keys & HidNpadButton_Y) { loginReturn_ = screen_; if (api_.loggedIn()) loadSessions(); else screen_ = Screen::Consent; return; }
     if (keys & HidNpadButton_B) {
-        if (screen_ == Screen::Details) {
+        if (screen_ == Screen::PlayStationDetails) screen_ = Screen::PlayStation;
+        else if (screen_ == Screen::Details) {
             screen_ = detailsFromAutomatic_ ? Screen::GameDetail : Screen::Computers;
             if (detailsFromAutomatic_) selection_ = automaticSelection_;
             if (detailsFromAutomatic_) latency_.cancel(); else latency_.request();
@@ -84,6 +86,34 @@ void ApplicationController::input(u64 keys) {
         else if (screen_ == Screen::Computers) { latency_.cancel(); screen_ = Screen::GameDetail; selection_ = 4; }
         else if (screen_ == Screen::GameDetail) { latency_.cancel(); screen_ = Screen::Games; selection_ = catalog_.selected(); }
         else sidebar_ = true;
+        return;
+    }
+    if (screen_ == Screen::PlayStationDetails) {
+        if (keys & HidNpadButton_A) createSession();
+        else if (keys & HidNpadButton_X) loadPlayStation();
+        return;
+    }
+    if (screen_ == Screen::PlayStation) {
+        const auto count = playStationComputers_.size();
+        constexpr std::size_t columns = 4;
+        if (!count) selection_ = 0;
+        else {
+            selection_ = std::min(selection_,count-1);
+            if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) {
+                if (selection_ % columns) --selection_;
+                else if (!sessionPending_) sidebar_ = true;
+            }
+            if ((keys & (HidNpadButton_Right | HidNpadButton_StickLRight)) && selection_ % columns < columns-1 && selection_+1 < count) ++selection_;
+            if ((keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) && selection_ >= columns) selection_ -= columns;
+            if ((keys & (HidNpadButton_Down | HidNpadButton_StickLDown)) && (selection_/columns+1)*columns < count)
+                selection_ = std::min(selection_+columns,count-1);
+        }
+        if (keys & HidNpadButton_X) loadPlayStation();
+        else if ((keys & HidNpadButton_A) && selection_ < playStationComputers_.size()) {
+            const auto& pc = playStationComputers_[selection_];
+            if (pc.value("listed",false) && pc.value("launchable",false)) screen_ = Screen::PlayStationDetails;
+            else status_ = "Тариф не подтверждён на сайте. Обновите список кнопкой X.";
+        }
         return;
     }
     if (screen_ == Screen::Details) { if (keys & HidNpadButton_A) createSession(); else if ((keys & HidNpadButton_X) && !detailsFromAutomatic_) latency_.request(); return; }

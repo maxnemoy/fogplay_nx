@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -10,33 +11,46 @@ namespace stream {
 // capacity for releases even when ordinary commands saturate the queue.
 class ControlQueue {
 public:
-    enum class Mode { Ordered, Gamepad, MouseMove, Pong, Release };
-    struct Message { std::string payload, input; Mode mode; std::uint64_t enqueuedMs = 0; std::string release; };
+    enum class Mode { Ordered, Gamepad, MouseMove, Pong, Release, GamepadEdge, GamepadRelease, TouchMove, Motion };
+    struct InputTrace {
+        bool playStation = false, touchDown = false, touchEdge = false;
+        std::uint64_t sequence = 0;
+        unsigned nativeInput = 0; // 1=touch down, 2=move, 3=up, 4=accel, 5=gyro.
+    };
+    struct Message { std::string payload, input; Mode mode; std::uint64_t enqueuedMs = 0; std::string release; InputTrace trace{}; };
     static constexpr std::size_t MaxMessages = 64, ReleaseReserve = 16;
     static constexpr std::size_t MaxBytes = 256 * 1024, ReleaseBytes = 16 * 1024;
     static constexpr std::size_t GamepadBytes = 64 * 1024;
     static constexpr std::uint64_t StallMs = 15000;
-    bool push(std::string payload, Mode mode, std::string input, std::uint64_t now, std::string releasePayload = {}) {
+    bool push(std::string payload, Mode mode, std::string input, std::uint64_t now, std::string releasePayload = {}, InputTrace trace = {false, false, false, 0, 0}) {
         if (mode == Mode::Release && !input.empty()) {
             // Multiple best-effort releases for an already released key/button
             // need one entry, unless a newer press for that input intervened.
             for (auto it = queue_.rbegin(); it != queue_.rend(); ++it)
                 if (it->input == input) {
-                    if (it->mode == Mode::Release) return true;
+                    if (it->mode == Mode::Release) {
+                        ++coalesced_;
+                        if (trace.nativeInput < nativeCoalesced_.size()) ++nativeCoalesced_[trace.nativeInput];
+                        return true;
+                    }
                     break;
                 }
         }
         auto replaced = queue_.end();
-        if (mode == Mode::Gamepad || mode == Mode::Pong || mode == Mode::MouseMove) {
+        if (mode == Mode::Gamepad || mode == Mode::Pong || mode == Mode::MouseMove || mode == Mode::TouchMove || mode == Mode::Motion) {
             for (auto it = queue_.end(); it != queue_.begin();) {
                 --it;
+                // A PS touchpad transition is an ordered boundary. A later
+                // analog snapshot must never replace a state before that edge.
+                if (mode == Mode::Gamepad && (it->mode == Mode::GamepadEdge || it->mode == Mode::GamepadRelease)) break;
                 // A pointer position before a click must stay before that click.
                 if (mode == Mode::MouseMove && (it->mode == Mode::Ordered || it->mode == Mode::Release)) break;
-                if (it->mode == mode) { replaced = it; break; }
+                if (mode == Mode::TouchMove && (it->mode == Mode::Ordered || it->mode == Mode::Release)) break;
+                if (it->mode == mode && ((mode != Mode::TouchMove && mode != Mode::Motion) || it->input == input)) { replaced = it; break; }
             }
         }
         const bool gamepad = mode == Mode::Gamepad;
-        const bool release = mode == Mode::Release;
+        const bool release = mode == Mode::Release || mode == Mode::GamepadRelease;
         const auto retainedCount = queue_.size() - (replaced == queue_.end() ? 0 : 1);
         const auto retainedBytes = bytes_ - (replaced == queue_.end() ? 0 : (replaced->payload.size() + replaced->release.size()));
         std::size_t stateBytes = 0, stateCount = 0;
@@ -56,10 +70,13 @@ public:
         }
         // Admit replacements before removing the previous state: rejected
         // oversize updates must leave the last accepted state deliverable.
-        if (replaced != queue_.end()) queue_.erase(replaced);
+        if (replaced != queue_.end()) {
+            if (replaced->trace.nativeInput < nativeCoalesced_.size()) ++nativeCoalesced_[replaced->trace.nativeInput];
+            queue_.erase(replaced); ++coalesced_;
+        }
         if (!pending_) { pending_ = true; began_ = now; }
         bytes_ = retainedBytes + payload.size() + releasePayload.size();
-        queue_.push_back({std::move(payload), std::move(input), mode, now, std::move(releasePayload)});
+        queue_.push_back({std::move(payload), std::move(input), mode, now, std::move(releasePayload), trace});
         return true;
     }
     bool empty() const { return queue_.empty(); }
@@ -78,11 +95,23 @@ public:
     std::size_t size() const { return queue_.size(); }
     std::size_t bytes() const { return bytes_; }
     std::uint64_t rejected() const { return rejected_; }
+    std::uint64_t coalesced() const { return coalesced_; }
+    const std::array<std::uint64_t, 6>& nativeCoalesced() const { return nativeCoalesced_; }
+    std::array<std::uint64_t, 6> nativePending() const {
+        std::array<std::uint64_t, 6> result{};
+        for (const auto& message : queue_)
+            if (message.trace.nativeInput < result.size()) ++result[message.trace.nativeInput];
+        return result;
+    }
+    std::size_t touchEdges() const {
+        return std::count_if(queue_.begin(), queue_.end(), [](const Message& message) { return message.trace.touchEdge; });
+    }
     void clear() { queue_.clear(); bytes_ = 0; pending_ = false; }
 private:
     std::deque<Message> queue_;
     std::size_t bytes_ = 0;
-    std::uint64_t began_ = 0, rejected_ = 0;
+    std::uint64_t began_ = 0, rejected_ = 0, coalesced_ = 0;
     bool pending_ = false;
+    std::array<std::uint64_t, 6> nativeCoalesced_{};
 };
 }

@@ -3,6 +3,7 @@
 #endif
 #include "platform/switch/switch_runtime.hpp"
 #include "app/app_diagnostics.hpp"
+#include "app/presentation/startup_screen.hpp"
 #include "core/storage/storage.hpp"
 #include "features/streaming/infrastructure/stream.hpp"
 #include <SDL_image.h>
@@ -75,42 +76,72 @@ std::string deviceId() {
     return id;
 }
 
-void Runtime::init() {
-    checkResult(romfsInit(), "RomFS"); romfs = true;
-    SocketInitConfig config = *socketGetDefaultInitConfig();
-    config.num_bsd_sessions = 12;
-    config.sb_efficiency = 8;
-    checkResult(socketInitialize(&config), "Sockets"); sockets = true;
-    checkResult(nifmInitialize(NifmServiceType_User), "Network interface service"); nifm = true;
-    checkResult(plInitialize(PlServiceType_User), "Shared font service"); pl = true;
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER) != 0) throw std::runtime_error(SDL_GetError());
-    sdl = true;
-    if (TTF_Init() != 0) throw std::runtime_error(TTF_GetError());
-    ttf = true;
-    image = true;
-    if ((IMG_Init(IMG_INIT_PNG) & IMG_INIT_PNG) == 0) throw std::runtime_error(IMG_GetError());
-    window = SDL_CreateWindow("FogPlay NX", 0, 0, 1280, 720, SDL_WINDOW_SHOWN);
-    if (!window) throw std::runtime_error(SDL_GetError());
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    if (!renderer) throw std::runtime_error(SDL_GetError());
-    SDL_RenderSetLogicalSize(renderer, 1280, 720);
-    SDL_RendererInfo renderInfo{};
-    if (SDL_GetRendererInfo(renderer,&renderInfo) == 0) {
-        bool iyuv = false, nv12 = false;
-        for (Uint32 i=0; i<renderInfo.num_texture_formats; ++i) {
-            iyuv |= renderInfo.texture_formats[i] == SDL_PIXELFORMAT_IYUV;
-            nv12 |= renderInfo.texture_formats[i] == SDL_PIXELFORMAT_NV12;
-        }
-        diagnostic("Renderer name=" + std::string(renderInfo.name ? renderInfo.name : "unknown") +
-            " flags=" + std::to_string(renderInfo.flags) + " nativeIYUV=" + std::to_string(iyuv) +
-            " nativeNV12=" + std::to_string(nv12));
+void Runtime::initGraphics() {
+    using diagnostics::StartupStage;
+    StartupStage graphics("graphics");
+    { StartupStage stage("romfs"); checkResult(romfsInit(), "RomFS"); romfs = true; }
+    {
+        StartupStage stage("sdl_video");
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) throw std::runtime_error(SDL_GetError());
+        sdl = true;
     }
-    PlFontData data{};
-    checkResult(plGetSharedFontByType(&data, PlSharedFontType_Standard), "System font");
-    font = TTF_OpenFontRW(SDL_RWFromConstMem(data.address, static_cast<int>(data.size)), 1, 23);
-    titleFont = TTF_OpenFontRW(SDL_RWFromConstMem(data.address, static_cast<int>(data.size)), 1, 34);
-    if (!font || !titleFont) throw std::runtime_error(TTF_GetError());
+    {
+        StartupStage stage("window");
+        window = SDL_CreateWindow("FogPlay NX", 0, 0, 1280, 720, SDL_WINDOW_SHOWN);
+        if (!window) throw std::runtime_error(SDL_GetError());
+    }
+    {
+        StartupStage stage("renderer");
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+        if (!renderer) throw std::runtime_error(SDL_GetError());
+        SDL_RenderSetLogicalSize(renderer, 1280, 720);
+        SDL_RendererInfo renderInfo{};
+        if (SDL_GetRendererInfo(renderer,&renderInfo) == 0) {
+            bool iyuv = false, nv12 = false;
+            for (Uint32 i=0; i<renderInfo.num_texture_formats; ++i) {
+                iyuv |= renderInfo.texture_formats[i] == SDL_PIXELFORMAT_IYUV;
+                nv12 |= renderInfo.texture_formats[i] == SDL_PIXELFORMAT_NV12;
+            }
+            diagnostic("Renderer name=" + std::string(renderInfo.name ? renderInfo.name : "unknown") +
+                " flags=" + std::to_string(renderInfo.flags) + " nativeIYUV=" + std::to_string(iyuv) +
+                " nativeNV12=" + std::to_string(nv12));
+        }
+    }
+    {
+        StartupStage stage("system_fonts");
+        checkResult(plInitialize(PlServiceType_User), "Shared font service"); pl = true;
+        if (TTF_Init() != 0) throw std::runtime_error(TTF_GetError());
+        ttf = true;
+        PlFontData data{};
+        checkResult(plGetSharedFontByType(&data, PlSharedFontType_Standard), "System font");
+        font = TTF_OpenFontRW(SDL_RWFromConstMem(data.address, static_cast<int>(data.size)), 1, 23);
+        titleFont = TTF_OpenFontRW(SDL_RWFromConstMem(data.address, static_cast<int>(data.size)), 1, 34);
+        if (!font || !titleFont) throw std::runtime_error(TTF_GetError());
+    }
+    { StartupStage stage("first_splash"); showStartup("Запускаем приложение…"); }
+    diagnostic("Startup first_splash_presented");
+}
+void Runtime::showStartup(const char* message) {
+    fog::ui::drawStartupScreen(renderer,font,titleFont,message);
+}
+void Runtime::initServices() {
+    using diagnostics::StartupStage;
+    StartupStage services("services");
+    showStartup("Подключаем службы…");
+    {
+        StartupStage stage("sockets");
+        SocketInitConfig config = *socketGetDefaultInitConfig();
+        config.num_bsd_sessions = 12;
+        config.sb_efficiency = 8;
+        checkResult(socketInitialize(&config), "Sockets"); sockets = true;
+    }
+    { StartupStage stage("network_interface"); checkResult(nifmInitialize(NifmServiceType_User), "Network interface service"); nifm = true; }
+    { StartupStage stage("sdl_audio"); if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) throw std::runtime_error(SDL_GetError()); }
+    {
+        StartupStage stage("image_codecs"); image = true;
+        if ((IMG_Init(IMG_INIT_PNG) & IMG_INIT_PNG) == 0) throw std::runtime_error(IMG_GetError());
+    }
 }
 
 Runtime::~Runtime() {

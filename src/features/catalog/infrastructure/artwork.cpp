@@ -285,7 +285,7 @@ std::vector<std::uint8_t> downloadArtwork(const std::string& requested,
         if (!handle) throw std::runtime_error("Cannot initialize artwork HTTPS request");
         DownloadBuffer buffer{{}, &cancelled};
         checkCurl(curl_easy_setopt(handle.get(), CURLOPT_URL, url.c_str()));
-        checkCurl(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "FogPlayNX/0.4.28"));
+        checkCurl(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "FogPlayNX/0.5.3"));
 #if LIBCURL_VERSION_NUM >= 0x075500
         checkCurl(curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS_STR, "https"));
 #else

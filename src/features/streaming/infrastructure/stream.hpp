@@ -44,6 +44,8 @@ public:
     bool configureVideo(const fog::video::Settings& settings);
     // Pre-start transport preference, retained across start(). Relay never falls back to direct.
     bool configureRelay(bool relay);
+    // Pre-start controller mode, retained across start(). Defaults to ordinary gamepad.
+    bool configurePlayStation(bool enabled);
     bool updateVideoSettings(const fog::video::Settings& settings);
     VideoCodec selectedVideoCodec() const;
     std::string qualityStatus() const;
@@ -70,6 +72,8 @@ public:
     std::string mutexDiagnostics() const;
     std::string dtlsDiagnostics() const;
     std::string rtcpDiagnostics() const;
+    // Local queue/RTC acceptance, scoped to this transport generation. No remote input ACK exists.
+    std::string inputDiagnostics() const;
     bool pollVideoDiagnostic(std::string& event);
     bool waitingForVideoKeyframe() const;
     bool requestVideoKeyframe(); // Best effort PLI on open video tracks; no transport reset.

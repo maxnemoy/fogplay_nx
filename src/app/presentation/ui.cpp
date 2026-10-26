@@ -146,14 +146,14 @@ struct Ui::Impl {
     Chrome chrome;
     bool xboxLayout=false;
     SDL_Texture* background=nullptr;
-    std::array<SDL_Texture*,5> branding{}; // Logo, search, games, history, settings.
+    std::array<SDL_Texture*,6> branding{}; // Logo, search, games, PlayStation, history, settings.
     void loadBranding() {
 #ifdef __SWITCH__
         const std::string root="romfs:/ui/";
 #else
         const std::string root="romfs/ui/";
 #endif
-        const char* files[]{"logo.png","magnifying-glass.svg","game-controller.svg","writing.svg","setting.svg"};
+        const char* files[]{"logo.png","magnifying-glass.svg","game-controller.svg","playstation.svg","writing.svg","setting.svg"};
         for(std::size_t i=0;i<branding.size();++i) {
             branding[i]=IMG_LoadTexture(renderer,(root+files[i]).c_str());
             if(branding[i]) SDL_SetTextureBlendMode(branding[i],SDL_BLENDMODE_BLEND);
@@ -165,7 +165,12 @@ struct Ui::Impl {
         if(!texture) { icon(renderer,x,y,fallback,tint); return; }
         SDL_SetTextureColorMod(texture,tint.r,tint.g,tint.b);
         SDL_SetTextureAlphaMod(texture,tint.a);
-        const SDL_Rect destination{x-16,y-16,32,32};
+        int width=0,height=0;
+        if(SDL_QueryTexture(texture,nullptr,nullptr,&width,&height)!=0 || width<=0 || height<=0) return;
+        const double scale=32./std::max(width,height);
+        const int drawnWidth=std::max(1,static_cast<int>(width*scale));
+        const int drawnHeight=std::max(1,static_cast<int>(height*scale));
+        const SDL_Rect destination{x-drawnWidth/2,y-drawnHeight/2,drawnWidth,drawnHeight};
         SDL_RenderCopy(renderer,texture,nullptr,&destination);
     }
         Impl(SDL_Renderer* r,TTF_Font* f,TTF_Font* l):renderer(r),regular(f),large(l) {
@@ -268,11 +273,11 @@ void Ui::frame(const Chrome& chrome) {
     fill(r,{0,0,rail,Height},{27,30,56,230}); fill(r,{rail-1,0,1,Height},{97,81,132,90});
     roundRect(r,{30,27,28,28},14,Cyan); roundRect(r,{37,30,14,14},7,White); roundRect(r,{34,44,20,10},5,White);
     if(chrome.sidebarExpanded) text(chrome.account,20,68,190,Muted,false,2);
-    const std::string names[]{"Поиск","Игры","Журнал сессий","Настройки"};
-    const Section sections[]{Section::Search,Section::Games,Section::History,Section::Settings};
-    const int types[]{0,1,3,4};
-    for(int i=0;i<4;++i) {
-        const int y=i==3?573:180+i*73;
+    const std::string names[]{"Поиск","Игры","PlayStation","Журнал сессий","Настройки"};
+    const Section sections[]{Section::Search,Section::Games,Section::PlayStation,Section::History,Section::Settings};
+    const int types[]{0,1,1,3,4};
+    for(int i=0;i<5;++i) {
+        const int y=i==4?573:180+i*73;
         const bool selected=chrome.section==sections[i] || (i==1 && chrome.section==Section::Computers);
         if(selected) {
             roundRect(r,{12,y-24,rail-24,50},10,chrome.sidebarFocused?SDL_Color{89,86,133,255}:SDL_Color{54,51,88,255});

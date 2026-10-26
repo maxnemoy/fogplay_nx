@@ -1,0 +1,56 @@
+#include "app/application_controller.hpp"
+
+namespace fogplay {
+void ApplicationController::loadPlayStation() {
+    if (sessionPending_ || pending_.valid()) return;
+    const bool alreadyViewing = screen_ == Screen::PlayStation || screen_ == Screen::PlayStationDetails;
+    latency_.cancel();
+    screen_ = Screen::PlayStation; nav_ = 2;
+    if (!alreadyViewing) selection_ = 0;
+    if (playStationPending_.valid()) return;
+    fog::applyPlayStationCatalogSnapshot(playStationComputers_,selection_,fog::playStationComputerPlaceholders());
+    playStationLoadedAt_ = {};
+    playStationError_.clear();
+    status_.clear();
+    auto updates = std::make_shared<fog::PlayStationCatalogProgressChannel>();
+    auto http = std::make_shared<fog::HttpClient>();
+    playStationUpdates_ = updates;
+    playStationHttp_ = http;
+    playStationPending_ = std::async(std::launch::async,[updates,http] {
+        return fog::fetchPlayStationComputers(*http,
+            [updates](const Json& snapshot) { updates->publish(snapshot); },
+            [updates] { return updates->cancelled(); });
+    });
+}
+void ApplicationController::pollPlayStation() {
+    if (!playStationPending_.valid()) return;
+    const bool viewing = screen_ == Screen::PlayStation || screen_ == Screen::PlayStationDetails;
+    if (playStationUpdates_) {
+        if (auto snapshot = playStationUpdates_->take()) {
+            if (viewing) fog::applyPlayStationCatalogSnapshot(playStationComputers_,selection_,std::move(*snapshot));
+            else playStationComputers_ = std::move(*snapshot);
+        }
+    }
+    if (playStationPending_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    try {
+        auto snapshot = playStationPending_.get();
+        if (playStationUpdates_ && playStationUpdates_->cancelled()) {
+            playStationUpdates_.reset(); playStationHttp_.reset(); return;
+        }
+        if (viewing) fog::applyPlayStationCatalogSnapshot(playStationComputers_,selection_,std::move(snapshot));
+        else playStationComputers_ = std::move(snapshot);
+        playStationLoadedAt_ = std::chrono::steady_clock::now();
+    } catch (const std::exception& error) {
+        if (!playStationUpdates_ || !playStationUpdates_->cancelled()) {
+            playStationError_ = safeText(error.what());
+            diagnostic("PlayStation refresh failed: " + playStationError_);
+        }
+    }
+    playStationUpdates_.reset();
+    playStationHttp_.reset();
+}
+void ApplicationController::cancelPlayStation() {
+    if (playStationUpdates_) playStationUpdates_->cancel();
+    if (playStationHttp_) playStationHttp_->cancel();
+}
+}

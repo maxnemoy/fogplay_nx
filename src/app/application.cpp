@@ -33,6 +33,8 @@ ApplicationController::ApplicationController(Runtime& runtime, const std::string
 }
 
 ApplicationController::~ApplicationController() {
+    cancelPlayStation();
+    if (playStationPending_.valid()) playStationPending_.wait();
     latency_.cancel();
     if (catalogApi_) catalogApi_->cancel();
     // Last attempt precedes permanent cancellation and networking teardown.
@@ -101,6 +103,7 @@ void ApplicationController::run() {
             pollRecentSave();
             poll();
             pollCatalog();
+            pollPlayStation();
             // The shutdown owner retries unresolved stops and provides an explicit escape.
             if (exitAfterStop_ && !pending_.valid()) break;
             if (screen_ == Screen::Checkout && !pending_.valid() && api_.loggedIn() &&
@@ -133,6 +136,7 @@ void ApplicationController::run() {
             if (sessionPending_ && !stopAfterTask_ && !pending_.valid()) beginFinish("render-exception");
         }
     }
+    cancelPlayStation();
     shutdownSession();
     api_.cancel();
     if (catalogApi_) catalogApi_->cancel();
@@ -161,7 +165,7 @@ void ApplicationController::poll() {
         if (kind == Task::Finish) { screen_ = Screen::Stopping; retryAt_ = std::chrono::steady_clock::now()+std::chrono::seconds(exitAfterStop_ ? 1 : 10); }
         if (kind == Task::Create || kind == Task::CheckoutPoll || kind == Task::CheckoutStop) {
             logCheckoutResult(kind);
-            syncPending(); screen_ = sessionPending_ ? Screen::Checkout : Screen::Details;
+            syncPending(); screen_ = sessionPending_ ? Screen::Checkout : selectedPlayStation_ ? Screen::PlayStationDetails : Screen::Details;
             checkoutAutoPoll_ = sessionPending_ && fog::checkoutNeedsAutomaticCheck(checkout_.result());
             checkoutAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
             if (!sessionPending_) disarmExitHandling();
@@ -186,6 +190,43 @@ void ApplicationController::poll() {
         } else loadGames();
         return;
     }
+    if (kind == Task::Create && data.value("playstation_offer_verified",false)) {
+        // The public fetch can outlive Back, HOME or shutdown intent. Only the
+        // main thread reads these flags and authorizes the separate paid worker.
+        syncPending();
+        if (sessionPending_) { beginFinish("playstation-preflight-journal"); return; }
+        if (stopAfterTask_ || exitAfterStop_ || appletGetFocusState() != AppletFocusState_InFocus) {
+            disarmExitHandling(); stopAfterTask_ = false;
+            screen_ = Screen::PlayStation;
+            status_ = "Подключение отменено. Заказ не создавался.";
+            return;
+        }
+        fog::CreateOrderRequest order;
+        order.computerId = data.at("computer_id").get<int>();
+        order.tariffId = data.at("tariff_id").get<int>();
+        order.gameId = 0; order.ownSteamAccount = false;
+        if (!selectedPlayStation_ || !api_.loggedIn() ||
+            !fog::isPlayStationComputerId(order.computerId) || order.tariffId <= 0) {
+            disarmExitHandling();
+            screen_ = Screen::PlayStation;
+            status_ = "Подключение не подтверждено. Обновите список и войдите в аккаунт.";
+            return;
+        }
+        sessionPending_ = true;
+        checkoutStatus_ = "Создаём заказ. Ожидаем ответ Fog Play…";
+        start(Task::Create,[this,order] { checkout_.create(order); return Json::object(); });
+        return;
+    }
+    if (kind == Task::Create && data.value("playstation_offer_changed",false)) {
+        syncPending();
+        if (sessionPending_) { beginFinish("playstation-offer-change"); return; }
+        disarmExitHandling(); stopAfterTask_ = false;
+        playStationComputers_ = std::move(data.at("computers"));
+        playStationLoadedAt_ = std::chrono::steady_clock::now();
+        screen_ = Screen::PlayStation; selection_ = 0;
+        status_ = "Тариф или цена изменились. Проверьте список и подтвердите подключение заново.";
+        return;
+    }
     if (kind == Task::Create || kind == Task::CheckoutPoll || kind == Task::CheckoutStop || kind == Task::ManualResolution) {
         logCheckoutResult(kind);
         handleCheckout();
@@ -195,7 +236,7 @@ void ApplicationController::poll() {
     if (stopAfterTask_ && sessionPending_ && kind != Task::Finish && kind != Task::Recovery && kind != Task::Profile && kind != Task::Phone && kind != Task::Captcha && kind != Task::Otp) {
         beginFinish(); return;
     }
-    if (kind == Task::History) { history_ = std::move(data); status_ = "История сессий"; return; }
+    if (kind == Task::History) { history_ = std::move(data); status_.clear(); return; }
     if (kind == Task::GameDetail) {
         detail_ = std::move(data.at("game")); autoComputers_ = std::move(data.at("auto"));
         status_.clear(); return;
@@ -221,7 +262,7 @@ void ApplicationController::poll() {
     }
     if (kind == Task::Sessions) {
         sessions_ = std::move(data); screen_ = Screen::Sessions; selection_ = 0;
-        status_ = ui_.controllerHints("A — подключиться • X — обновить");
+        status_.clear();
         diagnostic("Active sessions loaded; identifiers omitted.");
         return;
     }
@@ -236,6 +277,7 @@ void ApplicationController::poll() {
         diagnostic("Authenticated profile OK; personal fields not logged.");
         if (sessionPending_) recoverSession();
         else if (screen_ == Screen::History) loadHistory();
+        else if (screen_ == Screen::PlayStation) loadPlayStation();
         else if (screen_ == Screen::Games && catalog_.items().empty()) loadGames();
     } else {
         authStep_ = fog::authStep(data);
@@ -246,9 +288,9 @@ void ApplicationController::poll() {
             start(Task::Profile, [this] { return api_.userInfo(); });
         } else if (authStep_ == fog::AuthStep::Captcha) {
             setCaptcha(data);
-            status_ = ui_.controllerHints("Введите текст с картинки. A — открыть клавиатуру.");
+            status_.clear();
         } else if (authStep_ == fog::AuthStep::Otp) {
-            status_ = ui_.controllerHints("Введите полученный SMS-код кнопкой A.");
+            status_.clear();
         } else {
             status_ = ui_.controllerHints("Вход не завершён. B — назад, Y — новая попытка.");
             diagnostic("Auth stopped at unsupported/restart response; body omitted.");

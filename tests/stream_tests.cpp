@@ -72,9 +72,16 @@ int main() {
     assert(g["state"]["buttons"][0] == 1 && g["state"]["buttons"][17] == 1);
     assert(g["state"]["axes"] == Json::array({1.0f, -1.0f, 0.0f, 0.0f}));
     assert(g["state"]["rightTrigger"] == 1.0f && g["state"]["leftTrigger"] == 0.0f);
+    auto ps = g;
+    ps["isPS"] = true;
+    assert(gamepad(pad, true) == ps); // Identical buttons/axes/triggers; no invented PS fields.
+    assert(gamepad(pad, false) == g);
     const auto neutral = gamepad(stream::Gamepad{});
     for (const auto& b : neutral["state"]["buttons"]) assert(b == 0);
     for (const auto& a : neutral["state"]["axes"]) assert(a == 0);
+    auto psNeutral = neutral;
+    psNeutral["isPS"] = true;
+    assert(gamepad(stream::Gamepad{}, true) == psNeutral);
     const Json servers = Json::array({{{"urls", Json::array({"turn:host:3478", "turns:host:5349"})},
                                       {"username", "u"}, {"credential", "p"}}, {{"urls", "stun:host:3478"}}});
     const Json init{{"id", "init"}, {"data", Json::array({servers.dump(), "game"}).dump()}};

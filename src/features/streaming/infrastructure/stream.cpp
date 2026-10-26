@@ -13,6 +13,7 @@
 #include "features/streaming/domain/auto_quality.hpp"
 #include "features/streaming/domain/route_snapshot_schedule.hpp"
 #include <functional>
+#include <limits>
 #include <cmath>
 #include <cstdio>
 #include <rtc/rtc.hpp>
@@ -371,6 +372,8 @@ struct Client::Impl {
     Clock::time_point routeCapturedAt{};
     TransportStageTiming icePublishTiming;
     AsyncControlSender::Snapshot finalControl;
+    std::uint64_t psUnavailableFrames = 0;
+    std::uint64_t psInvalidNative = 0;
 #ifdef FOG_STREAM_TESTING
     struct ControlSendFixture {
         std::mutex mutex;
@@ -403,6 +406,7 @@ struct Client::Impl {
     bool running = false, stompConnected = false, remoteSet = false, channelOpen = false;
     bool isReady = false, decoderWaiting = false, retryableFailure = false, closingForRetry = false;
     bool relay = false, routeSelected = false, routeCurrent = false, wasReady = false;
+    bool playStation = false;
     Clock::time_point unprovenRouteAt{};
     SelectedRoute route;
     CandidateProofs remoteCandidateProofs;
@@ -709,7 +713,7 @@ struct Client::Impl {
         if (!isReady) state = "Waiting for video";
     }
     std::string neutralControl() const noexcept {
-        try { if (channelOpen) return protocol::gamepad(Gamepad{}).dump(); } catch (...) {}
+        try { if (channelOpen) return protocol::gamepad(Gamepad{}, playStation).dump(); } catch (...) {}
         return {};
     }
     void stop(bool notify) {
@@ -966,7 +970,7 @@ struct Client::Impl {
         state = "Waiting for offer";
         operation = "init.send-request";
         signal({{"id", "init_webrtc"}, {"client_hash", clientHash}, {"limit_fps", 30},
-                {"control_only", false}, {"iceTransportPolicy", relay ? "relay" : "all"}, {"gamepad", true}, {"isPS", false}});
+                {"control_only", false}, {"iceTransportPolicy", relay ? "relay" : "all"}, {"gamepad", true}, {"isPS", playStation}});
     }
     void candidate(const Json& candidate) {
         operation = "candidate.validate";
@@ -1314,10 +1318,12 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
                            const std::string& caPath, const std::string& url) {
     const auto preferences = impl_->videoSettings;
     const auto relay = impl_->relay;
+    const auto playStation = impl_->playStation;
     close();
     impl_ = std::make_unique<Impl>();
     impl_->videoSettings = preferences;
     impl_->relay = relay;
+    impl_->playStation = playStation;
     auto& i = *impl_;
     // Do not permit STOMP header/destination injection.
     const auto safe = [](const std::string& s) {
@@ -1513,6 +1519,11 @@ bool Client::configureVideo(const fog::video::Settings& settings) {
 bool Client::configureRelay(bool relay) {
     if (impl_->running) return false;
     impl_->relay = relay;
+    return true;
+}
+bool Client::configurePlayStation(bool enabled) {
+    if (impl_->running || impl_->shared) return false;
+    impl_->playStation = enabled;
     return true;
 }
 bool Client::updateVideoSettings(const fog::video::Settings& settings) {
@@ -1711,9 +1722,43 @@ bool Client::requestVideoKeyframe() {
     } catch (...) { return false; }
     return requested;
 }
+std::string Client::inputDiagnostics() const {
+    const auto out = impl_->controlSender ? impl_->controlSender->snapshot() : impl_->finalControl;
+    auto text = "PS input scope=transport-generation isPS=" + std::to_string(impl_->playStation) +
+        " frames=" + std::to_string(out.psFrames) + " accepted=" + std::to_string(out.psAccepted) +
+        " rejected=" + std::to_string(out.psRejected) + " unavailable=" + std::to_string(impl_->psUnavailableFrames) +
+        " touchQueuedDown=" + std::to_string(out.touchQueuedDown) + " touchQueuedUp=" + std::to_string(out.touchQueuedUp) +
+        " touchRejectedDown=" + std::to_string(out.touchRejectedDown) + " touchRejectedUp=" + std::to_string(out.touchRejectedUp) +
+        " touchAttemptDown=" + std::to_string(out.touchAttemptDown) + " touchAttemptUp=" + std::to_string(out.touchAttemptUp) +
+        " touchSentDown=" + std::to_string(out.touchSentDown) + " touchSentUp=" + std::to_string(out.touchSentUp) +
+        " touchFailedDown=" + std::to_string(out.touchFailedDown) + " touchFailedUp=" + std::to_string(out.touchFailedUp) +
+        " touchDroppedAtStop=" + std::to_string(out.touchDropped) + " stateCoalesced=" + std::to_string(out.gamepadCoalesced) +
+        " lastQueuedSeq=" + std::to_string(out.lastQueuedSeq) + " lastAttemptSeq=" + std::to_string(out.lastAttemptSeq) +
+        " lastSentSeq=" + std::to_string(out.lastSentSeq) + " invalidNative=" + std::to_string(impl_->psInvalidNative);
+    static constexpr const char* names[]{"unused", "nativeDown", "nativeMove", "nativeUp", "accel", "gyro"};
+    for (std::size_t n = 1; n < out.nativeQueued.size(); ++n) {
+        const std::string name = names[n];
+        text += " " + name + "Queued=" + std::to_string(out.nativeQueued[n]) +
+            " " + name + "Rejected=" + std::to_string(out.nativeRejected[n]) +
+            " " + name + "Attempt=" + std::to_string(out.nativeAttempt[n]) +
+            " " + name + "Sent=" + std::to_string(out.nativeSent[n]) +
+            " " + name + "Failed=" + std::to_string(out.nativeFailed[n]) +
+            " " + name + "Dropped=" + std::to_string(out.nativeDropped[n]) +
+            " " + name + "Coalesced=" + std::to_string(out.nativeCoalesced[n]);
+    }
+    return text + " sendSuccess=local-rtc-acceptance ack=unsupported";
+}
 bool Client::sendGamepad(const Gamepad& state) {
-    if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed()) return false;
-    try { return impl_->control(protocol::gamepad(state).dump(), ControlQueue::Mode::Gamepad); }
+    if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed() || !impl_->controlSender) {
+        if (impl_->playStation) ++impl_->psUnavailableFrames;
+        return false;
+    }
+    try {
+        if (impl_->controlSender->snapshot().stalled) { if (impl_->playStation) ++impl_->psUnavailableFrames; return false; }
+        const auto payload = protocol::gamepad(state, impl_->playStation).dump();
+        if (impl_->playStation) return impl_->controlSender->enqueueGamepad(payload, state.buttons[17] != 0);
+        return impl_->control(payload, ControlQueue::Mode::Gamepad);
+    }
     catch (const TransportError& error) {
         // Public send may run before pump. Examine queued terminal signaling first.
         if (error.retryable) {
@@ -1728,10 +1773,58 @@ bool Client::sendControl(const std::string& json) {
     if (!data.is_object()) return false;
     auto mode = ControlQueue::Mode::Ordered;
     std::string input, release;
+    bool psGamepad = false, psTouchDown = false;
+    unsigned nativeInput = 0;
     const auto id = data.find("id");
     if (id != data.end() && id->is_string()) {
         const auto& name = id->get_ref<const std::string&>();
-        if (name == "gamepad") mode = ControlQueue::Mode::Gamepad;
+        if (name == "gamepad_touch" || name == "gamepad_sensor") {
+            const auto reject = [&] { ++impl_->psInvalidNative; return false; };
+            const auto index = data.find("index"), details = data.find("data");
+            if (!impl_->playStation || index == data.end() || !index->is_number_integer() || *index != 0 ||
+                details == data.end() || !details->is_object()) return reject();
+            const auto number = [&](const char* key, double low, double high) {
+                const auto value = details->find(key);
+                if (value == details->end() || !value->is_number()) return false;
+                const auto numeric = value->get<double>();
+                return std::isfinite(numeric) && numeric >= low && numeric <= high;
+            };
+            if (name == "gamepad_touch") {
+                const auto type = details->find("type"), finger = details->find("finger");
+                if (type == details->end() || !type->is_number_integer() ||
+                    (*type != 0x656 && *type != 0x657 && *type != 0x658) ||
+                    finger == details->end() || !finger->is_number_integer() || (*finger != 0 && *finger != 1) ||
+                    !number("x", 0, 1) || !number("y", 0, 1)) return reject();
+                const auto event = type->get<unsigned>();
+                nativeInput = event == 0x656 ? 1 : event == 0x657 ? 2 : 3;
+                mode = nativeInput == 1 ? ControlQueue::Mode::Ordered : nativeInput == 2 ? ControlQueue::Mode::TouchMove : ControlQueue::Mode::Release;
+                input = "touch:" + finger->dump();
+                if (nativeInput != 3) { auto up = data; up["data"]["type"] = 0x658; release = up.dump(); }
+            } else {
+                const auto sensor = details->find("sensor");
+                const auto limit = static_cast<double>(std::numeric_limits<float>::max());
+                if (sensor == details->end() || !sensor->is_number_integer() || (*sensor != 1 && *sensor != 2) ||
+                    !number("x", -limit, limit) || !number("y", -limit, limit) || !number("z", -limit, limit)) return reject();
+                nativeInput = sensor->get<unsigned>() == 1 ? 4 : 5;
+                mode = ControlQueue::Mode::Motion; input = "sensor:" + sensor->dump();
+                auto neutral = data;
+                neutral["data"]["x"] = 0.0; neutral["data"]["y"] = nativeInput == 4 ? 9.80665 : 0.0; neutral["data"]["z"] = 0.0;
+                release = neutral.dump();
+            }
+        }
+        else if (name == "gamepad") {
+            // The negotiated controller type applies to every input path.
+            const auto playStation = data.find("isPS");
+            if (playStation == data.end() || !playStation->is_boolean() || *playStation != impl_->playStation) return false;
+            mode = ControlQueue::Mode::Gamepad;
+            if (impl_->playStation) {
+                const auto state = data.find("state");
+                if (state == data.end() || !state->is_object()) return false;
+                const auto buttons = state->find("buttons");
+                if (buttons == state->end() || !buttons->is_array() || buttons->size() != 18 || !(*buttons)[17].is_number()) return false;
+                psGamepad = true; psTouchDown = (*buttons)[17].get<double>() != 0;
+            }
+        }
         else if (name == "mousemove") mode = ControlQueue::Mode::MouseMove;
         else if (name == "keyup" || name == "mouseup") mode = ControlQueue::Mode::Release;
         // Tag down/up for the same input so repeated releases can be deduplicated.
@@ -1749,7 +1842,12 @@ bool Client::sendControl(const std::string& json) {
             auto up = data; up["id"] = name == "keydown" ? "keyup" : "mouseup"; release = up.dump();
         }
     }
-    try { return impl_->control(json, mode, input, release); }
+    try {
+        if (nativeInput != 0) return impl_->controlSender && !impl_->controlSender->snapshot().stalled &&
+            impl_->controlSender->enqueueNative(json, mode, input, release, nativeInput);
+        if (psGamepad) return impl_->controlSender && !impl_->controlSender->snapshot().stalled && impl_->controlSender->enqueueGamepad(json, psTouchDown);
+        return impl_->control(json, mode, input, release);
+    }
     catch (const TransportError& error) {
         // Public send may run before pump. Examine queued terminal signaling first.
         if (error.retryable) {

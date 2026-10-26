@@ -11,7 +11,7 @@ for option in "$@"; do
     esac
 done
 python3 tools/check-architecture.py
-for suite in build-tools host artwork steam-artwork catalog-artwork recent-games control-sender ice-snapshot stream timed-mutex loop-timing playback-drain media h264-rtp rtp-repair rtp-media hevc media-presentation decoder-diagnostics previews; do
+for suite in build-tools host stream-input ps-sensors ps-native-input playstation-catalog artwork steam-artwork catalog-artwork recent-games control-sender ice-snapshot stream timed-mutex loop-timing playback-drain media h264-rtp rtp-repair rtp-media hevc media-presentation decoder-diagnostics previews; do
     printf '\nRunning %s tests\n' "$suite"
     bash "tools/test/$suite.sh"
 done

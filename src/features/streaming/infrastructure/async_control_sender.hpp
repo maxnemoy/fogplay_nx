@@ -20,6 +20,12 @@ public:
         std::uint64_t rejected = 0, sent = 0, ageMs = 0, ageMaxMs = 0;
         std::uint64_t sendCalls = 0, sendTotalUs = 0, sendMaxUs = 0;
         std::uint64_t waitCalls = 0, waitTotalUs = 0, waitMaxUs = 0, inFlightMs = 0, pongCoalesced = 0;
+        std::uint64_t psFrames = 0, psAccepted = 0, psRejected = 0, gamepadCoalesced = 0;
+        std::uint64_t touchQueuedDown = 0, touchQueuedUp = 0, touchRejectedDown = 0, touchRejectedUp = 0;
+        std::uint64_t touchAttemptDown = 0, touchAttemptUp = 0, touchSentDown = 0, touchSentUp = 0;
+        std::uint64_t touchFailedDown = 0, touchFailedUp = 0, touchDropped = 0;
+        std::uint64_t lastQueuedSeq = 0, lastAttemptSeq = 0, lastSentSeq = 0;
+        std::array<std::uint64_t, 6> nativeQueued{}, nativeRejected{}, nativeAttempt{}, nativeSent{}, nativeFailed{}, nativeDropped{}, nativeCoalesced{};
         bool stalled = false, inFlight = false, transportActive = false;
         Failure failure = Failure::None;
     };
@@ -35,6 +41,37 @@ public:
     bool enqueue(std::string payload, Mode mode = Mode::Ordered, std::string input = {},
                  std::string release = {}) {
         std::lock_guard<std::mutex> lock(mutex_);
+        return enqueueLocked(std::move(payload), mode, std::move(input), std::move(release));
+    }
+    bool enqueueGamepad(std::string payload, bool touchDown) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.psFrames;
+        const bool edge = touchDown != acceptedTouchDown_;
+        const auto sequence = ++psSequence_;
+        const auto mode = edge ? (touchDown ? Mode::GamepadEdge : Mode::GamepadRelease) : Mode::Gamepad;
+        const bool accepted = enqueueLocked(std::move(payload), mode, {}, {}, {true, touchDown, edge, sequence});
+        if (accepted) {
+            ++stats_.psAccepted; stats_.lastQueuedSeq = sequence; psKnown_ = true;
+            if (edge) { if (touchDown) ++stats_.touchQueuedDown; else ++stats_.touchQueuedUp; }
+            acceptedTouchDown_ = touchDown;
+        } else {
+            ++stats_.psRejected;
+            if (edge) { if (touchDown) ++stats_.touchRejectedDown; else ++stats_.touchRejectedUp; }
+        }
+        return accepted;
+    }
+    bool enqueueNative(std::string payload, Mode mode, std::string input, std::string release, unsigned kind) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (kind == 0 || kind >= stats_.nativeQueued.size()) return false;
+        ControlQueue::InputTrace trace{true, false, false, ++psSequence_, kind};
+        const bool accepted = enqueueLocked(std::move(payload), mode, std::move(input), std::move(release), trace);
+        if (accepted) { ++stats_.nativeQueued[kind]; stats_.lastQueuedSeq = trace.sequence; }
+        else ++stats_.nativeRejected[kind];
+        return accepted;
+    }
+private:
+    bool enqueueLocked(std::string payload, Mode mode, std::string input, std::string release,
+                       ControlQueue::InputTrace trace = {false, false, false, 0, 0}) {
         if (stopping_ || stalled_ || failure_ != Failure::None) return false;
         if (mode == Mode::Pong) {
             if (payload.size() > 64 * 1024) { ++pongRejected_; return false; }
@@ -47,11 +84,12 @@ public:
             } else pongs_.push_back({std::move(payload), {}, mode, now(), {}});
         } else {
             if (release.size() > 64 * 1024 || input.size() > 1024) return false;
-            if (!queue_.push(std::move(payload), mode, std::move(input), now(), std::move(release))) return false;
+            if (!queue_.push(std::move(payload), mode, std::move(input), now(), std::move(release), trace)) return false;
         }
         condition_.notify_one();
         return true;
     }
+public:
     void allow(bool allowed) {
         std::lock_guard<std::mutex> lock(mutex_);
         allowed_ = allowed; condition_.notify_one();
@@ -64,6 +102,8 @@ public:
         out.bytes = queue_.bytes() + inFlightBytes_;
         for (const auto& pong : pongs_) out.bytes += pong.payload.size();
         out.rejected = queue_.rejected() + pongRejected_;
+        out.gamepadCoalesced = queue_.coalesced();
+        out.nativeCoalesced = queue_.nativeCoalesced();
         const auto oldest = queue_.empty() ? ms : queue_.front().enqueuedMs;
         out.ageMs = ms >= oldest ? ms - oldest : 0;
         if (!pongs_.empty() && ms >= pongs_.front().enqueuedMs) out.ageMs = std::max(out.ageMs, ms - pongs_.front().enqueuedMs);
@@ -91,6 +131,9 @@ public:
             if (!queue_.empty() && ms >= queue_.front().enqueuedMs)
                 stats_.ageMaxMs = std::max(stats_.ageMaxMs, ms - queue_.front().enqueuedMs);
             if (inFlight_ && ms >= inFlightAt_) stats_.ageMaxMs = std::max(stats_.ageMaxMs, ms - inFlightAt_);
+            stats_.touchDropped += queue_.touchEdges();
+            const auto dropped = queue_.nativePending();
+            for (std::size_t n = 1; n < dropped.size(); ++n) stats_.nativeDropped[n] += dropped[n];
             queue_.clear(); pongs_.clear();
         }
         if (!releaseInputs) shutdownAllowed_ = false;
@@ -119,6 +162,7 @@ private:
         return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count() + offsetMs_;
     }
     void transmit(const ControlQueue::Message& message) {
+        { std::lock_guard<std::mutex> lock(mutex_); recordInputAttempt(message.trace); }
         const auto began = Clock::now();
         Failure failure = Failure::None;
         try { send_(message.payload); }
@@ -128,6 +172,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ++stats_.sendCalls; stats_.sendTotalUs += elapsed;
+            recordInputSend(message.trace, failure == Failure::None);
             stats_.sendMaxUs = std::max(stats_.sendMaxUs, elapsed);
             if (failure == Failure::None) {
                 ++stats_.sent;
@@ -157,16 +202,23 @@ private:
         // Held inputs include an ambiguous in-flight press. Shutdown never
         // drains queued presses, and stops after the first failed release.
         for (const auto& entry : held_) {
-            if (!shutdownSend(entry.second)) return;
+            auto trace = entry.second.trace;
+            { std::lock_guard<std::mutex> lock(mutex_); if (trace.playStation) trace.sequence = ++psSequence_; }
+            if (!shutdownSend(entry.second.payload, trace)) return;
         }
-        if (!neutral_.empty()) shutdownSend(neutral_);
+        if (!neutral_.empty()) {
+            ControlQueue::InputTrace trace;
+            { std::lock_guard<std::mutex> lock(mutex_); trace = {psKnown_, false, sentTouchDown_, psKnown_ ? ++psSequence_ : 0}; }
+            shutdownSend(neutral_, trace);
+        }
     }
-    bool shutdownSend(const std::string& payload) noexcept {
+    bool shutdownSend(const std::string& payload, ControlQueue::InputTrace trace = {false, false, false, 0, 0}) noexcept {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             // A concurrent retry seal may revoke best-effort release permission.
             if (!shutdownAllowed_) return false;
             inFlight_ = true; transportActive_ = true; inFlightAt_ = now(); inFlightBytes_ = payload.size();
+            recordInputAttempt(trace);
         }
         const auto began = Clock::now();
         bool sent = true;
@@ -174,10 +226,38 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         const auto elapsed = micros(Clock::now() - began);
         ++stats_.sendCalls; stats_.sendTotalUs += elapsed;
+        recordInputSend(trace, sent);
         stats_.sendMaxUs = std::max(stats_.sendMaxUs, elapsed);
         if (sent) ++stats_.sent;
         inFlight_ = false; transportActive_ = false; inFlightBytes_ = 0;
         return sent;
+    }
+    // Called under mutex_ after RTC send returned. Success means local transport
+    // acceptance only; the Fog Play input protocol has no remote input ACK.
+    void recordInputSend(const ControlQueue::InputTrace& trace, bool sent) {
+        if (!trace.playStation) return;
+        if (trace.nativeInput != 0) {
+            if (sent) ++stats_.nativeSent[trace.nativeInput]; else ++stats_.nativeFailed[trace.nativeInput];
+        }
+        if (trace.touchEdge) {
+            if (trace.touchDown) {
+                if (sent) ++stats_.touchSentDown; else ++stats_.touchFailedDown;
+            } else {
+                if (sent) ++stats_.touchSentUp; else ++stats_.touchFailedUp;
+            }
+        }
+        if (sent) {
+            stats_.lastSentSeq = trace.sequence;
+            if (trace.nativeInput == 0) sentTouchDown_ = trace.touchDown;
+        }
+    }
+    void recordInputAttempt(const ControlQueue::InputTrace& trace) {
+        if (!trace.playStation) return;
+        stats_.lastAttemptSeq = trace.sequence;
+        if (trace.nativeInput != 0) ++stats_.nativeAttempt[trace.nativeInput];
+        if (trace.touchEdge) {
+            if (trace.touchDown) ++stats_.touchAttemptDown; else ++stats_.touchAttemptUp;
+        }
     }
     void run() noexcept {
         try {
@@ -220,7 +300,10 @@ private:
                     if (held_.size() >= 256 && held_.find(message.input) == held_.end()) {
                         failure_ = Failure::Unexpected; inFlight_ = false; inFlightBytes_ = 0; transportActive_ = false; continue;
                     }
-                    held_[message.input] = std::move(message.release);
+                    ControlQueue::Message released{std::move(message.release), message.input, Mode::Release,
+                                                   message.enqueuedMs, {}, message.trace};
+                    if (released.trace.nativeInput == 1 || released.trace.nativeInput == 2) released.trace.nativeInput = 3;
+                    held_[message.input] = std::move(released);
                 }
                 lock.unlock(); transmit(message); lock.lock();
             }
@@ -238,12 +321,14 @@ private:
     ControlQueue queue_;
     static constexpr std::size_t MaxPongs = 16;
     std::deque<ControlQueue::Message> pongs_;
-    std::map<std::string, std::string> held_;
+    std::map<std::string, ControlQueue::Message> held_;
     Snapshot stats_;
     Failure failure_ = Failure::None;
     mutable bool stalled_ = false;
     bool transportActive_ = false;
     bool allowed_ = false, blocked_ = false, stopping_ = false, shutdownAllowed_ = false, inFlight_ = false;
+    bool acceptedTouchDown_ = false, sentTouchDown_ = false, psKnown_ = false;
+    std::uint64_t psSequence_ = 0;
     std::uint64_t offsetMs_ = 0, inFlightAt_ = 0, pongRejected_ = 0;
     std::size_t inFlightBytes_ = 0, pongStreak_ = 0;
     std::string neutral_;

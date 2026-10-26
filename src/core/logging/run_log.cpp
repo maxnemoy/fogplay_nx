@@ -6,6 +6,8 @@
 #include <cerrno>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <cstdio>
 #include <fcntl.h>
 #include <limits>
 #include <sys/stat.h>
@@ -52,35 +54,104 @@ int createArchive(const std::string& directory, const std::string& prefix,
         }
     }
 }
-// Keep original legacy files until their copies have been written and synced.
-// Partial copies are deliberately retained; a later start uses another name.
+// A marker is only a hint to one exact archive, never evidence that bytes match.
+// Keep its input bounded and reject path components before opening that archive.
+std::string trackedArchive(const std::string& dataDir) {
+    const int fd = open((dataDir + "/.last-run-archive").c_str(), protectedFlags(O_RDONLY));
+    if (fd < 0) return {};
+    char name[128];
+    std::size_t size = 0;
+    bool valid = regularFile(fd);
+    while (valid && size < sizeof(name)) {
+        const auto count = read(fd, name + size, sizeof(name) - size);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) { valid = false; break; }
+        if (count == 0) break;
+        size += static_cast<std::size_t>(count);
+    }
+    if (::close(fd) != 0) valid = false;
+    if (!valid || size < 11 || size == sizeof(name)) return {};
+    const std::string result(name, size);
+    if (result.compare(0, 4, "run-") != 0 || result.compare(size - 4, 4, ".log") != 0) return {};
+    for (std::size_t i = 4; i < size - 4; ++i)
+        if ((result[i] < '0' || result[i] > '9') && result[i] != '-') return {};
+    return result;
+}
+ssize_t readChunk(int fd, char* buffer, std::size_t size, RunLog::Stats& stats) {
+    std::size_t total = 0;
+    while (total < size) {
+        const auto count = read(fd, buffer + total, size - total);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) return -1;
+        if (!count) break;
+        total += static_cast<std::size_t>(count);
+        stats.startupComparedBytes += static_cast<std::uint64_t>(count);
+    }
+    return static_cast<ssize_t>(total);
+}
+bool sameArchive(int input, const std::string& archive, RunLog::Stats& stats) {
+    const int other = open(archive.c_str(), protectedFlags(O_RDONLY));
+    if (other < 0) return false;
+    struct stat sourceInfo{}, archiveInfo{};
+    bool same = regularFile(other) && fstat(input, &sourceInfo) == 0 &&
+        fstat(other, &archiveInfo) == 0 && sourceInfo.st_size == archiveInfo.st_size;
+    // A user-created hard link must be renamed, since truncating the mirror
+    // would otherwise truncate its archive too. FAT has no hard links and may
+    // report inode zero, so zero is not treated as a meaningful identity.
+    if (same && sourceInfo.st_ino != 0 && sourceInfo.st_dev == archiveInfo.st_dev &&
+        sourceInfo.st_ino == archiveInfo.st_ino) same = false;
+    char sourceBytes[16384], archiveBytes[16384];
+    while (same) {
+        const auto sourceCount = readChunk(input, sourceBytes, sizeof(sourceBytes), stats);
+        const auto archiveCount = readChunk(other, archiveBytes, sizeof(archiveBytes), stats);
+        if (sourceCount < 0 || archiveCount < 0 || sourceCount != archiveCount ||
+            std::memcmp(sourceBytes, archiveBytes, static_cast<std::size_t>(sourceCount)) != 0) {
+            same = false; break;
+        }
+        if (!sourceCount) break;
+    }
+    if (::close(other) != 0) same = false;
+    return same;
+}
+// Owner-thread lifecycle operation: no simultaneous start on the same dataDir.
+// Rename preserves the source inode without bulk writes. libnx rename does not
+// replace an existing target; explicitly skip collisions on POSIX hosts too.
+// On a failed sync/commit the file remains at one of the two names, never deleted.
 bool preserveLegacy(const std::string& source, const std::string& directory,
-    const std::string& prefix, std::time_t timestamp) {
+    const std::string& prefix, std::time_t timestamp, const std::string& tracked,
+    RunLog::Stats& stats) {
+    const auto trackedPath = tracked.empty() ? std::string{} : directory + "/" + tracked;
     const int input = open(source.c_str(), protectedFlags(O_RDONLY));
     if (input < 0) return errno == ENOENT;
-    int output = -1;
     int error = 0;
-    try {
-        if (!regularFile(input)) error = errno;
-        std::string path;
-        if (!error) {
-            output = createArchive(directory, prefix, timestamp, path);
-            if (output < 0) error = errno;
-        }
-        char buffer[4096];
-        while (!error) {
-            const auto count = read(input, buffer, sizeof(buffer));
-            if (count < 0 && errno == EINTR) continue;
-            if (count < 0) { error = errno; break; }
-            if (count == 0) break;
-            if (!writeBytes(output, buffer, static_cast<std::size_t>(count))) error = errno;
-        }
-        if (!error && fsync(output) != 0) error = errno;
-    } catch (...) { error = ENOMEM; }
-    if (output >= 0 && ::close(output) != 0 && !error) error = errno;
+    struct stat info{};
+    if (!regularFile(input) || fstat(input, &info) != 0 || info.st_size < 0) error = errno ? errno : EIO;
+    const bool reused = !error && !tracked.empty() && sameArchive(input, trackedPath, stats);
     if (::close(input) != 0 && !error) error = errno;
     if (error) { errno = error; return false; }
-    return true;
+    const auto bytes = static_cast<std::uint64_t>(info.st_size);
+    if (reused) {
+        stats.startupPreservedBytes += bytes;
+        stats.startupReusedBytes += bytes;
+        return true;
+    }
+    const auto base = directory + "/" + prefix + "-" + std::to_string(timestamp) + "-";
+    for (unsigned long long collision = 0;; ++collision) {
+        const auto path = base + std::to_string(collision) + ".log";
+        struct stat existing{};
+        if (lstat(path.c_str(), &existing) != 0) {
+            if (errno != ENOENT) return false;
+            if (rename(source.c_str(), path.c_str()) == 0) {
+                stats.startupPreservedBytes += bytes;
+                stats.startupRenamedBytes += bytes;
+                return true;
+            }
+            if (errno != EEXIST && errno != ENOTEMPTY) return false;
+        }
+        if (collision == std::numeric_limits<unsigned long long>::max()) {
+            errno = EOVERFLOW; return false;
+        }
+    }
 }
 bool syncDirectory(const std::string& directory) {
 #ifdef __SWITCH__
@@ -97,6 +168,26 @@ bool syncDirectory(const std::string& directory) {
     return true;
 #endif
 }
+// Marker rotation deliberately removes only metadata before rename: libnx cannot
+// rename over an existing file. A crash in that gap simply disables dedup for the
+// next startup, which then conservatively archives the whole mirror by rename.
+bool storeTrackedArchive(const std::string& dataDir, const std::string& archivePath) {
+    const auto marker = dataDir + "/.last-run-archive";
+    const auto temporary = marker + ".tmp";
+    if (unlink(temporary.c_str()) != 0 && errno != ENOENT) return false;
+    const auto name = archivePath.substr(archivePath.find_last_of('/') + 1);
+    const int fd = open(temporary.c_str(), protectedFlags(O_WRONLY | O_CREAT | O_EXCL), S_IRUSR | S_IWUSR);
+    if (fd < 0) return false;
+    int error = 0;
+    if (!writeBytes(fd, name.data(), name.size()) || fsync(fd) != 0) error = errno;
+    if (::close(fd) != 0 && !error) error = errno;
+    if (!error && unlink(marker.c_str()) != 0 && errno != ENOENT) error = errno;
+    if (!error && rename(temporary.c_str(), marker.c_str()) != 0) error = errno;
+    if (!error && !syncDirectory(dataDir)) error = errno;
+    if (error) { errno = error; return false; }
+    return true;
+}
+
 }
 RunLog::~RunLog() { close(); }
 void RunLog::fail(const char* operation, int code) noexcept {
@@ -130,6 +221,17 @@ void RunLog::close() noexcept {
     }
     ready_.notify_all();
     if (worker_.joinable()) worker_.join();
+    bool track = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        track = archiveFd_ >= 0 && mirrorFd_ >= 0 && !errorOperation_;
+    }
+    if (track) {
+        try {
+            if (!storeTrackedArchive(dataDir_, archivePath_)) fail("track-archive", errno);
+            else if (commit_ && !commit_()) fail("commit-device", EIO);
+        } catch (...) { fail("track-archive", ENOMEM); }
+    }
     closeSink(archiveFd_, "close-archive");
     closeSink(mirrorFd_, "close-mirror");
 }
@@ -146,7 +248,9 @@ bool RunLog::start(const std::string& dataDir, std::time_t timestamp, bool (*com
         commit_ = commit;
     }
     archivePath_.clear();
+    const auto startupBegan = std::chrono::steady_clock::now();
     try {
+        dataDir_ = dataDir;
         const auto directory = dataDir + "/logs";
         bool directoryReady = mkdir(directory.c_str(), S_IRWXU) == 0;
         if (!directoryReady && errno == EEXIST) {
@@ -159,13 +263,13 @@ bool RunLog::start(const std::string& dataDir, std::time_t timestamp, bool (*com
         if (directoryReady) {
             archiveFd_ = createArchive(directory, "run", timestamp, archivePath_);
             if (archiveFd_ < 0) fail("open-archive", errno);
-            if (!preserveLegacy(dataDir + "/previous-run.log", directory, "legacy-previous", timestamp)) {
+            if (!preserveLegacy(dataDir + "/previous-run.log", directory, "legacy-previous", timestamp, {}, stats_)) {
                 fail("preserve-previous", errno); preserved = false;
             }
-            if (!preserveLegacy(dataDir + "/last-run.log", directory, "legacy-last", timestamp)) {
+            if (!preserveLegacy(dataDir + "/last-run.log", directory, "legacy-last", timestamp, trackedArchive(dataDir), stats_)) {
                 fail("preserve-last", errno); preserved = false;
             }
-            if (!syncDirectory(directory)) { fail("commit-archives", errno); preserved = false; }
+            if (!syncDirectory(directory) || !syncDirectory(dataDir)) { fail("commit-archives", errno); preserved = false; }
             if (commit && !commit()) { fail("commit-device", EIO); preserved = false; }
         }
         mirrorFd_ = open((dataDir + "/last-run.log").c_str(),
@@ -191,6 +295,8 @@ bool RunLog::start(const std::string& dataDir, std::time_t timestamp, bool (*com
         }
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    stats_.startupUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - startupBegan).count());
     return !errorOperation_;
 }
 bool RunLog::writeSink(int& fd, const std::string& batch, const char* operation) noexcept {

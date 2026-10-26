@@ -52,7 +52,9 @@ void ApplicationController::drawImageSettings() {
         ui_.button(labels[i], {area.x, y, area.w, 57}, selection_ == i);
         ui_.text(hints[i], area.x + 14, y + 65, area.w - 28, muted);
     }
-    ui_.text(videoSaveStatus_, area.x, 596, area.w, accent, false, 2);
+    if (!videoSaveStatus_.empty() && videoSaveStatus_ != "Изменения сохраняются сразу на SD." &&
+        videoSaveStatus_ != "Сохранено на SD.")
+        ui_.text(videoSaveStatus_, area.x, 596, area.w, accent, false, 2);
 }
 
 void ApplicationController::inputConnectionSettings(u64 keys) {
@@ -79,7 +81,9 @@ void ApplicationController::drawConnectionSettings() {
     ui_.text("Авто: TURN после 2 обрывов за 2 мин, до конца текущей аренды.", area.x + 14, 310, area.w - 28, muted);
     ui_.text("Повторные неудачные попытки одного восстановления не считаются новым обрывом.", area.x + 14, 365, area.w - 28, muted, false, 2);
     ui_.text("Через TURN: подключаться через сервер ретрансляции с самого начала.", area.x + 14, 440, area.w - 28, muted);
-    ui_.text(connectionSaveStatus_, area.x, 560, area.w, accent, false, 2);
+    if (!connectionSaveStatus_.empty() && connectionSaveStatus_ != "Изменения сохраняются на SD. Применяются при следующем подключении." &&
+        connectionSaveStatus_ != "Сохранено на SD. Применится при следующем подключении.")
+        ui_.text(connectionSaveStatus_, area.x, 560, area.w, accent, false, 2);
 }
 
 }

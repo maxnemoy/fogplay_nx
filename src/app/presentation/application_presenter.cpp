@@ -1,6 +1,19 @@
 #include "app/application_controller.hpp"
+#include "features/playstation/presentation/catalog_view.hpp"
 
 namespace fogplay {
+namespace {
+bool routineStatus(const std::string& value) {
+    // Explicitly known success/instruction copy only: unknown errors stay visible.
+    for (const auto* routine : {"Готово", "История сессий", "Раскладка сохранена на SD.",
+            "Вы вышли из аккаунта. Сохранённый токен удалён.",
+            "Аккаунт подключён. Вход сохранён на SD.",
+            "Подключение. Минус + Плюс — меню трансляции.",
+            "Связь восстановлена. Минус + Плюс — меню трансляции."})
+        if (value == routine) return true;
+    return value.empty();
+}
+}
 
 void ApplicationController::drawStreamOverlay() {
     using Mode = fog::stream::OverlayMode;
@@ -82,6 +95,11 @@ void ApplicationController::draw() {
     chrome.title = "ВЫБЕРИ ИГРУ";
     chrome.section = fog::ui::Section::Games;
     if (screen_ == Screen::Computers || screen_ == Screen::Details || screen_ == Screen::GameDetail) { chrome.title = selectedGameName_; chrome.section = fog::ui::Section::Computers; }
+    if (screen_ == Screen::PlayStation || screen_ == Screen::PlayStationDetails) {
+        chrome.title = "PLAYSTATION"; chrome.section = fog::ui::Section::PlayStation;
+        chrome.subtitle = playStationPending_.valid() ? "Обновление серверов…" : "PS5 · Статус из списка МТС Fog Play";
+        chrome.hints = "A Подключиться   B Назад   X Обновить   Y Аккаунт";
+    }
     if (screen_ == Screen::History) { chrome.title = "ИСТОРИЯ СЕССИЙ"; chrome.section = fog::ui::Section::History; }
     if (screen_ == Screen::Settings || screen_ == Screen::ImageSettings || screen_ == Screen::ConnectionSettings) {
         chrome.title = screen_ == Screen::ImageSettings ? "ИЗОБРАЖЕНИЕ" :
@@ -90,7 +108,7 @@ void ApplicationController::draw() {
     }
     if (screen_ == Screen::ConnectionSettings) chrome.hints = "← / → или A Изменить режим   B Настройки";
     if (screen_ == Screen::ImageSettings) chrome.hints = "↑ / ↓ Параметр   ← / → или A Изменить   B Настройки";
-    if (sidebar_) chrome.section = std::array<fog::ui::Section,4>{fog::ui::Section::Search,fog::ui::Section::Games,fog::ui::Section::History,fog::ui::Section::Settings}[nav_];
+    if (sidebar_) chrome.section = std::array<fog::ui::Section,5>{fog::ui::Section::Search,fog::ui::Section::Games,fog::ui::Section::PlayStation,fog::ui::Section::History,fog::ui::Section::Settings}[nav_];
     if (screen_ == Screen::Games) {
         if (!search_.empty()) chrome.title = "ПОИСК: " + search_;
         chrome.hints = "A Выбрать   B Меню   X Поиск   Y Аккаунт   ↑ Жанры / прокрутка";
@@ -139,6 +157,10 @@ void ApplicationController::draw() {
         } else if (catalog_.busy() || catalogPending_.valid() || pending_.valid()) ui_.empty("Загружаем игры", ui_.controllerHints("Каталог появится после ответа сервера. X — изменить поиск."));
         else if (!catalog_.error().empty()) ui_.empty("Не удалось загрузить игры", ui_.controllerHints("R — повторить • X — изменить поиск"));
         else ui_.empty("Игры не найдены", ui_.controllerHints("X — изменить поиск"));
+    } else if (screen_ == Screen::PlayStation) {
+        fog::playstation::drawCatalog(ui_,playStationComputers_,selection_,!sidebar_,playStationPending_.valid());
+    } else if (screen_ == Screen::PlayStationDetails && selection_ < playStationComputers_.size()) {
+        fog::playstation::drawConfirmation(ui_,playStationComputers_[selection_]);
     } else if (screen_ == Screen::Genres) {
         std::vector<std::string> labels{"Все игры"};
         for (const auto& genre : fog::catalogGenres()) labels.emplace_back(genre.label);
@@ -171,7 +193,7 @@ void ApplicationController::draw() {
         ui_.history(cards,selection_,selection_/fog::ui::HistoryColumns*fog::ui::HistoryColumns);
         if (cards.empty() && !pending_.valid()) ui_.empty("Сессий пока нет", "Здесь появится история ваших игровых сессий.");
     } else if (screen_ == Screen::Settings) {
-        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Подключение",fog::connection::label(connectionSettings_),"Выбор пути: обычный, авто или через TURN"},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.4.28","Удалить сохранённый вход с SD-карты"}},selection_);
+        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Подключение",fog::connection::label(connectionSettings_),"Выбор пути: обычный, авто или через TURN"},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.5.5","Удалить сохранённый вход с SD-карты"}},selection_);
     } else if (screen_ == Screen::ImageSettings) {
         drawImageSettings();
     } else if (screen_ == Screen::ConnectionSettings) {
@@ -209,9 +231,13 @@ void ApplicationController::draw() {
         else if (!catalog_.error().empty()) ui_.status("Не удалось загрузить игры. R — повторить: " + catalog_.error(), false, true);
         else if (catalog_.busy() || catalogPending_.valid()) ui_.status(catalog_.items().empty() ? "Загрузка игр…" : "Подгружаем игры…", true);
 
-    } else if (screen_ != Screen::Genres) ui_.status(pending_.valid() ? "Загрузка…" : status_, pending_.valid());
+    } else if ((screen_ == Screen::PlayStation || screen_ == Screen::PlayStationDetails) && !playStationError_.empty())
+        ui_.status(playStationError_,false,true);
+    else if (screen_ != Screen::Genres && (pending_.valid() || !routineStatus(status_)))
+        ui_.status(pending_.valid() ? "Загрузка…" : status_, pending_.valid());
     if (screen_ == Screen::Streaming) drawStreamOverlay();
     SDL_RenderPresent(rt_.renderer);
+    fogplay::diagnostics::firstUiFramePresented();
 }
 
 }
