@@ -1,4 +1,7 @@
+#include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
+
+namespace uiText = ::fog::constants::ui;
 
 namespace fogplay {
 
@@ -52,14 +55,14 @@ void ApplicationController::overlayAction(const fog::stream::OverlayAction& acti
     }
     if (action.type == Action::RequestKeyframe) {
         const bool sent = stream_ && stream_->requestVideoKeyframe();
-        overlayNotice_ = sent ? "Ключевой кадр запрошен; ответ сервера не гарантируется." : "Не удалось запросить кадр: видеоканал недоступен.";
+        overlayNotice_ = sent ? uiText::Stream::KeyframeRequested : uiText::Stream::KeyframeRequestFailed;
         overlayNoticeAt_ = std::chrono::steady_clock::now();
         return;
     }
     if (action.type == Action::SendText) {
         // Text is transient and never included in diagnostics or saved files.
         const bool sent = sendRemote(fog::remote::unicodeText(action.text));
-        overlayNotice_ = sent ? "Текст отправлен на ПК." : "Не удалось передать текст: канал управления недоступен.";
+        overlayNotice_ = sent ? uiText::Stream::TextSent : uiText::Stream::TextSendFailed;
         overlayNoticeAt_ = std::chrono::steady_clock::now();
         return;
     }
@@ -68,7 +71,7 @@ void ApplicationController::overlayAction(const fog::stream::OverlayAction& acti
     const bool pressed = sendRemote(fog::remote::key(true,code));
     // Always attempt key-up, even if the channel changed while sending.
     const bool released = sendRemote(fog::remote::key(false,code));
-    overlayNotice_ = pressed && released ? "Клавиша передана на ПК." : "Канал управления недоступен.";
+    overlayNotice_ = pressed && released ? uiText::Stream::KeySent : uiText::Stream::ControlUnavailable;
     overlayNoticeAt_ = std::chrono::steady_clock::now();
 }
 

@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/playstation/infrastructure/catalog.hpp"
 #include "features/playstation/infrastructure/availability.hpp"
 #include "core/network/http.hpp"
@@ -227,7 +228,7 @@ Json price(std::string_view card) {
 }
 }
 Json parsePlayStationComputers(std::string_view html, std::string_view promoSlug) {
-    if (html.size() > 8 * 1024 * 1024) throw std::runtime_error("PlayStation catalog response is too large");
+    if (html.size() > 8 * 1024 * 1024) throw std::runtime_error(fog::constants::error::PlayStation::PlayStationCatalogResponseIsTooLarge);
     Json result = Json::array();
     for (const auto& known : PlayStationComputers) {
         if (promoSlug != known.promoSlug) continue;
@@ -272,7 +273,7 @@ std::string loadPlayStationPromoPages(std::string_view promoSlug, const PlayStat
         std::string html;
         try {
             html = load(page);
-            if (html.size() > 8*1024*1024-combined.size()) throw std::runtime_error("PlayStation promo exceeds limit");
+            if (html.size() > 8*1024*1024-combined.size()) throw std::runtime_error(fog::constants::error::PlayStation::PlayStationPromoExceedsLimit);
         } catch (const std::exception&) {
             if (combined.empty()) throw;
             break;
@@ -322,7 +323,7 @@ Json fetchCatalog(const PagedCatalogLoader& load, const PlayStationCatalogProgre
         mergeOffers(result,computers);
         if (progress) progress(result);
     }
-    if (!anyLoaded) throw std::runtime_error("Не удалось загрузить список PlayStation ПК");
+    if (!anyLoaded) throw std::runtime_error(fog::constants::error::PlayStation::CatalogLoadFailed);
     return result;
 }
 }
@@ -341,11 +342,11 @@ Json fetchPlayStationComputers(HttpClient& http, const PlayStationCatalogProgres
             checkPlayStationCancellation(cancelled);
             const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline-std::chrono::steady_clock::now()).count();
-            if (remaining <= 0) throw std::runtime_error("PlayStation promo deadline reached");
+            if (remaining <= 0) throw std::runtime_error(fog::constants::error::PlayStation::PlayStationPromoDeadlineReached);
             const auto timeout = static_cast<long>(remaining);
             const auto response = http.request("GET", "/promo/computer/" + slug + "/",
                 {{"slug", slug}, {"page", std::to_string(page)}}, "", "", {timeout, std::min(3000L,timeout)});
-            if (response.status != 200) throw std::runtime_error("PlayStation promo source unavailable");
+            if (response.status != 200) throw std::runtime_error(fog::constants::error::PlayStation::PlayStationPromoSourceUnavailable);
             return response.body;
         },sourceProgress,cancelled);
     },progress,cancelled);

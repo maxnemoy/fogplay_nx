@@ -1,3 +1,6 @@
+#include "core/constants/resources.hpp"
+#include "core/constants/app_info.hpp"
+#include "core/constants/error_text.hpp"
 #include "features/catalog/infrastructure/artwork.hpp"
 #include "core/network/http.hpp"
 #include <SDL.h>
@@ -267,7 +270,7 @@ int imageProgress(void* data, curl_off_t total, curl_off_t, curl_off_t, curl_off
         total > static_cast<curl_off_t>(maxArtworkBytes) ? 1 : 0;
 }
 void checkCurl(CURLcode result) {
-    if (result != CURLE_OK) throw std::runtime_error("Artwork HTTPS request failed");
+    if (result != CURLE_OK) throw std::runtime_error(fog::constants::error::Catalog::ArtworkHTTPSRequestFailed);
 }
 std::vector<std::uint8_t> downloadArtwork(const std::string& requested,
                                         const std::atomic_bool& cancelled) {
@@ -276,23 +279,23 @@ std::vector<std::uint8_t> downloadArtwork(const std::string& requested,
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     std::string url = requested;
     for (unsigned redirect = 0; redirect <= 3; ++redirect) {
-        if (cancelled.load(std::memory_order_relaxed)) throw std::runtime_error("Artwork cancelled");
+        if (cancelled.load(std::memory_order_relaxed)) throw std::runtime_error(fog::constants::error::Catalog::ArtworkCancelled);
         const auto remaining = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now()).count());
-        if (remaining <= 0) throw std::runtime_error("Artwork request deadline reached");
-        if (!validArtworkUrl(url)) throw std::runtime_error("Artwork URL rejected");
+        if (remaining <= 0) throw std::runtime_error(fog::constants::error::Catalog::ArtworkRequestDeadlineReached);
+        if (!validArtworkUrl(url)) throw std::runtime_error(fog::constants::error::Catalog::ArtworkURLRejected);
         std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle(curl_easy_init(), &curl_easy_cleanup);
-        if (!handle) throw std::runtime_error("Cannot initialize artwork HTTPS request");
+        if (!handle) throw std::runtime_error(fog::constants::error::Catalog::CannotInitializeArtworkHTTPSRequest);
         DownloadBuffer buffer{{}, &cancelled};
         checkCurl(curl_easy_setopt(handle.get(), CURLOPT_URL, url.c_str()));
-        checkCurl(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "FogPlayNX/0.5.3"));
+        checkCurl(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, fog::constants::common::UserAgent));
 #if LIBCURL_VERSION_NUM >= 0x075500
         checkCurl(curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS_STR, "https"));
 #else
         checkCurl(curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS, CURLPROTO_HTTPS));
 #endif
 #ifdef __SWITCH__
-        checkCurl(curl_easy_setopt(handle.get(), CURLOPT_CAINFO, "romfs:/cacert.pem"));
+        checkCurl(curl_easy_setopt(handle.get(), CURLOPT_CAINFO, fog::constants::resources::CertificateBundle));
 #endif
         checkCurl(curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYPEER, 1L));
         checkCurl(curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYHOST, 2L));
@@ -313,14 +316,14 @@ std::vector<std::uint8_t> downloadArtwork(const std::string& requested,
         if (status >= 300 && status < 400) {
             char* location = nullptr;
             checkCurl(curl_easy_getinfo(handle.get(), CURLINFO_REDIRECT_URL, &location));
-            if (!location || redirect == 3) throw std::runtime_error("Artwork redirect rejected");
+            if (!location || redirect == 3) throw std::runtime_error(fog::constants::error::Catalog::ArtworkRedirectRejected);
             url = location;
             continue;
         }
-        if (status != 200) throw std::runtime_error("Artwork unavailable");
+        if (status != 200) throw std::runtime_error(fog::constants::error::Catalog::ArtworkUnavailable);
         return std::move(buffer.bytes);
     }
-    throw std::runtime_error("Artwork redirect limit reached");
+    throw std::runtime_error(fog::constants::error::Catalog::ArtworkRedirectLimitReached);
 }
 }
 
@@ -359,7 +362,7 @@ namespace {
 void validateDimensions(int width, int height) {
     if (width < 1 || height < 1 || width > 2048 || height > 2048 ||
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height) > maxArtworkPixels)
-        throw std::runtime_error("Invalid artwork dimensions");
+        throw std::runtime_error(fog::constants::error::Catalog::InvalidArtworkDimensions);
 }
 std::uint32_t bigEndian32(const std::uint8_t* data) {
     return (std::uint32_t(data[0]) << 24) | (std::uint32_t(data[1]) << 16) |
@@ -386,22 +389,22 @@ std::pair<int, int> jpegDimensions(const std::vector<std::uint8_t>& bytes) {
         }
         offset += length;
     }
-    throw std::runtime_error("Invalid JPEG artwork header");
+    throw std::runtime_error(fog::constants::error::Catalog::InvalidJPEGArtworkHeader);
 }
 }
 ArtworkPixels decodeArtwork(const std::vector<std::uint8_t>& bytes) {
-    if (bytes.empty() || bytes.size() > maxArtworkBytes) throw std::runtime_error("Invalid artwork size");
+    if (bytes.empty() || bytes.size() > maxArtworkBytes) throw std::runtime_error(fog::constants::error::Catalog::InvalidArtworkSize);
     const bool webp = bytes.size() >= 12 && std::memcmp(bytes.data(), "RIFF", 4) == 0 &&
         std::memcmp(bytes.data() + 8, "WEBP", 4) == 0;
     if (webp) {
         WebPBitstreamFeatures info{};
         if (WebPGetFeatures(bytes.data(), bytes.size(), &info) != VP8_STATUS_OK || info.has_animation)
-            throw std::runtime_error("Invalid WebP artwork");
+            throw std::runtime_error(fog::constants::error::Catalog::InvalidWebPArtwork);
         validateDimensions(info.width, info.height);
         ArtworkPixels pixels{info.width, info.height, {}};
         pixels.rgba.resize(static_cast<std::size_t>(info.width) * static_cast<std::size_t>(info.height) * 4);
         if (!WebPDecodeRGBAInto(bytes.data(), bytes.size(), pixels.rgba.data(), pixels.rgba.size(), info.width * 4))
-            throw std::runtime_error("Artwork decode failed");
+            throw std::runtime_error(fog::constants::error::Catalog::ArtworkDecodeFailed);
         return pixels;
     }
     constexpr std::uint8_t pngSignature[] = {137,80,78,71,13,10,26,10};
@@ -410,24 +413,24 @@ ArtworkPixels decodeArtwork(const std::vector<std::uint8_t>& bytes) {
     if (bytes.size() >= 33 && std::memcmp(bytes.data(), pngSignature, sizeof(pngSignature)) == 0 &&
         bigEndian32(bytes.data() + 8) == 13 && std::memcmp(bytes.data() + 12, "IHDR", 4) == 0) {
         const auto w = bigEndian32(bytes.data() + 16), h = bigEndian32(bytes.data() + 20);
-        if (w > 2048 || h > 2048) throw std::runtime_error("Invalid PNG artwork dimensions");
+        if (w > 2048 || h > 2048) throw std::runtime_error(fog::constants::error::Catalog::InvalidPNGArtworkDimensions);
         width = static_cast<int>(w); height = static_cast<int>(h); format = "PNG";
         validateDimensions(width, height);
     } else if (bytes.size() >= 4 && bytes[0] == 0xff && bytes[1] == 0xd8) {
         const auto dimensions = jpegDimensions(bytes);
         width = dimensions.first; height = dimensions.second; format = "JPG";
-    } else throw std::runtime_error("Unsupported artwork format");
+    } else throw std::runtime_error(fog::constants::error::Catalog::UnsupportedArtworkFormat);
     // Explicit loaders prevent SDL_image from attempting unrelated formats such as SVG.
     auto* input = SDL_RWFromConstMem(bytes.data(), static_cast<int>(bytes.size()));
-    if (!input) throw std::runtime_error("Artwork memory stream failed");
+    if (!input) throw std::runtime_error(fog::constants::error::Catalog::ArtworkMemoryStreamFailed);
     std::unique_ptr<SDL_Surface, decltype(&SDL_FreeSurface)> decoded(
         format[0] == 'P' ? IMG_LoadPNG_RW(input) : IMG_LoadJPG_RW(input), &SDL_FreeSurface);
     SDL_RWclose(input);
     if (!decoded || decoded->w != width || decoded->h != height)
-        throw std::runtime_error("Artwork decode failed");
+        throw std::runtime_error(fog::constants::error::Catalog::ArtworkDecodeFailed);
     std::unique_ptr<SDL_Surface, decltype(&SDL_FreeSurface)> rgba(
         SDL_ConvertSurfaceFormat(decoded.get(), SDL_PIXELFORMAT_RGBA32, 0), &SDL_FreeSurface);
-    if (!rgba) throw std::runtime_error("Artwork pixel conversion failed");
+    if (!rgba) throw std::runtime_error(fog::constants::error::Catalog::ArtworkPixelConversionFailed);
     ArtworkPixels pixels{width, height, {}};
     pixels.rgba.resize(static_cast<std::size_t>(width) * height * 4);
     for (int row = 0; row < height; ++row)

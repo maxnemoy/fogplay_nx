@@ -45,7 +45,8 @@ class BuildToolsTests(unittest.TestCase):
 
     def package_fixture(self):
         shutil.copyfile(ROOT / 'package.py', self.root / 'package.py')
-        self.write('Makefile', 'APP_VERSION := 1.2.3\n')
+        self.write('src/core/constants/app_info.hpp',
+                   '#define FOGPLAY_APP_VERSION "1.2.3"\n#define FOGPLAY_APP_AUTHOR "maxnemoy"\n')
         self.write('README.md', 'test readme')
         self.write('docs/THIRD-PARTY.md', 'test licenses')
         self.write('licenses/example.txt', 'test license')
@@ -56,6 +57,7 @@ class BuildToolsTests(unittest.TestCase):
         payload[0x80:0x84] = b'ASET'
         struct.pack_into('<QQ', payload, 0x80 + 24, 56, 0x4000)
         payload[0x80 + 56 + 0x200:0x80 + 56 + 0x208] = b'maxnemoy'
+        payload[0x80 + 56 + 0x3060:0x80 + 56 + 0x3065] = b'1.2.3'
         payload[-32:-15] = b'BEGIN CERTIFICATE'
         nro = self.root / 'dist/fogplay_nx.nro'
         nro.write_bytes(payload)
@@ -67,6 +69,7 @@ class BuildToolsTests(unittest.TestCase):
         for label, offset, data in (
             ('truncated', 0, b''), ('nro', 0x10, b'BAD!'),
             ('asset', 0x80, b'BAD!'), ('author', 0x80 + 56 + 0x200, b'bad-name'),
+            ('stale-version', 0x80 + 56 + 0x3060, b'1.2.2'),
             ('bounds', 0x80 + 24, struct.pack('<QQ', 2**63, 0x4000))):
             with self.subTest(label=label):
                 payload = bytearray(valid)
@@ -96,6 +99,8 @@ class BuildToolsTests(unittest.TestCase):
 
     def test_make_tracks_system_headers_flags_and_safe_clean(self):
         shutil.copyfile(ROOT / 'Makefile', self.root / 'Makefile')
+        self.write('src/core/constants/app_info.hpp',
+                   (ROOT / 'src/core/constants/app_info.hpp').read_text())
         self.write('fake-devkit/libnx/switch_rules', '')
         self.write('src/main.cpp', '#include <rtc-test.h>\nint value() { return RTC_VALUE; }\n')
         header = self.write('headers/rtc-test.h', '#define RTC_VALUE 1\n')

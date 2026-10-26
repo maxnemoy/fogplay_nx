@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/media_annexb.hpp"
 #include "features/streaming/domain/audio_queue_metrics.hpp"
@@ -199,7 +200,7 @@ struct Media::Impl {
 #endif
         Impl candidate(renderer, videoCodec);
         const auto* codec = avcodec_find_decoder(videoCodec == ::stream::VideoCodec::H265 ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
-        if (!codec) throw std::runtime_error("Selected video decoder unavailable");
+        if (!codec) throw std::runtime_error(fog::constants::error::Stream::SelectedVideoDecoderUnavailable);
         candidate.decoder = avcodec_alloc_context3(codec);
         candidate.frame = av_frame_alloc(); candidate.cpuFrame = av_frame_alloc(); candidate.packet = av_packet_alloc();
         candidate.pendingFrame = av_frame_alloc();
@@ -236,11 +237,11 @@ struct Media::Impl {
         initVideo(videoCodec == ::stream::VideoCodec::H265);
         int error = 0;
         opus = opus_decoder_create(48000, 2, &error);
-        if (!opus || error != OPUS_OK) throw std::runtime_error("Cannot initialize Opus decoder");
+        if (!opus || error != OPUS_OK) throw std::runtime_error(fog::constants::error::Stream::CannotInitializeOpusDecoder);
         SDL_AudioSpec wanted{}, obtained{};
         wanted.freq = 48000; wanted.format = AUDIO_S16SYS; wanted.channels = 2; wanted.samples = 960;
         audioDevice = SDL_OpenAudioDevice(nullptr, 0, &wanted, &obtained, 0);
-        if (!audioDevice) throw std::runtime_error("Cannot open audio output");
+        if (!audioDevice) throw std::runtime_error(fog::constants::error::Stream::CannotOpenAudioOutput);
         SDL_PauseAudioDevice(audioDevice, 0);
     }
     void receive() {
@@ -252,7 +253,7 @@ struct Media::Impl {
             // This client never sends the drain marker; EOF is unexpected.
             if (rc < 0) codecFailure("receive_frame", rc);
             if (frame->width < 1 || frame->height < 1 || frame->width > 1920 || frame->height > 1080)
-                throw std::runtime_error("Video exceeds prototype limit (1920x1080)");
+                throw std::runtime_error(fog::constants::error::Stream::VideoExceedsPrototypeLimit1920x1080);
             lastFrameFormat = frame->format;
             lastColorspace = frame->colorspace; lastRange = frame->color_range;
             lastTrc = frame->color_trc; lastPrimaries = frame->color_primaries;
@@ -286,30 +287,30 @@ struct Media::Impl {
         lastCpuFormat = decoded->format;
         const int w = decoded->width, h = decoded->height;
         if (w < 1 || h < 1 || w > 1920 || h > 1080)
-            throw std::runtime_error("Video exceeds prototype limit (1920x1080)");
+            throw std::runtime_error(fog::constants::error::Stream::VideoExceedsPrototypeLimit1920x1080);
         pixels.resize(static_cast<std::size_t>(w) * h + 2 * ((w+1)/2) * ((h+1)/2));
         scaler = sws_getCachedContext(scaler, w, h, static_cast<AVPixelFormat>(decoded->format),
             w, h, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-        if (!scaler) throw std::runtime_error("Cannot convert video pixel format");
+        if (!scaler) throw std::runtime_error(fog::constants::error::Stream::CannotConvertVideoPixelFormat);
         unsigned char* planes[4]{pixels.data(), pixels.data() + w*h,
             pixels.data() + w*h + ((w+1)/2)*((h+1)/2), nullptr};
         int strides[4]{w, (w+1)/2, (w+1)/2, 0};
         const auto scaleStart = DecoderClock::now();
         const int scaled = sws_scale(scaler, decoded->data, decoded->linesize, 0, h, planes, strides);
         scaleTiming.record(scaleStart);
-        if (scaled != h) throw std::runtime_error("Video conversion failed");
+        if (scaled != h) throw std::runtime_error(fog::constants::error::Stream::VideoConversionFailed);
         // Keep the last good texture until its replacement has been uploaded.
         const bool replace = !texture || w != textureWidth || h != textureHeight;
         std::unique_ptr<SDL_Texture, decltype(&SDL_DestroyTexture)> candidate(nullptr, SDL_DestroyTexture);
         if (replace) {
             candidate.reset(SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, w, h));
-            if (!candidate) throw std::runtime_error("Cannot allocate video texture");
+            if (!candidate) throw std::runtime_error(fog::constants::error::Stream::CannotAllocateVideoTexture);
         }
         SDL_Texture* target = replace ? candidate.get() : texture;
         const auto uploadStart = DecoderClock::now();
         const int uploaded = SDL_UpdateYUVTexture(target, nullptr, planes[0], strides[0], planes[1], strides[1], planes[2], strides[2]);
         uploadTiming.record(uploadStart);
-        if (uploaded != 0) throw std::runtime_error("Cannot update video texture");
+        if (uploaded != 0) throw std::runtime_error(fog::constants::error::Stream::CannotUpdateVideoTexture);
         if (replace) {
             if (texture) SDL_DestroyTexture(texture);
             texture = candidate.release();
@@ -326,7 +327,7 @@ struct Media::Impl {
 };
 Media::Media(SDL_Renderer* renderer, ::stream::VideoCodec codec, bool deferredPresentation)
     : impl_(std::make_unique<Impl>(renderer, codec, deferredPresentation)) {
-    if (codec == ::stream::VideoCodec::H265 && !supportsH265()) throw std::runtime_error("H.265 hardware decoder unavailable");
+    if (codec == ::stream::VideoCodec::H265 && !supportsH265()) throw std::runtime_error(fog::constants::error::Stream::H265HardwareDecoderUnavailable);
     impl_->waiting = impl_->awaitingIdr = codec == ::stream::VideoCodec::H265;
     acquireDecoderLogging();
     impl_->ownsCallback = true;
@@ -334,7 +335,7 @@ Media::Media(SDL_Renderer* renderer, ::stream::VideoCodec codec, bool deferredPr
 }
 Media::~Media() = default;
 void Media::video(const std::byte* data, std::size_t size) {
-    if (!data || !size || size > 4*1024*1024) throw std::runtime_error("Invalid video access unit");
+    if (!data || !size || size > 4*1024*1024) throw std::runtime_error(fog::constants::error::Stream::InvalidVideoAccessUnit);
     auto& m = *impl_;
     m.requireVideo();
     const auto* bytes = reinterpret_cast<const unsigned char*>(data);
@@ -375,7 +376,7 @@ bool Media::supportsH265() {
 void Media::setVideoCodec(::stream::VideoCodec codec) {
     auto& m = *impl_;
     if (m.videoCodec == codec) return;
-    if (codec == ::stream::VideoCodec::H265 && !supportsH265()) throw std::runtime_error("H.265 hardware decoder unavailable");
+    if (codec == ::stream::VideoCodec::H265 && !supportsH265()) throw std::runtime_error(fog::constants::error::Stream::H265HardwareDecoderUnavailable);
     const bool requireHardware = m.hw;
     m.releaseVideo();
     m.width = m.textureWidth; m.height = m.textureHeight;
@@ -405,11 +406,11 @@ void Media::resetVideoDecoder() {
 }
 bool Media::waitingForVideoKeyframe() const { return impl_->waiting; }
 void Media::audio(const std::byte* data, std::size_t size) {
-    if (!size || size > 65536) throw std::runtime_error("Invalid Opus packet");
+    if (!size || size > 65536) throw std::runtime_error(fog::constants::error::Stream::InvalidOpusPacket);
     std::array<opus_int16, 5760*2> pcm{};
     const int count = opus_decode(impl_->opus, reinterpret_cast<const unsigned char*>(data),
         static_cast<opus_int32>(size), pcm.data(), 5760, 0);
-    if (count < 0) throw std::runtime_error("Opus decoding failed");
+    if (count < 0) throw std::runtime_error(fog::constants::error::Stream::OpusDecodingFailed);
     // Drop stale queued audio after a scheduling stall instead of increasing latency.
     const auto queued = impl_->observeAudioQueue();
     if (queued > detail::AudioQueueMetrics::bytesPerSecond / 5) {
@@ -417,7 +418,7 @@ void Media::audio(const std::byte* data, std::size_t size) {
         impl_->audioMetrics.cleared(queued);
     }
     if (SDL_QueueAudio(impl_->audioDevice, pcm.data(), static_cast<Uint32>(count*2*sizeof(opus_int16))) != 0)
-        throw std::runtime_error("Cannot queue audio");
+        throw std::runtime_error(fog::constants::error::Stream::CannotQueueAudio);
     ++impl_->packets;
     impl_->audioMetrics.queued(SDL_GetQueuedAudioSize(impl_->audioDevice), DecoderClock::now());
 }
@@ -431,9 +432,9 @@ bool Media::draw() {
     // Redraw letterbox bars too, so closed overlays leave no stale pixels.
     SDL_SetRenderDrawColor(impl_->renderer, 0, 0, 0, 255);
     if (SDL_RenderClear(impl_->renderer) != 0)
-        throw std::runtime_error("Video background rendering failed");
+        throw std::runtime_error(fog::constants::error::Stream::VideoBackgroundRenderingFailed);
     if (SDL_RenderCopy(impl_->renderer, impl_->texture, nullptr, &rect) != 0)
-        throw std::runtime_error("Video rendering failed");
+        throw std::runtime_error(fog::constants::error::Stream::VideoRenderingFailed);
     impl_->drawnGeneration = impl_->uploadedFrames;
     return true;
 }

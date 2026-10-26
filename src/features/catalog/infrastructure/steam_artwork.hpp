@@ -1,4 +1,5 @@
 #pragma once
+#include "core/constants/storage_paths.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -13,7 +14,7 @@ struct SteamSearchResponse {
 };
 struct SteamArtworkOptions {
 #ifdef __SWITCH__
-    std::string directory = "sdmc:/switch/fogplay_nx/cache/steam";
+    std::string directory = fog::constants::storage::path(fog::constants::storage::SteamCache);
 #else
     std::string directory;
 #endif

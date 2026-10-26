@@ -17,6 +17,8 @@ def method(source, name):
 
 
 harness = r'''
+#include "core/constants/ui_text.hpp"
+namespace uiText = fog::constants::ui;
 #include "features/session/domain/service_models.hpp"
 #include "features/playstation/domain/computer.hpp"
 #include <algorithm>

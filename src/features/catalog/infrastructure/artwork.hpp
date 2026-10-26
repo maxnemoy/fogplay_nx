@@ -1,4 +1,5 @@
 #pragma once
+#include "core/constants/storage_paths.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -29,7 +30,7 @@ ArtworkPixels decodeArtwork(const std::vector<std::uint8_t>& bytes);
 // Limits include metadata and in-progress temporary files; lower values aid host tests.
 struct ArtworkDiskOptions {
 #ifdef __SWITCH__
-    std::string directory = "sdmc:/switch/fogplay_nx/cache/artwork";
+    std::string directory = fog::constants::storage::path(fog::constants::storage::ArtworkCache);
 #else
     std::string directory;
 #endif

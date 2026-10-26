@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/streaming/infrastructure/stream.hpp"
 #include "features/streaming/infrastructure/dtls_diagnostics.hpp"
 #include "features/streaming/infrastructure/stream_protocol.hpp"
@@ -552,7 +553,7 @@ struct Client::Impl {
                 TransportStageScope timing{value.pairTiming};
                 try {
 #ifdef FOG_STREAM_TESTING
-                    if (throws) throw std::runtime_error("Selected pair fixture failure");
+                    if (throws) throw std::runtime_error(fog::constants::error::Stream::SelectedPairFixtureFailure);
                     if (override) { value.pair = available; value.local = testL; value.remote = testR; }
                     else
 #endif
@@ -661,8 +662,8 @@ struct Client::Impl {
         transportSend([&] { ws->send(frame); }, "Signaling send failed");
     }
     void signal(const Json& payload) {
-        if (!ws || !ws->isOpen() || !stompConnected) throw TransportError("Signaling unavailable", true);
-        if (ws->bufferedAmount() > 256 * 1024) throw TransportError("Signaling backpressure", true);
+        if (!ws || !ws->isOpen() || !stompConnected) throw TransportError(fog::constants::error::Stream::SignalingUnavailable, true);
+        if (ws->bufferedAmount() > 256 * 1024) throw TransportError(fog::constants::error::Stream::SignalingBackpressure, true);
         const auto frame = protocol::frame("SEND", {{"destination", "/topic/" + hash + "/server"},
                   {"content-type", "application/json"}, {"client-hash", clientHash}}, payload.dump());
         sendSignaling(frame);
@@ -690,11 +691,11 @@ struct Client::Impl {
             controlSender->allow(routeAllowed());
         }
         const auto out = controlSender->snapshot();
-        if (out.failure == AsyncControlSender::Failure::Transport) throw TransportError("Control send failed", true);
-        if (out.failure == AsyncControlSender::Failure::Unexpected) throw TransportError("Control sender failed");
+        if (out.failure == AsyncControlSender::Failure::Transport) throw TransportError(fog::constants::error::Stream::ControlSendFailed, true);
+        if (out.failure == AsyncControlSender::Failure::Unexpected) throw TransportError(fog::constants::error::Stream::ControlSenderFailed);
         // A stalled synchronous sender must reach rental termination before any
         // cleanup join; retry cleanup could otherwise wait on the stalled call.
-        if (out.stalled) throw TransportError("Control channel stalled");
+        if (out.stalled) throw TransportError(fog::constants::error::Stream::ControlChannelStalled);
     }
     bool control(const std::string& payload, ControlQueue::Mode mode = ControlQueue::Mode::Ordered,
                  const std::string& input = {}, const std::string& release = {}) {
@@ -704,7 +705,7 @@ struct Client::Impl {
     void openChannel() {
         if (closingForRetry || channelOpen || !channel || !channel->isOpen()) return;
         if (!routeAllowed()) {
-            if (currentRoute() && route.isDirect()) throw TransportError("TURN required but direct path selected");
+            if (currentRoute() && route.isDirect()) throw TransportError(fog::constants::error::Stream::TURNRequiredButDirectPathSelected);
             state = "Waiting for TURN route";
             return;
         }
@@ -736,7 +737,7 @@ struct Client::Impl {
         if (notify) {
             closingForRetry = false; // A rejected retry follows ordinary final-close notification.
             try { if (stompConnected && ws && ws->isOpen()) signal({{"id", "close"}}); }
-            catch (const std::exception&) { if (failure.empty()) failure = "Close notification failed"; }
+            catch (const std::exception&) { if (failure.empty()) failure = fog::constants::error::Stream::CloseNotificationFailed; }
         }
         running = false; isReady = false; channelOpen = false; stompConnected = false;
         // Queued events can own tracks/channels. Release them outside the queue lock:
@@ -763,22 +764,22 @@ struct Client::Impl {
         }
         if (channel) {
             try { channel->resetCallbacks(); channel->close(); }
-            catch (const std::exception&) { if (failure.empty()) failure = "Control shutdown failed"; }
+            catch (const std::exception&) { if (failure.empty()) failure = fog::constants::error::Stream::ControlShutdownFailed; }
             channel.reset();
         }
         for (auto& track : tracks) {
             try { track->resetCallbacks(); track->close(); }
-            catch (const std::exception&) { if (failure.empty()) failure = "Track shutdown failed"; }
+            catch (const std::exception&) { if (failure.empty()) failure = fog::constants::error::Stream::TrackShutdownFailed; }
         }
         tracks.clear();
         if (peer) {
             try { peer->resetCallbacks(); peer->close(); }
-            catch (const std::exception&) { if (failure.empty()) failure = "Peer shutdown failed"; }
+            catch (const std::exception&) { if (failure.empty()) failure = fog::constants::error::Stream::PeerShutdownFailed; }
             peer.reset();
         }
         if (ws) {
             try { ws->resetCallbacks(); ws->close(); }
-            catch (const std::exception&) { if (failure.empty()) failure = "Signaling shutdown failed"; }
+            catch (const std::exception&) { if (failure.empty()) failure = fog::constants::error::Stream::SignalingShutdownFailed; }
             ws.reset();
         }
         shared.reset();
@@ -791,11 +792,11 @@ struct Client::Impl {
         // Terminal evidence wins over concurrent transport loss, even when the FIFO is full.
         if (mayRetry && shared) {
             TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
-            if (shared->terminalControl == IncomingControl::Kind::Close) { reason = "Remote control closed"; mayRetry = false; }
-            else if (shared->terminalControl == IncomingControl::Kind::Error) { reason = "Remote control error"; mayRetry = false; }
-            else if (shared->terminalControl == IncomingControl::Kind::Invalid) { reason = "Malformed control message"; mayRetry = false; }
-            else if (shared->eventOverflow) { reason = "Signaling/control event queue capacity exceeded"; mayRetry = false; }
-            else if (shared->callbackFailure) { reason = "Stream callback failed"; mayRetry = false; }
+            if (shared->terminalControl == IncomingControl::Kind::Close) { reason = fog::constants::error::Stream::RemoteControlClosed; mayRetry = false; }
+            else if (shared->terminalControl == IncomingControl::Kind::Error) { reason = fog::constants::error::Stream::RemoteControlError; mayRetry = false; }
+            else if (shared->terminalControl == IncomingControl::Kind::Invalid) { reason = fog::constants::error::Stream::MalformedControlMessage; mayRetry = false; }
+            else if (shared->eventOverflow) { reason = fog::constants::error::Stream::SignalingControlEventQueueCapacityExceeded; mayRetry = false; }
+            else if (shared->callbackFailure) { reason = fog::constants::error::Stream::StreamCallbackFailed; mayRetry = false; }
         }
         // Seal queued input before ICE's final-neutral allowance becomes
         // visible. No ordinary press may start in the shutdown handoff gap.
@@ -804,20 +805,20 @@ struct Client::Impl {
         if (rtcpWorker) {
             rtcpWorker->requestStop();
             if (mayRetry && !rtcpWorker->quiescent()) {
-                reason = "RTCP send in flight; ending rental before transport cleanup"; mayRetry = false;
+                reason = fog::constants::error::Stream::RTCPSendInFlightEndingRentalBeforeTransportCleanup; mayRetry = false;
             }
         }
         if (iceWorker) {
             iceWorker->requestStop();
             if (mayRetry && iceWorker->state().active) {
-                reason = "ICE snapshot in flight; ending rental before transport cleanup"; mayRetry = false;
+                reason = fog::constants::error::Stream::ICESnapshotInFlightEndingRentalBeforeTransportCleanup; mayRetry = false;
             }
         }
         if (controlSender) {
             // A completed failure may retry, but never join a still-running RTC
             // call before the owner can dispatch its rental-stop request.
             if (mayRetry && controlSender->snapshot().transportActive) {
-                reason = "Control operation blocked during transport failure"; mayRetry = false;
+                reason = fog::constants::error::Stream::ControlOperationBlockedDuringTransportFailure; mayRetry = false;
             }
         }
         if (failure.empty()) { failure = reason; retryableFailure = mayRetry; }
@@ -838,7 +839,7 @@ struct Client::Impl {
     }
     void createPeer(const Json& init) {
         operation = "init.ice-servers";
-        if (peer) throw TransportError("Duplicate peer initialization");
+        if (peer) throw TransportError(fog::constants::error::Stream::DuplicatePeerInitialization);
         rtc::Configuration config;
         config.disableAutoNegotiation = true;
         config.maxMessageSize = 64 * 1024;
@@ -923,7 +924,7 @@ struct Client::Impl {
                     {
                         TimedMutex::Guard lock(s.mutex, TimedMutex::Scope::Callback);
                         if (s.stopped) return;
-                        if (s.videoTrack) throw TransportError("Duplicate video track");
+                        if (s.videoTrack) throw TransportError(fog::constants::error::Stream::DuplicateVideoTrack);
                         s.videoTrack = true;
                         s.repair = RtpRepair(protocol::videoRepairConfig(static_cast<std::string>(desc)));
                         s.video.enableNack(s.repair.config().nack());
@@ -945,7 +946,7 @@ struct Client::Impl {
                     feedback = s.rtcpWorker;
                 }
                 if (!feedback || !feedback->addSession(receiver))
-                    throw TransportError("RTCP receiver registration failed");
+                    throw TransportError(fog::constants::error::Stream::RTCPReceiverRegistrationFailed);
                 depacketizer->addToChain(receiver);
                 if (kind == Kind::Video) depacketizer->addToChain(std::make_shared<RtxRtpHandler>([weak](rtc::binary& packet, bool control) {
                     bool accepted = false;
@@ -975,21 +976,21 @@ struct Client::Impl {
     void candidate(const Json& candidate) {
         operation = "candidate.validate";
         if (!candidate.is_object() || candidate.at("candidate").get<std::string>().size() > 8192)
-            throw TransportError("Invalid ICE candidate");
+            throw TransportError(fog::constants::error::Stream::InvalidICECandidate);
         // Browser end-of-candidates objects need neither a mid nor an ICE parser.
         if (candidate.at("candidate").get<std::string>().empty()) { ++emptyCandidates; return; }
         if (!peer || !remoteSet) {
-            if (pendingCandidates.size() >= 64) throw TransportError("ICE queue limit");
+            if (pendingCandidates.size() >= 64) throw TransportError(fog::constants::error::Stream::ICEQueueLimit);
             pendingCandidates.push_back(candidate); return;
         }
         std::string mid;
         if (candidate.contains("sdpMid") && candidate["sdpMid"].is_string()) mid = candidate["sdpMid"].get<std::string>();
         else {
             const auto index = candidate.at("sdpMLineIndex").get<int>();
-            if (index < 0 || static_cast<std::size_t>(index) >= mids.size()) throw TransportError("Invalid ICE media index");
+            if (index < 0 || static_cast<std::size_t>(index) >= mids.size()) throw TransportError(fog::constants::error::Stream::InvalidICEMediaIndex);
             mid = mids[index];
         }
-        if (std::find(mids.begin(), mids.end(), mid) == mids.end()) throw TransportError("Invalid ICE mid");
+        if (std::find(mids.begin(), mids.end(), mid) == mids.end()) throw TransportError(fog::constants::error::Stream::InvalidICEMid);
         const auto value = candidate.at("candidate").get<std::string>();
         operation = "candidate.apply";
         rtc::Candidate parsed(value, mid);
@@ -1004,14 +1005,14 @@ struct Client::Impl {
             operation = "offer.envelope";
             const auto encoded = message.at("data").get<std::string>();
             if (encoded.empty()) return; // Official Android ignores empty offer notifications.
-            if (!peer) throw TransportError("Unexpected offer");
-            if (remoteSet) throw TransportError("Remote renegotiation unsupported");
+            if (!peer) throw TransportError(fog::constants::error::Stream::UnexpectedOffer);
+            if (remoteSet) throw TransportError(fog::constants::error::Stream::RemoteRenegotiationUnsupported);
             ++offers;
             operation = "offer.base64";
             const auto decoded = protocol::base64Decode(encoded);
             operation = "offer.json";
             const auto offer = Json::parse(decoded);
-            if (offer.at("type") != "offer") throw TransportError("Invalid offer type");
+            if (offer.at("type") != "offer") throw TransportError(fog::constants::error::Stream::InvalidOfferType);
             operation = "offer.filter";
             const auto sdp = protocol::filterOffer(offer.at("sdp").get<std::string>(), videoSettings.codec);
             selectedCodec = protocol::offeredVideoCodec(sdp);
@@ -1022,11 +1023,11 @@ struct Client::Impl {
             operation = "offer.mids";
             mids = protocol::mediaMids(sdp);
             if (mids.empty() || mids.size() > 16 || std::any_of(mids.begin(), mids.end(), [](const std::string& mid) { return mid.empty() || mid.size() > 64; }))
-                throw TransportError("Missing SDP mid");
+                throw TransportError(fog::constants::error::Stream::MissingSDPMid);
             auto uniqueMids = mids;
             std::sort(uniqueMids.begin(), uniqueMids.end());
             if (std::adjacent_find(uniqueMids.begin(), uniqueMids.end()) != uniqueMids.end())
-                throw TransportError("Duplicate SDP mid");
+                throw TransportError(fog::constants::error::Stream::DuplicateSDPMid);
             operation = "offer.parse-sdp";
             rtc::Description remote(sdp, "offer");
             // v0.24.1 demux indexes individual SSRC attributes, not FID groups.
@@ -1062,9 +1063,9 @@ struct Client::Impl {
             operation = "candidate.json";
             candidate(Json::parse(decoded));
         } else if (id == "init_webrtc_error" || id == "init_webrtc" || id == "error" || id == "close") {
-            if (id == "close") throw TransportError("Remote signaling closed stream");
-            if (id == "error") throw TransportError("Remote signaling error");
-            throw TransportError(relay ? "Relay transport unavailable: remote initialization rejected" : "Remote WebRTC initialization rejected");
+            if (id == "close") throw TransportError(fog::constants::error::Stream::RemoteSignalingClosedStream);
+            if (id == "error") throw TransportError(fog::constants::error::Stream::RemoteSignalingError);
+            throw TransportError(relay ? fog::constants::error::Stream::RelayTransportUnavailableRemoteInitializationRejected : fog::constants::error::Stream::RemoteWebRTCInitializationRejected);
         } else if (id == "ping") {
             Json pong{{"id", "pong"}};
             if (message.contains("ts")) pong["ts"] = message["ts"];
@@ -1089,18 +1090,18 @@ struct Client::Impl {
             for (const auto& frame : parser.feed(event.text)) {
                 try {
                 if (frame.command == "CONNECTED") {
-                    if (stompConnected) throw TransportError("Duplicate STOMP connection");
+                    if (stompConnected) throw TransportError(fog::constants::error::Stream::DuplicateSTOMPConnection);
                     stompConnected = true;
                     const auto hb = frame.headers.find("heart-beat");
                     if (hb != frame.headers.end()) {
                         const auto comma = hb->second.find(',');
-                        if (comma == std::string::npos) throw TransportError("Invalid heartbeat negotiation");
+                        if (comma == std::string::npos) throw TransportError(fog::constants::error::Stream::InvalidHeartbeatNegotiation);
                         const auto interval = [](const std::string& value) {
                             if (value.empty() || value.size() > 5 ||
                                 !std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= '0' && c <= '9'; }))
-                                throw TransportError("Invalid heartbeat interval");
+                                throw TransportError(fog::constants::error::Stream::InvalidHeartbeatInterval);
                             const auto parsed = std::stoi(value);
-                            if (parsed > 60000) throw TransportError("Invalid heartbeat interval");
+                            if (parsed > 60000) throw TransportError(fog::constants::error::Stream::InvalidHeartbeatInterval);
                             return parsed;
                         };
                         const auto outgoing = interval(hb->second.substr(comma + 1));
@@ -1113,7 +1114,7 @@ struct Client::Impl {
                     signal({{"id", "enabled"}, {"client_hash", clientHash}});
                     state = "Waiting for remote host";
                 } else if (frame.command == "MESSAGE") { operation = "signal.json"; message(Json::parse(frame.body)); }
-                else if (frame.command == "ERROR") throw TransportError("STOMP rejected stream");
+                else if (frame.command == "ERROR") throw TransportError(fog::constants::error::Stream::STOMPRejectedStream);
                 } catch (const TransportError& error) {
                     if (!error.retryable) throw;
                     if (frameTransportFailure.empty()) frameTransportFailure = error.what();
@@ -1129,13 +1130,13 @@ struct Client::Impl {
         case EventType::Candidate: {
             operation = "candidate.send";
             const auto it = std::find(mids.begin(), mids.end(), event.mid);
-            if (it == mids.end()) throw TransportError("Unknown local ICE mid");
+            if (it == mids.end()) throw TransportError(fog::constants::error::Stream::UnknownLocalICEMid);
             const Json c{{"candidate", event.text}, {"sdpMid", event.mid}, {"sdpMLineIndex", std::distance(mids.begin(), it)}};
             signal({{"id", "ice_candidate"}, {"data", protocol::base64Encode(c.dump())}});
             break;
         }
         case EventType::Channel:
-            if (channel) throw TransportError("Duplicate control channel");
+            if (channel) throw TransportError(fog::constants::error::Stream::DuplicateControlChannel);
             channel = event.channel;
             {
                 const auto dc = channel;
@@ -1188,15 +1189,15 @@ struct Client::Impl {
             break;
         case EventType::Control:
             operation = "control.json";
-            if (event.text == "close") throw TransportError("Remote control closed");
-            if (event.text == "error") throw TransportError("Remote control error");
-            throw TransportError("Malformed control message");
+            if (event.text == "close") throw TransportError(fog::constants::error::Stream::RemoteControlClosed);
+            if (event.text == "error") throw TransportError(fog::constants::error::Stream::RemoteControlError);
+            throw TransportError(fog::constants::error::Stream::MalformedControlMessage);
         case EventType::Track: tracks.push_back(event.track); break;
         case EventType::PeerState:
             qualityEvent("transportEvent=peer state=" + std::to_string(static_cast<int>(event.peerState)) + " ms=" + std::to_string(event.arrivedMs));
             if (event.peerState == rtc::PeerConnection::State::Failed)
-                throw TransportError(relay ? "Relay transport unavailable: peer failed" : "Peer connection failed", true);
-            if (event.peerState == rtc::PeerConnection::State::Closed) throw TransportError("Peer connection closed", true);
+                throw TransportError(relay ? fog::constants::error::Stream::RelayTransportUnavailablePeerFailed : fog::constants::error::Stream::PeerConnectionFailed, true);
+            if (event.peerState == rtc::PeerConnection::State::Closed) throw TransportError(fog::constants::error::Stream::PeerConnectionClosed, true);
             if (!isReady) {
                 if (event.peerState == rtc::PeerConnection::State::Connecting) state = "Connecting peer";
                 else if (event.peerState == rtc::PeerConnection::State::Connected) state = channelOpen ? "Waiting for video" : "Waiting for video/control";
@@ -1204,18 +1205,18 @@ struct Client::Impl {
             break;
         case EventType::IceState:
             if (event.iceState == rtc::PeerConnection::IceState::Failed)
-                throw TransportError(relay ? "Relay transport unavailable: ICE failed" : "ICE connection failed", true);
+                throw TransportError(relay ? fog::constants::error::Stream::RelayTransportUnavailableICEFailed : fog::constants::error::Stream::ICEConnectionFailed, true);
             if (event.iceState == rtc::PeerConnection::IceState::Closed)
-                throw TransportError("ICE connection closed", true);
+                throw TransportError(fog::constants::error::Stream::ICEConnectionClosed, true);
             qualityEvent("transportEvent=ice state=" + std::to_string(static_cast<int>(event.iceState)) + " ms=" + std::to_string(event.arrivedMs));
             break;
         case EventType::GatheringState:
             qualityEvent("transportEvent=gathering state=" + std::to_string(static_cast<int>(event.gatheringState)) + " ms=" + std::to_string(event.arrivedMs));
             break;
         case EventType::WsClosed:
-            throw TransportError("Signaling transport closed", true);
+            throw TransportError(fog::constants::error::Stream::SignalingTransportClosed, true);
         case EventType::Failure:
-            throw TransportError(event.text.empty() ? "Transport failed" : event.text.c_str(), true);
+            throw TransportError(event.text.empty() ? fog::constants::error::Stream::TransportFailed : event.text.c_str(), true);
         }
     }
 };
@@ -1332,7 +1333,7 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
         });
     };
     if (hash.size() > 256 || !safe(hash) || suffix.size() != 5 || !safe(suffix) || caPath.empty()) {
-        i.failure = "Invalid stream configuration"; i.state = "Failed"; return false;
+        i.failure = fog::constants::error::Stream::InvalidStreamConfiguration; i.state = "Failed"; return false;
     }
     i.hash = hash; i.suffix = suffix; i.clientHash = hash + suffix;
     i.shared = std::make_shared<Impl::Shared>();
@@ -1364,7 +1365,7 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
         });
         i.ws->open(url);
         return true;
-    } catch (const std::exception&) { i.fail("Stream startup failed"); return false; }
+    } catch (const std::exception&) { i.fail(fog::constants::error::Stream::StreamStartupFailed); return false; }
 }
 void Client::pump() {
     auto& i = *impl_;
@@ -1394,10 +1395,10 @@ void Client::pump() {
             i.shared->eventDelayHighMs = std::max(i.shared->eventDelayHighMs, videoNow() - event.arrivedMs);
         events.swap(i.shared->events); i.shared->eventBytes = 0;
     } catch (...) {
-        i.fail("Video receive processing failed"); return;
+        i.fail(fog::constants::error::Stream::VideoReceiveProcessingFailed); return;
     }
-    if (eventOverflow) { i.fail("Signaling/control event queue capacity exceeded"); return; }
-    if (callbackFailure) { i.fail("Stream callback failed"); return; }
+    if (eventOverflow) { i.fail(fog::constants::error::Stream::SignalingControlEventQueueCapacityExceeded); return; }
+    if (callbackFailure) { i.fail(fog::constants::error::Stream::StreamCallbackFailed); return; }
     try {
         // Inspect the whole bounded batch before committing a retryable failure.
         // A later remote close/error or malformed protocol must remain terminal.
@@ -1429,13 +1430,13 @@ void Client::pump() {
         // between periodic queries. Unknown pairs also obey the interval.
         try { i.snapshotIce(); } catch (...) {} // Failed query leaves required TURN gated.
         if (i.relay && i.currentRoute() && i.route.isDirect())
-            throw TransportError("TURN required but direct path selected");
+            throw TransportError(fog::constants::error::Stream::TURNRequiredButDirectPathSelected);
         const auto routeNow = Clock::now();
         if (!i.routeAllowed()) {
             i.isReady = false; i.state = "Waiting for TURN route";
             if (i.unprovenRouteAt == Clock::time_point{}) i.unprovenRouteAt = routeNow;
             if (routeNow - i.unprovenRouteAt >= std::chrono::seconds(30)) {
-                i.fail("Relay transport unavailable: selected route unproven", true); return;
+                i.fail(fog::constants::error::Stream::RelayTransportUnavailableSelectedRouteUnproven, true); return;
             }
         } else i.unprovenRouteAt = {};
         {
@@ -1449,14 +1450,14 @@ void Client::pump() {
             i.isReady = true; i.wasReady = true; i.state = "Streaming";
         }
         if (!i.wasReady && !i.isReady && now - i.started >= std::chrono::seconds(30)) {
-            i.fail(i.relay ? "Relay transport unavailable: connection timed out" : "Stream connection timed out", true); return;
+            i.fail(i.relay ? fog::constants::error::Stream::RelayTransportUnavailableConnectionTimedOut : fog::constants::error::Stream::StreamConnectionTimedOut, true); return;
         }
-        if (i.isReady && now - lastVideo >= std::chrono::seconds(15)) { i.fail("Video stream stalled", true); return; }
+        if (i.isReady && now - lastVideo >= std::chrono::seconds(15)) { i.fail(fog::constants::error::Stream::VideoStreamStalled, true); return; }
         // STOMP's server interval is the first negotiated value. A zero value
         // disables incoming heartbeats; setup and received-video deadlines still apply.
         if (i.stompConnected && i.incomingHeartbeat.count() &&
             now - i.lastWs >= std::max(std::chrono::milliseconds(15000), i.incomingHeartbeat * 3)) {
-            i.fail("Signaling stream stalled", true); return;
+            i.fail(fog::constants::error::Stream::SignalingStreamStalled, true); return;
         }
         if (i.stompConnected && i.heartbeat.count() && now - i.lastHeartbeat >= i.heartbeat) {
             TransportStageScope timing{i.heartbeatTiming};
@@ -1628,21 +1629,21 @@ bool Client::disconnectForRetry() {
         return i.retryableFailure;
     }
     if (i.rtcpWorker && !i.rtcpWorker->quiescent()) {
-        i.fail("RTCP send in flight; ending rental before transport cleanup");
+        i.fail(fog::constants::error::Stream::RTCPSendInFlightEndingRentalBeforeTransportCleanup);
         return false; // HTTP rental stop precedes an uncancellable send join.
     }
     if (i.iceWorker && i.iceWorker->state().active) {
-        i.fail("ICE snapshot in flight; ending rental before transport cleanup");
+        i.fail(fog::constants::error::Stream::ICESnapshotInFlightEndingRentalBeforeTransportCleanup);
         return false; // Rental HTTP stop precedes the unavoidable close join.
     }
     if (i.controlSender) {
         const auto sender = i.controlSender->snapshot();
         if (sender.stalled || sender.transportActive) {
-            i.fail(sender.stalled ? "Control channel stalled" : "Control operation blocked during transport failure");
+            i.fail(sender.stalled ? fog::constants::error::Stream::ControlChannelStalled : fog::constants::error::Stream::ControlOperationBlockedDuringTransportFailure);
             return false; // Owner dispatches rental stop BEFORE close/destructor.
         }
         if (sender.failure == AsyncControlSender::Failure::Unexpected) {
-            i.fail("Control sender failed"); return false;
+            i.fail(fog::constants::error::Stream::ControlSenderFailed); return false;
         }
     }
     i.stop(false);
@@ -1765,7 +1766,7 @@ bool Client::sendGamepad(const Gamepad& state) {
             if (impl_->pendingTransportFailure.empty()) impl_->pendingTransportFailure = error.what();
         } else impl_->fail(error.what());
         return false;
-    } catch (const std::exception&) { impl_->fail("Control send failed"); return false; }
+    } catch (const std::exception&) { impl_->fail(fog::constants::error::Stream::ControlSendFailed); return false; }
 }
 bool Client::sendControl(const std::string& json) {
     if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed() || json.size() > 64 * 1024) return false;
@@ -1854,7 +1855,7 @@ bool Client::sendControl(const std::string& json) {
             if (impl_->pendingTransportFailure.empty()) impl_->pendingTransportFailure = error.what();
         } else impl_->fail(error.what());
         return false;
-    } catch (const std::exception&) { impl_->fail("Control send failed"); return false; }
+    } catch (const std::exception&) { impl_->fail(fog::constants::error::Stream::ControlSendFailed); return false; }
 }
 void Client::close() {
     if (impl_ && (impl_->running || impl_->shared))

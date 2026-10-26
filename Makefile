@@ -10,9 +10,11 @@ endif
 include $(DEVKITPRO)/libnx/switch_rules
 endif
 
-APP_VERSION := 0.5.5
-APP_TITLE := FogPlay NX $(APP_VERSION)
-APP_AUTHOR := maxnemoy
+APP_INFO := src/core/constants/app_info.hpp
+APP_VERSION := $(shell sed -n 's/^\#define FOGPLAY_APP_VERSION "\([^"]*\)"/\1/p' $(APP_INFO))
+APP_NAME := $(shell sed -n 's/^\#define FOGPLAY_APP_NAME "\([^"]*\)"/\1/p' $(APP_INFO))
+APP_TITLE := $(APP_NAME) $(APP_VERSION)
+APP_AUTHOR := $(shell sed -n 's/^\#define FOGPLAY_APP_AUTHOR "\([^"]*\)"/\1/p' $(APP_INFO))
 TARGET := fogplay_nx
 BUILD := build
 OUTPUT := $(CURDIR)/dist/$(TARGET)
@@ -40,7 +42,7 @@ all: $(OUTPUT).nro
 
 $(OUTPUT).nro: $(OUTPUT).elf $(OUTPUT).nacp $(ROMFS_FILES) $(APP_ICON)
 $(OUTPUT).elf: $(OFILES) build/.flags $(FFMPEG_DIAG)/lib/libavcodec.a $(wildcard $(RTC_PREFIX)/lib/*.a) | dist
-$(OUTPUT).nacp: Makefile | dist
+$(OUTPUT).nacp: Makefile $(APP_INFO) | dist
 
 build/%.o: src/%.cpp build/.flags | build
 	@mkdir -p $(dir $@)

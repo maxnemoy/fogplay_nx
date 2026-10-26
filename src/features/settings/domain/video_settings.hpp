@@ -48,16 +48,6 @@ inline bool adjust(Settings& value, Field field, int direction, bool allowH265 =
     }
     return value != before;
 }
-inline std::string codecLabel(const Settings& value) {
-    return value.codec == ::stream::VideoCodec::H265 ? "H.265 / HEVC · экспериментально" : "H.264";
-}
-inline std::string qualityLabel(const Settings& value) {
-    const std::array<const char*, 5> labels{"Авто", "Низкое", "Среднее", "Высокое", "Ультра"};
-    return value.quality >= 0 && value.quality <= 4 ? labels[static_cast<std::size_t>(value.quality)] : "Авто";
-}
-inline std::string keyframeLabel(const Settings& value) {
-    return value.keyframeSeconds ? "Запрос каждые " + std::to_string(value.keyframeSeconds) + " с" : "Только при потере (рекомендуется)";
-}
 // Missing file uses defaults. Invalid/unreadable files throw a fixed safe error;
 // the caller retains defaults and displays a warning. Authentication is separate.
 }

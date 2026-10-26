@@ -1,3 +1,4 @@
+#include "features/catalog/presentation/genre_text.hpp"
 #include "app/presentation/ui.hpp"
 #include "features/catalog/domain/catalog.hpp"
 #include <SDL_image.h>
@@ -34,10 +35,10 @@ int main(int argc,char** argv) {
             fog::ui::Chrome chrome;
             chrome.subtitle="";
             std::vector<std::string> genres;
-            for(std::size_t i=0;i<5;++i) genres.emplace_back(fog::catalogGenres()[i].label);
+            for(std::size_t i=0;i<5;++i) genres.emplace_back(fog::ui::genreLabel(fog::catalogGenres()[i]));
             genres.emplace_back("Все жанры");
             std::vector<std::string> genreLabels{"Все игры"};
-            for(const auto& genre:fog::catalogGenres()) genreLabels.emplace_back(genre.label);
+            for(const auto& genre:fog::catalogGenres()) genreLabels.emplace_back(fog::ui::genreLabel(genre));
             std::vector<fog::ui::GameCard> games;
             const std::string names[]{"Cyberpunk 2077","Red Dead Redemption 2","Horizon Zero Dawn","God of War","Marvel’s Spider-Man 2","Ghost of Tsushima DIRECTOR’S CUT","The Last of Us Part II Remastered","Forza Horizon 5"};
             for(const auto& name:names) games.push_back({name,"Цена не загружена","Поддержка сохранений",nullptr});

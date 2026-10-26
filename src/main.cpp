@@ -1,3 +1,5 @@
+#include "core/constants/ui_text.hpp"
+#include "core/constants/error_text.hpp"
 #include "app/application.hpp"
 #include "app/app_diagnostics.hpp"
 #include "platform/switch/switch_runtime.hpp"
@@ -10,22 +12,22 @@ int main(int, char**) {
     const auto type = appletGetAppletType();
     if (type != AppletType_Application && type != AppletType_SystemApplication) {
         logSession.start();
-        fogplay::platform::fatalScreen("Full application mode required. Album mode is not supported.");
+        fogplay::platform::fatalScreen(fog::constants::error::Internal::FullApplicationModeRequired);
         return 12;
     }
     try {
         fogplay::platform::Runtime runtime;
         runtime.initGraphics();
-        runtime.showStartup("Подготавливаем журналы…");
+        runtime.showStartup(fog::constants::ui::Startup::PreparingLogs);
         logSession.start();
         runtime.initServices();
         std::string id;
         { fogplay::diagnostics::StartupStage stage("device_id"); id = fogplay::platform::deviceId(); }
         fogplay::diagnostics::diagnostic("Platform full_application=1 BSD sessions=12 efficiency=8");
-        runtime.showStartup("Проверяем SD-карту…");
+        runtime.showStartup(fog::constants::ui::Startup::CheckingStorage);
         try { fogplay::diagnostics::StartupStage stage("sd_preflight"); fogplay::platform::checkStorage(); }
         catch (const std::exception& error) { fogplay::diagnostics::diagnostic(std::string("SD preflight failed; rental creation will be blocked: ") + error.what()); }
-        runtime.showStartup("Готовим интерфейс…");
+        runtime.showStartup(fog::constants::ui::Startup::PreparingInterface);
         std::unique_ptr<fogplay::Application> app;
         {
             fogplay::diagnostics::StartupStage stage("application_setup");

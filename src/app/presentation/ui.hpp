@@ -1,4 +1,5 @@
 #pragma once
+#include "core/constants/ui_text.hpp"
 #include <SDL.h>
 #include <SDL_ttf.h>
 #include <cstddef>
@@ -6,6 +7,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+namespace uiText = ::fog::constants::ui;
+
 namespace fog::ui {
 inline constexpr std::size_t HistoryColumns = 4;
 constexpr int Width = 1280;
@@ -15,10 +18,10 @@ struct Chrome {
     Section section = Section::Games;
     bool sidebarExpanded = false;
     bool sidebarFocused = false;
-    std::string account = "Войти в аккаунт";
-    std::string title = "ВЫБЕРИ ИГРУ";
+    std::string account = uiText::Profile::SignInAccount;
+    std::string title = uiText::Catalog::Title;
     std::string subtitle;
-    std::string hints = "A Выбрать   B Назад   X Поиск   Y Аккаунт   L / R Страницы";
+    std::string hints = uiText::Catalog::DefaultHints;
 };
 struct GameCard {
     std::string name, price, note;
@@ -39,7 +42,7 @@ struct GameDetail {
 struct HistoryCard { std::string name, start, end, duration, amount, note; };
 struct SettingCard { std::string title, value, description; std::optional<bool> checked = {}; };
 struct Dialog {
-    std::string title, body, primary = "Продолжить", secondary = "Назад";
+    std::string title, body, primary = uiText::Common::Continue, secondary = uiText::Common::Back;
     bool primaryFocused = true;
     bool danger = false;
     SDL_Texture* image = nullptr;
@@ -59,7 +62,7 @@ public:
     void frame(const Chrome& chrome);
     SDL_Rect content() const;
     void games(const std::vector<GameCard>& cards, std::size_t selected,
-               std::size_t first = 0, const std::string& heading = "Игры",
+               std::size_t first = 0, const std::string& heading = uiText::Catalog::Menu,
                int top = 154, std::size_t rows = 2);
     // Genre chips occupy y=82..126. Indices outside labels mean no focus/selection.
     void genres(const std::vector<std::string>& labels, std::size_t focused = static_cast<std::size_t>(-1),

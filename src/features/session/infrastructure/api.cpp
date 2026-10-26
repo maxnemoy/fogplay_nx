@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/session/infrastructure/api.hpp"
 #include "features/auth/infrastructure/auth_storage.hpp"
 #include <algorithm>
@@ -63,14 +64,14 @@ std::string stringField(const Json& object, const char* key) {
 }
 Json responseJson(const HttpResponse& response) {
     if (response.status < 200 || response.status >= 300)
-        throw std::runtime_error("HTTP " + std::to_string(response.status) + ": request rejected");
+        throw std::runtime_error("HTTP " + std::to_string(response.status) + fog::constants::error::Connection::RequestRejected);
     auto data = Json::parse(response.body, nullptr, false);
-    if (data.is_discarded()) throw std::runtime_error("Server response is not valid JSON");
+    if (data.is_discarded()) throw std::runtime_error(fog::constants::error::Connection::ServerResponseIsNotValidJSON);
     return data;
 }
 void validatePage(int page, int pageSize) {
     if (page < 1 || page > 1000000 || pageSize < 1 || pageSize > 100)
-        throw std::invalid_argument("Invalid pagination");
+        throw std::invalid_argument(fog::constants::error::Catalog::InvalidPagination);
 }
 bool positiveId(const Json& value) {
     if (value.is_number_unsigned()) return value.get<std::uint64_t>() > 0 &&
@@ -96,21 +97,21 @@ void validateCode(const std::string& code, bool digitsOnly) {
     if (code.empty() || code.size() > 12 || !std::all_of(code.begin(), code.end(),
         [digitsOnly](unsigned char c) { return digitsOnly ? c >= '0' && c <= '9' :
             (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }))
-        throw std::invalid_argument("Invalid authentication code");
+        throw std::invalid_argument(fog::constants::error::Auth::InvalidAuthenticationCode);
 }
 }
 
 std::string normalizePhone(const std::string& input) {
-    if (input.size() > 64) throw std::invalid_argument("Invalid phone number");
+    if (input.size() > 64) throw std::invalid_argument(fog::constants::error::Auth::InvalidPhoneNumber);
     std::string number;
     for (const unsigned char c : input) {
         if (c >= '0' && c <= '9') number += static_cast<char>(c);
         else if (c != '+' && c != ' ' && c != '-' && c != '(' && c != ')')
-            throw std::invalid_argument("Invalid phone number");
+            throw std::invalid_argument(fog::constants::error::Auth::InvalidPhoneNumber);
     }
     if (number.size() == 11 && number.front() == '8') number.front() = '7';
     if (number.size() != 11 || number.front() != '7')
-        throw std::invalid_argument("Expected +7 followed by 10 digits");
+        throw std::invalid_argument(fog::constants::error::Auth::Expected7FollowedBy10Digits);
     return "+" + number;
 }
 AuthStep authStep(const Json& response) {
@@ -126,16 +127,16 @@ AuthStep authStep(const Json& response) {
 }
 std::vector<unsigned char> decodeCaptcha(const std::string& encoded) {
     constexpr std::size_t maxEncoded = 4 * 1024 * 1024;
-    if (encoded.size() > maxEncoded + 64) throw std::runtime_error("Captcha is too large");
+    if (encoded.size() > maxEncoded + 64) throw std::runtime_error(fog::constants::error::Auth::CaptchaIsTooLarge);
     std::string_view input(encoded);
     if (input.substr(0, 11) == "data:image/") {
         const auto marker = input.find(";base64,");
         if (marker == std::string_view::npos || marker > 40)
-            throw std::runtime_error("Invalid captcha data URI");
+            throw std::runtime_error(fog::constants::error::Auth::InvalidCaptchaDataURI);
         input.remove_prefix(marker + 8);
     }
     if (input.empty() || input.size() > maxEncoded || input.size() % 4 != 0)
-        throw std::runtime_error("Invalid captcha base64 size");
+        throw std::runtime_error(fog::constants::error::Auth::InvalidCaptchaBase64Size);
     constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::vector<unsigned char> result;
     result.reserve(input.size() / 4 * 3);
@@ -145,18 +146,18 @@ std::vector<unsigned char> decodeCaptcha(const std::string& encoded) {
         for (unsigned j = 0; j < 4; ++j) {
             const char c = input[i + j];
             if (c == '=') {
-                if (i + 4 != input.size() || j < 2) throw std::runtime_error("Invalid captcha base64 padding");
+                if (i + 4 != input.size() || j < 2) throw std::runtime_error(fog::constants::error::Auth::InvalidCaptchaBase64Padding);
                 ++padding;
                 value <<= 6;
             } else {
                 const auto digit = alphabet.find(c);
-                if (digit == std::string_view::npos || padding) throw std::runtime_error("Invalid captcha base64");
+                if (digit == std::string_view::npos || padding) throw std::runtime_error(fog::constants::error::Auth::InvalidCaptchaBase64);
                 value = (value << 6) | static_cast<unsigned>(digit);
             }
         }
         // Reject noncanonical padding bits instead of silently accepting malformed input.
         if ((padding == 2 && (value & 0xffffu) != 0) || (padding == 1 && (value & 0xffu) != 0))
-            throw std::runtime_error("Invalid captcha base64 padding bits");
+            throw std::runtime_error(fog::constants::error::Auth::InvalidCaptchaBase64PaddingBits);
         result.push_back(static_cast<unsigned char>((value >> 16) & 255));
         if (padding < 2) result.push_back(static_cast<unsigned char>((value >> 8) & 255));
         if (!padding) result.push_back(static_cast<unsigned char>(value & 255));
@@ -169,7 +170,7 @@ Api::Api(std::string deviceId, Transport transport, OptionsTransport optionsTran
     : transport_(std::move(transport)), optionsTransport_(std::move(optionsTransport)), deviceId_(std::move(deviceId)) {
     if (deviceId_.size() != 32 || !std::all_of(deviceId_.begin(), deviceId_.end(),
         [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
-        throw std::invalid_argument("Expected a 32-character lowercase hex device ID");
+        throw std::invalid_argument(fog::constants::error::Auth::ExpectedA32CharacterLowercaseHexDeviceID);
 }
 Api::~Api() { clearToken(); }
 HttpResponse Api::request(const std::string& method, const std::string& path,
@@ -182,8 +183,8 @@ HttpResponse Api::request(const std::string& method, const std::string& path,
 }
 Json Api::games(std::string search, int page, int pageSize, int genreId) {
     validatePage(page, pageSize);
-    if (genreId < 0 || genreId > 1000000) throw std::invalid_argument("Invalid genre ID");
-    if (search.size() > 256) throw std::invalid_argument("Search text is too long");
+    if (genreId < 0 || genreId > 1000000) throw std::invalid_argument(fog::constants::error::Catalog::InvalidGenreID);
+    if (search.size() > 256) throw std::invalid_argument(fog::constants::error::Catalog::SearchTextIsTooLong);
     auto query = commonQuery();
     query.emplace_back("device_manufacturer", "FogPlayNX");
     query.emplace_back("page", std::to_string(page));
@@ -191,17 +192,17 @@ Json Api::games(std::string search, int page, int pageSize, int genreId) {
     if (!search.empty()) query.emplace_back("search", std::move(search));
     if (genreId) query.emplace_back("taxonomy_id", std::to_string(genreId));
     auto data = responseJson(request("GET", "/api/content/games/", query, "", token_));
-    if (!data.is_array()) throw std::runtime_error("Unexpected catalog format");
+    if (!data.is_array()) throw std::runtime_error(fog::constants::error::Catalog::UnexpectedCatalogFormat);
     for (const auto& item : data) {
         if (!item.is_object() || !item.contains("id") || !positiveId(item.at("id")) ||
             !item.contains("name") || !item.at("name").is_string())
-            throw std::runtime_error("Unexpected game format");
+            throw std::runtime_error(fog::constants::error::Catalog::UnexpectedGameFormat);
     }
     return data;
 }
 Json Api::computers(int gameId, int page, int pageSize, bool ownSteamAccount) {
     validatePage(page, pageSize);
-    if (gameId < 1) throw std::invalid_argument("Invalid game ID");
+    if (gameId < 1) throw std::invalid_argument(fog::constants::error::Catalog::InvalidGameID);
     auto query = commonQuery();
     query.emplace_back("game_id", std::to_string(gameId));
     query.emplace_back("steamacc", ownSteamAccount ? "1" : "0");
@@ -209,57 +210,57 @@ Json Api::computers(int gameId, int page, int pageSize, bool ownSteamAccount) {
     query.emplace_back("pageSize", std::to_string(pageSize));
     auto data = responseJson(request("GET", "/api/content/computer/", query, "", token_));
     if (!data.is_object() || !data.contains("computers") || !data.at("computers").is_array())
-        throw std::runtime_error("Unexpected computer list format");
+        throw std::runtime_error(fog::constants::error::Catalog::UnexpectedComputerListFormat);
     for (const auto& item : data.at("computers")) {
         if (!item.is_object() || !item.contains("id") || !computerId(item.at("id")))
-            throw std::runtime_error("Unexpected computer format");
+            throw std::runtime_error(fog::constants::error::Catalog::UnexpectedComputerFormat);
     }
     return data;
 }
 Json Api::computerAuto(int gameId, bool ownSteamAccount) {
-    if (gameId < 1) throw std::invalid_argument("Invalid game ID");
+    if (gameId < 1) throw std::invalid_argument(fog::constants::error::Catalog::InvalidGameID);
     auto query = commonQuery();
     query.emplace_back("game_id", std::to_string(gameId));
     query.emplace_back("no_cache", "1");
     query.emplace_back("steamacc", ownSteamAccount ? "1" : "0");
     auto data = responseJson(request("GET", "/api/content/computer-auto/", query, "", token_));
-    if (!data.is_object()) throw std::runtime_error("Unexpected automatic computer selection format");
+    if (!data.is_object()) throw std::runtime_error(fog::constants::error::Catalog::UnexpectedAutomaticComputerSelectionFormat);
     for (const auto* category : {"min_price", "optimum", "max_power"}) {
         if (!data.contains(category) || !data.at(category).is_array())
-            throw std::runtime_error("Unexpected automatic computer category");
+            throw std::runtime_error(fog::constants::error::Catalog::UnexpectedAutomaticComputerCategory);
         for (const auto& item : data.at(category))
             if (!item.is_object() || !item.contains("id") || !computerId(item.at("id")) ||
                 !item.contains("tariff_id") || !computerId(item.at("tariff_id")))
-                throw std::runtime_error("Unexpected automatic computer candidate");
+                throw std::runtime_error(fog::constants::error::Catalog::UnexpectedAutomaticComputerCandidate);
     }
     return data;
 }
 Json Api::gameDetail(int gameId) {
-    if (gameId < 1) throw std::invalid_argument("Invalid game ID");
+    if (gameId < 1) throw std::invalid_argument(fog::constants::error::Catalog::InvalidGameID);
     auto query = commonQuery();
     query.emplace_back("game_id", std::to_string(gameId));
     query.emplace_back("gamepad", "1");
     query.emplace_back("device_manufacturer", "FogPlayNX");
     auto data = responseJson(request("GET", "/api/content/games/", query, "", token_));
-    if (!data.is_array()) throw std::runtime_error("Unexpected game details format");
+    if (!data.is_array()) throw std::runtime_error(fog::constants::error::Catalog::UnexpectedGameDetailsFormat);
     for (const auto& item : data)
         if (item.is_object() && item.contains("id") && positiveId(item.at("id")) &&
             item.at("id").get<int>() == gameId && item.contains("name") && item.at("name").is_string())
             return item;
-    throw std::runtime_error("Game details unavailable");
+    throw std::runtime_error(fog::constants::error::Catalog::GameDetailsUnavailable);
 }
 Json Api::orderHistory() {
-    if (token_.empty()) throw std::logic_error("Sign in first");
+    if (token_.empty()) throw std::logic_error(fog::constants::error::Auth::SignInFirst);
     auto data = responseJson(request("GET", "/api/order/history/", {}, "", token_));
-    if (!data.is_array() || data.size() > 10000) throw std::runtime_error("Unexpected order history format");
+    if (!data.is_array() || data.size() > 10000) throw std::runtime_error(fog::constants::error::Session::UnexpectedOrderHistoryFormat);
     for (const auto& item : data)
-        if (!item.is_object()) throw std::runtime_error("Unexpected order history entry");
+        if (!item.is_object()) throw std::runtime_error(fog::constants::error::Session::UnexpectedOrderHistoryEntry);
     return data;
 }
 Json Api::createOrder(const CreateOrderRequest& order) {
-    if (token_.empty()) throw std::logic_error("Sign in first");
+    if (token_.empty()) throw std::logic_error(fog::constants::error::Auth::SignInFirst);
     if (order.computerId < 1 || order.tariffId < 1 || order.gameId < 0)
-        throw std::invalid_argument("Invalid checkout selection");
+        throw std::invalid_argument(fog::constants::error::Session::InvalidCheckoutSelection);
     auto query = commonQuery();
     query.emplace_back("computerId", std::to_string(order.computerId));
     query.emplace_back("tariffId", std::to_string(order.tariffId));
@@ -273,19 +274,19 @@ Json Api::createOrder(const CreateOrderRequest& order) {
     if (order.gameId) query.emplace_back("gameId", std::to_string(order.gameId));
     // One attempt only. CheckoutGuard records intent before this mutation.
     auto data = responseJson(request("POST", "/api/order/create/", query, "", token_, true, true));
-    if (!data.is_object()) throw std::runtime_error("Unexpected create order format");
+    if (!data.is_object()) throw std::runtime_error(fog::constants::error::Session::UnexpectedCreateOrderFormat);
     return data;
 }
 Json Api::orderStatus(std::int64_t orderId) {
-    if (token_.empty()) throw std::logic_error("Sign in first");
-    if (orderId <= 0) throw std::invalid_argument("Invalid order ID");
+    if (token_.empty()) throw std::logic_error(fog::constants::error::Auth::SignInFirst);
+    if (orderId <= 0) throw std::invalid_argument(fog::constants::error::Session::InvalidOrderID);
     auto data = responseJson(request("GET", "/api/order/status/", {{"id", std::to_string(orderId)}}, "", token_, true));
-    if (!data.is_object()) throw std::runtime_error("Unexpected order status format");
+    if (!data.is_object()) throw std::runtime_error(fog::constants::error::Session::UnexpectedOrderStatusFormat);
     return data;
 }
 Json Api::authPost(const std::string& endpoint, const Json& body) {
     auto data = responseJson(request("POST", endpoint, {}, body.dump()));
-    if (!data.is_object()) throw std::runtime_error("Unexpected authentication response");
+    if (!data.is_object()) throw std::runtime_error(fog::constants::error::Auth::UnexpectedAuthenticationResponse);
     nextStep_ = authStep(data);
     if (nextStep_ == AuthStep::Success) {
         token_ = stringField(data, "token");
@@ -306,61 +307,61 @@ Json Api::submitPhone(std::string phone) {
         {"deviceId", deviceId_}, {"agreement", true}, {"subscribe", false}});
 }
 Json Api::submitCaptcha(std::string code) {
-    if (nextStep_ != AuthStep::Captcha) throw std::logic_error("Captcha is not requested");
+    if (nextStep_ != AuthStep::Captcha) throw std::logic_error(fog::constants::error::Auth::CaptchaIsNotRequested);
     validateCode(code, false);
     return authPost("/api/login/mts-captcha/", {{"code", code}, {"deviceId", deviceId_}, {"appId", app}});
 }
 Json Api::submitOtp(std::string code) {
-    if (nextStep_ != AuthStep::Otp) throw std::logic_error("SMS code is not requested");
+    if (nextStep_ != AuthStep::Otp) throw std::logic_error(fog::constants::error::Auth::SMSCodeIsNotRequested);
     validateCode(code, true);
     return authPost("/api/login/mts-otp/", {{"code", code}, {"deviceId", deviceId_},
         {"deviceName", "FogPlay NX Switch"}, {"appId", app}});
 }
 Json Api::userInfo() {
-    if (token_.empty()) throw std::logic_error("Sign in first");
+    if (token_.empty()) throw std::logic_error(fog::constants::error::Auth::SignInFirst);
     auto data = responseJson(request("GET", "/api/login/user-info/", {}, "", token_));
-    if (!data.is_object()) throw std::runtime_error("Unexpected profile format");
+    if (!data.is_object()) throw std::runtime_error(fog::constants::error::Auth::UnexpectedProfileFormat);
     return data;
 }
 bool Api::loggedIn() const noexcept { return loggedIn_.load(std::memory_order_acquire); }
 Json Api::activeSessions(bool shutdown) {
-    if (token_.empty()) throw std::logic_error("Sign in first");
+    if (token_.empty()) throw std::logic_error(fog::constants::error::Auth::SignInFirst);
     auto data = responseJson(request("GET", "/api/order/get-active-sessions/", {}, "", token_, shutdown));
-    if (!data.is_array()) throw std::runtime_error("Unexpected active sessions format");
-    if (data.size() > 10000) throw std::runtime_error("Too many active sessions");
+    if (!data.is_array()) throw std::runtime_error(fog::constants::error::Session::UnexpectedActiveSessionsFormat);
+    if (data.size() > 10000) throw std::runtime_error(fog::constants::error::Session::TooManyActiveSessions);
     for (auto& item : data) {
         // Never skip an unidentified entry: doing so could falsely prove absence
         // of the exact rental being stopped. Display metadata is not identity.
         if (!item.is_object() || !validSessionHash(stringField(item, "hash")))
-            throw std::runtime_error("Unexpected active session format");
+            throw std::runtime_error(fog::constants::error::Session::UnexpectedActiveSessionFormat);
         if (!item.contains("computer_name") || item.at("computer_name").is_null())
             item["computer_name"] = "";
         else if (!item.at("computer_name").is_string())
-            throw std::runtime_error("Unexpected active session display format");
+            throw std::runtime_error(fog::constants::error::Session::UnexpectedActiveSessionDisplayFormat);
     }
     return data;
 }
 bool Api::finishSession(const std::string& hash) {
-    if (token_.empty()) throw std::logic_error("Sign in first");
-    if (!validSessionHash(hash)) throw std::invalid_argument("Invalid session hash");
+    if (token_.empty()) throw std::logic_error(fog::constants::error::Auth::SignInFirst);
+    if (!validSessionHash(hash)) throw std::invalid_argument(fog::constants::error::Session::InvalidSessionHash);
     const auto response = request("POST", "/api/order/finish-session/", {{"hash", hash}}, "", token_, true);
     if (response.status >= 300 && response.status < 500) throw FinishRejected();
     auto data = responseJson(response);
     if (!data.is_object() || !data.contains("ok") || !data.at("ok").is_boolean())
-        throw std::runtime_error("Unexpected finish session format");
+        throw std::runtime_error(fog::constants::error::Session::UnexpectedFinishSessionFormat);
     return data.at("ok").get<bool>();
 }
 void Api::configureAuthStorage(std::string path) {
     if (path.empty() || path.size() > 4096 || path.find('\0') != std::string::npos)
-        throw std::invalid_argument("Invalid sign-in storage path");
-    if (loggedIn()) throw std::logic_error("Configure sign-in storage before signing in");
+        throw std::invalid_argument(fog::constants::error::Auth::InvalidSignInStoragePath);
+    if (loggedIn()) throw std::logic_error(fog::constants::error::Auth::ConfigureSignInStorageBeforeSigningIn);
     authStoragePath_ = std::move(path);
     authStorageError_.clear();
 }
 bool Api::restoreAuth() {
     clearToken();
     authStorageError_.clear();
-    if (authStoragePath_.empty()) throw std::logic_error("Configure sign-in storage before restoring");
+    if (authStoragePath_.empty()) throw std::logic_error(fog::constants::error::Auth::ConfigureSignInStorageBeforeRestoring);
     std::optional<AuthCredentials> saved;
     try { saved = loadAuthCredentials(authStoragePath_); }
     catch (...) {

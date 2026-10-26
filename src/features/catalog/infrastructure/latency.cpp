@@ -1,3 +1,4 @@
+#include "core/constants/resources.hpp"
 #include "features/catalog/infrastructure/latency.hpp"
 #include "core/network/http.hpp"
 #include <curl/curl.h>
@@ -47,7 +48,7 @@ bool perform(const std::string& url, bool head, long timeout,
     curl_easy_setopt(curl,CURLOPT_SSL_VERIFYPEER,1L);
     curl_easy_setopt(curl,CURLOPT_SSL_VERIFYHOST,2L);
 #ifdef __SWITCH__
-    curl_easy_setopt(curl,CURLOPT_CAINFO,"romfs:/cacert.pem");
+    curl_easy_setopt(curl,CURLOPT_CAINFO,fog::constants::resources::CertificateBundle);
 #endif
 #if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(curl,CURLOPT_PROTOCOLS_STR,"https");

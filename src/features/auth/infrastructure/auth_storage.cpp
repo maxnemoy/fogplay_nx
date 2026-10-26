@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 // newlib hides descriptor truncation in strict C++ mode unless POSIX APIs are enabled.
 #if defined(__SWITCH__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
@@ -49,13 +50,13 @@ std::optional<AuthCredentials> loadAuthCredentials(const std::string& path) {
     const int fd = open(path.c_str(), noFollow(O_RDONLY));
     if (fd < 0) {
         if (errno == ENOENT) return std::nullopt;
-        throw std::runtime_error("Cannot read saved sign-in");
+        throw std::runtime_error(fog::constants::error::Auth::CannotReadSavedSignIn);
     }
     struct stat info{};
     if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 1 ||
         info.st_size > static_cast<off_t>(maxAuthBytes)) {
         close(fd);
-        throw std::runtime_error("Saved sign-in is invalid");
+        throw std::runtime_error(fog::constants::error::Auth::SavedSignInIsInvalid);
     }
     std::string bytes(static_cast<std::size_t>(info.st_size), '\0');
     std::size_t offset = 0;
@@ -71,20 +72,20 @@ std::optional<AuthCredentials> loadAuthCredentials(const std::string& path) {
     do { count = read(fd, &extra, 1); } while (count < 0 && errno == EINTR);
     if (count != 0) failed = true;
     if (close(fd) != 0) failed = true;
-    if (failed) throw std::runtime_error("Cannot read saved sign-in");
+    if (failed) throw std::runtime_error(fog::constants::error::Auth::CannotReadSavedSignIn);
     const auto data = nlohmann::json::parse(bytes, nullptr, false);
     std::fill(bytes.begin(), bytes.end(), '\0');
     try {
         if (!data.is_object() || data.size() != 4 || !data.at("version").is_number_integer() ||
-            data.at("version") != 1) throw std::runtime_error("invalid");
+            data.at("version") != 1) throw std::runtime_error(fog::constants::error::Internal::InvalidData);
         AuthCredentials credentials{data.at("token").get<std::string>(),
             data.at("account").get<std::string>(), data.at("deviceId").get<std::string>()};
-        if (!valid(credentials)) throw std::runtime_error("invalid");
+        if (!valid(credentials)) throw std::runtime_error(fog::constants::error::Internal::InvalidData);
         return credentials;
-    } catch (...) { throw std::runtime_error("Saved sign-in is invalid"); }
+    } catch (...) { throw std::runtime_error(fog::constants::error::Auth::SavedSignInIsInvalid); }
 }
 void saveAuthCredentials(const std::string& path, const AuthCredentials& credentials) {
-    if (!valid(credentials)) throw std::runtime_error("Cannot save invalid sign-in");
+    if (!valid(credentials)) throw std::runtime_error(fog::constants::error::Auth::CannotSaveInvalidSignIn);
     const auto bytes = nlohmann::json{{"version", 1}, {"token", credentials.token},
         {"account", credentials.account}, {"deviceId", credentials.deviceId}}.dump() + "\n";
     replaceStorage(path, bytes);

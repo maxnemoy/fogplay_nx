@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/session/application/checkout.hpp"
 #include "core/storage/storage.hpp"
 #include <algorithm>
@@ -43,7 +44,7 @@ bool paymentLink(const std::string& url) {
 CheckoutGuard::CheckoutGuard(RentalService& api, SessionGuard& sessions, std::string journalPath)
     : api_(api), sessions_(sessions), journalPath_(std::move(journalPath)) {
     if (journalPath_.empty() || journalPath_.find('\0') != std::string::npos)
-        throw std::invalid_argument("Invalid checkout journal path");
+        throw std::invalid_argument(fog::constants::error::Session::InvalidCheckoutJournalPath);
     load();
 }
 CheckoutResult CheckoutGuard::recovery(const std::string& message) {
@@ -62,14 +63,14 @@ void CheckoutGuard::load() {
     catch (const StorageError& error) {
         pending_ = true;
         invalid_ = true;
-        recovery(std::string("Checkout backup recovery required; ") + error.what());
+        recovery(std::string(fog::constants::error::Session::CheckoutBackupRecoveryRequiredPrefix) + error.what());
         return;
     }
     struct stat info{};
     if (stat(journalPath_.c_str(), &info) != 0 && errno == ENOENT) return;
     pending_ = true;
     invalid_ = true;
-    recovery("Checkout recovery marker retained; verify the official account before another rental");
+    recovery(fog::constants::error::Session::CheckoutRecoveryMarkerRetainedVerifyTheOfficialAccountBeforeAnotherRental);
     if (!S_ISREG(info.st_mode) || info.st_size < 1 || info.st_size > 131072) return;
     FILE* file = std::fopen(journalPath_.c_str(), "rb");
     if (!file) return;
@@ -94,7 +95,7 @@ void CheckoutGuard::load() {
         for (const auto& hash : before_) if (!validSessionHash(hash)) return;
         invalid_ = false;
         result_.message = result_.orderId ? "Sign in to the original account and check pending order" :
-            "Create outcome unknown; verify the official account manually. Creation will not be repeated";
+            fog::constants::error::Session::CreateOutcomeUnknownVerifyTheOfficialAccountManuallyCreationWillNotBeRepeated;
     } catch (...) {}
 }
 void CheckoutGuard::persist() {
@@ -119,12 +120,12 @@ bool CheckoutGuard::sameAccount() const {
 }
 CheckoutResult CheckoutGuard::create(const CreateOrderRequest& order) {
     if (pending_ || !sessions_.pendingHash().empty() || !sessions_.journalError().empty())
-        throw std::logic_error("Resolve pending checkout or rental before creating another");
-    if (!api_.loggedIn() || api_.accountIdentity().empty()) throw std::logic_error("Sign in first");
+        throw std::logic_error(fog::constants::error::Session::ResolvePendingCheckoutOrRentalBeforeCreatingAnother);
+    if (!api_.loggedIn() || api_.accountIdentity().empty()) throw std::logic_error(fog::constants::error::Auth::SignInFirst);
     if (order.computerId < 1 || order.tariffId < 1 || order.gameId < 0)
-        throw std::invalid_argument("Invalid checkout selection");
+        throw std::invalid_argument(fog::constants::error::Session::InvalidCheckoutSelection);
     const auto active = api_.activeSessions(true); // Before-create snapshot, never infer a new hash.
-    if (active.size() > 64) throw std::runtime_error("Too many sessions for safe checkout recovery");
+    if (active.size() > 64) throw std::runtime_error(fog::constants::error::Session::TooManySessionsForSafeCheckoutRecovery);
     selection_ = order;
     account_ = api_.accountIdentity();
     before_.clear();
@@ -135,20 +136,20 @@ CheckoutResult CheckoutGuard::create(const CreateOrderRequest& order) {
     pending_ = true;
     try { persist(); }
     catch (const StorageError& error) {
-        return recovery(std::string("Cannot save create intent; no create request sent. ") + error.what());
+        return recovery(std::string(fog::constants::error::Session::CannotSaveCreateIntentNoCreateRequestSentPrefix) + error.what());
     }
-    catch (...) { return recovery("Cannot save create intent; no create request sent. Recovery required"); }
+    catch (...) { return recovery(fog::constants::error::Session::CannotSaveCreateIntentNoCreateRequestSentRecoveryRequired); }
     try {
         const auto response = api_.createOrder(order);
         result_.orderId = id(response, "orderId");
         if (result_.orderId) persist(); // Before interpreting payment state or making more requests.
         if (!text(response, "error").empty()) {
-            if (result_.orderId) return recovery("Create returned an error with an order ID; check the recorded order");
+            if (result_.orderId) return recovery(fog::constants::error::Session::CreateReturnedAnErrorWithAnOrderIDCheckTheRecordedOrder);
             // No cancellation/idempotency contract establishes that an error cannot
             // follow partial creation. Preserve even an explicit no-ID rejection.
-            return recovery("Server reported a create error without order ID; verify official account before another rental");
+            return recovery(fog::constants::error::Session::ServerReportedACreateErrorWithoutOrderIDVerifyOfficialAccountBeforeAnotherRental);
         }
-        if (!result_.orderId) return recovery("Create outcome unknown; check official account. Do not create again");
+        if (!result_.orderId) return recovery(fog::constants::error::Session::CreateOutcomeUnknownCheckOfficialAccountDoNotCreateAgain);
         const auto link = text(response, "paymentUrl");
         if (paymentLink(link)) {
             result_.paymentUrl = link;
@@ -158,14 +159,14 @@ CheckoutResult CheckoutGuard::create(const CreateOrderRequest& order) {
         } else result_.message = "Order recorded; checking payment and session readiness";
         return result_;
     } catch (const StorageError& error) {
-        return recovery(std::string("Create outcome uncertain; marker retained. ") + error.what());
-    } catch (...) { return recovery("Create outcome uncertain; marker retained. Never repeat creation automatically"); }
+        return recovery(std::string(fog::constants::error::Session::CreateOutcomeUncertainMarkerRetainedPrefix) + error.what());
+    } catch (...) { return recovery(fog::constants::error::Session::CreateOutcomeUncertainMarkerRetainedNeverRepeatCreationAutomatically); }
 }
 CheckoutResult CheckoutGuard::poll(bool manualRetry) {
     if (!pending_) return result_;
-    if (invalid_) return recovery("Invalid checkout marker; preserve it and verify official account manually");
-    if (!sameAccount()) return recovery("Sign in to the original account before checking or stopping the order");
-    if (!result_.orderId) return recovery("Create outcome unknown; official account check required before another rental");
+    if (invalid_) return recovery(fog::constants::error::Session::InvalidCheckoutMarkerPreserveItAndVerifyOfficialAccountManually);
+    if (!sameAccount()) return recovery(fog::constants::error::Auth::SignInToTheOriginalAccountBeforeCheckingOrStoppingTheOrder);
+    if (!result_.orderId) return recovery(fog::constants::error::Session::CreateOutcomeUnknownOfficialAccountCheckRequiredBeforeAnotherRental);
     if (!manualRetry && polls_ >= 30) return waiting("");
     if (manualRetry) polls_ = 0;
     ++polls_;
@@ -183,21 +184,21 @@ CheckoutResult CheckoutGuard::poll(bool manualRetry) {
             [](unsigned char c) { return c > 32 && c != 127; });
         if (id(status, "id") != result_.orderId) {
             result_.readyObservations = 0;
-            return recovery("Order status identifier mismatch; marker retained");
+            return recovery(fog::constants::error::Session::OrderStatusIdentifierMismatchMarkerRetained);
         }
         const auto cancelled = status.find("found_cancel");
         if (cancelled != status.end() && !cancelled->is_boolean()) {
             result_.readyObservations = 0;
-            return recovery("Order cancellation status is unknown; marker retained");
+            return recovery(fog::constants::error::Session::OrderCancellationStatusIsUnknownMarkerRetained);
         }
         if (cancelled != status.end() && cancelled->get<bool>()) {
             result_.readyObservations = 0;
-            return recovery("Order cancellation reported; verify rental termination on the official account");
+            return recovery(fog::constants::error::Session::OrderCancellationReportedVerifyRentalTerminationOnTheOfficialAccount);
         }
         if (result_.serverStatus != 1 && result_.serverStatus != 2) {
             result_.readyObservations = 0;
-            if (result_.serverStatus == 3) return recovery("Order not paid; this does not prove rental termination. Check official account");
-            if (result_.serverStatus != 0) return recovery("Order status unavailable or unknown; marker retained");
+            if (result_.serverStatus == 3) return recovery(fog::constants::error::Session::OrderNotPaidThisDoesNotProveRentalTerminationCheckOfficialAccount);
+            if (result_.serverStatus != 0) return recovery(fog::constants::error::Session::OrderStatusUnavailableOrUnknownMarkerRetained);
             result_.state = result_.paymentUrl.empty() ? CheckoutState::Pending : CheckoutState::PaymentRequired;
             result_.message = result_.stopRequested ? "Stop requested; waiting for session hash. Order is not cancelled" :
                 "Waiting for payment or rental readiness";
@@ -212,11 +213,11 @@ CheckoutResult CheckoutGuard::poll(bool manualRetry) {
         }
         if (std::find(before_.begin(), before_.end(), hash) != before_.end()) {
             result_.readyObservations = 0;
-            return recovery("Order points to a pre-existing rental; manual account check required");
+            return recovery(fog::constants::error::Session::OrderPointsToAPreExistingRentalManualAccountCheckRequired);
         }
         if (!result_.hash.empty() && result_.hash != hash) {
             result_.readyObservations = 0;
-            return recovery("Order session changed; marker retained");
+            return recovery(fog::constants::error::Session::OrderSessionChangedMarkerRetained);
         }
         result_.hash = hash;
         // Persist the first attributed hash before any connection or cleanup action.
@@ -225,7 +226,7 @@ CheckoutResult CheckoutGuard::poll(bool manualRetry) {
         catch (...) { if (!result_.stopRequested) throw; }
         if (!result_.stopRequested && sessions_.pendingHash() == hash &&
             (!sessions_.persistent() || !sessions_.journalError().empty()))
-            return recovery("Session journal is not durable; connection blocked. Stop the recorded rental");
+            return recovery(fog::constants::error::Session::SessionJournalIsNotDurableConnectionBlockedStopTheRecordedRental);
         if (result_.readyObservations < 3) ++result_.readyObservations;
         if (!result_.stopRequested && result_.readyObservations < 3) {
             result_.state = CheckoutState::Pending;
@@ -246,20 +247,20 @@ CheckoutResult CheckoutGuard::poll(bool manualRetry) {
                 throw;
             }
         }
-        else if (sessions_.pendingHash() != hash) return recovery("Another rental is pending recovery; resolve it first");
+        else if (sessions_.pendingHash() != hash) return recovery(fog::constants::error::Session::AnotherRentalIsPendingRecoveryResolveItFirst);
         else if (!sessions_.ownsSession() && !sessions_.recoverMatchingSession())
-            return recovery("Cannot establish ownership of recorded rental");
+            return recovery(fog::constants::error::Session::CannotEstablishOwnershipOfRecordedRental);
         if (!result_.stopRequested && (!sessions_.persistent() || !sessions_.journalError().empty()))
-            return recovery("Session journal is not durable; connection blocked. Stop the recorded rental");
+            return recovery(fog::constants::error::Session::SessionJournalIsNotDurableConnectionBlockedStopTheRecordedRental);
         result_.state = CheckoutState::Ready;
         result_.message = "Rental ready; session recovery journal saved";
         return result_.stopRequested ? finishReady() : result_;
     } catch (const StorageError& error) {
         result_.readyObservations = 0;
-        return recovery(std::string("Cannot save recorded order; recovery marker retained. ") + error.what());
+        return recovery(std::string(fog::constants::error::Session::CannotSaveRecordedOrderRecoveryMarkerRetainedPrefix) + error.what());
     } catch (...) {
         result_.readyObservations = 0;
-        return waiting("Cannot verify recorded order temporarily; checking again. Recovery marker retained");
+        return waiting(fog::constants::error::Session::CannotVerifyRecordedOrderTemporarilyCheckingAgainRecoveryMarkerRetained);
     }
 }
 CheckoutResult CheckoutGuard::finishReady() {
@@ -267,9 +268,9 @@ CheckoutResult CheckoutGuard::finishReady() {
     if (!finished.terminated || !finished.journalCleared) return recovery(finished.message);
     try { clear(); }
     catch (const StorageError& error) {
-        return recovery(std::string("Rental stopped, but checkout marker retained. ") + error.what());
+        return recovery(std::string(fog::constants::error::Session::RentalStoppedButCheckoutMarkerRetainedPrefix) + error.what());
     }
-    catch (...) { return recovery("Rental stopped, but checkout recovery marker could not be cleared"); }
+    catch (...) { return recovery(fog::constants::error::Session::RentalStoppedButCheckoutRecoveryMarkerCouldNotBeCleared); }
     result_.message = "Rental termination confirmed";
     return result_;
 }
@@ -283,39 +284,39 @@ CheckoutResult CheckoutGuard::finishKnown() {
                 if (!sessions_.ownsSession() || sessions_.pendingHash() != result_.hash) throw;
             }
         } else if (sessions_.pendingHash() != result_.hash) {
-            return recovery("Another rental is pending recovery; resolve it first");
+            return recovery(fog::constants::error::Session::AnotherRentalIsPendingRecoveryResolveItFirst);
         } else if (!sessions_.ownsSession() && !sessions_.recoverMatchingSession()) {
-            return recovery("Cannot establish ownership of recorded rental");
+            return recovery(fog::constants::error::Session::CannotEstablishOwnershipOfRecordedRental);
         }
         return finishReady();
     } catch (const StorageError& error) {
-        return recovery(std::string("Cannot stop recorded rental; recovery marker retained. ") + error.what());
-    } catch (...) { return recovery("Cannot stop recorded rental; recovery marker retained"); }
+        return recovery(std::string(fog::constants::error::Session::CannotStopRecordedRentalRecoveryMarkerRetainedPrefix) + error.what());
+    } catch (...) { return recovery(fog::constants::error::Session::CannotStopRecordedRentalRecoveryMarkerRetained); }
 }
 CheckoutResult CheckoutGuard::stop() {
     if (!pending_) return result_;
-    if (invalid_) return recovery("Invalid checkout marker; verify official account manually");
+    if (invalid_) return recovery(fog::constants::error::Session::InvalidCheckoutMarkerVerifyOfficialAccountManually);
     result_.stopRequested = true;
     try { persist(); }
     catch (const StorageError& error) {
         if (sameAccount() && !result_.hash.empty()) return finishKnown();
         if (sameAccount() && result_.orderId > 0) return poll(true);
-        return recovery(std::string("Cannot save stop intent; order remains unresolved. ") + error.what());
+        return recovery(std::string(fog::constants::error::Session::CannotSaveStopIntentOrderRemainsUnresolvedPrefix) + error.what());
     }
     catch (...) {
         // Already-owned rentals remain stoppable when the SD becomes unwritable.
         if (sameAccount() && !result_.hash.empty()) return finishKnown();
         if (sameAccount() && result_.orderId > 0) return poll(true);
-        return recovery("Cannot save stop intent; order remains unresolved");
+        return recovery(fog::constants::error::Session::CannotSaveStopIntentOrderRemainsUnresolved);
     }
     if (sameAccount() && !result_.hash.empty()) return finishKnown();
     return poll(true);
 }
 CheckoutResult CheckoutGuard::acknowledgeManualResolution() {
     if (!sessions_.pendingHash().empty() || !sessions_.journalError().empty())
-        throw std::logic_error("Resolve session recovery before acknowledging checkout");
+        throw std::logic_error(fog::constants::error::Session::ResolveSessionRecoveryBeforeAcknowledgingCheckout);
     if (!pending_) return result_;
-    if (!invalid_ && !sameAccount()) throw std::logic_error("Sign in to the original account first");
+    if (!invalid_ && !sameAccount()) throw std::logic_error(fog::constants::error::Auth::SignInToTheOriginalAccountFirst);
     clear();
     result_.message = "Local marker cleared after your account check; no server cancellation was sent";
     return result_;

@@ -1,4 +1,9 @@
+#include "core/constants/storage_paths.hpp"
+#include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
+
+namespace uiText = ::fog::constants::ui;
+namespace storagePaths = ::fog::constants::storage;
 
 namespace fogplay {
 
@@ -112,7 +117,7 @@ void ApplicationController::input(u64 keys) {
         else if ((keys & HidNpadButton_A) && selection_ < playStationComputers_.size()) {
             const auto& pc = playStationComputers_[selection_];
             if (pc.value("listed",false) && pc.value("launchable",false)) screen_ = Screen::PlayStationDetails;
-            else status_ = "Тариф не подтверждён на сайте. Обновите список кнопкой X.";
+            else status_ = uiText::Server::TariffUnconfirmedRefreshHint;
         }
         return;
     }
@@ -130,10 +135,10 @@ void ApplicationController::input(u64 keys) {
                 const auto found = autoComputers_.find(key);
                 if (found != autoComputers_.end() && found->is_array() && !found->empty()) {
                     auto candidate = found->front();
-                    candidate["name"] = "Сервер №" + field(candidate,"id");
+                    candidate["name"] = uiText::Server::NumberPrefix + field(candidate,"id");
                     detailsFromAutomatic_ = true; automaticSelection_ = selection_;
                     computers_ = Json::array({candidate}); selection_ = 0; screen_ = Screen::Details; latency_.cancel();
-                } else status_ = "Нет предложения в этой категории. Выберите все серверы.";
+                } else status_ = uiText::Server::NoCategoryOffer;
             }
         }
         return;
@@ -145,14 +150,14 @@ void ApplicationController::input(u64 keys) {
             else if (selection_ == 1) {
                 auto next = controllerSettings_; next.xbox = !next.xbox;
                 try {
-                    fog::controller::saveSettings(std::string(dataDir) + "/controller-settings.json",next);
+                    fog::controller::saveSettings(storagePaths::path(storagePaths::ControllerSettings),next);
                     controllerSettings_ = next; ui_.setXboxLayout(next.xbox);
-                    status_ = "Раскладка сохранена на SD.";
-                } catch (...) { status_ = "Не удалось сохранить раскладку. Настройка не изменена."; }
+                    status_ = uiText::Settings::LayoutSaved;
+                } catch (...) { status_ = uiText::Settings::LayoutSaveFailed; }
             }
             else if (selection_ == 2) { screen_ = Screen::ConnectionSettings; selection_ = 0; }
             else if (selection_ == 3) loadSessions();
-            else { api_.forgetAuth(); authSaveFailed_ = false; status_ = "Вы вышли из аккаунта. Сохранённый токен удалён."; }
+            else { api_.forgetAuth(); authSaveFailed_ = false; status_ = uiText::Profile::SignedOut; }
         }
         return;
     }

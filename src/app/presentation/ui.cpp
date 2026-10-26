@@ -1,3 +1,5 @@
+#include "core/constants/resources.hpp"
+#include "core/constants/ui_text.hpp"
 #include "app/presentation/ui.hpp"
 #include "features/settings/domain/controller_layout.hpp"
 #include <SDL_image.h>
@@ -9,6 +11,8 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+
+namespace uiText = ::fog::constants::ui;
 
 namespace fog::ui {
 namespace {
@@ -148,12 +152,8 @@ struct Ui::Impl {
     SDL_Texture* background=nullptr;
     std::array<SDL_Texture*,6> branding{}; // Logo, search, games, PlayStation, history, settings.
     void loadBranding() {
-#ifdef __SWITCH__
-        const std::string root="romfs:/ui/";
-#else
-        const std::string root="romfs/ui/";
-#endif
-        const char* files[]{"logo.png","magnifying-glass.svg","game-controller.svg","playstation.svg","writing.svg","setting.svg"};
+const std::string root=constants::ui::Static::Directory;
+        const char* files[]{constants::ui::Static::Logo,constants::ui::Static::Search,constants::ui::Static::Games,constants::ui::Static::PlayStation,constants::ui::Static::History,constants::ui::Static::Settings};
         for(std::size_t i=0;i<branding.size();++i) {
             branding[i]=IMG_LoadTexture(renderer,(root+files[i]).c_str());
             if(branding[i]) SDL_SetTextureBlendMode(branding[i],SDL_BLENDMODE_BLEND);
@@ -273,7 +273,7 @@ void Ui::frame(const Chrome& chrome) {
     fill(r,{0,0,rail,Height},{27,30,56,230}); fill(r,{rail-1,0,1,Height},{97,81,132,90});
     roundRect(r,{30,27,28,28},14,Cyan); roundRect(r,{37,30,14,14},7,White); roundRect(r,{34,44,20,10},5,White);
     if(chrome.sidebarExpanded) text(chrome.account,20,68,190,Muted,false,2);
-    const std::string names[]{"Поиск","Игры","PlayStation","Журнал сессий","Настройки"};
+    const std::string names[]{uiText::Search::Menu,uiText::Catalog::Menu,"PlayStation",uiText::Profile::HistoryMenu,uiText::Settings::Menu};
     const Section sections[]{Section::Search,Section::Games,Section::PlayStation,Section::History,Section::Settings};
     const int types[]{0,1,1,3,4};
     for(int i=0;i<5;++i) {
@@ -290,7 +290,7 @@ void Ui::frame(const Chrome& chrome) {
     const auto area=content();
     const int logoX=area.x+area.w-151;
     if(impl_->branding[0]) image(impl_->branding[0],{logoX,27,151,38});
-    else text("FOG PLAY NX",logoX,27,151,White,false,2);
+    else text(fog::constants::ui::Common::BrandCaption,logoX,27,151,White,false,2);
     text(chrome.title,area.x,27,area.w-175,White,true);
     text(chrome.subtitle,area.x,77,area.w-80,Muted);
     fill(r,{rail,650,Width-rail,70},{12,16,32,248});
@@ -333,7 +333,7 @@ void Ui::image(SDL_Texture* texture,SDL_Rect rect,bool cover) {
 }
 void Ui::games(const std::vector<GameCard>& cards,std::size_t selected,std::size_t first,const std::string& heading,int top,std::size_t rows) {
     const auto area=content(); if(!heading.empty()) text(heading,area.x,top-42,area.w,White);
-    if(cards.empty()) { empty("Игры пока не найдены","Измените поиск или обновите каталог."); return; }
+    if(cards.empty()) { empty(uiText::Search::NoGamesYet,uiText::Search::ChangeOrRefreshHint); return; }
     const int width=(area.w-3*18)/4;
     for(std::size_t index=first;index<cards.size() && index<first+HistoryColumns*std::min(rows,std::size_t(2));++index) {
         const auto i=index-first; const int x=area.x+static_cast<int>(i%4)*(width+18),y=top+static_cast<int>(i/4)*244;
@@ -373,8 +373,8 @@ void Ui::genreDialog(const std::vector<std::string>& labels,std::size_t focused,
     fill(renderer,{0,0,Width,Height},{5,7,17,220});
     const SDL_Rect box{210,74,860,572};
     panel(box);
-    text("ЖАНРЫ",box.x+28,box.y+20,box.w-56,White,true);
-    text(controllerHints("A Выбрать    B Назад    ↑ / ↓ Прокрутка"),box.x+28,box.y+box.h-40,box.w-56,Muted);
+    text(uiText::Catalog::GenresTitle,box.x+28,box.y+20,box.w-56,White,true);
+    text(controllerHints(uiText::Catalog::GenreDialogHints),box.x+28,box.y+box.h-40,box.w-56,Muted);
     const int width=(box.w-72)/2;
     first-=first%2;
     for(std::size_t index=first;index<labels.size() && index<first+12;++index) {
@@ -389,9 +389,9 @@ void Ui::genreDialog(const std::vector<std::string>& labels,std::size_t focused,
 }
 void Ui::recentGames(const std::vector<GameCard>& cards,std::size_t selected,std::size_t first) {
     const auto area=content();
-    text("Недавно играли",area.x,142,area.w-200,White);
+    text(uiText::Catalog::RecentGames,area.x,142,area.w-200,White);
     if(cards.empty()) return;
-    text(std::to_string(first+1)+"–"+std::to_string(std::min(cards.size(),first+4))+" из "+std::to_string(cards.size()),
+    text(std::to_string(first+1)+"–"+std::to_string(std::min(cards.size(),first+4))+uiText::Common::OfSeparator+std::to_string(cards.size()),
          area.x+area.w-170,142,170,Muted);
     const int width=(area.w-3*18)/4;
     for(std::size_t index=first;index<cards.size() && index<first+HistoryColumns;++index) {
@@ -408,24 +408,24 @@ void Ui::recentGames(const std::vector<GameCard>& cards,std::size_t selected,std
 }
 void Ui::computers(const std::vector<ComputerCard>& cards,std::size_t selected,std::size_t first,int top) {
     const auto area=content();
-    if(cards.empty()) { empty("Нет доступных компьютеров","Обновите список или выберите другую игру."); return; }
+    if(cards.empty()) { empty(uiText::Server::NoComputers,uiText::Server::RefreshOrChangeGameHint); return; }
     const int width=(area.w-3*18)/4;
     const int height=std::min(top>280?186:232,637-top);
     for(std::size_t index=first;index<cards.size() && index<first+8;++index) {
         const auto i=index-first; const int x=area.x+static_cast<int>(i%4)*(width+18),y=top+static_cast<int>(i/4)*(height+18);
         if(height<70 || y+height>637) break;
         const auto& c=cards[index]; panel({x,y,width,height},index==selected);
-        const auto pingTint=c.ping.find("мс")!=std::string::npos && c.ping.find_first_of("0123456789")!=std::string::npos?Green:Muted;
+        const auto pingTint=c.ping.find(uiText::Common::MillisecondsUnit)!=std::string::npos && c.ping.find_first_of("0123456789")!=std::string::npos?Green:Muted;
         if(height<=125) {
             impl_->compactText(c.name,x+14,y+7,width-28,White,1);
-            impl_->compactText(c.ping.empty()?"Пинг не измерен":c.ping,x+14,y+35,width-28,pingTint,1);
-            impl_->compactText(c.available?c.price:"Недоступен",x+14,y+height-29,width-28,c.available?White:Muted,1);
+            impl_->compactText(c.ping.empty()?uiText::Server::PingNotMeasured:c.ping,x+14,y+35,width-28,pingTint,1);
+            impl_->compactText(c.available?c.price:uiText::Server::Unavailable,x+14,y+height-29,width-28,c.available?White:Muted,1);
             continue;
         }
         text(c.name,x+14,y+12,width-28,White);
         if(height>125) {
             if(!c.ping.empty()) text(c.ping,x+14,y+43,width-28,pingTint);
-            else text("Пинг не измерен",x+14,y+43,width-28,Muted);
+            else text(uiText::Server::PingNotMeasured,x+14,y+43,width-28,Muted);
         }
         if(height>200) {
             text(c.accountNote.empty()?c.platform:c.accountNote,x+14,y+73,width-28,Cyan);
@@ -435,7 +435,7 @@ void Ui::computers(const std::vector<ComputerCard>& cards,std::size_t selected,s
             text(c.platform,x+14,y+73,width-28,Cyan);
             text(c.gpu,x+14,y+105,width-28,White);
         }
-        text(c.available?c.price:"Недоступен",x+14,y+height-37,width-28,c.available?White:Muted);
+        text(c.available?c.price:uiText::Server::Unavailable,x+14,y+height-37,width-28,c.available?White:Muted);
     }
 }
 int Ui::gameDetail(const GameDetail& detail,int focus) {
@@ -450,34 +450,34 @@ int Ui::gameDetail(const GameDetail& detail,int focus) {
     const SDL_Rect toggle{a.x,239,332,46}; panel(toggle,focus==0);
     roundRect(impl_->renderer,{a.x+13,251,43,22},11,detail.ownSteamAccount?Green:SDL_Color{94,94,118,255});
     roundRect(impl_->renderer,{a.x+(detail.ownSteamAccount?36:16),254,16,16},8,White);
-    text("Свой Steam аккаунт",a.x+69,246,247,White);
-    text(detail.rating.empty()?"":"Рейтинг: "+detail.rating,a.x+359,248,a.w-360,Muted);
+    text(uiText::Profile::OwnSteamAccount,a.x+69,246,247,White);
+    text(detail.rating.empty()?"":uiText::Catalog::RatingPrefix+detail.rating,a.x+359,248,a.w-360,Muted);
     if(detail.choices.empty()) return 300;
-    text("Автоподбор сервера",a.x,300,a.w,White,true);
+    text(uiText::Server::AutoSelection,a.x,300,a.w,White,true);
     const int width=(a.w-36)/3;
     for(int i=0;i<3;++i) {
         const int cardX=a.x+i*(width+18);
         panel({cardX,351,width,135},focus==i+1);
         icon(impl_->renderer,cardX+28,380,2,Cyan);
-        const AutoChoice fallback{"Не доступно","Данные пока не загружены","",false};
+        const AutoChoice fallback{uiText::Server::NotAvailable,uiText::Server::DataNotLoaded,"",false};
         const auto& choice=static_cast<std::size_t>(i)<detail.choices.size()?detail.choices[i]:fallback;
         text(choice.title,cardX+53,364,width-68,choice.available?White:Muted);
         text(choice.description,cardX+15,393,width-30,Muted,false,2);
-        text(choice.available?choice.price:"Нет подходящих ПК",cardX+15,454,width-30,choice.available?White:Muted);
+        text(choice.available?choice.price:uiText::Server::NoSuitableComputers,cardX+15,454,width-30,choice.available?White:Muted);
     }
-    text("Все серверы",a.x,503,a.w,White);
+    text(uiText::Server::All,a.x,503,a.w,White);
     return 542;
 }
 void Ui::history(const std::vector<HistoryCard>& cards,std::size_t selected,std::size_t first) {
     const auto a=content();
-    if(cards.empty()) { empty("История сессий пуста","Здесь появятся завершённые сессии вашего аккаунта."); return; }
+    if(cards.empty()) { empty(uiText::Profile::EmptyHistory,uiText::Profile::CompletedHistoryExplanation); return; }
     const int width=(a.w-18*(static_cast<int>(HistoryColumns)-1))/static_cast<int>(HistoryColumns);
     for(std::size_t index=first;index<cards.size() && index<first+HistoryColumns;++index) {
         const auto& c=cards[index]; const int x=a.x+static_cast<int>(index-first)*(width+18),y=154;
         panel({x,y,width,370},index==selected);
         text(c.name,x+15,y+15,width-30,White,true);
-        text("Начало",x+15,y+71,width-30,Muted); text(c.start,x+15,y+99,width-30,White,false,2);
-        text("Окончание",x+15,y+157,width-30,Muted); text(c.end,x+15,y+185,width-30,White,false,2);
+        text(uiText::Profile::StartTime,x+15,y+71,width-30,Muted); text(c.start,x+15,y+99,width-30,White,false,2);
+        text(uiText::Profile::EndTime,x+15,y+157,width-30,Muted); text(c.end,x+15,y+185,width-30,White,false,2);
         text(c.duration,x+15,y+250,width-30,Muted); text(c.amount,x+15,y+284,width-30,White);
         text(c.note,x+15,y+330,width-30,Muted);
     }

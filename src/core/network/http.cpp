@@ -1,3 +1,6 @@
+#include "core/constants/resources.hpp"
+#include "core/constants/app_info.hpp"
+#include "core/constants/error_text.hpp"
 #include "core/network/http.hpp"
 
 #include <curl/curl.h>
@@ -13,7 +16,7 @@ class CurlRuntime {
 public:
     CurlRuntime() {
         if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-            throw std::runtime_error("Cannot initialize HTTPS transport");
+            throw std::runtime_error(fog::constants::error::Connection::CannotInitializeHTTPSTransport);
         }
     }
     ~CurlRuntime() { curl_global_cleanup(); }
@@ -52,17 +55,17 @@ int progress(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noe
 
 void check(CURLcode result) {
     if (result != CURLE_OK) {
-        throw std::runtime_error(std::string("HTTPS transport: ") + curl_easy_strerror(result));
+        throw std::runtime_error(std::string(fog::constants::error::Connection::HTTPSTransportPrefix) + curl_easy_strerror(result));
     }
 }
 
 std::string escape(CURL* handle, const std::string& value) {
     if (value.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
-        throw std::runtime_error("Query parameter is too large");
+        throw std::runtime_error(fog::constants::error::Connection::QueryParameterIsTooLarge);
     }
     std::unique_ptr<char, decltype(&curl_free)> escaped(
         curl_easy_escape(handle, value.data(), static_cast<int>(value.size())), &curl_free);
-    if (!escaped) { throw std::runtime_error("Cannot encode query parameter"); }
+    if (!escaped) { throw std::runtime_error(fog::constants::error::Connection::CannotEncodeQueryParameter); }
     return escaped.get();
 }
 }
@@ -96,23 +99,23 @@ void HttpClient::cancel() noexcept { cancelled_.store(true, std::memory_order_re
 HttpResponse HttpClient::request(const std::string& method, const std::string& path,
     const std::vector<std::pair<std::string, std::string>>& query,
     const std::string& jsonBody, const std::string& token, RequestOptions options) {
-    if (cancelled_.load(std::memory_order_relaxed)) throw std::runtime_error("Request cancelled");
+    if (cancelled_.load(std::memory_order_relaxed)) throw std::runtime_error(fog::constants::error::Connection::RequestCancelled);
     if (options.timeoutMs <= 0 || options.connectTimeoutMs <= 0 ||
         options.connectTimeoutMs > options.timeoutMs)
-        throw std::invalid_argument("Invalid HTTP timeout");
+        throw std::invalid_argument(fog::constants::error::Connection::InvalidHTTPTimeout);
     if (method != "GET" && method != "POST") {
-        throw std::invalid_argument("Only GET and POST are supported");
+        throw std::invalid_argument(fog::constants::error::Connection::OnlyGETAndPOSTAreSupported);
     }
     if (path.empty() || path.front() != '/' || path.rfind("//", 0) == 0 ||
         path.find_first_of("?#\\\r\n") != std::string::npos ||
         path.find('\0') != std::string::npos) {
-        throw std::invalid_argument("Expected a relative Fog Play API path");
+        throw std::invalid_argument(fog::constants::error::Connection::ExpectedARelativeFogPlayAPIPath);
     }
     if (token.find_first_of("\r\n") != std::string::npos || token.find('\0') != std::string::npos) {
-        throw std::invalid_argument("Invalid authentication token");
+        throw std::invalid_argument(fog::constants::error::Connection::InvalidAuthenticationToken);
     }
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle(curl_easy_init(), &curl_easy_cleanup);
-    if (!handle) { throw std::runtime_error("Cannot create HTTPS request"); }
+    if (!handle) { throw std::runtime_error(fog::constants::error::Connection::CannotCreateHTTPSRequest); }
     std::string url = "https://fogplay.mts.ru" + path;
     for (std::size_t index = 0; index < query.size(); ++index) {
         url += index == 0 ? '?' : '&';
@@ -121,7 +124,7 @@ HttpResponse HttpClient::request(const std::string& method, const std::string& p
     curl_slist* rawHeaders = nullptr;
     const auto appendHeader = [&rawHeaders](const std::string& value) {
         auto* appended = curl_slist_append(rawHeaders, value.c_str());
-        if (!appended) { throw std::runtime_error("Cannot allocate HTTP headers"); }
+        if (!appended) { throw std::runtime_error(fog::constants::error::Connection::CannotAllocateHTTPHeaders); }
         rawHeaders = appended;
     };
     try {
@@ -136,14 +139,14 @@ HttpResponse HttpClient::request(const std::string& method, const std::string& p
     ResponseBuffer buffer;
     check(curl_easy_setopt(handle.get(), CURLOPT_URL, url.c_str()));
     check(curl_easy_setopt(handle.get(), CURLOPT_HTTPHEADER, headers.get()));
-    check(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "FogPlayNX/0.5.5"));
+    check(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, fog::constants::common::UserAgent));
 #if LIBCURL_VERSION_NUM >= 0x075500
     check(curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS_STR, "https"));
 #else
     check(curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS, CURLPROTO_HTTPS));
 #endif
 #ifdef __SWITCH__
-    check(curl_easy_setopt(handle.get(), CURLOPT_CAINFO, "romfs:/cacert.pem"));
+    check(curl_easy_setopt(handle.get(), CURLOPT_CAINFO, fog::constants::resources::CertificateBundle));
 #endif
     check(curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYPEER, 1L));
     check(curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYHOST, 2L));
@@ -163,9 +166,9 @@ HttpResponse HttpClient::request(const std::string& method, const std::string& p
                                static_cast<curl_off_t>(jsonBody.size())));
     }
     const auto result = curl_easy_perform(handle.get());
-    if (buffer.tooLarge) { throw std::runtime_error("HTTP response exceeds 8 MiB"); }
-    if (buffer.allocationFailed) { throw std::runtime_error("Cannot allocate HTTP response buffer"); }
-    if (result == CURLE_ABORTED_BY_CALLBACK) throw std::runtime_error("Request cancelled");
+    if (buffer.tooLarge) { throw std::runtime_error(fog::constants::error::Connection::HTTPResponseExceeds8MiB); }
+    if (buffer.allocationFailed) { throw std::runtime_error(fog::constants::error::Connection::CannotAllocateHTTPResponseBuffer); }
+    if (result == CURLE_ABORTED_BY_CALLBACK) throw std::runtime_error(fog::constants::error::Connection::RequestCancelled);
     check(result);
     HttpResponse response;
     check(curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response.status));

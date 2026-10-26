@@ -11,16 +11,16 @@
 #include <utility>
 
 namespace fog {
-struct CatalogGenre { int id; const char* label; const char* slug; };
+struct CatalogGenre { int id; const char* slug; };
 // Public web taxonomy snapshot, 2026-10-20. The backend filters by taxonomy_id.
 inline const std::array<CatalogGenre,18>& catalogGenres() {
     static const std::array<CatalogGenre,18> genres{{
-        {173,"Шутер","shooter"},{13,"Гонки","racing"},{75,"Хоррор","horror"},
-        {93,"Фэнтези","fantasy"},{4,"Экшен","action"},{21,"Мультиплеер","multiplayer"},
-        {7,"Инди","indie"},{8,"Стратегия","strategy"},{9,"RPG","rpg"},{112,"Аниме","anime"},
-        {12,"Симулятор","simulation"},{15,"Казуальные","casual"},{20,"Спорт","sport"},
-        {94,"Аркады","arcade"},{176,"Выживание","survival"},{212,"Платформер","platformer"},
-        {309,"Файтинги","fighting"},{331,"MMORPG","mmorpg"}
+        {173,"shooter"},{13,"racing"},{75,"horror"},
+        {93,"fantasy"},{4,"action"},{21,"multiplayer"},
+        {7,"indie"},{8,"strategy"},{9,"rpg"},{112,"anime"},
+        {12,"simulation"},{15,"casual"},{20,"sport"},
+        {94,"arcade"},{176,"survival"},{212,"platformer"},
+        {309,"fighting"},{331,"mmorpg"}
     }};
     return genres;
 }

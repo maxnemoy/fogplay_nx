@@ -10,11 +10,6 @@ inline bool valid(const Settings& value) {
     return value.mode == Mode::Normal || value.mode == Mode::Auto || value.mode == Mode::Relay;
 }
 inline bool operator==(const Settings& a, const Settings& b) { return a.mode == b.mode; }
-inline std::string label(const Settings& value) {
-    if (value.mode == Mode::Auto) return "Авто";
-    if (value.mode == Mode::Relay) return "Через TURN";
-    return "Обычный";
-}
 inline bool adjust(Settings& value, int direction) {
     if (!valid(value) || !direction) return false;
     value.mode = static_cast<Mode>((static_cast<int>(value.mode) + (direction > 0 ? 1 : 2)) % 3);

@@ -1,4 +1,6 @@
 #pragma once
+#include "core/constants/storage_paths.hpp"
+#include "core/constants/ui_text.hpp"
 #include "features/session/infrastructure/api.hpp"
 #include "features/playstation/infrastructure/catalog.hpp"
 #include "core/network/http.hpp"
@@ -54,6 +56,9 @@
 #include "features/playstation/infrastructure/native_input.hpp"
 #include "app/app_diagnostics.hpp"
 #include "app/presentation/presentation_text.hpp"
+
+namespace uiText = ::fog::constants::ui;
+namespace storagePaths = ::fog::constants::storage;
 
 namespace fogplay {
 using fog::Json;
@@ -166,7 +171,7 @@ private:
     bool genreBarFocused_ = false;
     std::size_t genreChip_ = 5, genreDialogSelection_ = 0;
     fog::HomeCatalogNavigation homeCatalog_;
-    fog::RecentGames recentGames_{std::string(dataDir) + "/recent-games.json"};
+    fog::RecentGames recentGames_{storagePaths::path(storagePaths::RecentGames)};
     fog::RecentLaunch recentLaunch_;
     std::future<bool> recentSave_;
     bool recentSavePending_ = false;
@@ -209,8 +214,8 @@ private:
     fog::connection::RelaySelection relaySelection_;
     fog::controller::Settings controllerSettings_;
     bool firstFramePresented_ = false;
-    std::string videoSaveStatus_ = "Изменения сохраняются сразу на SD.";
-    std::string connectionSaveStatus_ = "Изменения сохраняются на SD. Применяются при следующем подключении.";
+    std::string videoSaveStatus_ = uiText::Settings::AutoSaveNotice;
+    std::string connectionSaveStatus_ = uiText::Settings::ConnectionAutoSaveNotice;
     fog::stream::StreamInputGate streamInputGate_;
     bool touchWasDown_ = false, touchDrag_ = false;
     bool mouseLeft_ = false, mouseRight_ = false;
@@ -249,7 +254,7 @@ private:
     std::size_t selection_ = 0;
     int computerPage_ = 1, selectedGameId_ = 0;
     std::string search_, selectedGameName_, status_;
-    std::string checkoutStatus_ = "Ожидаем готовность сервера…";
+    std::string checkoutStatus_ = uiText::Server::WaitingReady;
     fog::AuthStep authStep_ = fog::AuthStep::Unknown;
     SDL_Texture* captcha_ = nullptr;
     int captchaWidth_ = 1, captchaHeight_ = 1;

@@ -28,11 +28,15 @@ def main():
             'Invalid NACP bounds')
     nacp = payload[asset_offset + nacp_offset:asset_offset + nacp_offset + nacp_size]
     author = nacp[0x200:0x300].split(b'\0', 1)[0].decode('utf-8')
-    require(author == 'maxnemoy', f'Unexpected homebrew author: {author}')
-    version_match = re.search(r'^APP_VERSION := (\d+\.\d+\.\d+)$',
-                              (ROOT / 'Makefile').read_text(), re.M)
-    require(version_match is not None, 'APP_VERSION is missing or invalid in Makefile')
+    app_info = (ROOT / 'src/core/constants/app_info.hpp').read_text(encoding='utf-8')
+    author_match = re.search(r'^#define FOGPLAY_APP_AUTHOR "([^"\n]+)"$', app_info, re.M)
+    require(author_match is not None, 'FOGPLAY_APP_AUTHOR is missing or invalid')
+    require(author == author_match.group(1), f'Unexpected homebrew author: {author}')
+    version_match = re.search(r'^#define FOGPLAY_APP_VERSION "(\d+\.\d+\.\d+)"$', app_info, re.M)
+    require(version_match is not None, 'FOGPLAY_APP_VERSION is missing or invalid')
     version = version_match.group(1)
+    embedded_version = nacp[0x3060:0x3070].split(b'\0', 1)[0].decode('utf-8')
+    require(embedded_version == version, f'NRO version {embedded_version} differs from source {version}')
     install = 'switch/fogplay_nx'
     files = {'fogplay_nx.nro': nro, 'README.md': ROOT / 'README.md',
              'docs/THIRD-PARTY.md': ROOT / 'docs/THIRD-PARTY.md'}

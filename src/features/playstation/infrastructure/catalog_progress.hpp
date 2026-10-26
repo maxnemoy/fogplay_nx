@@ -1,4 +1,5 @@
 #pragma once
+#include "core/constants/error_text.hpp"
 #include "features/session/domain/service_models.hpp"
 #include <algorithm>
 #include <atomic>
@@ -11,7 +12,7 @@ namespace fog {
 using PlayStationCatalogProgress = std::function<void(const Json&)>;
 using PlayStationCancellation = std::function<bool()>;
 inline void checkPlayStationCancellation(const PlayStationCancellation& cancelled) {
-    if (cancelled && cancelled()) throw std::runtime_error("PlayStation refresh cancelled");
+    if (cancelled && cancelled()) throw std::runtime_error(fog::constants::error::PlayStation::PlayStationRefreshCancelled);
 }
 // One producer, main-thread consumer. Only the latest complete snapshot is retained.
 // The shared channel outlives either endpoint; cancellation discards late deliveries.

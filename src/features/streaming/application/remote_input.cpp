@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/streaming/application/remote_input.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -7,7 +8,7 @@ namespace fog::remote {
 namespace {
 void validateDimension(int value) {
     if (value < 1 || value > 8192)
-        throw std::invalid_argument("Remote input dimension must be between 1 and 8192");
+        throw std::invalid_argument(fog::constants::error::Stream::RemoteInputDimensionMustBeBetween1And8192);
 }
 void appendUtf16Unit(std::string& output, std::uint32_t unit) {
     output += static_cast<char>(unit & 0xff);
@@ -15,7 +16,7 @@ void appendUtf16Unit(std::string& output, std::uint32_t unit) {
 }
 std::string utf16le(const std::string& input) {
     if (input.size() > 512)
-        throw std::invalid_argument("Remote text exceeds 512 UTF-8 bytes");
+        throw std::invalid_argument(fog::constants::error::Stream::RemoteTextExceeds512UTF8Bytes);
     std::string output;
     output.reserve(input.size() * 2);
     for (std::size_t i = 0; i < input.size();) {
@@ -26,17 +27,17 @@ std::string utf16le(const std::string& input) {
         else if (lead >= 0xc2 && lead <= 0xdf) { scalar = lead & 0x1f; minimum = 0x80; count = 2; }
         else if (lead >= 0xe0 && lead <= 0xef) { scalar = lead & 0x0f; minimum = 0x800; count = 3; }
         else if (lead >= 0xf0 && lead <= 0xf4) { scalar = lead & 0x07; minimum = 0x10000; count = 4; }
-        else throw std::invalid_argument("Invalid UTF-8 remote text");
+        else throw std::invalid_argument(fog::constants::error::Stream::InvalidUTF8RemoteText);
         if (input.size() - i < count)
-            throw std::invalid_argument("Invalid UTF-8 remote text");
+            throw std::invalid_argument(fog::constants::error::Stream::InvalidUTF8RemoteText);
         for (std::size_t j = 1; j < count; ++j) {
             const auto continuation = static_cast<unsigned char>(input[i + j]);
             if ((continuation & 0xc0) != 0x80)
-                throw std::invalid_argument("Invalid UTF-8 remote text");
+                throw std::invalid_argument(fog::constants::error::Stream::InvalidUTF8RemoteText);
             scalar = (scalar << 6) | (continuation & 0x3f);
         }
         if (scalar < minimum || scalar > 0x10ffff || (scalar >= 0xd800 && scalar <= 0xdfff))
-            throw std::invalid_argument("Invalid UTF-8 remote text");
+            throw std::invalid_argument(fog::constants::error::Stream::InvalidUTF8RemoteText);
         if (scalar <= 0xffff) appendUtf16Unit(output, scalar);
         else {
             scalar -= 0x10000;
@@ -75,7 +76,7 @@ Json absoluteMouse(int x, int y, int width, int height, int frameWidth, int fram
 }
 Json mouseButton(bool down, int button) {
     if (button != 0 && button != 2)
-        throw std::invalid_argument("Unsupported remote mouse button");
+        throw std::invalid_argument(fog::constants::error::Stream::UnsupportedRemoteMouseButton);
     return {{"id", down ? "mousedown" : "mouseup"}, {"data", {{"button", button}}}};
 }
 Json wheel(int dy) {
@@ -83,7 +84,7 @@ Json wheel(int dy) {
 }
 Json key(bool down, const std::string& code) {
     if (code != "Enter" && code != "Backspace" && code != "Tab" && code != "Escape")
-        throw std::invalid_argument("Unsupported remote key code");
+        throw std::invalid_argument(fog::constants::error::Stream::UnsupportedRemoteKeyCode);
     return {{"id", down ? "keydown" : "keyup"}, {"data", {{"code", code},
             {"ctrlKey", false}, {"shiftKey", false}, {"altKey", false}}}};
 }

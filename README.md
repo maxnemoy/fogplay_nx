@@ -62,6 +62,8 @@ sudo apt install build-essential git cmake pkg-config python3 patch tar xz-utils
 
 ## Компиляция
 
+Версия, название и автор задаются в `src/core/constants/app_info.hpp`; приложение, Makefile и упаковщик используют этот общий источник. Тексты интерфейса сгруппированы в `ui_text.hpp`, ошибки — в `error_text.hpp`, ресурсы — в `resources.hpp`, пути данных — в `storage_paths.hpp` той же папки. Строки логов и протокольные поля остаются рядом с кодом, которому принадлежат.
+
 Из корня проекта:
 
 ```sh

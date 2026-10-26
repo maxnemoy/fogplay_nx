@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/streaming/infrastructure/stream_protocol.hpp"
 #include <algorithm>
 #include <cmath>
@@ -27,13 +28,13 @@ std::string unescape(const std::string& input) {
     std::string out;
     for (std::size_t i = 0; i < input.size(); ++i) {
         if (input[i] != '\\') { out += input[i]; continue; }
-        if (++i == input.size()) throw Error("Invalid STOMP escape");
+        if (++i == input.size()) throw Error(fog::constants::error::Stream::InvalidSTOMPEscape);
         switch (input[i]) {
         case '\\': out += '\\'; break;
         case 'n': out += '\n'; break;
         case 'r': out += '\r'; break;
         case 'c': out += ':'; break;
-        default: throw Error("Invalid STOMP escape");
+        default: throw Error(fog::constants::error::Stream::InvalidSTOMPEscape);
         }
     }
     return out;
@@ -56,21 +57,21 @@ float trigger(float x) { return std::max(0.0f, axis(x)); }
 int decimal(const std::string& text) {
     if (text.empty() || text.size() > 9 ||
         !std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c); }))
-        throw Error("Invalid decimal field");
+        throw Error(fog::constants::error::Stream::InvalidDecimalField);
     return std::stoi(text);
 }
 }
 
 std::vector<Frame> Parser::feed(const std::string& bytes) {
     if (bytes.size() > MaxFrame || pending_.size() + bytes.size() > MaxFrame)
-        throw Error("STOMP input limit exceeded");
+        throw Error(fog::constants::error::Stream::STOMPInputLimitExceeded);
     pending_ += bytes;
     std::vector<Frame> result;
     while (!pending_.empty()) {
         if (pending_[0] == '\n') { pending_.erase(0, 1); continue; }
         if (pending_[0] == '\r') {
             if (pending_.size() < 2) break;
-            if (pending_[1] != '\n') throw Error("Invalid STOMP heartbeat");
+            if (pending_[1] != '\n') throw Error(fog::constants::error::Stream::InvalidSTOMPHeartbeat);
             pending_.erase(0, 2); continue;
         }
         std::size_t cursor = 0;
@@ -84,16 +85,16 @@ std::vector<Frame> Parser::feed(const std::string& bytes) {
             cursor = end + 1;
             if (line.empty()) { complete = true; break; }
             headerLines.push_back(std::move(line));
-            if (headerLines.size() > 64) throw Error("Too many STOMP headers");
+            if (headerLines.size() > 64) throw Error(fog::constants::error::Stream::TooManySTOMPHeaders);
         }
         if (!complete) break;
-        if (headerLines.empty()) throw Error("Missing STOMP command");
+        if (headerLines.empty()) throw Error(fog::constants::error::Stream::MissingSTOMPCommand);
         Frame f;
         f.command = headerLines.front();
         const bool escaped = f.command != "CONNECTED" && f.command != "CONNECT";
         for (std::size_t i = 1; i < headerLines.size(); ++i) {
             const auto colon = headerLines[i].find(':');
-            if (colon == std::string::npos) throw Error("Invalid STOMP header");
+            if (colon == std::string::npos) throw Error(fog::constants::error::Stream::InvalidSTOMPHeader);
             auto name = headerLines[i].substr(0, colon);
             auto value = headerLines[i].substr(colon + 1);
             f.headers.emplace(escaped ? unescape(name) : name, escaped ? unescape(value) : value);
@@ -102,10 +103,10 @@ std::vector<Frame> Parser::feed(const std::string& bytes) {
         const auto length = f.headers.find("content-length");
         if (length != f.headers.end()) {
             const auto count = static_cast<std::size_t>(decimal(length->second));
-            if (count > MaxFrame) throw Error("STOMP body limit exceeded");
+            if (count > MaxFrame) throw Error(fog::constants::error::Stream::STOMPBodyLimitExceeded);
             end = cursor + count;
             if (pending_.size() <= end) break;
-            if (pending_[end] != '\0') throw Error("Missing STOMP terminator");
+            if (pending_[end] != '\0') throw Error(fog::constants::error::Stream::MissingSTOMPTerminator);
         } else {
             end = pending_.find('\0', cursor);
             if (end == std::string::npos) break;
@@ -147,7 +148,7 @@ std::string base64Encode(const std::string& input) {
 }
 std::string base64Decode(const std::string& input) {
     static const std::string table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    if (input.size() > MaxFrame || input.size() % 4 != 0) throw Error("Invalid base64 length");
+    if (input.size() > MaxFrame || input.size() % 4 != 0) throw Error(fog::constants::error::Stream::InvalidBase64Length);
     std::string out;
     for (std::size_t i = 0; i < input.size(); i += 4) {
         unsigned v[4]{};
@@ -155,15 +156,15 @@ std::string base64Decode(const std::string& input) {
             const char c = input[i + j];
             if (c == '=') {
                 if (i + 4 != input.size() || j < 2 || (j == 2 && input[i + 3] != '='))
-                    throw Error("Invalid base64 padding");
+                    throw Error(fog::constants::error::Stream::InvalidBase64Padding);
             } else {
                 const auto p = table.find(c);
-                if (p == std::string::npos) throw Error("Invalid base64 alphabet");
+                if (p == std::string::npos) throw Error(fog::constants::error::Stream::InvalidBase64Alphabet);
                 v[j] = static_cast<unsigned>(p);
             }
         }
         if ((input[i + 2] == '=' && (v[1] & 15)) || (input[i + 3] == '=' && (v[2] & 3)))
-            throw Error("Invalid base64 padding bits");
+            throw Error(fog::constants::error::Stream::InvalidBase64PaddingBits);
         out += static_cast<char>((v[0] << 2) | (v[1] >> 4));
         if (input[i + 2] != '=') out += static_cast<char>((v[1] << 4) | (v[2] >> 2));
         if (input[i + 3] != '=') out += static_cast<char>((v[2] << 6) | v[3]);
@@ -180,19 +181,19 @@ Json gamepad(const Gamepad& state, bool playStation) {
 }
 std::vector<IceServer> iceServers(const Json& initMessage) {
     const auto init = Json::parse(initMessage.at("data").get<std::string>());
-    if (!init.is_array() || init.empty() || !init[0].is_string()) throw Error("Invalid ICE init envelope");
+    if (!init.is_array() || init.empty() || !init[0].is_string()) throw Error(fog::constants::error::Stream::InvalidICEInitEnvelope);
     const auto servers = Json::parse(init[0].get<std::string>());
-    if (!servers.is_array() || servers.size() > 32) throw Error("Invalid ICE server list");
+    if (!servers.is_array() || servers.size() > 32) throw Error(fog::constants::error::Stream::InvalidICEServerList);
     std::vector<IceServer> result;
     for (const auto& server : servers) {
         auto urls = server.at("urls");
         if (urls.is_string()) urls = Json::array({urls});
-        if (!urls.is_array() || urls.empty() || urls.size() > 16) throw Error("Invalid ICE urls");
+        if (!urls.is_array() || urls.empty() || urls.size() > 16) throw Error(fog::constants::error::Stream::InvalidICEUrls);
         for (const auto& url : urls) {
             IceServer item{url.get<std::string>(), server.value("username", ""), server.value("credential", "")};
             if (item.url.size() > 2048 || item.username.size() > 1024 || item.credential.size() > 1024 ||
                 (item.url.rfind("stun:", 0) != 0 && item.url.rfind("turn:", 0) != 0 && item.url.rfind("turns:", 0) != 0))
-                throw Error("Invalid ICE server");
+                throw Error(fog::constants::error::Stream::InvalidICEServer);
             result.push_back(std::move(item));
         }
     }
@@ -302,7 +303,7 @@ VideoCodec commonOfferCodec(const std::vector<std::string>& input, VideoCodec pr
 
 }
 std::string filterOffer(const std::string& sdp, VideoCodec preferred) {
-    if (sdp.size() > MaxFrame) throw Error("SDP limit exceeded");
+    if (sdp.size() > MaxFrame) throw Error(fog::constants::error::Stream::SDPLimitExceeded);
     auto input = lines(sdp);
     preferred = commonOfferCodec(input, preferred);
     std::string result;
@@ -329,7 +330,7 @@ std::string filterOffer(const std::string& sdp, VideoCodec preferred) {
             map >> id >> codec;
             codec = normalized(codec);
             const int payload = decimal(id);
-            if (payload > 127 || !mappings.emplace(payload, codec).second) throw Error("Invalid SDP payload mapping");
+            if (payload > 127 || !mappings.emplace(payload, codec).second) throw Error(fog::constants::error::Stream::InvalidSDPPayloadMapping);
             if (!offered.count(payload)) continue;
             if (type == "m=video" && (codec == "h264/90000" || codec == "h265/90000")) {
                 const bool hevc = codec == "h265/90000";
@@ -380,16 +381,16 @@ std::string filterOffer(const std::string& sdp, VideoCodec preferred) {
         if (!active) result += "a=inactive\r\n";
         begin = end;
     }
-    if (!video) throw Error("No supported video codec offered");
+    if (!video) throw Error(fog::constants::error::Stream::NoSupportedVideoCodecOffered);
     return result;
 }
 RtpRepairConfig videoRepairConfig(const std::string& sdp) {
-    if (sdp.size() > MaxFrame) throw Error("SDP limit exceeded");
+    if (sdp.size() > MaxFrame) throw Error(fog::constants::error::Stream::SDPLimitExceeded);
     RtpRepairConfig result; const auto input = lines(sdp);
     std::map<unsigned, std::string> mappings;
     for (const auto& line : input) if (line.rfind("a=rtpmap:", 0) == 0) {
         std::istringstream fields(line.substr(9)); std::string id, codec; fields >> id >> codec;
-        const auto pt = decimal(id); if (pt > 127) throw Error("Invalid repair payload");
+        const auto pt = decimal(id); if (pt > 127) throw Error(fog::constants::error::Stream::InvalidRepairPayload);
         mappings.emplace(pt, normalized(codec));
         if (normalized(codec) == "h264/90000" || normalized(codec) == "h265/90000") result.media.emplace(pt, false);
     }
@@ -409,7 +410,7 @@ RtpRepairConfig videoRepairConfig(const std::string& sdp) {
         if (line.rfind("a=ssrc-group:FID ", 0) == 0) {
             std::istringstream fields(line.substr(17)); std::uint64_t media = 0, rtx = 0; std::string extra;
             if (!(fields >> media >> rtx) || (fields >> extra) || !media || !rtx || media == rtx ||
-                media > 0xffffffffu || rtx > 0xffffffffu) throw Error("Invalid repair SSRC group");
+                media > 0xffffffffu || rtx > 0xffffffffu) throw Error(fog::constants::error::Stream::InvalidRepairSSRCGroup);
             ++fidGroups; result.mediaSsrc = media; result.rtxSsrc = rtx;
         }
     }
@@ -419,7 +420,7 @@ RtpRepairConfig videoRepairConfig(const std::string& sdp) {
     return result;
 }
 VideoCodec offeredVideoCodec(const std::string& sdp) {
-    if (sdp.size() > MaxFrame) throw Error("SDP limit exceeded");
+    if (sdp.size() > MaxFrame) throw Error(fog::constants::error::Stream::SDPLimitExceeded);
     const auto input = lines(sdp);
     bool found = false; VideoCodec selected = VideoCodec::H264;
     for (std::size_t begin = 0; begin < input.size();) {
@@ -435,32 +436,32 @@ VideoCodec offeredVideoCodec(const std::string& sdp) {
         if (type == "m=video" && port != "0" && receiving) {
             std::set<std::string> offered;
             while (media >> id) offered.insert(id);
-            if (offered.empty()) throw Error("Missing video payload");
+            if (offered.empty()) throw Error(fog::constants::error::Stream::MissingVideoPayload);
             for (const auto& payload : offered) {
-                if (decimal(payload) > 127) throw Error("Invalid selected video payload");
+                if (decimal(payload) > 127) throw Error(fog::constants::error::Stream::InvalidSelectedVideoPayload);
                 std::string codec;
                 for (auto i = begin + 1; i < end; ++i) {
                     const auto prefix = "a=rtpmap:" + payload + " ";
                     if (input[i].rfind(prefix, 0) != 0) continue;
-                    if (!codec.empty()) throw Error("Ambiguous video payload mapping");
+                    if (!codec.empty()) throw Error(fog::constants::error::Stream::AmbiguousVideoPayloadMapping);
                     codec = normalized(input[i].substr(prefix.size()));
                 }
                 if (codec == "rtx/90000") {
                     const auto apt = rtxApt(input, begin + 1, end, decimal(payload));
-                    if (apt < 0 || !offered.count(std::to_string(apt))) throw Error("Invalid selected RTX mapping");
+                    if (apt < 0 || !offered.count(std::to_string(apt))) throw Error(fog::constants::error::Stream::InvalidSelectedRTXMapping);
                     continue;
                 }
-                if (codec != "h264/90000" && codec != "h265/90000") throw Error("Unsupported selected video codec");
+                if (codec != "h264/90000" && codec != "h265/90000") throw Error(fog::constants::error::Stream::UnsupportedSelectedVideoCodec);
                 const auto candidate = codec == "h265/90000" ? VideoCodec::H265 : VideoCodec::H264;
-                if (found && selected != candidate) throw Error("Mixed selected video codecs");
+                if (found && selected != candidate) throw Error(fog::constants::error::Stream::MixedSelectedVideoCodecs);
                 if (!packetizationSupported(input, begin, end, payload, candidate == VideoCodec::H265))
-                    throw Error("Unsupported selected video packetization");
+                    throw Error(fog::constants::error::Stream::UnsupportedSelectedVideoPacketization);
                 found = true; selected = candidate;
             }
         }
         begin = end;
     }
-    if (!found) throw Error("No selected video codec");
+    if (!found) throw Error(fog::constants::error::Stream::NoSelectedVideoCodec);
     return selected;
 }
 

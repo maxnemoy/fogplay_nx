@@ -1,4 +1,7 @@
+#include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
+
+namespace uiText = ::fog::constants::ui;
 
 namespace fogplay {
 
@@ -71,10 +74,10 @@ void ApplicationController::shutdownSession() noexcept {
             try {
                 SDL_SetRenderDrawColor(rt_.renderer, 12, 16, 28, 255);
                 SDL_RenderClear(rt_.renderer);
-                ui_.text("Завершение аренды не подтверждено", 40, 240, 1200);
-                ui_.text("Повторяем остановку. Проверьте сессию на fogplay.mts.ru с телефона.", 40, 290, 1200);
-                ui_.text("Сначала завершите аренду на сайте. Затем удерживайте − и + 3 секунды для выхода.", 40, 340, 1200);
-                ui_.text("Этот выход не подтверждает остановку: журнал восстановления останется на SD.", 40, 390, 1200);
+                ui_.text(uiText::Server::TerminationUnconfirmed, 40, 240, 1200);
+                ui_.text(uiText::Server::StopRetryNotice, 40, 290, 1200);
+                ui_.text(uiText::Server::ManualExitHint, 40, 340, 1200);
+                ui_.text(uiText::Server::ManualExitWarning, 40, 390, 1200);
                 SDL_RenderPresent(rt_.renderer);
             } catch (...) {}
         }
@@ -110,7 +113,7 @@ void ApplicationController::logCheckoutResult(Task phase) {
 void ApplicationController::queueCheckoutStop() {
     diagnostic("Stop trigger: user pressed Back during checkout.");
     stopAfterTask_ = true;
-    checkoutStatus_ = "Завершение запрошено. Ждём текущий ответ сервера, затем остановим аренду.";
+    checkoutStatus_ = uiText::Server::StopAfterResponse;
     status_ = checkoutStatus_;
     if (!pending_.valid()) beginFinish();
 }
@@ -128,19 +131,19 @@ void ApplicationController::handleCheckout() {
     if (!sessionPending_) {
         disarmExitHandling(); stopAfterTask_ = false;
         screen_ = selectedPlayStation_ ? Screen::PlayStation : Screen::Games;
-        status_ = result.state == fog::CheckoutState::Rejected ? "Сервер отклонил заказ. Обновите список ПК." : "Аренда завершена.";
+        status_ = result.state == fog::CheckoutState::Rejected ? uiText::Server::OrderRejected : uiText::Server::RentalFinished;
         return;
     }
     screen_ = Screen::Checkout;
-    if (result.stopRequested || stopAfterTask_) checkoutStatus_ = "Ожидаем данные для остановки. Заказ пока не отменён.";
-    else if (result.state == fog::CheckoutState::RecoveryRequired) checkoutStatus_ = ui_.controllerHints("Заказ требует проверки. A — проверить, B — остановить, Y — вход.");
-    else if (result.pollCount >= 30) checkoutStatus_ = ui_.controllerHints("Автопроверка приостановлена. A — проверить ещё раз, B — остановить аренду.");
-    else if (result.readyObservations > 0) checkoutStatus_ = "Проверяем готовность сессии (" + std::to_string(result.readyObservations) + "/3)…";
-    else if (result.serverStatus == 2 && !result.serverHashPresent) checkoutStatus_ = "Оплата подтверждена. Ожидаем адрес сессии…";
-    else if (result.serverStatus == 1) checkoutStatus_ = result.serverHashPresent ? "Сервер готовится к подключению…" : "Ожидаем адрес сессии…";
-    else if (result.serverStatus == 0) checkoutStatus_ = "Заказ создан. Ожидаем сервер…";
-    else if (result.state == fog::CheckoutState::PaymentRequired) checkoutStatus_ = "Сервис запросил оплату. Проверьте заказ на fogplay.mts.ru.";
-    else checkoutStatus_ = "Заказ записан. Ожидаем готовность сервера…";
+    if (result.stopRequested || stopAfterTask_) checkoutStatus_ = uiText::Server::WaitingStopData;
+    else if (result.state == fog::CheckoutState::RecoveryRequired) checkoutStatus_ = ui_.controllerHints(uiText::Server::OrderRecoveryHint);
+    else if (result.pollCount >= 30) checkoutStatus_ = ui_.controllerHints(uiText::Server::AutoCheckPausedHint);
+    else if (result.readyObservations > 0) checkoutStatus_ = uiText::Server::ReadyObservationsPrefix + std::to_string(result.readyObservations) + "/3)…";
+    else if (result.serverStatus == 2 && !result.serverHashPresent) checkoutStatus_ = uiText::Server::PaymentConfirmedWaitingAddress;
+    else if (result.serverStatus == 1) checkoutStatus_ = result.serverHashPresent ? uiText::Server::PreparingConnection : uiText::Server::WaitingAddress;
+    else if (result.serverStatus == 0) checkoutStatus_ = uiText::Server::OrderCreated;
+    else if (result.state == fog::CheckoutState::PaymentRequired) checkoutStatus_ = uiText::Server::PaymentRequired;
+    else checkoutStatus_ = uiText::Server::OrderRecorded;
     status_ = checkoutStatus_;
     if (!result.stopRequested && (stopAfterTask_ ||
         (result.state == fog::CheckoutState::RecoveryRequired && !result.hash.empty()))) {
@@ -160,7 +163,7 @@ void ApplicationController::createSession() {
     if (playStation && (playStationLoadedAt_ == std::chrono::steady_clock::time_point{} ||
         std::chrono::steady_clock::now()-playStationLoadedAt_ > std::chrono::seconds(60))) {
         loadPlayStation();
-        status_ = "Список устарел. Обновляем тариф: подтвердите новую цену перед подключением.";
+        status_ = uiText::Server::RefreshingTariff;
         return;
     }
     const auto& computers = playStation ? playStationComputers_ : computers_;
@@ -171,7 +174,7 @@ void ApplicationController::createSession() {
     order.tariffId = std::stoi(field(pc,"tariff_id","0"));
     if (playStation && (!pc.value("listed",false) || !pc.value("launchable",false) ||
         !fog::isPlayStationComputerId(order.computerId) || order.tariffId <= 0)) {
-        status_ = "Тариф PlayStation не подтверждён. Вернитесь к списку и нажмите X.";
+        status_ = uiText::PlayStation::TariffUnconfirmedHint;
         return;
     }
     if (!api_.loggedIn()) {
@@ -187,7 +190,7 @@ void ApplicationController::createSession() {
     // Lock focus/exit before the worker can send a billable create request.
     armExitHandling(); sessionPending_ = true; stopAfterTask_ = false;
     screen_ = Screen::Checkout;
-    checkoutStatus_ = playStation ? "Проверяем актуальность тарифа PlayStation…" : "Создаём заказ. Ожидаем ответ Fog Play…";
+    checkoutStatus_ = playStation ? uiText::PlayStation::CheckingTariff : uiText::Server::CreatingOrder;
     start(Task::Create, [this, order, playStation, offeredPrice = pc.value("price",Json{})] {
         if (playStation) {
             auto current = fog::fetchPlayStationComputers();
@@ -254,7 +257,7 @@ void ApplicationController::beginFinish(const char* reason) {
         if (checkout_.unresolved()) {
             screen_ = Screen::Checkout;
             start(Task::CheckoutStop,[this] { checkout_.stop(); return Json::object(); });
-            checkoutStatus_ = status_ = "Запрашиваем завершение аренды…";
+            checkoutStatus_ = status_ = uiText::Server::RequestingStop;
         } else {
             screen_ = Screen::Stopping;
             retryAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
@@ -262,7 +265,7 @@ void ApplicationController::beginFinish(const char* reason) {
                 const auto result = guard_.finishAttempt();
                 return Json{{"terminated",result.terminated},{"cleared",result.journalCleared},{"message",result.message}};
             });
-            status_ = "Завершаем аренду на сервере. Ждём подтверждение.";
+            status_ = uiText::Server::Stopping;
         }
     } catch (...) {
         closeStream();

@@ -1,9 +1,13 @@
+#include "features/settings/presentation/settings_text.hpp"
+#include "core/constants/ui_text.hpp"
 #include "features/streaming/presentation/stream_overlay.hpp"
 #include "app/presentation/ui.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <vector>
+
+namespace uiText = ::fog::constants::ui;
 
 namespace fog::stream {
 namespace {
@@ -132,8 +136,8 @@ void Overlay::eraseLast() {
 std::string Overlay::keyLabel(int index) const {
     if (index < 48) return alphabet(russian_, uppercase_)[static_cast<std::size_t>(index)];
     const std::array<std::string, 11> labels{
-        russian_ ? "RU → EN" : "EN → RU", uppercase_ ? "ABC → abc" : "abc → ABC", "Пробел", "Удалить", "Очистить", "Отмена",
-        "Отправить текст", "Enter ПК", "Tab ПК", "Backspace ПК", "Escape ПК"};
+        russian_ ? "RU → EN" : "EN → RU", uppercase_ ? "ABC → abc" : "abc → ABC", uiText::Stream::Space, uiText::Stream::Delete, uiText::Stream::Clear, uiText::Common::Cancel,
+        uiText::Stream::SendText, uiText::Stream::EnterKey, uiText::Stream::TabKey, uiText::Stream::BackspaceKey, uiText::Stream::EscapeKey};
     return labels[static_cast<std::size_t>(index - 48)];
 }
 OverlayAction Overlay::select() {
@@ -200,46 +204,46 @@ void Overlay::paint(ui::Ui& ui, SDL_Renderer* renderer) const {
     if (!renderer || mode_ == OverlayMode::Closed) return;
     if (mode_ == OverlayMode::Mouse) {
         ui.panel({26, 598, 1228, 96});
-        ui.text(ui.controllerHints("Мышь: левый стик — курсор · A / ZR — левая кнопка · X — правая"), 48, 610, 1184, White);
-        ui.text(ui.controllerHints("L / R — прокрутка · касание — курсор и перетаскивание · B — меню"), 48, 648, 1184, Muted);
+        ui.text(ui.controllerHints(uiText::Stream::MouseControlsHint), 48, 610, 1184, White);
+        ui.text(ui.controllerHints(uiText::Stream::MouseTouchHint), 48, 648, 1184, Muted);
         return;
     }
     shade(renderer);
     if (mode_ == OverlayMode::Menu) {
         ui.panel(MenuBox);
-        ui.text("Управление сессией", 408, 108, 464, White, true);
-        const std::array<std::string, 5> labels{"Мышь", "Клавиатура", "Изображение", "Завершить сессию", "Закрыть меню"};
+        ui.text(uiText::Stream::SessionControlsTitle, 408, 108, 464, White, true);
+        const std::array<std::string, 5> labels{uiText::Stream::Mouse, uiText::Stream::Keyboard, uiText::Settings::Image, uiText::Stream::FinishSession, uiText::Stream::CloseMenu};
         for (int i = 0; i < 5; ++i) ui.button(labels[static_cast<std::size_t>(i)], menuButton(i), selection_ == i);
-        ui.text(ui.controllerHints("A — выбрать · B — закрыть"), 408, 593, 464, Muted);
+        ui.text(ui.controllerHints(uiText::Stream::MenuControlsHint), 408, 593, 464, Muted);
     } else if (mode_ == OverlayMode::ImageSettings) {
         ui.panel({140, 15, 1000, 690});
-        ui.text("Изображение · трансляция продолжается", 174, 42, 932, White, true);
-        ui.text(ui.controllerHints("Кодек меняется до подключения. ← / → или A — изменить · B — меню"), 174, 96, 932, Muted);
+        ui.text(uiText::Stream::ImageSettingsTitle, 174, 42, 932, White, true);
+        ui.text(ui.controllerHints(uiText::Stream::ImageSettingsHint), 174, 96, 932, Muted);
         const std::array<std::string, 6> labels{
-            "Кодек: " + video::codecLabel(videoSettings_) + " (до подключения)",
-            "Качество сервера: " + video::qualityLabel(videoSettings_),
-            "Запрошенный предел: " + std::to_string(videoSettings_.bitrateMbps) + " Мбит/с",
-            "Ключевые кадры: " + video::keyframeLabel(videoSettings_),
-            "Запросить ключевой кадр сейчас", "Назад"};
+            uiText::Settings::CodecPrefix + fog::ui::videoCodecLabel(videoSettings_) + uiText::Settings::BeforeConnectionSuffix,
+            uiText::Settings::QualityPrefix + fog::ui::videoQualityLabel(videoSettings_),
+            uiText::Settings::BitrateLimitPrefix + std::to_string(videoSettings_.bitrateMbps) + uiText::Common::MegabitsSuffix,
+            uiText::Settings::KeyframesPrefix + fog::ui::videoKeyframeLabel(videoSettings_),
+            uiText::Stream::RequestKeyframe, uiText::Common::Back};
         for (int i = 0; i < 6; ++i) ui.button(labels[static_cast<std::size_t>(i)], imageButton(i), selection_ == i, i != 0);
-        ui.text("Битрейт может отличаться. Запрос кадров не задаёт частоту видео.", 174, 523, 932, Muted);
+        ui.text(uiText::Stream::BitrateNotice, 174, 523, 932, Muted);
         ui.text(videoStatus_, 174, 559, 932, White, false, 2);
         ui.text(saveStatus_, 174, 630, 932, Muted, false, 2);
     } else if (mode_ == OverlayMode::StopConfirm) {
         ui.panel(ConfirmBox, false, true);
-        ui.text("Завершить сессию?", 328, 240, 624, White, true);
-        ui.text("Аренда завершится после подтверждения сервера.\nДождитесь результата.", 328, 300, 624, Muted, false, 3);
-        ui.button("Завершить", confirmButton(0), selection_ == 0);
-        ui.button("Продолжить сессию", confirmButton(1), selection_ == 1);
+        ui.text(uiText::Stream::FinishSessionTitle, 328, 240, 624, White, true);
+        ui.text(uiText::Stream::FinishSessionNotice, 328, 300, 624, Muted, false, 3);
+        ui.button(uiText::Common::Finish, confirmButton(0), selection_ == 0);
+        ui.button(uiText::Stream::ContinueSession, confirmButton(1), selection_ == 1);
     } else if (mode_ == OverlayMode::Keyboard) {
         ui.panel(KeyboardBox);
-        ui.text("Клавиатура", 52, 36, 600, White, true);
-        ui.text(ui.controllerHints("Текст отправляется только кнопкой «Отправить текст». B — отмена"), 52, 84, 1176, Muted);
+        ui.text(uiText::Stream::Keyboard, 52, 36, 600, White, true);
+        ui.text(ui.controllerHints(uiText::Stream::KeyboardHint), 52, 84, 1176, Muted);
         ui.panel({52, 130, 1176, 100});
-        ui.text(text_.empty() ? "Введите текст…" : visibleText(text_), 68, 143, 1144, text_.empty() ? Muted : White, false, 2);
-        ui.text(std::to_string(text_.size()) + " / 512 байт · " + (russian_ ? "RU" : "EN") + (uppercase_ ? " ABC" : " abc"), 836, 39, 392, Muted);
+        ui.text(text_.empty() ? uiText::Stream::EnterTextPlaceholder : visibleText(text_), 68, 143, 1144, text_.empty() ? Muted : White, false, 2);
+        ui.text(std::to_string(text_.size()) + uiText::Stream::TextByteCountSuffix + (russian_ ? "RU" : "EN") + (uppercase_ ? " ABC" : " abc"), 836, 39, 392, Muted);
         for (int i = 0; i < KeyboardKeyCount; ++i) ui.button(keyLabel(i), keyRect(i), selection_ == i, i != 54 || !text_.empty());
-        ui.text("Удалить / Очистить — местный текст. Кнопки «ПК» сразу отправляют клавишу.", 52, 650, 1176, Muted);
+        ui.text(uiText::Stream::LocalEditingHint, 52, 650, 1176, Muted);
     }
 }
 }

@@ -1,3 +1,7 @@
+#include "core/constants/storage_paths.hpp"
+#include "core/constants/resources.hpp"
+#include "core/constants/app_info.hpp"
+#include "core/constants/error_text.hpp"
 #include "features/catalog/infrastructure/steam_artwork.hpp"
 #include "core/network/http.hpp"
 #include "core/storage/storage.hpp"
@@ -76,11 +80,11 @@ bool validTitle(const std::string& title) {
     return !title.empty() && title.size() <= maxTitleBytes && !normalize(title).empty();
 }
 std::int64_t integer(const Json& value) {
-    if (!value.is_number_integer()) throw std::runtime_error("Invalid Steam integer");
+    if (!value.is_number_integer()) throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamInteger);
     if (value.is_number_unsigned()) {
         const auto number = value.get<std::uint64_t>();
         if (number > static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()))
-            throw std::runtime_error("Invalid Steam integer");
+            throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamInteger);
         return static_cast<std::int64_t>(number);
     }
     return value.get<std::int64_t>();
@@ -88,29 +92,29 @@ std::int64_t integer(const Json& value) {
 Json parseJson(const std::string& bytes) {
     std::size_t events = 0;
     return Json::parse(bytes, [&events](int depth, Json::parse_event_t, Json&) {
-        if (depth > 16 || ++events > 16384) throw std::runtime_error("Steam JSON is too complex");
+        if (depth > 16 || ++events > 16384) throw std::runtime_error(fog::constants::error::Catalog::SteamJSONIsTooComplex);
         return true;
     });
 }
 std::int64_t matchedAppId(const std::string& title, const std::string& body) {
-    if (body.size() > maxResponseBytes) throw std::runtime_error("Steam response is too large");
+    if (body.size() > maxResponseBytes) throw std::runtime_error(fog::constants::error::Catalog::SteamResponseIsTooLarge);
     const auto data = parseJson(body);
     if (!data.is_object() || !data.contains("items") || !data.at("items").is_array() ||
-        data.at("items").size() > 512) throw std::runtime_error("Invalid Steam search response");
+        data.at("items").size() > 512) throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamSearchResponse);
     const auto expected = normalize(title);
     std::int64_t result = 0;
     bool ambiguous = false;
     for (const auto& item : data.at("items")) {
-        if (!item.is_object()) throw std::runtime_error("Invalid Steam item");
+        if (!item.is_object()) throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamItem);
         const auto type = item.find("type");
         if (type == item.end()) continue;
-        if (!type->is_string()) throw std::runtime_error("Invalid Steam item type");
+        if (!type->is_string()) throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamItemType);
         // Search also returns packages and bundles; their ids are not app ids.
         if (*type != "app") continue;
         if (!item.contains("id") || !item.contains("name") ||
-            !item.at("name").is_string()) throw std::runtime_error("Invalid Steam item");
+            !item.at("name").is_string()) throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamItem);
         const auto id = integer(item.at("id"));
-        if (id <= 0 || id > 2147483647) throw std::runtime_error("Invalid Steam app id");
+        if (id <= 0 || id > 2147483647) throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamAppId);
         const auto name = item.at("name").get<std::string>();
         if (name.size() > maxTitleBytes || normalize(name) != expected) continue;
         if (result != 0 && result != id) ambiguous = true;
@@ -138,7 +142,7 @@ int progress(void* userdata, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noe
     return static_cast<const std::atomic_bool*>(userdata)->load(std::memory_order_relaxed) ? 1 : 0;
 }
 void check(CURLcode code) {
-    if (code != CURLE_OK) throw std::runtime_error("Steam transport configuration failed");
+    if (code != CURLE_OK) throw std::runtime_error(fog::constants::error::Catalog::SteamTransportConfigurationFailed);
 }
 SteamSearchResponse download(const std::string& title, const std::atomic_bool& cancelled) {
     HttpClient runtime;
@@ -152,7 +156,7 @@ SteamSearchResponse download(const std::string& title, const std::atomic_bool& c
         encoded.get() + "&cc=us&l=en";
     ResponseBuffer buffer;
     check(curl_easy_setopt(handle.get(), CURLOPT_URL, url.c_str()));
-    check(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "FogPlayNX/0.5.3"));
+    check(curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, fog::constants::common::UserAgent));
 #if LIBCURL_VERSION_NUM >= 0x075500
     check(curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS_STR, "https"));
 #else
@@ -162,7 +166,7 @@ SteamSearchResponse download(const std::string& title, const std::atomic_bool& c
     check(curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYPEER, 1L));
     check(curl_easy_setopt(handle.get(), CURLOPT_SSL_VERIFYHOST, 2L));
 #ifdef __SWITCH__
-    check(curl_easy_setopt(handle.get(), CURLOPT_CAINFO, "romfs:/cacert.pem"));
+    check(curl_easy_setopt(handle.get(), CURLOPT_CAINFO, fog::constants::resources::CertificateBundle));
 #endif
     check(curl_easy_setopt(handle.get(), CURLOPT_NOSIGNAL, 1L));
     check(curl_easy_setopt(handle.get(), CURLOPT_TIMEOUT_MS, 8000L));
@@ -182,14 +186,14 @@ void ensureDirectory(const std::string& directory) {
     while (start < directory.size()) {
         const auto end = directory.find('/', start);
         const auto part = directory.substr(start, end == std::string::npos ? end : end - start);
-        if (part == ".." || part == ".") throw std::runtime_error("Invalid Steam directory");
+        if (part == ".." || part == ".") throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamDirectory);
         const auto path = directory.substr(0, end);
         if (!path.empty() && path.back() != ':') {
             if (mkdir(path.c_str(), 0700) != 0 && errno != EEXIST)
-                throw std::runtime_error("Cannot create Steam cache directory");
+                throw std::runtime_error(fog::constants::error::Catalog::CannotCreateSteamCacheDirectory);
             struct stat info{};
             if (lstat(path.c_str(), &info) != 0 || !S_ISDIR(info.st_mode))
-                throw std::runtime_error("Invalid Steam cache directory");
+                throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamCacheDirectory);
         }
         if (end == std::string::npos) break;
         start = end + 1;
@@ -204,25 +208,25 @@ std::string readMappings(const std::string& path) {
     flags |= O_NONBLOCK;
 #endif
     const int fd = open(path.c_str(), flags);
-    if (fd < 0) throw std::runtime_error("Cannot read Steam mappings");
+    if (fd < 0) throw std::runtime_error(fog::constants::error::Catalog::CannotReadSteamMappings);
     struct stat info{};
     if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 1 ||
         static_cast<std::uint64_t>(info.st_size) > maxMappingBytes) {
-        close(fd); throw std::runtime_error("Invalid Steam mappings");
+        close(fd); throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamMappings);
     }
     std::string bytes(static_cast<std::size_t>(info.st_size), '\0');
     std::size_t offset = 0;
     while (offset < bytes.size()) {
         const auto count = read(fd, bytes.data() + offset, bytes.size() - offset);
         if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) { close(fd); throw std::runtime_error("Cannot read Steam mappings"); }
+        if (count <= 0) { close(fd); throw std::runtime_error(fog::constants::error::Catalog::CannotReadSteamMappings); }
         offset += static_cast<std::size_t>(count);
     }
     char extra{};
     ssize_t count;
     do { count = read(fd, &extra, 1); } while (count < 0 && errno == EINTR);
     const auto closed = close(fd);
-    if (count != 0 || closed != 0) throw std::runtime_error("Cannot read Steam mappings");
+    if (count != 0 || closed != 0) throw std::runtime_error(fog::constants::error::Catalog::CannotReadSteamMappings);
     return bytes;
 }
 }
@@ -271,7 +275,7 @@ struct SteamArtworkResolver::Impl {
     }
     void load() noexcept {
         if (options.directory.empty()) return;
-        const auto path = options.directory + "/mappings.json";
+        const auto path = options.directory + fog::constants::storage::SteamMappings;
         bool safeDirectory = false;
         try {
             ensureDirectory(options.directory);
@@ -281,25 +285,25 @@ struct SteamArtworkResolver::Impl {
             if (!data.is_object() || data.size() != 2 || !data.contains("version") ||
                 integer(data.at("version")) != 2 || !data.contains("records") ||
                 !data.at("records").is_array() || data.at("records").size() > 256)
-                throw std::runtime_error("Invalid Steam mappings");
+                throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamMappings);
             std::map<Key, Record> loaded;
             for (const auto& item : data.at("records")) {
                 if (!item.is_object() || item.size() != 4 || !item.contains("mtsId") ||
                     !item.contains("title") || !item.at("title").is_string() ||
                     !item.contains("appId") || !item.contains("saved"))
-                    throw std::runtime_error("Invalid Steam mapping");
+                    throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamMapping);
                 const auto id = integer(item.at("mtsId"));
                 const auto title = item.at("title").get<std::string>();
                 const auto appId = integer(item.at("appId"));
                 const auto saved = integer(item.at("saved"));
                 if (id <= 0 || id > 2147483647 || !validTitle(title) || appId < 0 ||
                     appId > 2147483647 || saved < 0)
-                    throw std::runtime_error("Invalid Steam mapping");
+                    throw std::runtime_error(fog::constants::error::Catalog::InvalidSteamMapping);
                 // Clock rollback makes future timestamps stale, not corrupt.
                 // Retain positive mappings for offline display and let current()
                 // schedule refresh without discarding unrelated valid records.
                 if (!loaded.emplace(Key{static_cast<int>(id), title}, Record{appId, saved, -1, 0, false}).second)
-                    throw std::runtime_error("Duplicate Steam mapping");
+                    throw std::runtime_error(fog::constants::error::Catalog::DuplicateSteamMapping);
             }
             std::lock_guard<std::mutex> lock(mutex);
             for (const auto& item : loaded) {
@@ -341,7 +345,7 @@ struct SteamArtworkResolver::Impl {
             }
             bytes += "]}";
             ensureDirectory(options.directory);
-            replaceStorage(options.directory + "/mappings.json", bytes);
+            replaceStorage(options.directory + fog::constants::storage::SteamMappings, bytes);
         } catch (...) { /* Optional disk cache failure never blocks resolution. */ }
     }
     void run() noexcept {

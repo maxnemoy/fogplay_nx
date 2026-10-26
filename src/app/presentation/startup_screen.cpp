@@ -1,3 +1,4 @@
+#include "core/constants/ui_text.hpp"
 #include "app/presentation/startup_screen.hpp"
 #include <memory>
 #include <stdexcept>
@@ -21,7 +22,7 @@ void drawStartupScreen(SDL_Renderer* renderer, TTF_Font* font, TTF_Font* titleFo
     SDL_SetRenderDrawColor(renderer,174,131,245,255);
     const SDL_Rect accent{592,243,96,5};
     SDL_RenderFillRect(renderer,&accent);
-    text(renderer,titleFont,"FOG PLAY NX",278,{247,248,255,255});
+    text(renderer,titleFont,fog::constants::ui::Common::BrandCaption,278,{247,248,255,255});
     text(renderer,font,message,350,{183,188,210,255});
     SDL_RenderPresent(renderer);
 }

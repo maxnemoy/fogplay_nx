@@ -1,3 +1,5 @@
+#include "core/constants/app_info.hpp"
+#include "core/constants/storage_paths.hpp"
 #include "app/app_diagnostics.hpp"
 #include "platform/switch/switch_runtime.hpp"
 #include <ctime>
@@ -66,7 +68,7 @@ void firstUiFramePresented() {
 }
 LogSession::LogSession() {
     startupAt = std::chrono::steady_clock::now();
-    diagnostic("FogPlay NX 0.5.5 startup. Live session candidate; tested LAN AV stack. No credentials logged.");
+    diagnostic(std::string(fog::constants::common::Title) + " startup. Live session candidate; tested LAN AV stack. No credentials logged.");
     diagnostic("Startup main_entered; time before main (loader/SD executable read) is not measured");
 }
 void LogSession::start() {
@@ -74,7 +76,7 @@ void LogSession::start() {
     started_ = true;
     StartupStage stage("log_setup");
     using platform::dataDir;
-    mkdir("sdmc:/switch",0777);
+    mkdir(fog::constants::storage::SdRoot,0777);
     mkdir(dataDir,0777);
     runLog.start(dataDir,std::time(nullptr),[]{ return R_SUCCEEDED(fsdevCommitDevice("sdmc")); });
     {

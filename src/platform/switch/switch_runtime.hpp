@@ -1,4 +1,5 @@
 #pragma once
+#include "core/constants/storage_paths.hpp"
 #include <switch.h>
 #include <SDL.h>
 #include <SDL_ttf.h>
@@ -6,7 +7,7 @@
 #include <string>
 
 namespace fogplay::platform {
-inline constexpr const char* dataDir = "sdmc:/switch/fogplay_nx";
+inline constexpr const char* dataDir = fog::constants::storage::Directory;
 void checkResult(Result rc, const char* operation);
 void checkStorage();
 std::string deviceId();

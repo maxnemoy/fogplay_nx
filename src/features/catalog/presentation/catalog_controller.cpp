@@ -1,4 +1,7 @@
+#include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
+
+namespace uiText = ::fog::constants::ui;
 
 namespace fogplay {
 
@@ -110,8 +113,8 @@ void ApplicationController::searchGames() {
 }
 
 std::string ApplicationController::latencyText(const Json& computer) const {
-    if (const auto ping = latency_.estimate(computer)) return "≈ " + std::to_string(*ping) + " мс";
-    return latency_.busy() ? "Пинг: измеряем…" : "Пинг: нет данных";
+    if (const auto ping = latency_.estimate(computer)) return "≈ " + std::to_string(*ping) + uiText::Common::MillisecondsSuffix;
+    return latency_.busy() ? uiText::Server::MeasuringPing : uiText::Server::PingUnknown;
 }
 
 std::size_t ApplicationController::selectedGenreIndex() const {

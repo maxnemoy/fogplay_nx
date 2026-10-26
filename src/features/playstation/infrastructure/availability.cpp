@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/playstation/infrastructure/availability.hpp"
 #include "core/network/http.hpp"
 #include <algorithm>
@@ -28,7 +29,7 @@ int computerId(const Json& value) {
 void updatePlayStationAvailability(Json& computers, const PlayStationAvailabilityLoader& load,
                                   int pageSize, int maxPages, const PlayStationCatalogProgress& progress,
                                   const PlayStationCancellation& cancelled) {
-    if (pageSize < 1 || pageSize > 100 || maxPages < 1) throw std::invalid_argument("Invalid catalog bounds");
+    if (pageSize < 1 || pageSize > 100 || maxPages < 1) throw std::invalid_argument(fog::constants::error::PlayStation::InvalidCatalogBounds);
     std::set<int> seen;
     bool complete = false, consistent = true;
     for (auto& computer : computers) computer["availability"] = "unknown";
@@ -43,7 +44,7 @@ void updatePlayStationAvailability(Json& computers, const PlayStationAvailabilit
             std::set<int> pageIds;
             for (const auto& item : items) {
                 const int id = item.is_object() && item.contains("id") ? computerId(item["id"]) : 0;
-                if (!id || !pageIds.insert(id).second) throw std::runtime_error("Invalid catalog identities");
+                if (!id || !pageIds.insert(id).second) throw std::runtime_error(fog::constants::error::PlayStation::InvalidCatalogIdentities);
             }
             // A shifting or repeated page cannot establish that an absent PC is offline.
             for (const auto id : pageIds)
@@ -75,13 +76,13 @@ void updatePlayStationAvailability(Json& computers, HttpClient& http,
     updatePlayStationAvailability(computers, [&http, deadline](int page, int pageSize) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline-std::chrono::steady_clock::now()).count();
-        if (remaining <= 0) throw std::runtime_error("Catalog status deadline reached");
+        if (remaining <= 0) throw std::runtime_error(fog::constants::error::PlayStation::CatalogStatusDeadlineReached);
         const auto response = http.request("GET", "/api/content/computer/",
             {{"app", "android:ru.mts.fogplay"}, {"version", "1.0.159"},
              {"page", std::to_string(page)}, {"pageSize", std::to_string(pageSize)}}, "", "",
             {static_cast<long>(std::min<std::int64_t>(remaining, 5000)),
              static_cast<long>(std::min<std::int64_t>(remaining, 3000))});
-        if (response.status != 200) throw std::runtime_error("Catalog status unavailable");
+        if (response.status != 200) throw std::runtime_error(fog::constants::error::PlayStation::CatalogStatusUnavailable);
         return Json::parse(response.body);
     },100,50,progress,cancelled);
 }

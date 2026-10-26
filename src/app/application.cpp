@@ -1,32 +1,37 @@
+#include "core/constants/storage_paths.hpp"
+#include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 #include "app/application.hpp"
+
+namespace uiText = ::fog::constants::ui;
+namespace storagePaths = ::fog::constants::storage;
 
 namespace fogplay {
 
 ApplicationController::ApplicationController(Runtime& runtime, const std::string& id)
-    : rt_(runtime), api_(id), catalogDeviceId_(id), guard_(api_, std::string(dataDir) + "/pending-session.json"),
-      checkout_(api_, guard_, std::string(dataDir) + "/pending-order.json"),
+    : rt_(runtime), api_(id), catalogDeviceId_(id), guard_(api_, storagePaths::path(storagePaths::PendingSession)),
+      checkout_(api_, guard_, storagePaths::path(storagePaths::PendingOrder)),
       ui_(runtime.renderer, runtime.font, runtime.titleFont) {
-    api_.configureAuthStorage(std::string(dataDir) + "/auth.json");
+    api_.configureAuthStorage(storagePaths::path(storagePaths::Auth));
     if (!recentGames_.load()) diagnostic("Recent games load unavailable; history will remain optional.");
     syncPending();
     try {
-        videoSettings_ = fog::video::loadSettings(std::string(dataDir) + "/video-settings.json");
+        videoSettings_ = fog::video::loadSettings(storagePaths::path(storagePaths::VideoSettings));
     } catch (...) {
         videoSettings_ = {};
-        videoSaveStatus_ = "Настройки не прочитаны. Используются стандартные; измените, чтобы сохранить.";
+        videoSaveStatus_ = uiText::Settings::VideoLoadFailed;
         diagnostic("Video settings unreadable or invalid; using defaults.");
     }
     if (videoSettings_.codec == ::stream::VideoCodec::H265 && !fog::Media::supportsH265()) {
         videoSettings_.codec = ::stream::VideoCodec::H264;
-        videoSaveStatus_ = "H.265 недоступен в этой сборке. Выбран H.264; файл не изменён.";
+        videoSaveStatus_ = uiText::Settings::H265FallbackPreserved;
     }
-    try { connectionSettings_ = fog::connection::loadSettings(std::string(dataDir) + "/connection-settings.json"); }
+    try { connectionSettings_ = fog::connection::loadSettings(storagePaths::path(storagePaths::ConnectionSettings)); }
     catch (...) {
-        connectionSaveStatus_ = "Настройки не прочитаны. Используется обычный режим; измените, чтобы сохранить.";
+        connectionSaveStatus_ = uiText::Settings::ConnectionLoadFailed;
         diagnostic("Connection settings unreadable or invalid; using normal mode.");
     }
-    try { controllerSettings_ = fog::controller::loadSettings(std::string(dataDir) + "/controller-settings.json"); }
+    try { controllerSettings_ = fog::controller::loadSettings(storagePaths::path(storagePaths::ControllerSettings)); }
     catch (...) { diagnostic("Controller settings unreadable; using Xbox layout default."); }
     ui_.setXboxLayout(controllerSettings_.xbox);
     overlay_.setVideoSettings(videoSettings_);
@@ -55,7 +60,7 @@ void ApplicationController::run() {
     padInitializeDefault(&pad);
     screen_ = sessionPending_ ? Screen::Recovery : Screen::Games;
     start(Task::RestoreAuth,[this] { return Json{{"restored",api_.restoreAuth()}}; });
-    status_ = "Проверяем сохранённый вход…";
+    status_ = uiText::Profile::ValidatingSavedAuth;
     for (;;) {
         fog::stream::LoopTiming::Scope loopScope(loopTiming_, fog::stream::LoopTiming::Stage::Loop,
             stream_ || transportReconnect_.recovering());
@@ -146,7 +151,7 @@ void ApplicationController::run() {
 void ApplicationController::start(Task kind, std::function<Json()> work) {
     if (pending_.valid()) return;
     task_ = kind;
-    status_ = "Подключение к Fog Play…";
+    status_ = uiText::Profile::ConnectingService;
     pending_ = std::async(std::launch::async, std::move(work));
 }
 
@@ -158,7 +163,7 @@ void ApplicationController::poll() {
     catch (...) {
         if (kind == Task::RestoreAuth) {
             screen_ = Screen::Consent; loginReturn_ = Screen::Games;
-            status_ = ui_.controllerHints("Не удалось восстановить вход. A — войти заново.");
+            status_ = ui_.controllerHints(uiText::Profile::RestoreFailedHint);
             diagnostic("Saved authentication restore failed; credentials omitted.");
             return;
         }
@@ -182,11 +187,11 @@ void ApplicationController::poll() {
             if (sessionPending_) recoverSession(); else loadGames();
         } else if (!api_.authStorageError().empty()) {
             screen_ = Screen::Consent; loginReturn_ = Screen::Games;
-            status_ = ui_.controllerHints("Сохранённый вход не прошёл проверку. A — войти заново.");
+            status_ = ui_.controllerHints(uiText::Profile::ValidationFailedHint);
             diagnostic("Saved authentication rejected or unreadable; credentials omitted.");
         } else if (sessionPending_) {
             screen_ = Screen::Recovery;
-            status_ = ui_.controllerHints("Нужно проверить прежнюю аренду. Y — войти в аккаунт.");
+            status_ = ui_.controllerHints(uiText::Profile::PreviousRentalSignInHint);
         } else loadGames();
         return;
     }
@@ -198,7 +203,7 @@ void ApplicationController::poll() {
         if (stopAfterTask_ || exitAfterStop_ || appletGetFocusState() != AppletFocusState_InFocus) {
             disarmExitHandling(); stopAfterTask_ = false;
             screen_ = Screen::PlayStation;
-            status_ = "Подключение отменено. Заказ не создавался.";
+            status_ = uiText::Server::ConnectionCancelled;
             return;
         }
         fog::CreateOrderRequest order;
@@ -209,11 +214,11 @@ void ApplicationController::poll() {
             !fog::isPlayStationComputerId(order.computerId) || order.tariffId <= 0) {
             disarmExitHandling();
             screen_ = Screen::PlayStation;
-            status_ = "Подключение не подтверждено. Обновите список и войдите в аккаунт.";
+            status_ = uiText::Server::ConnectionNotConfirmed;
             return;
         }
         sessionPending_ = true;
-        checkoutStatus_ = "Создаём заказ. Ожидаем ответ Fog Play…";
+        checkoutStatus_ = uiText::Server::CreatingOrder;
         start(Task::Create,[this,order] { checkout_.create(order); return Json::object(); });
         return;
     }
@@ -224,13 +229,13 @@ void ApplicationController::poll() {
         playStationComputers_ = std::move(data.at("computers"));
         playStationLoadedAt_ = std::chrono::steady_clock::now();
         screen_ = Screen::PlayStation; selection_ = 0;
-        status_ = "Тариф или цена изменились. Проверьте список и подтвердите подключение заново.";
+        status_ = uiText::Server::TariffChanged;
         return;
     }
     if (kind == Task::Create || kind == Task::CheckoutPoll || kind == Task::CheckoutStop || kind == Task::ManualResolution) {
         logCheckoutResult(kind);
         handleCheckout();
-        if (kind == Task::ManualResolution && !sessionPending_) status_ = "Локальная отметка снята после вашей проверки аккаунта.";
+        if (kind == Task::ManualResolution && !sessionPending_) status_ = uiText::Server::LocalBlockCleared;
         return;
     }
     if (stopAfterTask_ && sessionPending_ && kind != Task::Finish && kind != Task::Recovery && kind != Task::Profile && kind != Task::Phone && kind != Task::Captcha && kind != Task::Otp) {
@@ -244,12 +249,12 @@ void ApplicationController::poll() {
     if (kind == Task::Finish) {
         if (data.value("terminated",false) && data.value("cleared",false)) {
             sessionPending_ = false; stopAfterTask_ = false; screen_ = Screen::Sessions; sessions_ = Json::array(); selection_ = 0;
-            status_ = "Сервер подтвердил завершение сессии.";
+            status_ = uiText::Server::TerminationConfirmed;
             diagnostic("Session finish confirmed; active-session absence checked; journal cleared.");
             disarmExitHandling();
         } else {
             screen_ = Screen::Stopping;
-            status_ = ui_.controllerHints("Остановка НЕ подтверждена. Повторяем. Y — повторный вход.");
+            status_ = ui_.controllerHints(uiText::Server::TerminationRetrySignInHint);
             retryAt_ = std::chrono::steady_clock::now()+std::chrono::seconds(exitAfterStop_ ? 1 : 10);
             diagnostic("Session stop unresolved; journal retained.");
         }
@@ -257,7 +262,7 @@ void ApplicationController::poll() {
     }
     if (kind == Task::Recovery) {
         if (data.value("matched",false)) { armExitHandling(); beginFinish(); }
-        else { screen_ = Screen::Recovery; status_ = "Прежняя сессия не сопоставлена. Проверьте её на сайте Fog Play."; }
+        else { screen_ = Screen::Recovery; status_ = uiText::Server::PreviousRentalNotMatched; }
         return;
     }
     if (kind == Task::Sessions) {
@@ -272,8 +277,8 @@ void ApplicationController::poll() {
         diagnostic("Computers OK, count=" + std::to_string(computers_.size()));
     } else if (kind == Task::Profile) {
         screen_ = loginReturn_;
-        status_ = api_.authStorageError().empty() ? "Аккаунт подключён. Вход сохранён на SD." :
-            "Вход выполнен, но сохранить его на SD не удалось.";
+        status_ = api_.authStorageError().empty() ? uiText::Profile::AuthSaved :
+            uiText::Profile::AuthSaveFailed;
         diagnostic("Authenticated profile OK; personal fields not logged.");
         if (sessionPending_) recoverSession();
         else if (screen_ == Screen::History) loadHistory();
@@ -292,7 +297,7 @@ void ApplicationController::poll() {
         } else if (authStep_ == fog::AuthStep::Otp) {
             status_.clear();
         } else {
-            status_ = ui_.controllerHints("Вход не завершён. B — назад, Y — новая попытка.");
+            status_ = ui_.controllerHints(uiText::Profile::SignInIncompleteHint);
             diagnostic("Auth stopped at unsupported/restart response; body omitted.");
         }
     }

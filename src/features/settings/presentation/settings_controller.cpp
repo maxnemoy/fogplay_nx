@@ -1,4 +1,10 @@
+#include "core/constants/storage_paths.hpp"
+#include "features/settings/presentation/settings_text.hpp"
+#include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
+
+namespace uiText = ::fog::constants::ui;
+namespace storagePaths = ::fog::constants::storage;
 
 namespace fogplay {
 
@@ -6,14 +12,14 @@ void ApplicationController::changeVideoSettings(const fog::video::Settings& valu
     videoSettings_ = value;
     bool saved = false;
     try {
-        fog::video::saveSettings(std::string(dataDir) + "/video-settings.json", videoSettings_);
+        fog::video::saveSettings(storagePaths::path(storagePaths::VideoSettings), videoSettings_);
         saved = true;
     } catch (...) { diagnostic("Video settings save failed; no settings payload logged."); }
-    videoSaveStatus_ = saved ? "Сохранено на SD." : "Не сохранено на SD. После перезапуска изменения потеряются.";
+    videoSaveStatus_ = saved ? uiText::Settings::Saved : uiText::Settings::NotSaved;
     if (live) {
         const bool requested = stream_ && stream_->updateVideoSettings(videoSettings_);
-        videoSaveStatus_ += requested ? " Запрошено; подтверждение сервера не гарантируется." :
-            " Канал недоступен; для текущей сессии запрос не отправлен.";
+        videoSaveStatus_ += requested ? uiText::Settings::RequestSentNotice :
+            uiText::Settings::RequestNotSentNotice;
     }
     overlay_.setVideoSettings(videoSettings_);
     overlay_.setSaveStatus(videoSaveStatus_);
@@ -32,28 +38,28 @@ void ApplicationController::inputImageSettings(u64 keys) {
     auto value = videoSettings_;
     if (fog::video::adjust(value, fields[selection_], direction, fog::Media::supportsH265()))
         changeVideoSettings(value, false);
-    else if (selection_ == 0) videoSaveStatus_ = "H.265 недоступен в этой сборке. Используется H.264.";
+    else if (selection_ == 0) videoSaveStatus_ = uiText::Settings::H265Fallback;
 }
 
 void ApplicationController::drawImageSettings() {
     const auto area = ui_.content();
     const std::array<std::string, 4> labels{
-        "Кодек: " + fog::video::codecLabel(videoSettings_),
-        "Качество сервера: " + fog::video::qualityLabel(videoSettings_),
-        "Запрошенный предел: " + std::to_string(videoSettings_.bitrateMbps) + " Мбит/с",
-        "Ключевые кадры: " + fog::video::keyframeLabel(videoSettings_)};
+        uiText::Settings::CodecPrefix + fog::ui::videoCodecLabel(videoSettings_),
+        uiText::Settings::QualityPrefix + fog::ui::videoQualityLabel(videoSettings_),
+        uiText::Settings::BitrateLimitPrefix + std::to_string(videoSettings_.bitrateMbps) + uiText::Common::MegabitsSuffix,
+        uiText::Settings::KeyframesPrefix + fog::ui::videoKeyframeLabel(videoSettings_)};
     const std::array<std::string, 4> hints{
-        fog::Media::supportsH265() ? "H.265 экспериментальный. Изменяется только до подключения." : "H.265 недоступен в этой сборке.",
-        "Авто / Низкое / Среднее / Высокое / Ультра — запрос серверу.",
-        "5–40 Мбит/с. Сервер может использовать другой фактический битрейт.",
-        "При потере или каждые 2 / 5 / 10 с — интервал запроса, не частота видео."};
+        fog::Media::supportsH265() ? uiText::Settings::H265ExperimentalNotice : uiText::Settings::H265Unavailable,
+        uiText::Settings::QualityDescription,
+        uiText::Settings::BitrateDescription,
+        uiText::Settings::KeyframeDescription};
     for (std::size_t i = 0; i < labels.size(); ++i) {
         const int y = 145 + static_cast<int>(i) * 108;
         ui_.button(labels[i], {area.x, y, area.w, 57}, selection_ == i);
         ui_.text(hints[i], area.x + 14, y + 65, area.w - 28, muted);
     }
-    if (!videoSaveStatus_.empty() && videoSaveStatus_ != "Изменения сохраняются сразу на SD." &&
-        videoSaveStatus_ != "Сохранено на SD.")
+    if (!videoSaveStatus_.empty() && videoSaveStatus_ != uiText::Settings::AutoSaveNotice &&
+        videoSaveStatus_ != uiText::Settings::Saved)
         ui_.text(videoSaveStatus_, area.x, 596, area.w, accent, false, 2);
 }
 
@@ -65,24 +71,24 @@ void ApplicationController::inputConnectionSettings(u64 keys) {
     auto next = connectionSettings_;
     if (!fog::connection::adjust(next, direction)) return;
     try {
-        fog::connection::saveSettings(std::string(dataDir) + "/connection-settings.json", next);
+        fog::connection::saveSettings(storagePaths::path(storagePaths::ConnectionSettings), next);
         connectionSettings_ = next;
-        connectionSaveStatus_ = "Сохранено на SD. Применится при следующем подключении.";
+        connectionSaveStatus_ = uiText::Settings::ConnectionSaved;
     } catch (...) {
-        connectionSaveStatus_ = "Не удалось сохранить на SD. Режим не изменён.";
+        connectionSaveStatus_ = uiText::Settings::ConnectionSaveFailed;
         diagnostic("Connection settings save failed; no settings payload logged.");
     }
 }
 
 void ApplicationController::drawConnectionSettings() {
     const auto area = ui_.content();
-    ui_.button("Режим: " + fog::connection::label(connectionSettings_), {area.x, 154, area.w, 57}, true);
-    ui_.text("Обычный: автоматический выбор пути, как в прежних версиях.", area.x + 14, 240, area.w - 28, muted);
-    ui_.text("Авто: TURN после 2 обрывов за 2 мин, до конца текущей аренды.", area.x + 14, 310, area.w - 28, muted);
-    ui_.text("Повторные неудачные попытки одного восстановления не считаются новым обрывом.", area.x + 14, 365, area.w - 28, muted, false, 2);
-    ui_.text("Через TURN: подключаться через сервер ретрансляции с самого начала.", area.x + 14, 440, area.w - 28, muted);
-    if (!connectionSaveStatus_.empty() && connectionSaveStatus_ != "Изменения сохраняются на SD. Применяются при следующем подключении." &&
-        connectionSaveStatus_ != "Сохранено на SD. Применится при следующем подключении.")
+    ui_.button(uiText::Settings::ConnectionModePrefix + fog::ui::connectionModeLabel(connectionSettings_), {area.x, 154, area.w, 57}, true);
+    ui_.text(uiText::Settings::NormalConnectionDescription, area.x + 14, 240, area.w - 28, muted);
+    ui_.text(uiText::Settings::AutoConnectionDescription, area.x + 14, 310, area.w - 28, muted);
+    ui_.text(uiText::Settings::ReconnectCountingDescription, area.x + 14, 365, area.w - 28, muted, false, 2);
+    ui_.text(uiText::Settings::TurnConnectionDescription, area.x + 14, 440, area.w - 28, muted);
+    if (!connectionSaveStatus_.empty() && connectionSaveStatus_ != uiText::Settings::ConnectionAutoSaveNotice &&
+        connectionSaveStatus_ != uiText::Settings::ConnectionSaved)
         ui_.text(connectionSaveStatus_, area.x, 560, area.w, accent, false, 2);
 }
 

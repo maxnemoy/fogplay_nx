@@ -1,15 +1,21 @@
+#include "core/constants/app_info.hpp"
+#include "features/catalog/presentation/genre_text.hpp"
+#include "features/settings/presentation/settings_text.hpp"
+#include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 #include "features/playstation/presentation/catalog_view.hpp"
+
+namespace uiText = ::fog::constants::ui;
 
 namespace fogplay {
 namespace {
 bool routineStatus(const std::string& value) {
     // Explicitly known success/instruction copy only: unknown errors stay visible.
-    for (const auto* routine : {"Готово", "История сессий", "Раскладка сохранена на SD.",
-            "Вы вышли из аккаунта. Сохранённый токен удалён.",
-            "Аккаунт подключён. Вход сохранён на SD.",
-            "Подключение. Минус + Плюс — меню трансляции.",
-            "Связь восстановлена. Минус + Плюс — меню трансляции."})
+    for (const auto* routine : {uiText::Common::Ready, uiText::Profile::SessionHistory, uiText::Settings::LayoutSaved,
+            uiText::Profile::SignedOut,
+            uiText::Profile::AuthSaved,
+            uiText::Stream::ConnectingMenuHint,
+            uiText::Stream::RestoredMenuHint})
         if (value == routine) return true;
     return value.empty();
 }
@@ -34,11 +40,11 @@ void ApplicationController::drawStreamOverlay() {
         const auto attempt = transportReconnect_.connecting() ? transportReconnect_.attempts() :
             std::min(transportReconnect_.attempts()+1,fog::stream::TransportReconnect::MaxAttempts);
         box(0,0,1280,82,{23,32,46,255});
-        text("Связь: попытка " + std::to_string(attempt) + "/3 за 2 мин. Та же аренда; оплата продолжается.",20,8,accent,1240);
-        text("Минус + Плюс — меню и завершение аренды. Лимит восстановления — 90 секунд.",20,44,white,1240);
+        text(uiText::Stream::ReconnectAttemptPrefix + std::to_string(attempt) + uiText::Stream::ReconnectAttemptSuffix,20,8,accent,1240);
+        text(uiText::Stream::ReconnectLimitHint,20,44,white,1240);
     } else if (videoRecovery_.active() || videoLossWaiting_) {
         box(0,0,1280,45,{23,32,46,255});
-        text("Восстанавливаем видео… Минус + Плюс — меню сессии",20,8,accent,1240);
+        text(uiText::Stream::RecoveringVideo,20,8,accent,1240);
     } else if (!overlayNotice_.empty() && std::chrono::steady_clock::now()-overlayNoticeAt_ < std::chrono::seconds(4)) {
         box(0,0,1280,45,{23,32,46,255}); text(overlayNotice_,20,8,accent,1240);
     }
@@ -71,7 +77,7 @@ void ApplicationController::draw() {
         fog::stream::LoopTiming::Scope overlayScope(loopTiming_, fog::stream::LoopTiming::Stage::Overlay);
         if (overlay_.mode() == fog::stream::OverlayMode::Closed && std::chrono::steady_clock::now()-streamStarted_ < std::chrono::seconds(12)) {
             box(0,665,1280,55,{23,32,46,255});
-            text("Минус + Плюс — меню: мышь, клавиатура, изображение, завершение.",30,680,accent);
+            text(uiText::Stream::OverlayMenuHint,30,680,accent);
         }
         drawStreamOverlay();
         overlayScope.finish();
@@ -91,40 +97,40 @@ void ApplicationController::draw() {
     loopTiming_.suspendPresentation();
     fog::ui::Chrome chrome;
     chrome.sidebarExpanded = sidebar_; chrome.sidebarFocused = sidebar_;
-    chrome.account = api_.loggedIn() ? "Аккаунт подключён" : "Войти в аккаунт";
-    chrome.title = "ВЫБЕРИ ИГРУ";
+    chrome.account = api_.loggedIn() ? uiText::Profile::Connected : uiText::Profile::SignInAccount;
+    chrome.title = uiText::Catalog::Title;
     chrome.section = fog::ui::Section::Games;
     if (screen_ == Screen::Computers || screen_ == Screen::Details || screen_ == Screen::GameDetail) { chrome.title = selectedGameName_; chrome.section = fog::ui::Section::Computers; }
     if (screen_ == Screen::PlayStation || screen_ == Screen::PlayStationDetails) {
         chrome.title = "PLAYSTATION"; chrome.section = fog::ui::Section::PlayStation;
-        chrome.subtitle = playStationPending_.valid() ? "Обновление серверов…" : "PS5 · Статус из списка МТС Fog Play";
-        chrome.hints = "A Подключиться   B Назад   X Обновить   Y Аккаунт";
+        chrome.subtitle = playStationPending_.valid() ? uiText::PlayStation::RefreshingServers : uiText::PlayStation::SourceStatus;
+        chrome.hints = uiText::PlayStation::CatalogHints;
     }
-    if (screen_ == Screen::History) { chrome.title = "ИСТОРИЯ СЕССИЙ"; chrome.section = fog::ui::Section::History; }
+    if (screen_ == Screen::History) { chrome.title = uiText::Profile::HistoryTitle; chrome.section = fog::ui::Section::History; }
     if (screen_ == Screen::Settings || screen_ == Screen::ImageSettings || screen_ == Screen::ConnectionSettings) {
-        chrome.title = screen_ == Screen::ImageSettings ? "ИЗОБРАЖЕНИЕ" :
-            screen_ == Screen::ConnectionSettings ? "ПОДКЛЮЧЕНИЕ" : "НАСТРОЙКИ";
+        chrome.title = screen_ == Screen::ImageSettings ? uiText::Settings::ImageTitle :
+            screen_ == Screen::ConnectionSettings ? uiText::Settings::ConnectionTitle : uiText::Settings::Title;
         chrome.section = fog::ui::Section::Settings;
     }
-    if (screen_ == Screen::ConnectionSettings) chrome.hints = "← / → или A Изменить режим   B Настройки";
-    if (screen_ == Screen::ImageSettings) chrome.hints = "↑ / ↓ Параметр   ← / → или A Изменить   B Настройки";
+    if (screen_ == Screen::ConnectionSettings) chrome.hints = uiText::Settings::ConnectionHints;
+    if (screen_ == Screen::ImageSettings) chrome.hints = uiText::Settings::ImageHints;
     if (sidebar_) chrome.section = std::array<fog::ui::Section,5>{fog::ui::Section::Search,fog::ui::Section::Games,fog::ui::Section::PlayStation,fog::ui::Section::History,fog::ui::Section::Settings}[nav_];
     if (screen_ == Screen::Games) {
-        if (!search_.empty()) chrome.title = "ПОИСК: " + search_;
-        chrome.hints = "A Выбрать   B Меню   X Поиск   Y Аккаунт   ↑ Жанры / прокрутка";
-        if (!catalog_.error().empty()) chrome.hints += "   R Повторить";
+        if (!search_.empty()) chrome.title = uiText::Search::TitlePrefix + search_;
+        chrome.hints = uiText::Catalog::Hints;
+        if (!catalog_.error().empty()) chrome.hints += uiText::Common::RetryHintSuffix;
     }
-    if (screen_ == Screen::Genres) { chrome.title = "ЖАНРЫ"; chrome.hints = "↑ / ↓ / ← / → Жанр   A Применить   B Назад"; }
-    if (screen_ == Screen::Computers) chrome.hints = "A Подключиться   B Назад   X Обновить   L / R Страницы   ≈ оценка через МТС";
-    if (screen_ == Screen::Details) chrome.hints = detailsFromAutomatic_ ? "A Подключиться   B Назад" : "A Подключиться   B Назад   X Обновить пинг";
-    if (sessionPending_) chrome.hints = "A Проверить / выбрать   B Завершить аренду   Y Войти   Минус + Плюс: меню в игре";
+    if (screen_ == Screen::Genres) { chrome.title = uiText::Catalog::GenresTitle; chrome.hints = uiText::Catalog::GenreHints; }
+    if (screen_ == Screen::Computers) chrome.hints = uiText::Server::CatalogHints;
+    if (screen_ == Screen::Details) chrome.hints = detailsFromAutomatic_ ? uiText::Server::ConnectHints : uiText::Server::RefreshPingHints;
+    if (sessionPending_) chrome.hints = uiText::Server::PendingSessionHints;
     if (api_.loggedIn() && authSaveFailed_) chrome.subtitle.clear();
     ui_.frame(chrome);
     const auto area = ui_.content();
     if (screen_ == Screen::Games) {
         std::vector<std::string> genreLabels;
-        for (std::size_t i=0; i<5; ++i) genreLabels.emplace_back(fog::catalogGenres()[i].label);
-        genreLabels.emplace_back(selectedGenreIndex()>5 ? fog::catalogGenres()[selectedGenreIndex()-1].label : "Все жанры");
+        for (std::size_t i=0; i<5; ++i) genreLabels.emplace_back(fog::ui::genreLabel(fog::catalogGenres()[i]));
+        genreLabels.emplace_back(selectedGenreIndex()>5 ? fog::ui::genreLabel(fog::catalogGenres()[selectedGenreIndex()-1]) : uiText::Catalog::AllGenres);
         ui_.genres(genreLabels,!sidebar_ && genreBarFocused_ ? genreChip_ : SIZE_MAX,selectedGenreChip());
         const bool strip = homeCatalog_.stripVisible(catalog_,recentGames_.items().size());
         const bool recentFocused = homeCatalog_.recentFocused(catalog_,recentGames_.items().size());
@@ -152,18 +158,18 @@ void ApplicationController::draw() {
         }
         if (!cards.empty()) ui_.games(cards,sidebar_ || genreBarFocused_ || recentFocused ? cards.size() : catalog_.selected()-first,0,"",strip ? 386 : 154,strip ? 1 : 2);
         else if (strip) {
-            ui_.text(catalog_.busy() || catalogPending_.valid() || pending_.valid() ? "Загружаем каталог…" :
-                     !catalog_.error().empty() ? ui_.controllerHints("Не удалось загрузить каталог. R — повторить • X — поиск") : ui_.controllerHints("Игры не найдены. X — поиск"),area.x,390,area.w,muted,false,2);
-        } else if (catalog_.busy() || catalogPending_.valid() || pending_.valid()) ui_.empty("Загружаем игры", ui_.controllerHints("Каталог появится после ответа сервера. X — изменить поиск."));
-        else if (!catalog_.error().empty()) ui_.empty("Не удалось загрузить игры", ui_.controllerHints("R — повторить • X — изменить поиск"));
-        else ui_.empty("Игры не найдены", ui_.controllerHints("X — изменить поиск"));
+            ui_.text(catalog_.busy() || catalogPending_.valid() || pending_.valid() ? uiText::Catalog::LoadingCatalog :
+                     !catalog_.error().empty() ? ui_.controllerHints(uiText::Catalog::LoadFailedRetryHint) : ui_.controllerHints(uiText::Search::NoGamesSearchHint),area.x,390,area.w,muted,false,2);
+        } else if (catalog_.busy() || catalogPending_.valid() || pending_.valid()) ui_.empty(uiText::Catalog::LoadingGames, ui_.controllerHints(uiText::Catalog::LoadingExplanation));
+        else if (!catalog_.error().empty()) ui_.empty(uiText::Catalog::LoadFailed, ui_.controllerHints(uiText::Search::RetrySearchHint));
+        else ui_.empty(uiText::Search::NoGames, ui_.controllerHints(uiText::Search::ChangeQueryHint));
     } else if (screen_ == Screen::PlayStation) {
         fog::playstation::drawCatalog(ui_,playStationComputers_,selection_,!sidebar_,playStationPending_.valid());
     } else if (screen_ == Screen::PlayStationDetails && selection_ < playStationComputers_.size()) {
         fog::playstation::drawConfirmation(ui_,playStationComputers_[selection_]);
     } else if (screen_ == Screen::Genres) {
-        std::vector<std::string> labels{"Все игры"};
-        for (const auto& genre : fog::catalogGenres()) labels.emplace_back(genre.label);
+        std::vector<std::string> labels{uiText::Catalog::AllGames};
+        for (const auto& genre : fog::catalogGenres()) labels.emplace_back(fog::ui::genreLabel(genre));
         const auto first = genreDialogSelection_ < 12 ? 0 : (genreDialogSelection_/2-5)*2;
         ui_.genreDialog(labels,genreDialogSelection_,first,selectedGenreIndex());
     } else if (screen_ == Screen::GameDetail) {
@@ -171,29 +177,29 @@ void ApplicationController::draw() {
         detail.name = selectedGameName_; detail.description = field(detail_,"description","");
         detail.rating = field(detail_,"metacritic_score",""); detail.ownSteamAccount = ownSteam_;
         const std::array<const char*,3> keys{"min_price","optimum","max_power"};
-        const std::array<const char*,3> names{"Лучшая цена","Оптимальный","Мощный"};
+        const std::array<const char*,3> names{uiText::Server::BestPrice,uiText::Server::Balanced,uiText::Server::Powerful};
         for (std::size_t i=0; i<keys.size(); ++i) {
             const auto found = autoComputers_.find(keys[i]);
             const bool available = found != autoComputers_.end() && found->is_array() && !found->empty();
-            detail.choices.push_back({names[i],"",available ? field(found->front(),"price")+" руб./час" : "Нет серверов",available});
+            detail.choices.push_back({names[i],"",available ? field(found->front(),"price")+uiText::Common::RublesPerHourSuffix : uiText::Server::None,available});
         }
         ui_.gameDetail(detail,selection_ < 4 ? int(selection_) : -1);
-        ui_.button("Все серверы",{area.x,535,area.w,56},selection_ == 4);
+        ui_.button(uiText::Server::All,{area.x,535,area.w,56},selection_ == 4);
     } else if (screen_ == Screen::Computers) {
         std::vector<fog::ui::ComputerCard> cards;
-        for (const auto& pc : computers_) cards.push_back({field(pc,"name"),field(pc,"gpu"),field(pc,"cpu"),field(pc,"price")+" руб./час","Steam",ownSteam_ ? "Свой аккаунт" : "Аккаунт сервера",latencyText(pc),true});
+        for (const auto& pc : computers_) cards.push_back({field(pc,"name"),field(pc,"gpu"),field(pc,"cpu"),field(pc,"price")+uiText::Common::RublesPerHourSuffix,"Steam",ownSteam_ ? uiText::Profile::OwnAccount : uiText::Profile::ServerAccount,latencyText(pc),true});
         ui_.computers(cards,selection_);
-        if (computers_.empty() && !pending_.valid()) ui_.empty("Нет подходящих серверов", ui_.controllerHints("X — обновить • L / R — страницы"));
+        if (computers_.empty() && !pending_.valid()) ui_.empty(uiText::Server::NoSuitableServers, ui_.controllerHints(uiText::Server::RefreshPagesHints));
     } else if (screen_ == Screen::Details && selection_ < computers_.size()) {
         const auto& pc = computers_[selection_];
-        ui_.dialog({"Подключиться к " + field(pc,"name") + "?", field(pc,"gpu") + " • " + field(pc,"cpu") + "\n" + field(pc,"price") + " руб./час. " + (ownSteam_ ? "Вход в свой Steam." : "Аккаунт сервера.") + (detailsFromAutomatic_ ? "" : "\n" + latencyText(pc) + " — оценка через узлы МТС.") + "\nНачнётся платная аренда. При выходе приложение запросит её завершение.", "Подключиться", "Назад"});
+        ui_.dialog({uiText::Server::ConnectPrefix + field(pc,"name") + "?", field(pc,"gpu") + " • " + field(pc,"cpu") + "\n" + field(pc,"price") + uiText::Server::HourlyPriceSentenceSuffix + (ownSteam_ ? uiText::Profile::OwnSteamSentence : uiText::Profile::ServerAccountSentence) + (detailsFromAutomatic_ ? "" : "\n" + latencyText(pc) + uiText::Server::PingEstimateSuffix) + uiText::Server::PaidRentalNotice, uiText::Common::Connect, uiText::Common::Back});
     } else if (screen_ == Screen::History) {
         std::vector<fog::ui::HistoryCard> cards;
-        for (const auto& item : history_) cards.push_back({field(item,"comp_name"),field(item,"created"),field(item,"finished"),field(item,"duration_minutes")+" мин.",field(item,"sum")+" руб.",""});
+        for (const auto& item : history_) cards.push_back({field(item,"comp_name"),field(item,"created"),field(item,"finished"),field(item,"duration_minutes")+uiText::Common::MinutesSuffix,field(item,"sum")+uiText::Common::RublesSuffix,""});
         ui_.history(cards,selection_,selection_/fog::ui::HistoryColumns*fog::ui::HistoryColumns);
-        if (cards.empty() && !pending_.valid()) ui_.empty("Сессий пока нет", "Здесь появится история ваших игровых сессий.");
+        if (cards.empty() && !pending_.valid()) ui_.empty(uiText::Profile::NoSessions, uiText::Profile::HistoryExplanation);
     } else if (screen_ == Screen::Settings) {
-        ui_.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},{"Xbox-раскладка",controllerSettings_.xbox ? "Включена" : "Выключена",controllerSettings_.xbox ? "В меню: B — выбор, A — назад. В игре — Xbox." : "В меню: A — выбор, B — назад. В игре — Nintendo.",controllerSettings_.xbox},{"Подключение",fog::connection::label(connectionSettings_),"Выбор пути: обычный, авто или через TURN"},{"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},{"Выйти из аккаунта","FogPlay NX 0.5.5","Удалить сохранённый вход с SD-карты"}},selection_);
+        ui_.settings({{uiText::Settings::Image,uiText::Common::Open,uiText::Settings::ImageDescription},{uiText::Settings::XboxLayout,controllerSettings_.xbox ? uiText::Common::Enabled : uiText::Common::Disabled,controllerSettings_.xbox ? uiText::Settings::XboxLayoutDescription : uiText::Settings::NintendoLayoutDescription,controllerSettings_.xbox},{uiText::Settings::Connection,fog::ui::connectionModeLabel(connectionSettings_),uiText::Settings::ConnectionDescription},{uiText::Profile::ActiveSessions,uiText::Common::Open,uiText::Profile::ActiveSessionsDescription},{uiText::Profile::SignOut,fog::constants::common::Title,uiText::Profile::SignOutDescription}},selection_);
     } else if (screen_ == Screen::ImageSettings) {
         drawImageSettings();
     } else if (screen_ == Screen::ConnectionSettings) {
@@ -201,40 +207,40 @@ void ApplicationController::draw() {
     } else if (screen_ == Screen::Sessions) {
         for (std::size_t i = selection_/5*5; i < sessions_.size() && i < selection_/5*5+5; ++i)
             ui_.button(field(sessions_[i],"computer_name"),{area.x,170+int(i%5)*75,area.w,65},i==selection_);
-        if (sessions_.empty() && !pending_.valid()) ui_.empty("Активных сессий нет", "Выберите игру и сервер в каталоге, чтобы начать новую аренду.");
+        if (sessions_.empty() && !pending_.valid()) ui_.empty(uiText::Profile::NoActiveSessions, uiText::Profile::StartRentalHint);
     } else if (screen_ == Screen::ConnectConsent) {
-        ui_.dialog({"Подключиться к действующей аренде?","Приложение будет завершать эту сессию при выходе, уходе в HOME или потере видео. Минус + Плюс — меню завершения.","Подключиться","Назад"});
+        ui_.dialog({uiText::Server::AdoptRentalTitle,uiText::Server::AdoptRentalNotice,uiText::Common::Connect,uiText::Common::Back});
     } else if (screen_ == Screen::Checkout) {
         // Worker owns the coordinator while a request is running. Never read its mutable result here.
-        ui_.dialog({"Подключение к серверу", checkoutStatus_ + ui_.controllerHints("\nЕсли связь потеряна, проверьте аренду на fogplay.mts.ru с телефона. X — подтвердить ручную проверку."),ui_.controllerHints("Проверить (A)"),ui_.controllerHints("Завершить (B)")});
+        ui_.dialog({uiText::Server::ConnectingTitle, checkoutStatus_ + ui_.controllerHints(uiText::Server::ManualCheckHint),ui_.controllerHints(uiText::Server::CheckButtonHint),ui_.controllerHints(uiText::Server::FinishButtonHint)});
     } else if (screen_ == Screen::ManualResolution) {
-        ui_.dialog({"Вы проверили заказ на сайте?","Подтверждайте только если в официальном аккаунте нет работающей аренды и ожидающего оплаты заказа. Это снимает локальную блокировку; команду отмены на сервер не отправляет.","Я проверил, аренды нет","Назад",true,true});
+        ui_.dialog({uiText::Server::ManualResolutionTitle,uiText::Server::ManualResolutionNotice,uiText::Server::ManualResolutionConfirmed,uiText::Common::Back,true,true});
     } else if (screen_ == Screen::StopConfirm) {
-        ui_.dialog({"Завершить игровую сессию?","Аренда завершится после подтверждения сервера. Дождитесь результата.","Завершить аренду","Продолжить",true,true});
+        ui_.dialog({uiText::Server::FinishGameSessionTitle,uiText::Server::FinishRentalNotice,uiText::Server::FinishRental,uiText::Common::Continue,true,true});
     } else if (screen_ == Screen::Stopping || screen_ == Screen::Recovery) {
-        ui_.dialog({"Завершение аренды не подтверждено",ui_.controllerHints("A — проверить и завершить. Y — войти в прежний аккаунт. При отсутствии связи завершите сессию на fogplay.mts.ru с телефона: списания могут продолжаться."),"Проверить","",true,true});
+        ui_.dialog({uiText::Server::TerminationUnconfirmed,ui_.controllerHints(uiText::Server::TerminationRecoveryHint),uiText::Common::Check,"",true,true});
     } else if (screen_ == Screen::Streaming) {
         if (transportReconnect_.recovering())
-            ui_.empty("Восстанавливаем связь…","Повторное подключение к той же аренде. Оплата продолжается. Минус + Плюс — меню завершения.");
-        else ui_.empty("Подключаемся к ПК…","Ожидаем первый видеокадр. Минус + Плюс — меню трансляции.");
+            ui_.empty(uiText::Stream::Reconnecting,uiText::Stream::ReconnectNotice);
+        else ui_.empty(uiText::Stream::ConnectingComputer,uiText::Stream::FirstFrameHint);
     } else if (screen_ == Screen::Consent) {
-        ui_.dialog({"Вход в МТС Fog Play",ui_.controllerHints("A — согласиться с условиями сервиса fogplay.mts.ru и запросить SMS. Подписка на рассылку не включается. Токен сохранится на SD для следующего запуска. SMS-код не сохраняется."),"Войти","Назад"});
+        ui_.dialog({uiText::Profile::MtsSignInTitle,ui_.controllerHints(uiText::Profile::MtsSignInConsent),uiText::Profile::SignIn,uiText::Common::Back});
     } else if (screen_ == Screen::Auth) {
-        ui_.dialog({"Вход в аккаунт",authStep_ == fog::AuthStep::Captcha ? ui_.controllerHints("Запомните текст картинки и нажмите A для ввода.") : ui_.controllerHints("Нажмите A и введите код из SMS."),"Ввести код","Назад",true,false,captcha_});
+        ui_.dialog({uiText::Profile::SignInTitle,authStep_ == fog::AuthStep::Captcha ? ui_.controllerHints(uiText::Profile::CaptchaHint) : ui_.controllerHints(uiText::Profile::SmsHint),uiText::Profile::EnterCode,uiText::Common::Back,true,false,captcha_});
     }
     if (api_.loggedIn() && authSaveFailed_ && screen_ != Screen::Games && screen_ != Screen::Genres)
-        ui_.text("Вход не сохранён на SD. После закрытия понадобится войти снова.", area.x, 77, area.w-80);
+        ui_.text(uiText::Profile::AuthNotSaved, area.x, 77, area.w-80);
     if (screen_ == Screen::Checkout) ui_.status(checkoutStatus_, pending_.valid());
     else if (screen_ == Screen::Games) {
-        if (api_.loggedIn() && authSaveFailed_) ui_.status("Вход не сохранён на SD. После закрытия понадобится войти снова.",false,true);
-        else if (pending_.valid()) ui_.status("Загрузка…", true);
-        else if (!catalog_.error().empty()) ui_.status("Не удалось загрузить игры. R — повторить: " + catalog_.error(), false, true);
-        else if (catalog_.busy() || catalogPending_.valid()) ui_.status(catalog_.items().empty() ? "Загрузка игр…" : "Подгружаем игры…", true);
+        if (api_.loggedIn() && authSaveFailed_) ui_.status(uiText::Profile::AuthNotSaved,false,true);
+        else if (pending_.valid()) ui_.status(uiText::Common::Loading, true);
+        else if (!catalog_.error().empty()) ui_.status(uiText::Catalog::LoadFailedPrefix + catalog_.error(), false, true);
+        else if (catalog_.busy() || catalogPending_.valid()) ui_.status(catalog_.items().empty() ? uiText::Catalog::LoadingStatus : uiText::Catalog::LoadMoreStatus, true);
 
     } else if ((screen_ == Screen::PlayStation || screen_ == Screen::PlayStationDetails) && !playStationError_.empty())
         ui_.status(playStationError_,false,true);
     else if (screen_ != Screen::Genres && (pending_.valid() || !routineStatus(status_)))
-        ui_.status(pending_.valid() ? "Загрузка…" : status_, pending_.valid());
+        ui_.status(pending_.valid() ? uiText::Common::Loading : status_, pending_.valid());
     if (screen_ == Screen::Streaming) drawStreamOverlay();
     SDL_RenderPresent(rt_.renderer);
     fogplay::diagnostics::firstUiFramePresented();

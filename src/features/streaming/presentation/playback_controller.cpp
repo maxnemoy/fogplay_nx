@@ -1,6 +1,10 @@
+#include "core/constants/resources.hpp"
+#include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 #include "features/streaming/domain/playback_drain.hpp"
 #include "features/playstation/domain/controller.hpp"
+
+namespace uiText = ::fog::constants::ui;
 
 namespace fogplay {
 
@@ -144,7 +148,7 @@ bool ApplicationController::startTransport() {
     std::array<unsigned char,5> random{}; randomGet(random.data(),random.size());
     std::string suffix;
     for (auto value : random) suffix += "0123456789abcdefghijklmnopqrstuvwxyz"[value % 36];
-    const bool started = stream_->start(streamHash_, suffix, "romfs:/cacert.pem");
+    const bool started = stream_->start(streamHash_, suffix, fog::constants::resources::CertificateBundle);
     streamStarted_ = lastVideo_ = lastMediaLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
     return started;
 }
@@ -164,7 +168,7 @@ void ApplicationController::retryTransport(const char* reason) {
     if (!closeTransport(false)) {
         beginFinish("transport-retry-terminal"); return;
     }
-    status_ = "Связь потеряна. Повторяем подключение к той же аренде; оплата продолжается.";
+    status_ = uiText::Stream::ReconnectStatus;
     diagnostic("Transport recovery scheduled; reason=" + std::string(reason) +
         " attemptsIn120s=" + std::to_string(transportReconnect_.attempts()) + " limit=3 rollingWindow=120s recoveryDeadline=90s");
 }
@@ -202,7 +206,7 @@ void ApplicationController::startStream(const std::string& hash, bool createdFro
             if (stream_->retryableError()) { retryTransport("initial-start"); return; }
             throw std::runtime_error("Signaling startup failed; stopping rental");
         }
-        status_ = "Подключение. Минус + Плюс — меню трансляции.";
+        status_ = uiText::Stream::ConnectingMenuHint;
         diagnostic("Stream connection requested; recovery journal saved.");
     } catch (...) { beginFinish(); throw; }
 }
@@ -449,7 +453,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         if (transportReconnect_.recovering() && stream_->ready() && !stream_->disconnected() &&
             transportReconnect_.prepared(std::chrono::steady_clock::now())) {
             diagnostic("Transport recovery succeeded; attemptsIn120s=" + std::to_string(transportReconnect_.attempts()));
-            status_ = "Связь восстановлена. Минус + Плюс — меню трансляции.";
+            status_ = uiText::Stream::RestoredMenuHint;
         }
         if (!transportReconnect_.recovering() && stream_->ready() && !stream_->disconnected())
             relaySelection_.connected();

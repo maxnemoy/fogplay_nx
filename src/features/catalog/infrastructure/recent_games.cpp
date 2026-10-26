@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/catalog/infrastructure/recent_games.hpp"
 #include "features/catalog/infrastructure/artwork.hpp"
 #include "core/storage/storage.hpp"
@@ -69,12 +70,12 @@ std::string readFile(const std::string& path, bool& missing) {
     const int fd = open(path.c_str(), flags);
     if (fd < 0) {
         if (errno == ENOENT) { missing = true; return {}; }
-        throw std::runtime_error("Recent games read failed");
+        throw std::runtime_error(fog::constants::error::Catalog::RecentGamesReadFailed);
     }
     struct stat info{};
     if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 1 ||
         static_cast<std::uint64_t>(info.st_size) > RecentGames::MaxBytes) {
-        close(fd); throw std::runtime_error("Invalid recent games file");
+        close(fd); throw std::runtime_error(fog::constants::error::Catalog::InvalidRecentGamesFile);
     }
     std::string bytes(static_cast<std::size_t>(info.st_size), '\0');
     std::size_t offset = 0; bool failed = false;
@@ -88,7 +89,7 @@ std::string readFile(const std::string& path, bool& missing) {
     do { count = read(fd, &extra, 1); } while (count < 0 && errno == EINTR);
     if (count != 0) failed = true;
     if (close(fd) != 0) failed = true;
-    if (failed) throw std::runtime_error("Recent games read failed");
+    if (failed) throw std::runtime_error(fog::constants::error::Catalog::RecentGamesReadFailed);
     return bytes;
 }
 }
@@ -111,12 +112,12 @@ bool RecentGames::load() {
         if (!data.is_object() || data.size() != 2 || !data.contains("version") ||
             !data.at("version").is_number_integer() || data.at("version") != 1 ||
             !data.contains("games") || !data.at("games").is_array() || data.at("games").size() > Limit)
-            throw std::runtime_error("Invalid recent games file");
+            throw std::runtime_error(fog::constants::error::Catalog::InvalidRecentGamesFile);
         std::vector<RecentGame> next;
         std::unordered_set<int> ids;
         for (const auto& item : data.at("games")) {
             auto game = parse(item, true);
-            if (!game || !ids.insert(game->id).second) throw std::runtime_error("Invalid recent games entry");
+            if (!game || !ids.insert(game->id).second) throw std::runtime_error(fog::constants::error::Catalog::InvalidRecentGamesEntry);
             next.push_back(std::move(*game));
         }
         items_ = std::move(next); error_.clear(); return true;
@@ -142,7 +143,7 @@ bool RecentGames::save() {
             games.push_back(std::move(entry));
         }
         const auto bytes = Json{{"version",1},{"games",std::move(games)}}.dump() + "\n";
-        if (bytes.size() > MaxBytes) throw std::runtime_error("Recent games limit exceeded");
+        if (bytes.size() > MaxBytes) throw std::runtime_error(fog::constants::error::Catalog::RecentGamesLimitExceeded);
         replaceStorage(path_, bytes); error_.clear(); return true;
     } catch (...) { error_ = "Recent games not saved; available for this run only"; return false; }
 }

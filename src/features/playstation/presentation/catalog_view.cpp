@@ -1,7 +1,10 @@
+#include "core/constants/ui_text.hpp"
 #include "features/playstation/presentation/catalog_view.hpp"
 #include <cmath>
 #include <iomanip>
 #include <sstream>
+
+namespace uiText = ::fog::constants::ui;
 
 namespace fog::playstation {
 namespace {
@@ -11,29 +14,29 @@ std::string name(const nlohmann::json& computer) {
 }
 std::string price(const nlohmann::json& computer) {
     const auto found = computer.find("price");
-    if (found == computer.end() || !found->is_number()) return "Тариф не подтверждён";
+    if (found == computer.end() || !found->is_number()) return uiText::Server::TariffUnconfirmed;
     const auto amount = found->get<double>();
-    if (!std::isfinite(amount) || amount <= 0) return "Тариф не подтверждён";
+    if (!std::isfinite(amount) || amount <= 0) return uiText::Server::TariffUnconfirmed;
     std::ostringstream value;
     value << std::fixed << std::setprecision(2) << amount;
     auto result = value.str();
     if (result.size() >= 3 && result.substr(result.size()-3) == ".00") result.resize(result.size()-3);
-    return result + " руб./час";
+    return result + uiText::Common::RublesPerHourSuffix;
 }
 std::string availability(const nlohmann::json& computer) {
     return computer.value("availability",std::string("unknown"));
 }
 std::string status(const std::string& availability) {
-    if (availability == "online") return "Онлайн";
-    if (availability == "offline") return "Офлайн";
-    return "Статус неизвестен";
+    if (availability == "online") return uiText::PlayStation::Online;
+    if (availability == "offline") return uiText::PlayStation::Offline;
+    return uiText::PlayStation::UnknownStatus;
 }
 }
 void drawCatalog(ui::Ui& ui, const nlohmann::json& computers, std::size_t selected,
                  bool focused, bool loading) {
     if (computers.empty()) {
-        ui.empty(loading ? "Загружаем PlayStation" : "Список не загружен",
-            ui.controllerHints("X — обновить список с сайта Fog Play."));
+        ui.empty(loading ? uiText::PlayStation::Loading : uiText::PlayStation::NotLoaded,
+            ui.controllerHints(uiText::PlayStation::RefreshHint));
         return;
     }
     const auto area = ui.content();
@@ -54,11 +57,9 @@ void drawCatalog(ui::Ui& ui, const nlohmann::json& computers, std::size_t select
     }
 }
 void drawConfirmation(ui::Ui& ui, const nlohmann::json& computer) {
-    ui.dialog({"Подключиться к " + name(computer) + "?",
+    ui.dialog({uiText::Server::ConnectPrefix + name(computer) + "?",
         "PlayStation 5 · " + price(computer) + ".\n" + status(availability(computer)) +
-        " — по списку МТС Fog Play. Подключение проверится при заказе.\n"
-        "Игра выбирается на PS5. Свой Steam не используется.\n"
-        "Начнётся платная аренда. При выходе приложение запросит её завершение.",
-        "Подключиться", "Назад"});
+        uiText::PlayStation::ConnectionNotice,
+        uiText::Common::Connect, uiText::Common::Back});
 }
 }

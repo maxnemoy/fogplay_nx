@@ -1,3 +1,6 @@
+#include "core/constants/ui_text.hpp"
+#include "core/constants/error_text.hpp"
+#include "core/constants/app_info.hpp"
 #if defined(__SWITCH__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -30,13 +33,13 @@ void checkResult(Result rc, const char* operation) {
 }
 
 void checkStorage() {
-    const std::string path = std::string(dataDir) + "/storage-probe.txt";
+    const std::string path = fog::constants::storage::path(fog::constants::storage::StorageProbe);
     try {
         fog::replaceStorage(path, "first");
         fog::replaceStorage(path, "updated");
         std::ifstream input(path, std::ios::binary);
         std::string content((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-        if (input.bad() || content != "updated") throw std::runtime_error("SD storage preflight readback failed");
+        if (input.bad() || content != "updated") throw std::runtime_error(fog::constants::error::Internal::StoragePreflightReadbackFailed);
         input.close();
         fog::clearStorage(path);
     } catch (...) {
@@ -47,19 +50,19 @@ void checkStorage() {
 }
 
 std::string deviceId() {
-    for (const char* path : {"sdmc:/switch", dataDir}) {
-        if (mkdir(path, 0777) != 0 && errno != EEXIST) throw std::runtime_error("Cannot create application folder on SD card.");
+    for (const char* path : {fog::constants::storage::SdRoot, dataDir}) {
+        if (mkdir(path, 0777) != 0 && errno != EEXIST) throw std::runtime_error(fog::constants::error::Internal::CannotCreateApplicationFolder);
     }
-    const std::string path = std::string(dataDir) + "/device-id.txt";
+    const std::string path = fog::constants::storage::path(fog::constants::storage::DeviceId);
     if (auto* file = std::fopen(path.c_str(), "r")) {
         char value[128]{};
         const auto* read = std::fgets(value, sizeof(value), file);
         std::fclose(file);
         const std::string id = read ? std::string(value).substr(0, std::strcspn(value, "\r\n")) : "";
         if (id.size() == 32 && std::all_of(id.begin(), id.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) return id;
-        throw std::runtime_error("Invalid SD device-id.txt; rename it and restart.");
+        throw std::runtime_error(fog::constants::error::Internal::InvalidDeviceIdFile);
     }
-    if (errno != ENOENT) throw std::runtime_error("Cannot read device-id.txt.");
+    if (errno != ENOENT) throw std::runtime_error(fog::constants::error::Internal::CannotReadDeviceIdFile);
     std::array<unsigned char, 16> bytes{};
     randomGet(bytes.data(), bytes.size());
     bytes[6] = static_cast<unsigned char>((bytes[6] & 15) | 64);
@@ -68,11 +71,11 @@ std::string deviceId() {
     std::string id;
     for (const auto byte : bytes) { id += hex[byte >> 4]; id += hex[byte & 15]; }
     auto* out = std::fopen((path + ".tmp").c_str(), "w");
-    if (!out) throw std::runtime_error("Cannot write device ID to SD card.");
+    if (!out) throw std::runtime_error(fog::constants::error::Internal::CannotWriteDeviceId);
     const bool written = std::fprintf(out, "%s\n", id.c_str()) > 0;
     const bool closed = std::fclose(out) == 0;
     if (!written || !closed || std::rename((path + ".tmp").c_str(), path.c_str()) != 0)
-        throw std::runtime_error("Cannot save device ID to SD card.");
+        throw std::runtime_error(fog::constants::error::Internal::CannotSaveDeviceId);
     return id;
 }
 
@@ -87,7 +90,7 @@ void Runtime::initGraphics() {
     }
     {
         StartupStage stage("window");
-        window = SDL_CreateWindow("FogPlay NX", 0, 0, 1280, 720, SDL_WINDOW_SHOWN);
+        window = SDL_CreateWindow(fog::constants::common::Name, 0, 0, 1280, 720, SDL_WINDOW_SHOWN);
         if (!window) throw std::runtime_error(SDL_GetError());
     }
     {
@@ -119,7 +122,7 @@ void Runtime::initGraphics() {
         titleFont = TTF_OpenFontRW(SDL_RWFromConstMem(data.address, static_cast<int>(data.size)), 1, 34);
         if (!font || !titleFont) throw std::runtime_error(TTF_GetError());
     }
-    { StartupStage stage("first_splash"); showStartup("Запускаем приложение…"); }
+    { StartupStage stage("first_splash"); showStartup(fog::constants::ui::Startup::StartingApplication); }
     diagnostic("Startup first_splash_presented");
 }
 void Runtime::showStartup(const char* message) {
@@ -128,7 +131,7 @@ void Runtime::showStartup(const char* message) {
 void Runtime::initServices() {
     using diagnostics::StartupStage;
     StartupStage services("services");
-    showStartup("Подключаем службы…");
+    showStartup(fog::constants::ui::Startup::ConnectingServices);
     {
         StartupStage stage("sockets");
         SocketInitConfig config = *socketGetDefaultInitConfig();
@@ -155,7 +158,7 @@ Runtime::~Runtime() {
             if (renderer && font && appletGetFocusState() == AppletFocusState_InFocus) {
                 SDL_SetRenderDrawColor(renderer, 12, 16, 28, 255);
                 SDL_RenderClear(renderer);
-                auto* surface = TTF_RenderUTF8_Blended(font, "Waiting for network cleanup. Please wait.", white);
+                auto* surface = TTF_RenderUTF8_Blended(font, fog::constants::ui::Startup::WaitingForCleanup, white);
                 if (surface) {
                     auto* texture = SDL_CreateTextureFromSurface(renderer, surface);
                     SDL_Rect rect{32, 300, surface->w, surface->h};
@@ -200,7 +203,7 @@ std::optional<std::string> keyboard(const char* title, const std::string& initia
 void fatalScreen(const std::string& message) {
     diagnostic("Fatal: " + message);
     consoleInit(nullptr);
-    std::printf("FogPlay NX startup failed\n\n%s\n\nUse full application mode (hold R when launching a game).\nCheck SD card and firmware date/time.\nPress + to exit.\n", safeText(message).c_str());
+    std::printf(fog::constants::ui::Startup::FailureFormat, fog::constants::common::Name, safeText(message).c_str());
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard); padInitializeDefault(&pad);
     while (appletMainLoop()) {

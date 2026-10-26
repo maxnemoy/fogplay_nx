@@ -1,3 +1,4 @@
+#include "core/constants/error_text.hpp"
 #include "features/session/application/session.hpp"
 #include "core/storage/storage.hpp"
 #include <cerrno>
@@ -27,7 +28,7 @@ bool hasHash(const Json& sessions, const std::string& hash) {
 SessionGuard::SessionGuard(RentalService& api, std::string journalPath)
     : api_(api), journalPath_(std::move(journalPath)) {
     if (journalPath_.empty() || journalPath_.find('\0') != std::string::npos)
-        throw std::invalid_argument("Invalid session journal path");
+        throw std::invalid_argument(fog::constants::error::Session::InvalidSessionJournalPath);
     loadJournal();
 }
 void SessionGuard::loadJournal() {
@@ -35,26 +36,26 @@ void SessionGuard::loadJournal() {
     catch (const StorageError& error) {
         persistent_ = true;
         invalidJournal_ = true;
-        journalError_ = std::string("Session backup recovery required; ") + error.what();
+        journalError_ = std::string(fog::constants::error::Session::SessionBackupRecoveryRequiredPrefix) + error.what();
         return;
     }
     struct stat info{};
     if (stat(journalPath_.c_str(), &info) != 0) {
         if (errno == ENOENT) return;
         invalidJournal_ = true;
-        journalError_ = "Cannot read pending session journal; preserve it for recovery";
+        journalError_ = fog::constants::error::Session::CannotReadPendingSessionJournalPreserveItForRecovery;
         return;
     }
     persistent_ = true;
     if (!S_ISREG(info.st_mode) || info.st_size < 1 || info.st_size > 4096) {
         invalidJournal_ = true;
-        journalError_ = "Invalid pending session journal; preserve it for recovery";
+        journalError_ = fog::constants::error::Session::InvalidPendingSessionJournalPreserveItForRecovery;
         return;
     }
     FILE* file = std::fopen(journalPath_.c_str(), "rb");
     if (!file) {
         invalidJournal_ = true;
-        journalError_ = "Cannot read pending session journal; preserve it for recovery";
+        journalError_ = fog::constants::error::Session::CannotReadPendingSessionJournalPreserveItForRecovery;
         return;
     }
     char bytes[4097];
@@ -66,7 +67,7 @@ void SessionGuard::loadJournal() {
         !data.contains("version") || data.at("version") != 1 || !data.contains("hash") ||
         !data.at("hash").is_string() || !validSessionHash(data.at("hash").get<std::string>())) {
         invalidJournal_ = true;
-        journalError_ = "Invalid or unreadable pending session journal; preserve it for recovery";
+        journalError_ = fog::constants::error::Session::InvalidOrUnreadablePendingSessionJournalPreserveItForRecovery;
         return;
     }
     pendingHash_ = data.at("hash").get<std::string>();
@@ -86,10 +87,10 @@ void SessionGuard::writeJournal() {
     }
 }
 void SessionGuard::adopt(const std::string& hash, bool observedActive) {
-    if (invalidJournal_ || !journalError_.empty()) throw std::runtime_error("Session journal needs recovery");
-    if (!api_.loggedIn()) throw std::logic_error("Sign in before adopting a session");
-    if (!validSessionHash(hash)) throw std::invalid_argument("Invalid session hash");
-    if (!pendingHash_.empty()) throw std::logic_error("Resolve pending session before connecting another");
+    if (invalidJournal_ || !journalError_.empty()) throw std::runtime_error(fog::constants::error::Session::SessionJournalNeedsRecovery);
+    if (!api_.loggedIn()) throw std::logic_error(fog::constants::error::Auth::SignInBeforeAdoptingASession);
+    if (!validSessionHash(hash)) throw std::invalid_argument(fog::constants::error::Session::InvalidSessionHash);
+    if (!pendingHash_.empty()) throw std::logic_error(fog::constants::error::Session::ResolvePendingSessionBeforeConnectingAnother);
     pendingHash_ = hash;
     observedActive_ = observedActive;
     // An authenticated rental was selected or attributed to the recorded order.
@@ -98,11 +99,11 @@ void SessionGuard::adopt(const std::string& hash, bool observedActive) {
     authGeneration_ = api_.authGeneration();
     try { writeJournal(); }
     catch (const StorageError& error) {
-        journalError_ = std::string("Session journal write failed; live connection is blocked. ") + error.what();
+        journalError_ = std::string(fog::constants::error::Session::SessionJournalWriteFailedLiveConnectionIsBlockedPrefix) + error.what();
         throw;
     }
     catch (...) {
-        journalError_ = "Session journal write failed; live connection is blocked";
+        journalError_ = fog::constants::error::Session::SessionJournalWriteFailedLiveConnectionIsBlocked;
         throw;
     }
 }
@@ -131,7 +132,7 @@ void SessionGuard::clearJournal() {
 }
 FinishResult SessionGuard::finishAttempt() {
     if (!ownsSession() || pendingHash_.empty() || invalidJournal_)
-        return {false, false, "Pending session must match the signed-in account before stopping"};
+        return {false, false, fog::constants::error::Session::PendingSessionMustMatchTheSignedInAccountBeforeStopping};
     bool acknowledged = false;
     try { acknowledged = api_.finishSession(pendingHash_); }
     catch (const FinishRejected&) {}
@@ -142,22 +143,22 @@ FinishResult SessionGuard::finishAttempt() {
         const auto sessions = api_.activeSessions(true);
         if (hasHash(sessions, pendingHash_)) {
             observedActive_ = true;
-            return {false, false, "Session remains active; stop is unconfirmed and can be retried"};
+            return {false, false, fog::constants::error::Session::SessionRemainsActiveStopIsUnconfirmedAndCanBeRetried};
         }
         // An attributed checkout hash can precede activation. A failed POST and
         // absence alone never establish that this not-yet-active rental stopped.
         if (!terminationEvidence_ && !observedActive_)
-            return {false, false, "Session termination is unconfirmed; pending recovery marker retained"};
+            return {false, false, fog::constants::error::Session::SessionTerminationIsUnconfirmedPendingRecoveryMarkerRetained};
     } catch (...) {
-        return {false, false, "Cannot verify session termination; pending recovery marker retained"};
+        return {false, false, fog::constants::error::Session::CannotVerifySessionTerminationPendingRecoveryMarkerRetained};
     }
     try { clearJournal(); }
     catch (const StorageError& error) {
-        journalError_ = std::string("Session terminated, but recovery journal could not be cleared. ") + error.what();
+        journalError_ = std::string(fog::constants::error::Session::SessionTerminatedButRecoveryJournalCouldNotBeClearedPrefix) + error.what();
         return {true, false, journalError_};
     }
     catch (...) {
-        journalError_ = "Session terminated, but recovery journal could not be cleared";
+        journalError_ = fog::constants::error::Session::SessionTerminatedButRecoveryJournalCouldNotBeCleared;
         return {true, false, journalError_};
     }
     return {true, true, "Session termination confirmed"};

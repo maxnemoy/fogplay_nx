@@ -15,6 +15,7 @@ def method(source, name):
     return source[start:end]
 
 harness = r'''
+#include "core/constants/ui_text.hpp"
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <cassert>
@@ -28,6 +29,7 @@ harness = r'''
 #include <string>
 #include <thread>
 using Json = nlohmann::json;
+namespace uiText = fog::constants::ui;
 using namespace std::chrono_literals;
 struct ApplicationController {
     enum class Task { None, Finish, CheckoutStop };
@@ -100,5 +102,5 @@ with tempfile.TemporaryDirectory(prefix='fog-rental-stop-') as directory:
     path = Path(directory)
     (path/'test.cpp').write_text(harness)
     subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-pthread',
-                    '-I'+str(root/'third_party'),str(path/'test.cpp'),'-o',str(path/'test')],check=True)
+                    '-I'+str(root/'src'),'-I'+str(root/'third_party'),str(path/'test.cpp'),'-o',str(path/'test')],check=True)
     subprocess.run([str(path/'test')],check=True,timeout=15)
