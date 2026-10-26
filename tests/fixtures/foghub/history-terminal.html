@@ -1,0 +1,24 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body><form action="/site/logout" method="post"><input type="hidden" name="_csrf" value="fixture-csrf-placeholder"></form><main id="main" role="main"><h1>Журнал сессий</h1><div class="summary">Отображается 1–2 из 2 сессий</div><table class="table table-striped table-bordered table-responsive fs-6 fs-md-5"><thead>
+<tr><th><a href="/session/list?sort=pc_id" data-sort="pc_id">Комп.</a></th><th class="d-none d-md-table-cell"><a href="/session/list?sort=game_id" data-sort="game_id">Игра</a></th><th><a class="desc" href="/session/list?sort=date_start" data-sort="date_start">Сроки</a></th><th>Цена</th><th><a href="/session/list?sort=-comment_id" data-sort="-comment_id">Статус</a></th><th class="d-none d-md-table-cell">Отзыв</th></tr><tr id="w0-filters" class="filters"><td><select class="form-control" name="SessionSearch[pc_id]">
+<option value=""></option>
+<option value="1836">f4bX10</option>
+<option value="1838">f4bX8</option>
+</select></td><td class="d-none d-md-table-cell"><select id="sessionsearch-game_id" class="form-control select2-hidden-accessible" name="SessionSearch[game_id]" data-s2-options="s2options_fd268a17" data-krajee-select2="select2_43538554" style="width: 1px; height: 1px; visibility: hidden;" data-select2-id="select2-data-sessionsearch-game_id" tabindex="-1" aria-hidden="true">
+<option value="" data-select2-id="select2-data-2-jjy7">все</option>
+<option value="20">-</option>
+</select><span class="select2 select2-container select2-container--krajee-bs5" dir="undefined" data-select2-id="select2-data-1-j6ce" style="width: auto;"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" aria-haspopup="true" aria-expanded="false" tabindex="0" aria-disabled="false" aria-labelledby="select2-sessionsearch-game_id-container" aria-controls="select2-sessionsearch-game_id-container"><span class="select2-selection__rendered" id="select2-sessionsearch-game_id-container" role="textbox" aria-readonly="true" title="все"><span class="select2-selection__placeholder">все</span></span><span class="select2-selection__arrow" role="presentation"><b role="presentation"></b></span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span></td><td></td><td></td><td><select class="form-control" name="SessionSearch[comment_id]">
+<option value=""></option>
+<option value="-1">Активна</option>
+<option value="2">Автоматическое завершение после отключения пользователя</option>
+<option value="1">Завершена пользователем</option>
+<option value="4">Кончилось оплаченное пользователем время</option>
+<option value="7">Не было оплаты</option>
+<option value="3">Не было подключения</option>
+<option value="6">Потеряна связь с сервером</option>
+<option value="5">Сервер перезагрузился во время сессии</option>
+</select></td><td class="d-none d-md-table-cell">&nbsp;</td></tr>
+</thead>
+<tbody>
+<tr data-key="9000002"><td><a href="/pc/preview?id=1836" data-pjax="0">f4bX10</a><br><small class="d-block d-md-none"><a href="/game/preview?id=20" data-pjax="0">-</a></small></td><td class="d-none d-md-table-cell" style="min-width: 200px;"><a href="/game/preview?id=20" data-pjax="0">-</a></td><td style="min-width: 95px;"><small>01.01.2026<br>12:00-12:03</small><br>3 мин.</td><td>0.00</td><td><small>Завершена <br>Бонус: 0мин. </small></td><td class="d-none d-md-table-cell"><a class="btn btn-sm btn-warning" href="/session/review?id=9000002" pjax="0">Оценить</a></td></tr>
+<tr data-key="9000001"><td><a href="/pc/preview?id=1838" data-pjax="0">f4bX8</a><br><small class="d-block d-md-none"><a href="/game/preview?id=20" data-pjax="0">-</a></small></td><td class="d-none d-md-table-cell" style="min-width: 200px;"><a href="/game/preview?id=20" data-pjax="0">-</a></td><td style="min-width: 95px;"><small>01.01.2026<br>11:00-11:03</small><br>2 мин.</td><td>0.00</td><td><small>Завершена <br>Бонус: 0мин. </small></td><td class="d-none d-md-table-cell"><a class="btn btn-sm btn-warning" href="/session/review?id=9000001" pjax="0">Оценить</a></td></tr>
+</tbody></table></main></body></html>

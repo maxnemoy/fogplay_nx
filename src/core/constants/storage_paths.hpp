@@ -5,6 +5,7 @@ namespace fog::constants::storage {
 inline constexpr char SdRoot[] = "sdmc:/switch";
 inline constexpr char Directory[] = "sdmc:/switch/fogplay_nx";
 inline constexpr char Auth[] = "/auth.json";
+inline constexpr char FogHubAuth[] = "/foghub-auth.json";
 inline constexpr char PendingSession[] = "/pending-session.json";
 inline constexpr char PendingOrder[] = "/pending-order.json";
 inline constexpr char VideoSettings[] = "/video-settings.json";

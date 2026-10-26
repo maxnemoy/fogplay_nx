@@ -14,7 +14,7 @@ for path in sorted(source.rglob('*')):
     for line, text in enumerate(path.read_text().splitlines(), 1):
         match = re.match(r'\s*#include\s*[<"]([^>"\n]+)', text)
         dependency = match.group(1) if match else ''
-        forbidden = ('nlohmann/', 'core/network/', '/infrastructure/api.hpp', '/infrastructure/mts_', '/infrastructure/input_protocol.hpp')
+        forbidden = ('nlohmann/', 'libxml/', 'core/network/', '/infrastructure/api.hpp', '/infrastructure/mts_', '/infrastructure/foghub_', '/infrastructure/input_protocol.hpp')
         invalid = any(part in dependency for part in forbidden)
         if domain:
             adapters = ('/infrastructure/', '/presentation/', '/application/', 'platform/', 'app/',

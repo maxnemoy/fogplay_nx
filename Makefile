@@ -20,7 +20,7 @@ BUILD := build
 OUTPUT := $(CURDIR)/dist/$(TARGET)
 PORTLIBS := $(DEVKITPRO)/portlibs/switch
 PC_ENV := PKG_CONFIG_LIBDIR=$(PORTLIBS)/lib/pkgconfig
-PACKAGES := libcurl SDL2_ttf SDL2_image sdl2 libavcodec libavutil libswscale opus
+PACKAGES := libcurl libxml-2.0 SDL2_ttf SDL2_image sdl2 libavcodec libavutil libswscale opus
 RTC_PREFIX := $(CURDIR)/third_party/rtc/switch
 FFMPEG_DIAG := $(CURDIR)/third_party/ffmpeg-diag/switch
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE

@@ -14,7 +14,7 @@ struct Game {
     std::string name, description, rating;
     std::vector<std::string> artworkUrls;
 };
-enum class Availability { Unknown, Online, Offline };
+enum class Availability { Unknown, Online, Offline, Busy };
 struct RouteLatency { std::string routeKey; int serverToNodeMs = 0; };
 struct Computer {
     EntityId id;
@@ -35,9 +35,13 @@ struct AutomaticComputers {
     }
 };
 struct GameDetail { Game game; AutomaticComputers recommendations; };
+enum class HistoryStatus { Unknown, Active, Finished };
 struct HistoryEntry {
     std::string computerName, startedAt, finishedAt, durationMinutes, amount;
     std::optional<Money> total;
+    EntityId id{};
+    EntityId computerId{};
+    HistoryStatus status = HistoryStatus::Unknown;
 };
 struct GameQuery { std::string search; int page = 1, pageSize = 16, genreId = 0; };
 struct ComputerQuery { EntityId gameId; int page = 1, pageSize = 5; bool ownSteamAccount = false; };

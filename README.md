@@ -45,7 +45,7 @@ H.265 используется только при совместимом пре
 
 - C++17, Bash, Git, Python 3, CMake >= 3.16, make, pkg-config, tar, patch и binutils;
 - devkitPro с devkitA64, libnx и инструментами `elf2nro`, `nacptool`;
-- Switch portlibs: curl, SDL2, SDL2_image, SDL2_ttf, Opus, FFmpeg 7.1 с **NVTEGRA/Horizon** и их статические зависимости;
+- Switch portlibs: curl, libxml2, SDL2, SDL2_image, SDL2_ttf, Opus, FFmpeg 7.1 с **NVTEGRA/Horizon** и их статические зависимости;
 - интернет для первоначального получения закреплённых исходников RTC и FFmpeg.
 
 Установка devkitPro описана в [официальной инструкции Switchbrew](https://switchbrew.org/wiki/Setting_up_Development_Environment). Официальный [образ devkitpro/devkita64](https://github.com/devkitPro/docker/blob/master/devkita64/Dockerfile) устанавливает группы `switch-dev` и `switch-portlibs`.
@@ -56,7 +56,7 @@ H.265 используется только при совместимом пре
 
 ```sh
 sudo apt install build-essential git cmake pkg-config python3 patch tar xz-utils \
-    libcurl4-openssl-dev libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev \
+    libcurl4-openssl-dev libxml2-dev libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev \
     libavcodec-dev libavutil-dev libswscale-dev libopus-dev libwebp-dev ffmpeg fonts-dejavu-core
 ```
 
@@ -115,11 +115,14 @@ src/
     session/        # оформление, восстановление и остановка аренды
     streaming/      # протокол, видео, звук, управление
     settings/       # изображение и раскладка
+    providers/      # инфраструктура веб-сессии и адаптеров FogHub
 ```
 
 Доменные модели не зависят от JSON, HTTP или SDL/libnx. Контроллеры работают через `AuthRepository`, `AccountRepository`, `CatalogRepository`, `RentalRepository` и `StreamingClient`; адаптеры МТС преобразуют внешние данные в эти модели. Идентификатор включает провайдера, секреты остаются внутри адаптера. Общие сценарии аренды используют отдельные интерфейсы журналов; существующие файлы МТС на SD совместимы. Сборка зависимостей находится в `composition`, последовательное владение заданиями сохраняется в координаторе. Детали — в [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Рабочие сборки, кэш зависимостей, журналы и данные аккаунта исключены через `.gitignore`. История исследований и старые инструкции выпусков не входят в исходники.
+
+Адаптер FogHub пока доступен только в коде и тестах: собственный вход, профиль, баланс, история и публичный каталог преобразуются в общие доменные модели. Он не подключён к интерфейсу и не создаёт аренды. Сохранение cookie-сессии предусмотрено отдельно от МТС (`foghub-auth.json`); этот файл также нельзя публиковать. Проверки формы входа используют подставные ответы, работа входа на настоящем аккаунте и Switch ещё не подтверждена.
 
 ## PlayStation через Fog Play
 

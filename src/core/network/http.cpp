@@ -2,6 +2,7 @@
 #include "core/constants/app_info.hpp"
 #include "core/constants/error_text.hpp"
 #include "core/network/http.hpp"
+#include "core/network/curl_runtime.hpp"
 
 #include <curl/curl.h>
 #include <limits>
@@ -11,16 +12,6 @@
 namespace fog {
 namespace {
 constexpr std::size_t maxResponseBytes = 8 * 1024 * 1024;
-
-class CurlRuntime {
-public:
-    CurlRuntime() {
-        if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-            throw std::runtime_error(fog::constants::error::Connection::CannotInitializeHTTPSTransport);
-        }
-    }
-    ~CurlRuntime() { curl_global_cleanup(); }
-};
 
 struct ResponseBuffer {
     std::string body;
@@ -88,8 +79,7 @@ std::string base64Encode(std::string_view input) {
 }
 
 HttpClient::HttpClient() {
-    static CurlRuntime runtime;
-    (void)runtime;
+    detail::ensureCurlRuntime();
 }
 
 HttpClient::~HttpClient() = default;

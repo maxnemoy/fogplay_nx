@@ -24,6 +24,7 @@
 .idea/
 .vscode/
 auth.json*
+foghub-auth.json*
 device-id.txt*
 pending-order.json*
 pending-session.json*

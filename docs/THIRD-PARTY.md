@@ -16,6 +16,7 @@
 | SDL2, SDL2_image, SDL2_ttf | [libsdl-org](https://github.com/libsdl-org), zlib; FreeType, HarfBuzz и декодеры изображений имеют собственные уведомления |
 | libnx | [switchbrew/libnx](https://github.com/switchbrew/libnx), ISC |
 | curl | [curl/curl](https://github.com/curl/curl), curl license |
+| libxml2 | [GNOME/libxml2](https://gitlab.gnome.org/GNOME/libxml2), MIT; уведомление сохранено в `licenses/libxml2-Copyright.txt` |
 | Opus | [xiph/opus](https://github.com/xiph/opus), BSD |
 | libpng, libjpeg-turbo, libwebp, FreeType, HarfBuzz, zlib, bzip2 | Статические зависимости Switch portlibs; сохраняются соответствующие upstream-лицензии |
 | Корневые сертификаты | Mozilla CA bundle от [curl.se](https://curl.se/docs/caextract.html), заголовок происхождения сохранён в `romfs/cacert.pem` |

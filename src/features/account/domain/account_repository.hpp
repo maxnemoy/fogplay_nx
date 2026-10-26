@@ -2,7 +2,11 @@
 #include "features/auth/domain/auth_repository.hpp"
 #include "features/catalog/domain/models.hpp"
 namespace fog {
-struct UserProfile { AccountId account; };
+struct UserProfile {
+    AccountId account;
+    std::string displayName{};
+    std::optional<Money> balance{};
+};
 class AccountRepository {
 public:
     virtual ~AccountRepository() = default;
