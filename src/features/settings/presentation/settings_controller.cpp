@@ -1,6 +1,8 @@
 #include "core/constants/storage_paths.hpp"
 #include "features/settings/presentation/settings_text.hpp"
 #include "features/settings/presentation/rumble_text.hpp"
+#include "features/settings/presentation/controller_text.hpp"
+#include "features/settings/presentation/controller_settings_view.hpp"
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 
@@ -8,6 +10,32 @@ namespace uiText = ::fog::constants::ui;
 namespace storagePaths = ::fog::constants::storage;
 
 namespace fogplay {
+
+void ApplicationController::inputControllerSettings(u64 keys) {
+    if (keys & HidNpadButton_B) { screen_ = Screen::Settings; selection_ = 1; return; }
+    if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp | HidNpadButton_Down | HidNpadButton_StickLDown))
+        selection_ = (selection_ + 1) % 2;
+    if (!(keys & (HidNpadButton_Left | HidNpadButton_StickLLeft | HidNpadButton_Right | HidNpadButton_StickLRight | HidNpadButton_A))) return;
+    auto next = controllerSettings_;
+    if (selection_ == 0) next.profile = next.profile == ::stream::ControllerProfile::Xbox ?
+        ::stream::ControllerProfile::DualSense : ::stream::ControllerProfile::Xbox;
+    else next.xbox = !next.xbox;
+    try {
+        fog::controller::saveSettings(storagePaths::path(storagePaths::ControllerSettings), next);
+        controllerSettings_ = next;
+        ui_.setXboxLayout(next.xbox);
+        controllerSaveStatus_ = fog::controller::text::Saved;
+        diagnostic(std::string("Controller settings saved: profile=") + fog::controller::text::profileLabel(next.profile) +
+            " layout=" + (next.xbox ? "xbox" : "nintendo") + "; applies to next connection");
+    } catch (...) {
+        controllerSaveStatus_ = fog::controller::text::SaveFailed;
+        diagnostic("Controller settings save failed; previous settings retained.");
+    }
+}
+
+void ApplicationController::drawControllerSettings() {
+    fog::ui::controllerSettings(ui_, controllerSettings_, selection_, controllerSaveStatus_);
+}
 
 void ApplicationController::inputImageSettings(u64 keys) {
     if (keys & HidNpadButton_B) { screen_ = Screen::Settings; selection_ = 0; return; }

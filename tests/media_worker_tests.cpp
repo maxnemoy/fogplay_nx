@@ -88,7 +88,7 @@ public:
     bool start(const stream::StreamConnection&) override { return true; }
     bool configureVideo(const fog::video::Settings&) override { return true; }
     bool configureRelay(bool) override { return true; }
-    bool configurePlayStation(bool) override { return true; }
+    bool configureController(stream::ControllerProfile) override { return true; }
     bool updateVideoSettings(const fog::video::Settings&) override { return true; }
     stream::VideoCodec selectedVideoCodec() const override { return stream::VideoCodec::H264; }
     std::string qualityStatus() const override { return {}; }

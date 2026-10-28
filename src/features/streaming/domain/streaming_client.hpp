@@ -1,6 +1,7 @@
 #pragma once
 #include "core/domain/identity.hpp"
 #include "features/settings/domain/video_settings.hpp"
+#include "features/streaming/domain/controller_profile.hpp"
 #include "features/streaming/domain/remote_input.hpp"
 #include "features/streaming/domain/rumble.hpp"
 #include <array>
@@ -45,8 +46,9 @@ public:
     virtual bool configureVideo(const fog::video::Settings& settings) = 0;
     // Pre-start transport preference, retained across start(). Relay never falls back to direct.
     virtual bool configureRelay(bool relay) = 0;
-    // Pre-start controller mode, retained across start(). Defaults to ordinary gamepad.
-    virtual bool configurePlayStation(bool enabled) = 0;
+    // Pre-start controller preference, retained across start(). The host chooses
+    // the virtual device supported by its driver for the requested profile.
+    virtual bool configureController(ControllerProfile profile) = 0;
     virtual bool updateVideoSettings(const fog::video::Settings& settings) = 0;
     virtual VideoCodec selectedVideoCodec() const = 0;
     virtual std::string qualityStatus() const = 0;

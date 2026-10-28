@@ -1379,14 +1379,15 @@ int main(int argc, char** argv) {
         // Reuse one Client and rental hash, changing only its connection suffix.
         // Old callbacks must not contaminate the replacement RTC generation.
         stream::Client client;
-        assert(client.configurePlayStation(playStation));
+        assert(!client.configureController(static_cast<stream::ControllerProfile>(-1)));
+        assert(client.configureController(playStation ? stream::ControllerProfile::DualSense : stream::ControllerProfile::Xbox));
         for (unsigned attempt=0; attempt<2; ++attempt) {
             const std::string suffix = attempt == 0 ? "abcde" : "abcdf";
             Fixture fixture("4000,4000",true,false,suffix,false,false,playStation);
             assert(client.startForTesting("fixture",suffix,"ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
             stream::Rumble vibration;
             assert(!client.pollRumble(vibration)); // A new transport never exposes prior-generation feedback.
-            assert(!client.configurePlayStation(!playStation));
+            assert(!client.configureController(playStation ? stream::ControllerProfile::Xbox : stream::ControllerProfile::DualSense));
             // Callback ping before sender publication must survive in a bounded
             // slot and transfer to the worker only after route authorization.
             client.receiveControlForTesting(R"({"id":"ping","ts":42})");
@@ -1475,7 +1476,7 @@ int main(int argc, char** argv) {
                 assert(native.find("invalidNative=6 ") != std::string::npos);
             } else assert(!client.sendControl(touch.dump()));
             assert(client.diagnostics().find("incomingIgnored=0 ") != std::string::npos);
-            assert(!client.configurePlayStation(!playStation));
+            assert(!client.configureController(playStation ? stream::ControllerProfile::Xbox : stream::ControllerProfile::DualSense));
             stream::Gamepad pad; pad.buttons[0] = 1; pad.buttons[17] = 1;
             pad.axes[0] = 0.5f; pad.leftTrigger = 0.25f; pad.rightTrigger = 0.75f;
             assert(!client.sendControl(stream::protocol::gamepad(pad, !playStation).dump()));
@@ -1514,7 +1515,7 @@ int main(int argc, char** argv) {
                 client.pump();
                 assert(!client.error().empty());
                 // Failed transports still own their final neutral until close.
-                assert(!client.configurePlayStation(!playStation));
+                assert(!client.configureController(playStation ? stream::ControllerProfile::Xbox : stream::ControllerProfile::DualSense));
                 client.close();
                 assert(!client.pollRumble(vibration));
             }
@@ -1537,7 +1538,7 @@ int main(int argc, char** argv) {
     std::cout << "Both controller modes: same Client reinit, mode lock, matching init/input/neutral, retry no-close/final-close passed\n";
     {
         stream::Client client;
-        assert(client.configurePlayStation(true));
+        assert(client.configureController(stream::ControllerProfile::DualSense));
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
             const std::string suffix = attempt == 0 ? "abcde" : "abcdf";
             Fixture fixture("4000,4000", true, false, suffix, false, false, true);

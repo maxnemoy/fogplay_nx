@@ -4,6 +4,7 @@
 #include "app/application.hpp"
 #include "features/session/presentation/session_rating_text.hpp"
 #include "features/settings/presentation/rumble_text.hpp"
+#include "features/settings/presentation/controller_text.hpp"
 
 namespace uiText = ::fog::constants::ui;
 namespace storagePaths = ::fog::constants::storage;
@@ -101,7 +102,10 @@ ApplicationController::ApplicationController(Runtime& runtime, std::unique_ptr<S
         diagnostic("Connection settings unreadable or invalid; using normal mode.");
     }
     try { controllerSettings_ = fog::controller::loadSettings(storagePaths::path(storagePaths::ControllerSettings)); }
-    catch (...) { diagnostic("Controller settings unreadable; using Xbox layout default."); }
+    catch (...) {
+        controllerSaveStatus_ = fog::controller::text::LoadFailed;
+        diagnostic("Controller settings unreadable; using Xbox profile and layout defaults.");
+    }
     try { rumbleSettings_ = fog::rumble::loadSettings(storagePaths::path(storagePaths::RumbleSettings)); }
     catch (...) {
         rumbleSaveStatus_ = fog::rumble::text::LoadFailed;

@@ -83,7 +83,7 @@ inline constexpr SDL_Color white{234, 238, 245, 255};
 inline constexpr SDL_Color muted{163, 178, 200, 255};
 inline constexpr SDL_Color accent{107, 216, 190, 255};
 
-enum class Screen { Profile, Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails, SessionRating, RumbleSettings };
+enum class Screen { Profile, Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails, SessionRating, RumbleSettings, ControllerSettings };
 enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation, PairedCreate, PairedPoll, PairedStop, ProviderProfile, ProviderForget, SessionRatingLoad, SessionRatingSubmit };
 
 struct RestoredProviders {
@@ -173,6 +173,8 @@ private:
     void inputConnectionSettings(u64 keys);
     void drawConnectionSettings();
     void inputRumbleSettings(u64 keys);
+    void inputControllerSettings(u64 keys);
+    void drawControllerSettings();
     void drawRumbleSettings();
     void changeRumbleSettings(const fog::rumble::Settings& value);
     void overlayAction(const fog::stream::OverlayAction& action);
@@ -275,6 +277,7 @@ private:
     fog::connection::Settings connectionSettings_;
     fog::connection::RelaySelection relaySelection_;
     fog::controller::Settings controllerSettings_;
+    std::string controllerSaveStatus_;
     fog::rumble::Settings rumbleSettings_;
     std::string rumbleSaveStatus_;
     bool firstFramePresented_ = false;

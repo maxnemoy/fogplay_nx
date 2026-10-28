@@ -26,8 +26,8 @@ public:
     bool configureVideo(const fog::video::Settings& settings) override;
     // Pre-start transport preference, retained across start(). Relay never falls back to direct.
     bool configureRelay(bool relay) override;
-    // Pre-start controller mode, retained across start(). Defaults to ordinary gamepad.
-    bool configurePlayStation(bool enabled) override;
+    // Pre-start controller preference, retained across start().
+    bool configureController(ControllerProfile profile) override;
     bool updateVideoSettings(const fog::video::Settings& settings) override;
     VideoCodec selectedVideoCodec() const override;
     std::string qualityStatus() const override;

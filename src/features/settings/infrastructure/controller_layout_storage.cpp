@@ -44,25 +44,36 @@ Settings loadSettings(const std::string& path) {
     if (close(fd) != 0) failed = true;
     if (failed) throw std::runtime_error(fog::constants::error::Settings::CannotReadControllerSettings);
     if (bytes.find('\0') != std::string::npos) throw std::runtime_error(fog::constants::error::Settings::InvalidControllerSettings);
-    bool seenVersion = false, seenXbox = false, duplicate = false;
+    bool seenVersion = false, seenXbox = false, seenProfile = false, duplicate = false;
     const auto data = nlohmann::json::parse(bytes,
         [&](int depth, nlohmann::json::parse_event_t event, nlohmann::json& parsed) {
             if (depth == 1 && event == nlohmann::json::parse_event_t::key) {
                 const auto key = parsed.get<std::string>();
                 if (key == "version") { duplicate |= seenVersion; seenVersion = true; }
                 if (key == "xbox") { duplicate |= seenXbox; seenXbox = true; }
+                if (key == "profile") { duplicate |= seenProfile; seenProfile = true; }
             }
             return true;
         }, false);
     try {
-        if (duplicate || !data.is_object() || data.size() != 2 ||
-            !data.at("version").is_number_integer() || data.at("version") != 1 ||
+        if (duplicate || !data.is_object() ||
+            !data.at("version").is_number_integer() ||
             !data.at("xbox").is_boolean()) throw std::runtime_error(fog::constants::error::Internal::InvalidData);
-        return {data.at("xbox").get<bool>()};
+        const bool xbox = data.at("xbox").get<bool>();
+        if (data.at("version") == 1 && data.size() == 2) return {xbox};
+        if (data.at("version") != 2 || data.size() != 3 || !data.at("profile").is_string())
+            throw std::runtime_error(fog::constants::error::Internal::InvalidData);
+        const auto profile = data.at("profile").get<std::string>();
+        if (profile == "xbox") return {xbox, ::stream::ControllerProfile::Xbox};
+        if (profile == "dualsense") return {xbox, ::stream::ControllerProfile::DualSense};
+        throw std::runtime_error(fog::constants::error::Internal::InvalidData);
     } catch (...) { throw std::runtime_error(fog::constants::error::Settings::InvalidControllerSettings); }
 }
 void saveSettings(const std::string& path, const Settings& settings) {
-    const auto bytes = nlohmann::json{{"version", 1}, {"xbox", settings.xbox}}.dump() + "\n";
+    if (!::stream::validControllerProfile(settings.profile))
+        throw std::runtime_error(fog::constants::error::Settings::InvalidControllerSettings);
+    const auto bytes = nlohmann::json{{"version", 2}, {"xbox", settings.xbox},
+        {"profile", settings.profile == ::stream::ControllerProfile::DualSense ? "dualsense" : "xbox"}}.dump() + "\n";
     replaceStorage(path, bytes);
 }
 }

@@ -1630,9 +1630,9 @@ bool Client::configureRelay(bool relay) {
     impl_->relay = relay;
     return true;
 }
-bool Client::configurePlayStation(bool enabled) {
-    if (impl_->running || impl_->shared) return false;
-    impl_->playStation = enabled;
+bool Client::configureController(ControllerProfile profile) {
+    if (impl_->running || impl_->shared || !validControllerProfile(profile)) return false;
+    impl_->playStation = profile == ControllerProfile::DualSense;
     return true;
 }
 bool Client::updateVideoSettings(const fog::video::Settings& settings) {

@@ -2,6 +2,7 @@
 #include "features/catalog/presentation/genre_text.hpp"
 #include "features/settings/presentation/settings_text.hpp"
 #include "features/settings/presentation/rumble_text.hpp"
+#include "features/settings/presentation/controller_text.hpp"
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 #include "features/playstation/presentation/catalog_view.hpp"
@@ -139,15 +140,17 @@ void ApplicationController::draw() {
         chrome.section = fog::ui::Section::PlayStation;
     }
     if (screen_ == Screen::History) { chrome.title = uiText::Profile::HistoryTitle; chrome.section = fog::ui::Section::History; }
-    if (screen_ == Screen::Settings || screen_ == Screen::ImageSettings || screen_ == Screen::ConnectionSettings || screen_ == Screen::RumbleSettings) {
+    if (screen_ == Screen::Settings || screen_ == Screen::ImageSettings || screen_ == Screen::ConnectionSettings || screen_ == Screen::RumbleSettings || screen_ == Screen::ControllerSettings) {
         chrome.title = screen_ == Screen::ImageSettings ? uiText::Settings::ImageTitle :
             screen_ == Screen::ConnectionSettings ? uiText::Settings::ConnectionTitle :
-            screen_ == Screen::RumbleSettings ? fog::rumble::text::Title : uiText::Settings::Title;
+            screen_ == Screen::RumbleSettings ? fog::rumble::text::Title :
+            screen_ == Screen::ControllerSettings ? fog::controller::text::Title : uiText::Settings::Title;
         chrome.section = fog::ui::Section::Settings;
     }
     if (screen_ == Screen::ConnectionSettings) chrome.hints = uiText::Settings::ConnectionHints;
     if (screen_ == Screen::ImageSettings) chrome.hints = uiText::Settings::ImageHints;
     if (screen_ == Screen::RumbleSettings) chrome.hints = fog::rumble::text::Hints;
+    if (screen_ == Screen::ControllerSettings) chrome.hints = uiText::Settings::ImageHints;
     if (sidebar_) chrome.section = std::array<fog::ui::Section,5>{fog::ui::Section::Search,fog::ui::Section::Games,fog::ui::Section::PlayStation,fog::ui::Section::History,fog::ui::Section::Settings}[nav_];
     if (screen_ == Screen::Games) {
         if (!search_.empty()) chrome.title = uiText::Search::TitlePrefix + search_;
@@ -246,13 +249,15 @@ void ApplicationController::draw() {
         ui_.history(cards,selection_,selection_/fog::ui::HistoryColumns*fog::ui::HistoryColumns);
         if (cards.empty() && !pending_.valid()) ui_.empty(uiText::Profile::NoSessions, uiText::Profile::HistoryExplanation);
     } else if (screen_ == Screen::Settings) {
-        ui_.settings({{uiText::Settings::Image,uiText::Common::Open,uiText::Settings::ImageDescription},{uiText::Settings::XboxLayout,controllerSettings_.xbox ? uiText::Common::Enabled : uiText::Common::Disabled,controllerSettings_.xbox ? uiText::Settings::XboxLayoutDescription : uiText::Settings::NintendoLayoutDescription,controllerSettings_.xbox},{uiText::Settings::Connection,fog::ui::connectionModeLabel(connectionSettings_),uiText::Settings::ConnectionDescription},{uiText::Profile::ActiveSessions,uiText::Common::Open,uiText::Profile::ActiveSessionsDescription},{uiText::Profile::SignOut,fog::constants::common::Title,uiText::Profile::SignOutDescription},{fog::rumble::text::MenuLabel,fog::rumble::text::label(rumbleSettings_.mode),fog::rumble::text::Description}},selection_);
+        ui_.settings({{uiText::Settings::Image,uiText::Common::Open,uiText::Settings::ImageDescription},{fog::controller::text::Menu,fog::controller::text::profileLabel(controllerSettings_.profile),fog::controller::text::Description},{uiText::Settings::Connection,fog::ui::connectionModeLabel(connectionSettings_),uiText::Settings::ConnectionDescription},{uiText::Profile::ActiveSessions,uiText::Common::Open,uiText::Profile::ActiveSessionsDescription},{uiText::Profile::SignOut,fog::constants::common::Title,uiText::Profile::SignOutDescription},{fog::rumble::text::MenuLabel,fog::rumble::text::label(rumbleSettings_.mode),fog::rumble::text::Description}},selection_);
     } else if (screen_ == Screen::ImageSettings) {
         drawImageSettings();
     } else if (screen_ == Screen::ConnectionSettings) {
         drawConnectionSettings();
     } else if (screen_ == Screen::RumbleSettings) {
         drawRumbleSettings();
+    } else if (screen_ == Screen::ControllerSettings) {
+        drawControllerSettings();
     } else if (screen_ == Screen::Sessions) {
         for (std::size_t i = selection_/5*5; i < sessions_.size() && i < selection_/5*5+5; ++i)
             ui_.button(display(sessions_[i].computerName),{area.x,170+int(i%5)*75,area.w,65},i==selection_);

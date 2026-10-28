@@ -150,7 +150,6 @@ void ApplicationController::handlePairedCheckout() {
     }
     if (result.state == fog::PairedCheckoutState::Ready && !stopAfterTask_ && !result.stopRequested) {
         if (!pairedServices_->bindRental(result.rental)) { beginFinish("paired-stream-binding-failed"); return; }
-        streamPlayStation_ = false;
         startStream(result.rental,false);
         return;
     }
@@ -171,7 +170,6 @@ void ApplicationController::handleCheckout() {
     checkoutAutoPoll_ = fog::checkoutNeedsAutomaticCheck(result);
     if (result.stopRequested) checkoutAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
     if (result.state == fog::CheckoutState::Ready && !stopAfterTask_ && !result.stopRequested) {
-        streamPlayStation_ = selectedPlayStation_;
         startStream(result.rentalId,!selectedPlayStation_); return;
     }
     if (!sessionPending_) {
@@ -321,10 +319,6 @@ void ApplicationController::connectSession() {
         }
         throw;
     }
-    // Only an exact known computer identity selects the PlayStation protocol.
-    // Missing/unknown identity keeps the ordinary stream mode.
-    const auto& session = sessions_[selection_];
-    streamPlayStation_ = session.computerId && fog::isPlayStationComputerId(*session.computerId);
     startStream(rental,false);
 }
 

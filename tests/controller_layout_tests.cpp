@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 int assertions = 0;
@@ -64,6 +65,10 @@ void checkMappings() {
         }
     }
     require(mapStreamButtons(a, {}, masks) == a, "default preserves current remote mapping");
+    require(mapStreamButtons(a, {true, stream::ControllerProfile::DualSense}, masks) == a,
+        "DualSense profile preserves independent Xbox button layout");
+    require(mapStreamButtons(a, {false, stream::ControllerProfile::DualSense}, masks) == b,
+        "DualSense profile preserves independent Nintendo button layout");
     require(mapUiButtons(a, {}, masks) == b, "default switches UI confirm to physical B");
     require(uiHints("A B X Y", {true}) == "B A Y X", "hints swap simultaneously without cascading");
     require(uiHints("A B X Y", {false}) == "A B X Y", "Nintendo hint labels unchanged");
@@ -78,19 +83,33 @@ void checkMappings() {
 }
 void checkPersistence(const std::string& path) {
     using namespace fog::controller;
-    require(loadSettings(path).xbox, "missing settings default to Xbox");
+    using Profile = stream::ControllerProfile;
+    require(loadSettings(path) == Settings{true, Profile::Xbox}, "missing settings default to Xbox layout and profile");
     require(!std::filesystem::exists(path), "loading defaults does not write a file");
-    for (const bool xbox : {false, true, false}) {
-        saveSettings(path, {xbox});
-        require(loadSettings(path) == Settings{xbox}, "both layouts survive save and restart");
-        const auto data = nlohmann::json::parse(readFile(path));
-        require(data.size() == 2 && data.at("version") == 1 && data.at("xbox").is_boolean() &&
-            data.at("xbox") == xbox, "saved schema is bounded and authentication-free");
-        require(!std::filesystem::exists(path + ".bak") && !std::filesystem::exists(path + ".tmp"),
-            "successful save removes auxiliary files");
+    for (const bool xbox : {false, true}) {
+        for (const auto profile : {Profile::Xbox, Profile::DualSense}) {
+            saveSettings(path, {xbox, profile});
+            require(loadSettings(path) == Settings{xbox, profile}, "layout and profile independently survive save and restart");
+            const auto data = nlohmann::json::parse(readFile(path));
+            require(data.size() == 3 && data.at("version") == 2 && data.at("xbox").is_boolean() &&
+                data.at("xbox") == xbox && data.at("profile") == (profile == Profile::Xbox ? "xbox" : "dualsense"),
+                "saved schema is bounded and authentication-free");
+            require(!std::filesystem::exists(path + ".bak") && !std::filesystem::exists(path + ".tmp"),
+                "successful save removes auxiliary files");
+        }
+        const auto legacy = nlohmann::json{{"version", 1}, {"xbox", xbox}}.dump();
+        writeFile(path, legacy);
+        const auto migrated = loadSettings(path);
+        require(migrated == Settings{xbox, Profile::Xbox}, "legacy settings preserve layout and default to Xbox profile");
+        require(readFile(path) == legacy, "legacy load does not rewrite settings");
+        saveSettings(path, migrated);
+        require(nlohmann::json::parse(readFile(path)).at("version") == 2, "next save upgrades legacy schema");
     }
+    const auto committed = readFile(path);
+    require(rejectsSave(path, {false, static_cast<Profile>(99)}), "invalid profile enum cannot be saved");
+    require(readFile(path) == committed, "invalid profile save leaves committed settings intact");
     const std::string valid = "{\"version\":1,\"xbox\":false}";
-    const std::array<std::string, 24> invalid{
+    const std::vector<std::string> invalid{
         "", "{", "null", "[]", "{}", "true", "{\"version\":1}", "{\"xbox\":false}",
         "{\"version\":2,\"xbox\":false}", "{\"version\":1.0,\"xbox\":false}",
         "{\"version\":true,\"xbox\":false}", "{\"version\":4294967297,\"xbox\":false}",
@@ -100,12 +119,28 @@ void checkPersistence(const std::string& path) {
         "{\"version\":1,\"xbox\":false,\"xbox\":true}",
         "{\"version\":1,\"version\":1,\"xbox\":false}",
         valid + "{}", valid + std::string(1, '\0'), std::string(1025, ' '),
-        "{\"version\":1,\"xbox\":false,\"private\":\"" + std::string(1, static_cast<char>(0xff)) + "\"}"};
+        "{\"version\":1,\"xbox\":false,\"private\":\"" + std::string(1, static_cast<char>(0xff)) + "\"}",
+        "{\"version\":1,\"xbox\":false,\"profile\":\"xbox\"}",
+        "{\"version\":2,\"xbox\":false,\"profile\":\"ps5\"}",
+        "{\"version\":2,\"xbox\":false,\"profile\":\"DualSense\"}",
+        "{\"version\":2,\"xbox\":false,\"profile\":null}",
+        "{\"version\":2,\"xbox\":false,\"profile\":1}",
+        "{\"version\":2,\"xbox\":false,\"profile\":false}",
+        "{\"version\":2,\"xbox\":false,\"profile\":{}}",
+        "{\"version\":2,\"xbox\":false,\"profile\":[]}",
+        "{\"version\":2,\"xbox\":false,\"profile\":\"\"}",
+        "{\"version\":2,\"xbox\":false,\"profile\":\"dualsense\",\"profile\":\"xbox\"}",
+        "{\"version\":2,\"version\":2,\"xbox\":false,\"profile\":\"dualsense\"}",
+        "{\"version\":2,\"xbox\":false,\"xbox\":true,\"profile\":\"dualsense\"}",
+        "{\"version\":2,\"xbox\":false,\"profile\":\"dualsense\",\"extra\":0}",
+        "{\"version\":2.0,\"xbox\":false,\"profile\":\"dualsense\"}",
+        "{\"version\":4294967298,\"xbox\":false,\"profile\":\"dualsense\"}",
+        "{\"version\":3,\"xbox\":false,\"profile\":\"dualsense\"}"};
     for (const auto& bytes : invalid) {
         writeFile(path, bytes);
         Settings retained;
         try { retained = loadSettings(path); } catch (const std::runtime_error&) {}
-        require(retained.xbox, "invalid load retains caller's safe default");
+        require(retained == Settings{}, "invalid load retains caller's safe default");
         require(rejectsLoad(path), "malformed or unsupported schema rejected");
     }
     writeFile(path, valid + std::string(1024 - valid.size(), ' '));
@@ -140,39 +175,41 @@ void checkPersistence(const std::string& path) {
 }
 void checkRecovery(const std::string& path) {
     using namespace fog::controller;
+    const Settings previous{false, stream::ControllerProfile::DualSense};
+    const Settings replacement{true, stream::ControllerProfile::Xbox};
     writeFile(path + ".tmp", "private-uncommitted");
     require(loadSettings(path).xbox && !std::filesystem::exists(path), "orphan temporary never promoted");
-    saveSettings(path, {false});
+    saveSettings(path, previous);
     std::filesystem::rename(path, path + ".bak");
     writeFile(path + ".tmp", "{\"version\":1,\"xbox\":true}");
-    require(!loadSettings(path).xbox && !std::filesystem::exists(path + ".bak"), "interrupted swap recovers backup");
+    require(loadSettings(path) == previous && !std::filesystem::exists(path + ".bak"), "interrupted swap recovers layout and profile from backup");
     writeFile(path + ".bak", "{\"version\":1,\"xbox\":true}");
-    require(!loadSettings(path).xbox, "existing primary stays authoritative over backup");
+    require(loadSettings(path) == previous, "existing layout and profile stay authoritative over backup");
     writeFile(path, "private-corrupt-primary");
     require(rejectsLoad(path), "corrupt primary cannot silently revert to a backup");
     writeFile(path, "{\"version\":1,\"xbox\":false}");
-    saveSettings(path, {false});
+    saveSettings(path, previous);
     installPath = path;
     failInstall = true;
-    require(rejectsSave(path, {true}), "install failure observable");
+    require(rejectsSave(path, replacement), "install failure observable");
     failInstall = false;
-    require(!loadSettings(path).xbox, "install failure restores old committed setting");
+    require(loadSettings(path) == previous, "install failure restores old committed layout and profile");
     failFlushAt = 1;
-    require(rejectsSave(path, {true}), "temporary flush failure observable");
-    require(!loadSettings(path).xbox, "temporary flush failure retains old setting");
+    require(rejectsSave(path, replacement), "temporary flush failure observable");
+    require(loadSettings(path) == previous, "temporary flush failure retains old layout and profile");
     failFlushAt = 2;
-    require(rejectsSave(path, {true}), "backup directory commit failure observable");
-    require(!loadSettings(path).xbox, "backup commit failure recovers old setting");
+    require(rejectsSave(path, replacement), "backup directory commit failure observable");
+    require(loadSettings(path) == previous, "backup commit failure recovers old layout and profile");
     failFlushAt = 3;
-    require(rejectsSave(path, {true}), "installed primary commit failure observable");
-    require(loadSettings(path).xbox, "present primary authoritative after final commit failure");
-    saveSettings(path, {false});
-    require(!loadSettings(path).xbox && !std::filesystem::exists(path + ".bak"), "retry cleans backup and saves normally");
+    require(rejectsSave(path, replacement), "installed primary commit failure observable");
+    require(loadSettings(path) == replacement, "present primary authoritative after final commit failure");
+    saveSettings(path, previous);
+    require(loadSettings(path) == previous && !std::filesystem::exists(path + ".bak"), "retry cleans backup and saves normally");
     const auto target = path + ".private-target";
     writeFile(target, "private-target-content");
     std::filesystem::create_symlink(target, path + ".tmp");
-    require(rejectsSave(path, {true}), "symlink temporary rejected");
-    require(!loadSettings(path).xbox && readFile(target) == "private-target-content", "failed save leaves primary and target intact");
+    require(rejectsSave(path, replacement), "symlink temporary rejected");
+    require(loadSettings(path) == previous && readFile(target) == "private-target-content", "failed save leaves primary and target intact");
 }
 }
 extern "C" int __real_rename(const char*, const char*);

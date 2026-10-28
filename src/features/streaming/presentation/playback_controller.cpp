@@ -146,7 +146,7 @@ bool ApplicationController::startTransport(bool resumeOnly) {
     if (!provider) throw std::runtime_error("Stream provider unavailable; stopping rental");
     stream_ = provider->stream();
     if (!stream_) throw std::runtime_error("Stream transport unavailable; stopping rental");
-    if (!stream_->configurePlayStation(streamPlayStation_))
+    if (!stream_->configureController(streamPlayStation_ ? ::stream::ControllerProfile::DualSense : ::stream::ControllerProfile::Xbox))
         throw std::runtime_error("Invalid controller configuration; stopping rental");
     if (streamPlayStation_) {
         psSensors_.start(); psTouchTrace_ = {}; psNativeInput_ = {}; psTouchLastSubmitted_ = false;
@@ -154,7 +154,8 @@ bool ApplicationController::startTransport(bool resumeOnly) {
         psGyroPeak_ = psAccelPeak_ = 0; psMotionMovedFrames_ = 0;
         diagnostic("PS touch reset: pending both contacts UP for new transport");
     }
-    diagnostic(std::string("Controller mode: ") + (streamPlayStation_ ? "PlayStation (isPS=1); native gamepad_touch/gamepad_sensor enabled; tap=button17; ack=unavailable" : "standard (isPS=0)"));
+    diagnostic(std::string("Controller profile: ") + (streamPlayStation_ ? "dualsense; PlayStation touch/motion enabled" : "xbox") +
+        "; provider=" + (streamRental_.provider == fog::ProviderId::Mts ? "mts" : "moonlight"));
     const bool rtcTransport = streamRental_.provider == fog::ProviderId::Mts;
     if (!stream_->configureRelay(rtcTransport && relaySelection_.relay()))
         throw std::runtime_error("Invalid connection configuration; stopping rental");
@@ -203,6 +204,7 @@ void ApplicationController::retryTransport(const char* reason) {
 }
 
 void ApplicationController::startStream(const fog::RentalId& rental, bool createdFromCatalog) {
+    streamPlayStation_ = controllerSettings_.profile == ::stream::ControllerProfile::DualSense;
     pairedVideoReconnectPending_ = false;
     latency_.cancel();
     recentLaunch_.stream(createdFromCatalog);

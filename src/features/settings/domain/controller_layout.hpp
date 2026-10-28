@@ -1,4 +1,5 @@
 #pragma once
+#include "features/streaming/domain/controller_profile.hpp"
 #include <cstdint>
 #include <string>
 
@@ -6,8 +7,9 @@ namespace fog::controller {
 struct Settings {
     // Preserve the existing stream protocol mapping on first launch.
     bool xbox = true;
+    ::stream::ControllerProfile profile = ::stream::ControllerProfile::Xbox;
 };
-inline bool operator==(const Settings& a, const Settings& b) { return a.xbox == b.xbox; }
+inline bool operator==(const Settings& a, const Settings& b) { return a.xbox == b.xbox && a.profile == b.profile; }
 inline bool operator!=(const Settings& a, const Settings& b) { return !(a == b); }
 
 // Supply the platform's distinct, single-bit physical face button masks.

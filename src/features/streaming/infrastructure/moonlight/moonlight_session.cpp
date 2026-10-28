@@ -2,6 +2,7 @@
 #include "app_selection.hpp"
 #include "frame_diagnostics.hpp"
 #include "resume_retry.hpp"
+#include "controller_input.hpp"
 #include "features/streaming/application/remote_input.hpp"
 #include "features/streaming/infrastructure/rumble_mailbox.hpp"
 #include <Settings.hpp>
@@ -66,6 +67,8 @@ struct State {
     std::atomic<stream::VideoCodec> selectedCodec{stream::VideoCodec::H264};
     std::atomic<int> negotiatedWidth{0}, negotiatedHeight{0}, negotiatedFps{0};
     std::atomic<std::uint64_t> frames{0}, audioFrames{0}, videoDrops{0}, audioDrops{0}, inputAccepted{0}, inputRejected{0};
+    std::atomic<std::uint64_t> inputIgnored{0};
+    std::atomic<unsigned short> accelRateHz{0}, gyroRateHz{0};
     std::atomic<std::uint64_t> videoFullYields{0}, videoQueueHigh{0}, videoBatchMax{0}, videoQueueAgeMaxMs{0};
     std::atomic<std::uint64_t> videoInvalid{0}, videoWaitDrops{0}, videoResyncs{0};
     detail::FrameDiagnostics trace;
@@ -109,6 +112,13 @@ void rumble(unsigned short controller, unsigned short lowFrequency, unsigned sho
         std::lock_guard<std::mutex> lock(state->mutex);
         if (!state->valid || state->stop || state->failed || state->terminated || !state->streamInUse) return;
         state->rumble.put({controller, lowFrequency, highFrequency, 0, nowMs()});
+    }
+}
+void motionEventState(unsigned short controller, unsigned char type, unsigned short rateHz) {
+    if (controller != 0) return;
+    if (auto* state = active.load()) {
+        if (type == LI_MOTION_TYPE_ACCEL) state->accelRateHz = rateHz;
+        else if (type == LI_MOTION_TYPE_GYRO) state->gyroRateHz = rateHz;
     }
 }
 void ignoreLog(const char*, ...) {}
@@ -295,7 +305,8 @@ public:
         state_->rumble.clear();
         state_->stop = false; state_->failed = false; state_->terminated = false;
         state_->frames = 0; state_->audioFrames = 0; state_->videoDrops = 0; state_->audioDrops = 0;
-        state_->inputAccepted = 0; state_->inputRejected = 0;
+        state_->inputAccepted = 0; state_->inputRejected = 0; state_->inputIgnored = 0;
+        state_->accelRateHz = 0; state_->gyroRateHz = 0; lastMotionMs_ = {};
         state_->videoFullYields = 0; state_->videoQueueHigh = 0; state_->videoBatchMax = 0; state_->videoQueueAgeMaxMs = 0;
         state_->videoInvalid = 0; state_->videoWaitDrops = 0; state_->videoResyncs = 0;
         state_->trace.reset();
@@ -328,7 +339,10 @@ public:
         settings_ = value; return true;
     }
     bool configureRelay(bool enabled) override { return !enabled; }
-    bool configurePlayStation(bool enabled) override { return !enabled; }
+    bool configureController(stream::ControllerProfile profile) override {
+        if (!stream::validControllerProfile(profile) || (state_ && state_->streamInUse)) return false;
+        profile_ = profile; return true;
+    }
     bool updateVideoSettings(const fog::video::Settings& value) override {
         return value == settings_; // Live bitrate/quality/keyframe changes unsupported.
     }
@@ -516,7 +530,12 @@ public:
     }
     std::string dtlsDiagnostics() const override { return "Moonlight transport has no DTLS"; }
     std::string rtcpDiagnostics() const override { return "Moonlight feedback managed by core"; }
-    std::string inputDiagnostics() const override { return "Moonlight input accepted=" + std::to_string(state_->inputAccepted.load()) + " rejected=" + std::to_string(state_->inputRejected.load()); }
+    std::string inputDiagnostics() const override {
+        return std::string("Moonlight input profile=") + (profile_ == stream::ControllerProfile::DualSense ? "dualsense" : "xbox") +
+            " accepted=" + std::to_string(state_->inputAccepted.load()) + " rejected=" + std::to_string(state_->inputRejected.load()) +
+            " optionalIgnored=" + std::to_string(state_->inputIgnored.load()) +
+            " accelRateHz=" + std::to_string(state_->accelRateHz.load()) + " gyroRateHz=" + std::to_string(state_->gyroRateHz.load());
+    }
     bool pollVideoDiagnostic(std::string&) override { return false; }
     bool waitingForVideoKeyframe() const override { return state_->assemblyWaiting || state_->decoderWaiting; }
     bool requestVideoKeyframe() override {
@@ -528,10 +547,7 @@ public:
     bool sendGamepad(const stream::Gamepad& gamepad) override {
         std::lock_guard<std::mutex> lock(state_->apiMutex);
         if (!state_->running || state_->stop) return rejected();
-        static constexpr int buttons[18] = { A_FLAG, B_FLAG, X_FLAG, Y_FLAG, LB_FLAG, RB_FLAG, 0, 0,
-            BACK_FLAG, PLAY_FLAG, LS_CLK_FLAG, RS_CLK_FLAG, UP_FLAG, DOWN_FLAG, LEFT_FLAG, RIGHT_FLAG, SPECIAL_FLAG, 0 };
-        int flags = 0;
-        for (std::size_t i = 0; i < 18; ++i) if (gamepad.buttons[i]) flags |= buttons[i];
+        const int flags = detail::controllerButtonFlags(gamepad.buttons, profile_);
         return accepted(LiSendMultiControllerEvent(0, 1, flags, trigger(gamepad.leftTrigger), trigger(gamepad.rightTrigger),
             axis(gamepad.axes[0]), axis(-gamepad.axes[1]), axis(gamepad.axes[2]), axis(-gamepad.axes[3])));
     }
@@ -557,6 +573,8 @@ public:
 private:
     std::shared_ptr<State> state_;
     fog::video::Settings settings_;
+    stream::ControllerProfile profile_ = stream::ControllerProfile::Xbox;
+    std::array<std::uint64_t, 2> lastMotionMs_{};
     bool resumeOnly_ = false;
     std::thread worker_;
     FogMoonlightDiagnostics coreSnapshot() const {
@@ -566,6 +584,7 @@ private:
     }
     bool accepted(int result) { if (result == 0) { ++state_->inputAccepted; return true; } return rejected(); }
     bool rejected() { ++state_->inputRejected; return false; }
+    bool ignored() { ++state_->inputIgnored; return true; }
     static short axis(float value) { return static_cast<short>(std::isfinite(value) ? std::clamp(value, -1.f, 1.f) * 32767.f : 0); }
     static unsigned char trigger(float value) { return static_cast<unsigned char>(std::isfinite(value) ? std::clamp(value, 0.f, 1.f) * 255.f : 0); }
     bool send(const fog::remote::AbsoluteMouse& value) {
@@ -595,8 +614,36 @@ private:
         try { fog::remote::validateText(value.utf8); } catch (...) { return rejected(); }
         return accepted(LiSendUtf8TextEvent(value.utf8.data(), static_cast<unsigned int>(value.utf8.size())));
     }
-    bool send(const fog::remote::Touch&) { return rejected(); }
-    bool send(const fog::remote::Sensor&) { return rejected(); }
+    bool send(const fog::remote::Touch& value) {
+        const int type = detail::controllerTouchType(value);
+        if (profile_ != stream::ControllerProfile::DualSense || type < 0) return rejected();
+        // Unsupported optional input must not hold up contact initialization and
+        // consequently block all ordinary controller buttons on older hosts.
+        if (!(LiGetHostFeatureFlags() & LI_FF_CONTROLLER_TOUCH_EVENTS)) return ignored();
+        const int result = LiSendControllerTouchEvent(0, static_cast<std::uint8_t>(type),
+            static_cast<std::uint32_t>(value.finger), value.x, value.y, type == LI_TOUCH_EVENT_UP ? 0.f : 1.f);
+        return result == LI_ERR_UNSUPPORTED ? ignored() : accepted(result);
+    }
+    bool send(const fog::remote::Sensor& value) {
+        std::array<float, 3> xyz{};
+        const int type = detail::controllerMotion(value, xyz);
+        if (profile_ != stream::ControllerProfile::DualSense || type < 0) return rejected();
+        if (!(LiGetHostFeatureFlags() & LI_FF_CONTROLLER_TOUCH_EVENTS)) return ignored();
+        const unsigned rate = type == LI_MOTION_TYPE_ACCEL ? state_->accelRateHz.load() : state_->gyroRateHz.load();
+        if (!rate) return ignored();
+        const auto now = nowMs();
+        auto& last = lastMotionMs_[static_cast<std::size_t>(type - 1)];
+        const auto period = (1000u + rate - 1u) / rate;
+        // Focus/overlay loss must stop motion immediately even if the previous
+        // sample was sent within this host's requested reporting period.
+        const bool neutral = xyz[0] == 0.f && xyz[2] == 0.f &&
+            xyz[1] == (type == LI_MOTION_TYPE_ACCEL ? 9.80665f : 0.f);
+        if (!neutral && last && now >= last && now - last < period) return ignored();
+        const int result = LiSendControllerMotionEvent(0, static_cast<std::uint8_t>(type), xyz[0], xyz[1], xyz[2]);
+        if (result == LI_ERR_UNSUPPORTED) return ignored();
+        if (result == 0) last = now;
+        return accepted(result);
+    }
     bool take(stream::Packet& packet, bool audio) {
         std::lock_guard<std::mutex> lock(state_->mutex); auto& queue = audio ? state_->audio : state_->video;
         if (queue.empty()) return false;
@@ -619,6 +666,7 @@ private:
                 listeners.stageStarting = stageStarting; listeners.stageFailed = stageFailed;
                 listeners.connectionTerminated = terminated; listeners.logMessage = ignoreLog;
                 listeners.rumble = rumble;
+                listeners.setMotionEventState = motionEventState;
                 active = state_.get();
                 { std::lock_guard<std::mutex> lock(state_->apiMutex);
                     if (!state_->stop && state_->valid && !Settings::instance().request_cancelled()) {
@@ -630,8 +678,12 @@ private:
                 { std::lock_guard<std::mutex> lock(state_->apiMutex); state_->starting = false; }
                 if (result != 0) { if (!state_->stop) state_->fail("Moonlight connection failed", result); }
                 else {
-                    started = true; state_->coreDiagnosticsReady = true; state_->running = true;
-                    { std::lock_guard<std::mutex> lock(state_->apiMutex); LiSendControllerArrivalEvent(0, 1, LI_CTYPE_XBOX, 0xffff, LI_CCAP_RUMBLE); }
+                    started = true; state_->coreDiagnosticsReady = true;
+                    { std::lock_guard<std::mutex> lock(state_->apiMutex);
+                        LiSendControllerArrivalEvent(0, 1, detail::controllerType(profile_),
+                            detail::controllerButtons(profile_), detail::controllerCapabilities(profile_));
+                        state_->running = true;
+                    }
                     state_->status("Moonlight stream active: 720p30");
                     while (!state_->stop && !state_->terminated) {
                         const auto began = detail::steadyUs();

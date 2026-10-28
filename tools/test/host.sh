@@ -65,6 +65,8 @@ python3 tests/playback_decoder_waiting_tests.py | tee work/logs/playback-decoder
 
 python3 tests/moonlight_video_queue_tests.py | tee work/logs/moonlight-video-queue-tests.log
 
+python3 tests/moonlight_controller_input_tests.py | tee work/logs/moonlight-controller-input-tests.log
+
 bash tools/test/moonlight-frame-diagnostics.sh
 
 bash tools/test/media-workers.sh
