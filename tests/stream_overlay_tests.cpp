@@ -19,6 +19,64 @@ fog::stream::OverlayAction key(fog::stream::Overlay& overlay, int index) {
     else { const int starts[]{0, 3, 5, 7, 10}; x = 52 + starts[index - 54] * 98; y += 325; }
     return overlay.touch(x + 8, y + 8);
 }
+void rumbleSettings() {
+    using namespace fog::stream;
+    using RumbleMode = fog::rumble::Mode;
+    for (const auto provider : {fog::ProviderId::Mts, fog::ProviderId::FogHub}) {
+        Overlay overlay;
+        overlay.setProvider(provider);
+        overlay.openMenu(); overlay.up();
+        require(overlay.selection() == 5, "menu wraps to added rumble item");
+        require(overlay.select().type == OverlayActionType::None &&
+            overlay.mode() == OverlayMode::RumbleSettings && overlay.selection() == 0,
+            "rumble opens without changing or sending remote controls");
+        require(overlay.rumbleSettings().mode == RumbleMode::Balanced, "rumble defaults to balanced");
+        require(overlay.left().type == OverlayActionType::RumbleSettingsChanged &&
+            overlay.rumbleSettings().mode == RumbleMode::Disabled, "rumble left wraps to disabled");
+        require(overlay.right().type == OverlayActionType::RumbleSettingsChanged &&
+            overlay.rumbleSettings().mode == RumbleMode::Balanced, "rumble right wraps to balanced");
+        require(overlay.select().type == OverlayActionType::RumbleSettingsChanged &&
+            overlay.rumbleSettings().mode == RumbleMode::DualBand, "rumble A selects dual band");
+        require(overlay.right().type == OverlayActionType::RumbleSettingsChanged &&
+            overlay.rumbleSettings().mode == RumbleMode::Chromium, "rumble right selects Chromium");
+        require(overlay.touch(200, 230).type == OverlayActionType::RumbleSettingsChanged &&
+            overlay.rumbleSettings().mode == RumbleMode::Disabled, "rumble touch selects disabled");
+        overlay.down();
+        require(overlay.selection() == 1 && overlay.left().type == OverlayActionType::None &&
+            overlay.right().type == OverlayActionType::None && overlay.rumbleSettings().mode == RumbleMode::Disabled,
+            "rumble back row does not modify settings with directions");
+        overlay.up();
+        require(overlay.selection() == 0, "rumble vertical navigation returns to mode row");
+        require(overlay.touch(200, 400).type == OverlayActionType::None &&
+            overlay.rumbleSettings().mode == RumbleMode::Disabled, "rumble explanatory text ignores touch");
+        overlay.back();
+        require(overlay.mode() == OverlayMode::Menu && overlay.selection() == 5,
+            "rumble B returns to originating menu item");
+        overlay.select();
+        require(overlay.rumbleSettings().mode == RumbleMode::Disabled, "reopening rumble preserves selected mode");
+        overlay.touch(200, 575);
+        require(overlay.mode() == OverlayMode::Menu && overlay.selection() == 5,
+            "rumble touch back returns to originating menu item");
+        overlay.close(); overlay.openMenu();
+        require(overlay.rumbleSettings().mode == RumbleMode::Disabled, "closing stream menu preserves disabled mode");
+        overlay.touch(416, 510);
+        require(overlay.mode() == OverlayMode::RumbleSettings, "sixth menu item accepts touch");
+        overlay.setRumbleSettings({RumbleMode::Balanced});
+        overlay.setRumbleStatus("save failed");
+        require(overlay.rumbleSettings().mode == RumbleMode::Balanced,
+            "application can roll back setting after failed persistence");
+        overlay.setProvider(provider == fog::ProviderId::Mts ? fog::ProviderId::FogHub : fog::ProviderId::Mts);
+        require(overlay.mode() == OverlayMode::RumbleSettings && overlay.selection() == 0 &&
+            overlay.rumbleSettings().mode == RumbleMode::Balanced, "rumble settings are independent of stream provider");
+        overlay.down(); overlay.select();
+        require(overlay.mode() == OverlayMode::Menu && overlay.selection() == 5,
+            "rumble A on back returns to menu");
+        for (int i = 0; i < 30; ++i) {
+            overlay.down();
+            require(overlay.selection() >= 0 && overlay.selection() < 6, "six item menu navigation remains bounded");
+        }
+    }
+}
 }
 int main() {
     using namespace fog::stream;
@@ -26,8 +84,9 @@ int main() {
         Overlay overlay;
         require(overlay.mode() == OverlayMode::Closed, "initially closed");
         require(!overlay.appendText("outside"), "only keyboard accepts text");
-        overlay.openMenu(); overlay.up();
-        require(overlay.selection() == 4, "menu wraps up");
+        rumbleSettings();
+        overlay.openMenu(); overlay.up(); overlay.up();
+        require(overlay.selection() == 4, "close menu retains its original index");
         overlay.select(); require(overlay.mode() == OverlayMode::Closed, "close menu item");
         overlay.openMenu(); overlay.select();
         require(overlay.mode() == OverlayMode::Mouse, "mouse menu item");

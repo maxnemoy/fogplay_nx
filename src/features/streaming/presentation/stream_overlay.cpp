@@ -1,4 +1,5 @@
 #include "features/settings/presentation/settings_text.hpp"
+#include "features/settings/presentation/rumble_text.hpp"
 #include "core/constants/ui_text.hpp"
 #include "features/streaming/presentation/stream_overlay.hpp"
 #include "app/presentation/ui.hpp"
@@ -15,9 +16,11 @@ constexpr SDL_Color White{247, 248, 255, 255}, Muted{179, 185, 209, 255};
 constexpr SDL_Rect MenuBox{374, 82, 532, 563};
 constexpr SDL_Rect KeyboardBox{28, 22, 1224, 680};
 constexpr SDL_Rect ConfirmBox{294, 215, 692, 290};
+constexpr int MenuItemCount = 6;
 constexpr int KeyX = 52, KeyY = 244, KeyStep = 98, RowStep = 65;
-SDL_Rect menuButton(int index) { return {408, 174 + index * 76, 464, 58}; }
+SDL_Rect menuButton(int index) { return {408, 174 + index * 64, 464, 54}; }
 SDL_Rect imageButton(int index) { return {174, 142 + index * 62, 932, 53}; }
+SDL_Rect rumbleButton(int index) { return {174, index ? 550 : 206, 932, index ? 58 : 62}; }
 SDL_Rect confirmButton(int index) { return {328 + index * 320, 412, 296, 58}; }
 SDL_Rect keyRect(int index) {
     if (index < 48) return {KeyX + (index % 12) * KeyStep, KeyY + (index / 12) * RowStep, 90, 55};
@@ -89,10 +92,12 @@ void Overlay::setProvider(ProviderId value) {
 }
 OverlayAction Overlay::left() {
     if (mode_ == OverlayMode::ImageSettings) return adjustVideo(-1);
+    if (mode_ == OverlayMode::RumbleSettings) return adjustRumble(-1);
     move(-1, 0); return {};
 }
 OverlayAction Overlay::right() {
     if (mode_ == OverlayMode::ImageSettings) return adjustVideo(1);
+    if (mode_ == OverlayMode::RumbleSettings) return adjustRumble(1);
     move(1, 0); return {};
 }
 OverlayAction Overlay::adjustVideo(int direction) {
@@ -108,13 +113,20 @@ OverlayAction Overlay::adjustVideo(int direction) {
     return video::adjust(videoSettings_, fields[static_cast<std::size_t>(selection_ - 1)], direction) ?
         OverlayAction{OverlayActionType::SettingsChanged, {}} : OverlayAction{};
 }
+OverlayAction Overlay::adjustRumble(int direction) {
+    if (mode_ != OverlayMode::RumbleSettings || selection_ != 0) return {};
+    return rumble::adjust(rumbleSettings_, direction) ?
+        OverlayAction{OverlayActionType::RumbleSettingsChanged, {}} : OverlayAction{};
+}
 void Overlay::move(int horizontal, int vertical) {
     if (mode_ == OverlayMode::Menu) {
         const int step = vertical != 0 ? vertical : horizontal;
-        selection_ = (selection_ + step + 5) % 5;
+        selection_ = (selection_ + step + MenuItemCount) % MenuItemCount;
     } else if (mode_ == OverlayMode::ImageSettings) {
         const int first = firstImageSelection(), count = imageRowCount() - first;
         selection_ = first + (selection_ - first + vertical + count) % count;
+    } else if (mode_ == OverlayMode::RumbleSettings) {
+        if (vertical) selection_ = 1 - selection_;
     } else if (mode_ == OverlayMode::StopConfirm) {
         selection_ = 1 - selection_;
     } else if (mode_ == OverlayMode::Keyboard) {
@@ -163,6 +175,7 @@ OverlayAction Overlay::select() {
             case 2: mode_ = OverlayMode::ImageSettings; selection_ = firstImageSelection(); return {};
             case 3: mode_ = OverlayMode::StopConfirm; selection_ = 1; return {};
             case 4: close(); return {};
+            case 5: mode_ = OverlayMode::RumbleSettings; selection_ = 0; return {};
         }
         selection_ = 0;
     } else if (mode_ == OverlayMode::StopConfirm) {
@@ -172,6 +185,8 @@ OverlayAction Overlay::select() {
         if (selection_ == imageRowCount() - 2) return {OverlayActionType::RequestKeyframe, {}};
         if (selection_ == imageRowCount() - 1) return back();
         return adjustVideo(1);
+    } else if (mode_ == OverlayMode::RumbleSettings) {
+        return selection_ == 1 ? back() : adjustRumble(1);
     } else if (mode_ == OverlayMode::Keyboard) {
         if (selection_ < 48) appendText(keyLabel(selection_));
         else switch (selection_) {
@@ -198,17 +213,20 @@ OverlayAction Overlay::select() {
 OverlayAction Overlay::back() {
     if (mode_ == OverlayMode::Menu) close();
     else if (mode_ != OverlayMode::Closed) {
-        const int item = mode_ == OverlayMode::Keyboard ? 1 : mode_ == OverlayMode::StopConfirm ? 3 : mode_ == OverlayMode::ImageSettings ? 2 : 0;
+        const int item = mode_ == OverlayMode::Keyboard ? 1 : mode_ == OverlayMode::StopConfirm ? 3 :
+            mode_ == OverlayMode::ImageSettings ? 2 : mode_ == OverlayMode::RumbleSettings ? 5 : 0;
         text_.clear(); mode_ = OverlayMode::Menu; selection_ = item;
     }
     return {};
 }
 OverlayAction Overlay::touch(int x, int y) {
     if (mode_ == OverlayMode::Menu) {
-        for (int i = 0; i < 5; ++i) if (contains(menuButton(i), x, y)) { selection_ = i; return select(); }
+        for (int i = 0; i < MenuItemCount; ++i) if (contains(menuButton(i), x, y)) { selection_ = i; return select(); }
     } else if (mode_ == OverlayMode::ImageSettings) {
         for (int i = firstImageSelection(); i < imageRowCount(); ++i)
             if (contains(imageButton(i), x, y)) { selection_ = i; return select(); }
+    } else if (mode_ == OverlayMode::RumbleSettings) {
+        for (int i = 0; i < 2; ++i) if (contains(rumbleButton(i), x, y)) { selection_ = i; return select(); }
     } else if (mode_ == OverlayMode::Keyboard) {
         for (int i = 0; i < KeyboardKeyCount; ++i) if (contains(keyRect(i), x, y)) { selection_ = i; return select(); }
     } else if (mode_ == OverlayMode::StopConfirm) {
@@ -228,8 +246,9 @@ void Overlay::paint(ui::Ui& ui, SDL_Renderer* renderer) const {
     if (mode_ == OverlayMode::Menu) {
         ui.panel(MenuBox);
         ui.text(uiText::Stream::SessionControlsTitle, 408, 108, 464, White, true);
-        const std::array<std::string, 5> labels{uiText::Stream::Mouse, uiText::Stream::Keyboard, uiText::Settings::Image, uiText::Stream::FinishSession, uiText::Stream::CloseMenu};
-        for (int i = 0; i < 5; ++i) ui.button(labels[static_cast<std::size_t>(i)], menuButton(i), selection_ == i);
+        const std::array<std::string, MenuItemCount> labels{uiText::Stream::Mouse, uiText::Stream::Keyboard,
+            uiText::Settings::Image, uiText::Stream::FinishSession, uiText::Stream::CloseMenu, rumble::text::MenuLabel};
+        for (int i = 0; i < MenuItemCount; ++i) ui.button(labels[static_cast<std::size_t>(i)], menuButton(i), selection_ == i);
         ui.text(ui.controllerHints(uiText::Stream::MenuControlsHint), 408, 593, 464, Muted);
     } else if (mode_ == OverlayMode::ImageSettings) {
         ui.panel({140, 15, 1000, 690});
@@ -256,6 +275,15 @@ void Overlay::paint(ui::Ui& ui, SDL_Renderer* renderer) const {
         ui.text(foghub ? uiText::Settings::FogHubVideoDescription : uiText::Stream::BitrateNotice, 174, 523, 932, Muted);
         ui.text(videoStatus_, 174, 559, 932, White, false, 2);
         ui.text(saveStatus_, 174, 630, 932, Muted, false, 2);
+    } else if (mode_ == OverlayMode::RumbleSettings) {
+        ui.panel({140, 82, 1000, 563});
+        ui.text(rumble::text::Title, 174, 108, 932, White, true);
+        ui.text(ui.controllerHints(rumble::text::Hints), 174, 155, 932, Muted);
+        ui.button(rumble::text::label(rumbleSettings_.mode), rumbleButton(0), selection_ == 0);
+        ui.text(rumble::text::description(rumbleSettings_.mode), 174, 294, 932, White, false, 3);
+        ui.text(rumble::text::Shared, 174, 402, 932, Muted, false, 2);
+        ui.text(rumbleStatus_, 174, 462, 932, Muted, false, 2);
+        ui.button(uiText::Common::Back, rumbleButton(1), selection_ == 1);
     } else if (mode_ == OverlayMode::StopConfirm) {
         ui.panel(ConfirmBox, false, true);
         ui.text(uiText::Stream::FinishSessionTitle, 328, 240, 624, White, true);

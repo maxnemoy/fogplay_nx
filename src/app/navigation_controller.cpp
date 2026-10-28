@@ -80,6 +80,7 @@ void ApplicationController::input(u64 keys) {
     }
     if (screen_ == Screen::ImageSettings) { inputImageSettings(keys); return; }
     if (screen_ == Screen::ConnectionSettings) { inputConnectionSettings(keys); return; }
+    if (screen_ == Screen::RumbleSettings) { inputRumbleSettings(keys); return; }
     if (screen_ == Screen::Genres) { inputGenres(keys); return; }
     if (sidebar_) {
         if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) nav_ = (nav_ + 4) % 5;
@@ -159,7 +160,7 @@ void ApplicationController::input(u64 keys) {
         return;
     }
     if (screen_ == Screen::Settings) {
-        moveGrid(keys, 5, 2);
+        moveGrid(keys, 6, 2);
         if (keys & HidNpadButton_A) {
             if (!selection_) { screen_ = Screen::ImageSettings; selection_ = 0; }
             else if (selection_ == 1) {
@@ -172,7 +173,8 @@ void ApplicationController::input(u64 keys) {
             }
             else if (selection_ == 2) { screen_ = Screen::ConnectionSettings; selection_ = 0; }
             else if (selection_ == 3) loadSessions();
-            else { openProfile(); }
+            else if (selection_ == 4) { openProfile(); }
+            else { screen_ = Screen::RumbleSettings; selection_ = 0; }
         }
         return;
     }

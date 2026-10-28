@@ -3,6 +3,7 @@
 #include "app/application_controller.hpp"
 #include "app/application.hpp"
 #include "features/session/presentation/session_rating_text.hpp"
+#include "features/settings/presentation/rumble_text.hpp"
 
 namespace uiText = ::fog::constants::ui;
 namespace storagePaths = ::fog::constants::storage;
@@ -101,11 +102,22 @@ ApplicationController::ApplicationController(Runtime& runtime, std::unique_ptr<S
     }
     try { controllerSettings_ = fog::controller::loadSettings(storagePaths::path(storagePaths::ControllerSettings)); }
     catch (...) { diagnostic("Controller settings unreadable; using Xbox layout default."); }
+    try { rumbleSettings_ = fog::rumble::loadSettings(storagePaths::path(storagePaths::RumbleSettings)); }
+    catch (...) {
+        rumbleSaveStatus_ = fog::rumble::text::LoadFailed;
+        diagnostic("Rumble settings unreadable or invalid; using balanced mode.");
+    }
+    const auto rumbleNowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    rumble_.setMode(rumbleSettings_.mode, rumbleNowMs);
+    overlay_.setRumbleSettings(rumbleSettings_);
+    overlay_.setRumbleStatus(rumbleSaveStatus_);
     ui_.setXboxLayout(controllerSettings_.xbox);
     overlay_.setVideoSettings(videoSettings_);
 }
 
 ApplicationController::~ApplicationController() {
+    stopRumble();
     cancelPlayStation();
     if (playStationPending_.valid()) playStationPending_.wait();
     latency_.cancel();
@@ -156,8 +168,10 @@ void ApplicationController::run() {
             exitAfterStop_ = true; stopAfterTask_ = true;
         }
         eventsScope.finish();
-        if (!focused || screen_ != Screen::Streaming || stopAfterTask_)
+        if (!focused || screen_ != Screen::Streaming || stopAfterTask_) {
+            stopRumble();
             loopTiming_.suspendPresentation();
+        }
         try {
             fog::stream::LoopTiming::Scope pollScope(loopTiming_, fog::stream::LoopTiming::Stage::Poll);
             if (exitAfterStop_ && sessionPending_ && !pending_.valid() && !stopStartedOnExit_) {
@@ -195,11 +209,13 @@ void ApplicationController::run() {
             }
             fog::stream::LoopTiming::Scope inputScope(loopTiming_, fog::stream::LoopTiming::Stage::Input);
             if (!pending_.valid() && focused) input(uiDown);
+            updateRumble(pad, focused);
             if (screen_ == Screen::Games && focused && (!sidebar_ || catalog_.items().empty())) requestCatalog();
             if (screen_ == Screen::Stopping && !pending_.valid() && !pairedPending_ && auth_.authenticated() &&
                 std::chrono::steady_clock::now() >= retryAt_) beginFinish();
         }
         catch (const std::exception& error) {
+            stopRumble();
             status_ = safeText(error.what()); diagnostic(status_);
             if (screen_ == Screen::Checkout && !pending_.valid()) checkoutStatus_ = status_;
             if (sessionPending_ && (stream_ || !streamRental_.empty() || transportReconnect_.recovering())) beginFinish("stream-exception");

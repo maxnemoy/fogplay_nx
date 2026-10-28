@@ -13,6 +13,7 @@ const char* menuModeName(fog::stream::OverlayMode mode) {
         case Mode::Mouse: return "mouse";
         case Mode::Keyboard: return "keyboard";
         case Mode::ImageSettings: return "image-settings";
+        case Mode::RumbleSettings: return "rumble-settings";
         case Mode::StopConfirm: return "stop-confirm";
     }
     return "unknown";
@@ -91,12 +92,37 @@ void ApplicationController::releaseMouse() noexcept {
 }
 
 void ApplicationController::neutralizeStreamInput() {
+    stopRumble();
     releasePlayStationInput();
     psTouchLastSubmitted_ = false;
     releaseMouse();
     if (stream_) stream_->sendGamepad(stream::Gamepad{});
     touchWasDown_ = false;
     mouseAt_ = overlayHintAt_ = std::chrono::steady_clock::now();
+}
+
+void ApplicationController::stopRumble() noexcept {
+    const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    rumble_.stop(nowMs);
+}
+
+void ApplicationController::updateRumble(PadState& pad, bool focused) {
+    stream::Rumble feedback;
+    const bool received = stream_ && stream_->pollRumble(feedback);
+    // Poll can wait for a callback's lock; sample time afterwards so newly
+    // received feedback cannot appear to come from the future and be dropped.
+    const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    const bool enabled = focused && screen_ == Screen::Streaming && !stopAfterTask_ &&
+        stream_ && stream_->ready() && !stream_->disconnected() &&
+        !transportReconnect_.recovering() && !videoRecovery_.active() && !videoLossWaiting_ &&
+        streamInputGate_.gamepadAllowed(overlay_.mode() != fog::stream::OverlayMode::Closed);
+    rumble_.update(pad, received ? &feedback : nullptr, enabled, nowMs);
+    if (stream_ && nowMs - rumbleLogAtMs_ >= 5000) {
+        diagnostic(rumble_.diagnostics());
+        rumbleLogAtMs_ = nowMs;
+    }
 }
 
 void ApplicationController::suspendVideoInput() {
@@ -126,6 +152,9 @@ void ApplicationController::overlayAction(const fog::stream::OverlayAction& acti
     }
     if (action.type == Action::SettingsChanged) {
         changeVideoSettings(overlay_.videoSettings(), true); return;
+    }
+    if (action.type == Action::RumbleSettingsChanged) {
+        changeRumbleSettings(overlay_.rumbleSettings()); return;
     }
     if (action.type == Action::RequestKeyframe) {
         const bool sent = stream_ && stream_->requestVideoKeyframe();

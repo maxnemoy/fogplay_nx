@@ -16,6 +16,7 @@
 #include "features/settings/domain/video_settings.hpp"
 #include "features/settings/infrastructure/video_settings_storage.hpp"
 #include "features/settings/infrastructure/connection_settings_storage.hpp"
+#include "features/settings/infrastructure/rumble_settings_storage.hpp"
 #include "features/session/application/session.hpp"
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/video_recovery.hpp"
@@ -56,6 +57,7 @@
 
 #include "platform/switch/switch_runtime.hpp"
 #include "platform/switch/ps_sensors.hpp"
+#include "platform/switch/rumble.hpp"
 #include "features/playstation/domain/touch_trace.hpp"
 #include "features/playstation/infrastructure/native_input.hpp"
 #include "app/app_diagnostics.hpp"
@@ -81,7 +83,7 @@ inline constexpr SDL_Color white{234, 238, 245, 255};
 inline constexpr SDL_Color muted{163, 178, 200, 255};
 inline constexpr SDL_Color accent{107, 216, 190, 255};
 
-enum class Screen { Profile, Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails, SessionRating };
+enum class Screen { Profile, Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails, SessionRating, RumbleSettings };
 enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation, PairedCreate, PairedPoll, PairedStop, ProviderProfile, ProviderForget, SessionRatingLoad, SessionRatingSubmit };
 
 struct RestoredProviders {
@@ -123,7 +125,10 @@ private:
     void disarmExitHandling();
     std::string playbackTimings() const;
     void logOutputTimings(bool final);
+    void logIncomingControl(bool final = false) noexcept;
     void closeStream() noexcept;
+    void stopRumble() noexcept;
+    void updateRumble(PadState& pad, bool focused);
     void samplePlayStationInput(PadState& pad);
     void logPlayStationInput(bool final);
     void dispatchPlayStationInput(bool allowed);
@@ -167,6 +172,9 @@ private:
     void drawImageSettings();
     void inputConnectionSettings(u64 keys);
     void drawConnectionSettings();
+    void inputRumbleSettings(u64 keys);
+    void drawRumbleSettings();
+    void changeRumbleSettings(const fog::rumble::Settings& value);
     void overlayAction(const fog::stream::OverlayAction& action);
     bool handleStreamOverlay(PadState& pad, u64 held, u64 down);
     void updateMouse(PadState& pad,u64 held,u64 down,const HidTouchScreenState& touch);
@@ -240,6 +248,8 @@ private:
     bool detailsFromAutomatic_ = false;
     bool selectedPlayStation_ = false, streamPlayStation_ = false;
     platform::PsSensors psSensors_;
+    platform::Rumble rumble_;
+    std::uint64_t rumbleLogAtMs_ = 0;
     fog::playstation::TouchTrace psTouchTrace_;
     fog::playstation::NativeInput psNativeInput_;
     bool psTouchLastSubmitted_ = false;
@@ -265,6 +275,8 @@ private:
     fog::connection::Settings connectionSettings_;
     fog::connection::RelaySelection relaySelection_;
     fog::controller::Settings controllerSettings_;
+    fog::rumble::Settings rumbleSettings_;
+    std::string rumbleSaveStatus_;
     bool firstFramePresented_ = false;
     std::string videoSaveStatus_ = uiText::Settings::AutoSaveNotice;
     std::string connectionSaveStatus_ = uiText::Settings::ConnectionAutoSaveNotice;

@@ -193,6 +193,9 @@ inline constexpr char UnexpectedOrderStatusFormat[] = "Unexpected order status f
 namespace Settings {
 inline constexpr char CannotReadConnectionSettings[] = "Cannot read connection settings";
 inline constexpr char CannotReadControllerSettings[] = "Cannot read controller settings";
+inline constexpr char CannotReadRumbleSettings[] = "Cannot read rumble settings";
+inline constexpr char CannotSaveInvalidRumbleSettings[] = "Cannot save invalid rumble settings";
+inline constexpr char InvalidRumbleSettings[] = "Invalid rumble settings";
 inline constexpr char CannotReadVideoSettings[] = "Cannot read video settings";
 inline constexpr char CannotSaveInvalidConnectionSettings[] = "Cannot save invalid connection settings";
 inline constexpr char CannotSaveInvalidVideoSettings[] = "Cannot save invalid video settings";

@@ -20,6 +20,10 @@ namespace {
 std::atomic<bool> providerPin{false}, failPair{false};
 std::atomic<int> stops{0}, launches{0}, interrupts{0};
 std::atomic<ConnListenerConnectionTerminated> terminateConnection{nullptr};
+std::atomic<ConnListenerRumble> rumbleConnection{nullptr};
+std::atomic<int> connectionResult{0};
+std::atomic<bool> rumbleDuringStart{false}, rumbleDuringStop{false};
+std::atomic<std::uint16_t> controllerCapabilities{0};
 std::atomic<int> currentApp{0}, listedApp{42};
 std::atomic<int> refreshes{0}, pairs{0}, launchOnlyCalls{0}, resumeOnlyCalls{0};
 std::atomic<int> faultCount{0}, faultsReturned{0}, faultCurl{22}, faultHttp{503}, faultXml{0}, faultXmlResult{-1}, faultGame{-1};
@@ -149,6 +153,9 @@ int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION config, PCONNEC
     PDECODER_RENDERER_CALLBACKS video, PAUDIO_RENDERER_CALLBACKS audio, void*, int, void*, int) {
     assert(config->fps == 30 && config->supportedVideoFormats == expectedVideoFormats);
     terminateConnection = listeners->connectionTerminated;
+    assert(listeners->rumble);
+    rumbleConnection = listeners->rumble;
+    if (rumbleDuringStart) listeners->rumble(0, 65535, 32768);
     assert(video->setup(VIDEO_FORMAT_H265_MAIN10, 1280, 720, 30, nullptr, 0) != 0);
     assert(video->setup(VIDEO_FORMAT_AV1_MAIN8, 1280, 720, 30, nullptr, 0) != 0);
     assert(video->setup(negotiatedFormat, 0, 720, 30, nullptr, 0) != 0);
@@ -163,9 +170,12 @@ int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION config, PCONNEC
         char bytes[2]{static_cast<char>(i), 2}; audio->decodeAndPlaySample(bytes, 2);
     }
     videoReturned = 0;
-    return 0;
+    return connectionResult;
 }
-void LiStopConnection() { ++stops; }
+void LiStopConnection() {
+    if (rumbleDuringStop) rumbleConnection.load()(0, 65535, 65535);
+    ++stops;
+}
 void LiInterruptConnection() { ++interrupts; }
 bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* handle, PDECODE_UNIT* unit) {
     if (videoReturned++) return false;
@@ -176,7 +186,11 @@ bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* handle, PDECODE_UNIT* unit) {
 }
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE, int result) { assert(result == DR_OK); }
 void LiRequestIdrFrame() {}
-int LiSendControllerArrivalEvent(uint8_t, uint16_t, uint8_t, uint32_t, uint16_t) { return 0; }
+int LiSendControllerArrivalEvent(uint8_t controller, uint16_t mask, uint8_t type, uint32_t buttons, uint16_t capabilities) {
+    assert(controller == 0 && mask == 1 && type == LI_CTYPE_XBOX && buttons == 0xffff);
+    assert(capabilities & LI_CCAP_RUMBLE);
+    controllerCapabilities = capabilities; return 0;
+}
 int LiSendMultiControllerEvent(short, short, int buttons, unsigned char lt, unsigned char, short, short ly, short, short) {
     buttonFlags = buttons; leftTrigger = lt; leftY = ly; return 0;
 }
@@ -185,6 +199,54 @@ int LiSendMouseButtonEvent(char, int button) { mouseButton = button; return 0; }
 int LiSendKeyboardEvent(short key, char, char) { keyCode = key; return 0; }
 int LiSendHighResScrollEvent(short amount) { wheelAmount = amount; return 0; }
 int LiSendUtf8TextEvent(const char*, unsigned int) { return 0; }
+
+void rumbleScenarios(const std::filesystem::path& path) {
+    moonlight::MoonlightSession session(path.string());
+    currentApp = 0; listedApp = 42; ambiguousApps = false; failPair = false;
+    expectedVideoFormats = VIDEO_FORMAT_H264 | VIDEO_FORMAT_H265;
+    negotiatedFormat = VIDEO_FORMAT_H264; audioBurst = 1;
+    pair(session);
+    auto client = session.create(); assert(client);
+    stream::Rumble value;
+    assert(!client->pollRumble(value));
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    eventually([] { return controllerCapabilities.load() & LI_CCAP_RUMBLE; });
+    const auto rumble = rumbleConnection.load(); assert(rumble);
+    const auto before = LiGetMicroseconds() / 1000;
+    std::thread feedback([&] { rumble(0, 123, 456); rumble(0, 65535, 32768); });
+    feedback.join();
+    // Other host slots neither erase slot 0 nor produce feedback for this pad.
+    rumble(1, 1, 2);
+    assert(client->pollRumble(value));
+    assert(value.controller == 0 && value.lowFrequency == 65535 && value.highFrequency == 32768);
+    assert(value.durationMs == 0 && value.receivedAtMs >= before && value.receivedAtMs <= LiGetMicroseconds() / 1000);
+    assert(!client->pollRumble(value));
+    rumble(65535, 65535, 65535); assert(!client->pollRumble(value));
+    // A stop is a motor state and must replace an unconsumed vibration burst.
+    rumble(0, 500, 600); rumble(0, 0, 0);
+    assert(client->pollRumble(value) && value.lowFrequency == 0 && value.highFrequency == 0);
+    assert(!client->pollRumble(value));
+    rumble(0, 100, 200); rumbleDuringStop = true;
+    client->close(); assert(!client->pollRumble(value));
+    rumble(0, 300, 400); assert(!client->pollRumble(value)); // No active context after join.
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    assert(!client->pollRumble(value));
+    // Terminal feedback is suppressed immediately, before teardown completes.
+    rumble(0, 500, 600); terminateConnection.load()(-55);
+    rumble(0, 700, 800); assert(!client->pollRumble(value));
+    eventually([&] { return !client->ready(); }); client->close();
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    assert(!client->pollRumble(value)); client->close();
+    // A core startup failure can follow an early feedback callback.
+    connectionResult = -77; rumbleDuringStart = true;
+    assert(client->start({rental()})); eventually([&] { return !client->error().empty(); });
+    assert(!client->pollRumble(value)); client->close();
+    connectionResult = 0; rumbleDuringStart = false;
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    assert(!client->pollRumble(value));
+    rumble(0, 9, 10); assert(client->pollRumble(value) && value.lowFrequency == 9 && value.highFrequency == 10);
+    client->close(); rumbleDuringStop = false;
+}
 
 void retryScenarios(const std::filesystem::path& path) {
     using Retry = moonlight::detail::ResumeRetry;
@@ -385,6 +447,7 @@ int main() {
         assert(failure.find("2001:db8") == std::string::npos && failure.find("1234") == std::string::npos);
     }
     retryScenarios(path / "resume-tests");
+    rumbleScenarios(path / "rumble-tests");
     std::filesystem::remove_all(path);
     std::cout << "Moonlight production lifecycle/input tests passed\n";
 }

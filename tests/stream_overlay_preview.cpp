@@ -1,5 +1,6 @@
 #include "app/presentation/ui.hpp"
 #include "features/streaming/presentation/stream_overlay.hpp"
+#include "features/settings/presentation/rumble_text.hpp"
 #include <SDL_image.h>
 #include <filesystem>
 #include <stdexcept>
@@ -16,7 +17,7 @@ int main(int argc, char** argv) {
     if (!surface || !renderer || !font || !title) return 2;
     {
         fog::ui::Ui ui(renderer,font,title);
-        for (int mode=0; mode<9; ++mode) {
+        for (int mode=0; mode<14; ++mode) {
             SDL_SetRenderDrawColor(renderer,30,53,57,255);
             SDL_RenderClear(renderer);
             ui.text("Синтетический фон трансляции",30,10,1000);
@@ -38,14 +39,23 @@ int main(int argc, char** argv) {
                 overlay.setSaveStatus("Сохранено на SD. Применится при следующем подключении.");
                 if (mode==8) overlay.setVideoChangesEnabled(false);
             }
+            if (mode>=9) {
+                overlay.up(); overlay.select();
+                overlay.setRumbleSettings({static_cast<fog::rumble::Mode>((mode - 9) % 4)});
+                overlay.setRumbleStatus(mode==13 ? fog::rumble::text::SaveFailed : fog::rumble::text::Saved);
+            }
             if (mode==6) {
                 fog::ui::Chrome chrome;
                 chrome.title = "НАСТРОЙКИ"; chrome.section = fog::ui::Section::Settings;
                 chrome.account = "Аккаунт подключён";
                 ui.frame(chrome);
                 ui.settings({{"Изображение","Открыть","Кодек, качество, битрейт и ключевые кадры"},
+                    {"Раскладка Xbox","Включено","Кнопки A/B и X/Y расположены как на Xbox",true},
+                    {"Соединение","Обычное","Выбор способа подключения"},
                     {"Активные сессии","Открыть","Подключиться к уже работающему ПК или завершить аренду"},
-                    {"Выйти из аккаунта","FogPlay NX 0.4.7","Удалить сохранённый вход с SD-карты"}},0);
+                    {"Выйти из аккаунта","FogPlay NX","Удалить сохранённый вход с SD-карты"},
+                    {fog::rumble::text::MenuLabel,fog::rumble::text::label(fog::rumble::Mode::DualBand),
+                        fog::rumble::text::Description}},5);
             } else overlay.paint(ui,renderer);
             SDL_RenderPresent(renderer);
             if (IMG_SavePNG(surface,(path+"/overlay-"+std::to_string(mode)+".png").c_str()) != 0) return 3;

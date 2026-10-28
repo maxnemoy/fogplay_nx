@@ -8,6 +8,15 @@ namespace uiText = ::fog::constants::ui;
 
 namespace fogplay {
 
+void ApplicationController::logIncomingControl(bool final) noexcept {
+    if (!stream_) return;
+    try {
+        std::string event;
+        for (unsigned i = 0; i < 40 && stream_->pollControlDiagnostic(event, final); ++i)
+            diagnostic("Stream control: " + event, 2048);
+    } catch (...) {} // Diagnostics cannot interrupt playback or teardown.
+}
+
 std::string ApplicationController::playbackTimings() const {
     const auto log = runLog.stats();
     return "Playback timing: " + drainTiming_.text("drain") + " " + presentTiming_.text("present") +
@@ -56,6 +65,7 @@ void ApplicationController::logOutputTimings(bool final) {
 }
 
 bool ApplicationController::closeTransport(bool final) noexcept {
+    stopRumble();
     bool retryAllowed = true;
     if (media_) media_->stopWorkers();
     if (streamPlayStation_) {
@@ -70,6 +80,8 @@ bool ApplicationController::closeTransport(bool final) noexcept {
     loopTiming_.suspendPresentation();
     if (stream_) {
         try {
+            logIncomingControl(true);
+            diagnostic(rumble_.diagnostics());
             std::string event;
             for (unsigned i = 0; i < 96 && stream_->pollVideoDiagnostic(event); ++i)
                 diagnostic("Stream final event: " + event,2048);
@@ -92,6 +104,7 @@ bool ApplicationController::closeTransport(bool final) noexcept {
             }
         } catch (...) { retryAllowed = false; }
         try {
+            logIncomingControl(true);
             diagnostic("Stream transport closed: " + stream_->transportTimings(),4096);
             if (streamPlayStation_) diagnostic("PS transport input closed: " + stream_->inputDiagnostics(),3072);
             diagnostic("Video gaps final: " + stream_->gapDiagnostics(),4096);
@@ -302,6 +315,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         lastPumpAt_ = pumpAt;
         const auto transportStarted = std::chrono::steady_clock::now();
         stream_->pump();
+        logIncomingControl();
         if (streamRental_.provider == fog::ProviderId::FogHub)
             overlay_.setVideoChangesEnabled(stream_->ready());
         transportPumpTiming_.record(transportStarted);

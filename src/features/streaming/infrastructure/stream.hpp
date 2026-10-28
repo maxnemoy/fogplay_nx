@@ -36,6 +36,7 @@ public:
     void observePlayback(const PlaybackObservation& observation) override;
     bool poll(Packet& packet) override;
     bool pollAudio(Packet& packet) override; // Audio FIFO, independent of queued compressed video.
+    bool pollRumble(Rumble& rumble) override; // Latest slot-0 feedback, drained on the application thread.
     std::uint64_t queuedVideoAgeMs() const override;
     std::size_t queuedVideoPackets() const override;
     bool ready() const override;
@@ -58,6 +59,7 @@ public:
     // Local queue/RTC acceptance, scoped to this transport generation. No remote input ACK exists.
     std::string inputDiagnostics() const override;
     bool pollVideoDiagnostic(std::string& event) override;
+    bool pollControlDiagnostic(std::string& event, bool final = false) override;
     bool waitingForVideoKeyframe() const override;
     bool requestVideoKeyframe() override; // Best effort PLI on open video tracks; no transport reset.
     // Decoder recovery is independent of transport assembly and quality mode.

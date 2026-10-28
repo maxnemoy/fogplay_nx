@@ -9,6 +9,7 @@
 #include "features/streaming/infrastructure/async_ice_snapshot.hpp"
 #include "features/streaming/infrastructure/rtcp_feedback_worker.hpp"
 #include "features/streaming/infrastructure/incoming_control.hpp"
+#include "features/streaming/infrastructure/rumble_mailbox.hpp"
 #include "features/streaming/infrastructure/transport_history.hpp"
 #include "features/streaming/infrastructure/timed_mutex.hpp"
 #include "features/streaming/infrastructure/stream_route.hpp"
@@ -137,6 +138,8 @@ struct Client::Impl {
         MediaQueue media;
         TransportHistory transportHistory;
         IncomingControl incoming;
+        IncomingControlDiagnostics incomingEvents;
+        RumbleMailbox rumble;
         std::shared_ptr<AsyncControlSender> controlSender;
         std::shared_ptr<IceWorker> iceWorker;
         std::shared_ptr<RtcpFeedbackWorker> rtcpWorker;
@@ -253,7 +256,7 @@ struct Client::Impl {
                 " eventQueue=" + std::to_string(events.size()) + " eventBytes=" + std::to_string(eventBytes) +
                 " eventHigh=" + std::to_string(eventHigh) + " eventDrop=" + std::to_string(eventDropped) +
                 " eventOverflow=" + std::to_string(eventOverflow) + " callbackFailure=" + std::to_string(callbackFailure) +
-                transportHistory.diagnostics() + incoming.diagnostics() +
+                transportHistory.diagnostics() + incoming.diagnostics() + incomingEvents.diagnostics() +
                 " eventDelayHighMs=" + std::to_string(eventDelayHighMs);
         }
         void event(Event e) {
@@ -308,8 +311,24 @@ struct Client::Impl {
                 if (stopped) return;
                 lastControlMs = videoNow();
                 incoming.receive(message, lastControlMs + qualityTimeOffset);
+                try {
+                    auto description = message.diagnostic;
+                    const auto classification = std::string(" parsed=") + IncomingControl::kindName(message.kind);
+                    description.key += classification;
+                    description.sample += classification;
+                    incomingEvents.receive(description, lastControlMs);
+                }
+                catch (...) {} // Losing a diagnostic sample must not end the stream.
                 if (message.kind == IncomingControl::Kind::Close || message.kind == IncomingControl::Kind::Error ||
-                    message.kind == IncomingControl::Kind::Invalid) terminalControl = message.kind;
+                    message.kind == IncomingControl::Kind::Invalid) {
+                    terminalControl = message.kind;
+                    rumble.clear();
+                }
+                if (message.kind == IncomingControl::Kind::Rumble && terminalControl == IncomingControl::Kind::Ignored) {
+                    auto value = message.rumble;
+                    value.receivedAtMs = lastControlMs;
+                    rumble.put(value);
+                }
                 sender = controlSender;
                 if (!sender && message.kind == IncomingControl::Kind::Ping) pendingPong = message.pong;
             }
@@ -632,6 +651,7 @@ struct Client::Impl {
     std::string finalVideoDiagnostics, finalTransportDiagnostics, finalQueueDiagnostics, finalGapDiagnostics;
     std::string finalMutexDiagnostics;
     std::deque<std::string> finalVideoEvents;
+    std::deque<std::string> finalControlEvents;
     const char* operation = "idle";
     unsigned offers = 0, candidatesReceived = 0, emptyCandidates = 0, heartbeatsSent = 0;
     // Application-thread counters. A non-throwing WebSocket send is local
@@ -762,6 +782,10 @@ struct Client::Impl {
         return {};
     }
     void stop(bool notify) {
+        if (shared) {
+            TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
+            shared->rumble.clear();
+        }
         // Publish stop intent before querying any RTC locks. The worker drops
         // pending old-generation states immediately, then releases held input.
         if (controlSender) controlSender->requestStop(neutralControl());
@@ -791,6 +815,7 @@ struct Client::Impl {
         if (shared) {
             TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
             shared->stopped = true;
+            shared->rumble.clear();
             // Diagnostics must never interrupt transport teardown, including
             // allocation failure while snapshotting counters or event strings.
             try {
@@ -801,6 +826,9 @@ struct Client::Impl {
                 finalMutexDiagnostics = TimedMutex::diagnostics(lock.snapshot());
                 std::string videoEvent;
                 while (shared->video.pollEvent(videoEvent)) finalVideoEvents.push_back(std::move(videoEvent));
+                std::string controlEvent;
+                while (finalControlEvents.size() < 33 && shared->incomingEvents.poll(controlEvent, videoNow(), true))
+                    finalControlEvents.push_back(std::move(controlEvent));
             } catch (...) {}
             abandonedEvents.swap(shared->events);
             abandonedPackets.swap(shared->media.packets);
@@ -874,6 +902,7 @@ struct Client::Impl {
             if (shared) {
                 TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
                 shared->stopped = true;
+                shared->rumble.clear();
             }
             running = false; isReady = false; state = "Failed";
             return;
@@ -950,6 +979,14 @@ struct Client::Impl {
                     callback(weak, [&msg](Shared& st) {
                         if (const auto text = std::get_if<std::string>(&msg))
                             st.controlMessage(*text);
+                        else if (const auto bytes = std::get_if<rtc::binary>(&msg)) {
+                            TimedMutex::Guard lock(st.mutex, TimedMutex::Scope::Callback);
+                            if (!st.stopped) {
+                                try { st.incomingEvents.receive({"binary", "event=<binary> bytes=" +
+                                    std::to_string(bytes->size())}, videoNow()); }
+                                catch (...) {}
+                            }
+                        }
                     });
                 });
                 Event e(EventType::Channel); e.channel = dc; s.event(std::move(e));
@@ -1567,6 +1604,17 @@ bool Client::pollAudio(Packet& packet) {
     i.shared->expireMedia(videoNow());
     return i.shared->media.popAudio(packet);
 }
+bool Client::pollRumble(Rumble& rumble) {
+    auto& i = *impl_;
+    if (!i.shared || !i.running || i.closingForRetry) return false;
+    TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
+    if (i.shared->stopped || i.shared->terminalControl != IncomingControl::Kind::Ignored ||
+        i.shared->eventOverflow || i.shared->callbackFailure) {
+        i.shared->rumble.clear();
+        return false;
+    }
+    return i.shared->rumble.take(rumble);
+}
 std::uint64_t Client::queuedVideoAgeMs() const {
     if (!impl_->shared) return 0;
     TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
@@ -1681,6 +1729,7 @@ bool Client::disconnectForRetry() {
     {
         TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
         i.shared->stopped = true;
+        i.shared->rumble.clear();
     }
     i.closingForRetry = true;
     pump(); // Frozen terminal evidence still wins over transport-only recovery.
@@ -1757,6 +1806,18 @@ bool Client::pollVideoDiagnostic(std::string& event) {
     }
     if (impl_->finalVideoEvents.empty()) return false;
     event = std::move(impl_->finalVideoEvents.front()); impl_->finalVideoEvents.pop_front(); return true;
+}
+bool Client::pollControlDiagnostic(std::string& event, bool final) {
+    if (impl_->shared) {
+        TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Diagnostics);
+        if (!impl_->shared->incomingEvents.poll(event, videoNow(), final)) return false;
+    } else {
+        if (impl_->finalControlEvents.empty()) return false;
+        event = std::move(impl_->finalControlEvents.front());
+        impl_->finalControlEvents.pop_front();
+    }
+    event = "provider=mts " + event;
+    return true;
 }
 bool Client::waitingForVideoKeyframe() const {
     if (!impl_->shared) return false;

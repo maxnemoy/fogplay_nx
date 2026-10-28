@@ -3,6 +3,7 @@
 #include "frame_diagnostics.hpp"
 #include "resume_retry.hpp"
 #include "features/streaming/application/remote_input.hpp"
+#include "features/streaming/infrastructure/rumble_mailbox.hpp"
 #include <Settings.hpp>
 #include <Diagnostics.hpp>
 #include <FogMoonlightDiagnostics.h>
@@ -68,6 +69,7 @@ struct State {
     std::atomic<std::uint64_t> videoFullYields{0}, videoQueueHigh{0}, videoBatchMax{0}, videoQueueAgeMaxMs{0};
     std::atomic<std::uint64_t> videoInvalid{0}, videoWaitDrops{0}, videoResyncs{0};
     detail::FrameDiagnostics trace;
+    stream::RumbleMailbox rumble;
     mutable std::mutex mutex, apiMutex;
     std::condition_variable changed;
     std::deque<stream::Packet> video, audio;
@@ -85,8 +87,9 @@ struct State {
     void releaseLease() { if (ownsLease) { ownsLease = false; protocolClaimed = false; } }
     void status(const char* value) { std::lock_guard<std::mutex> lock(mutex); message = value; }
     void fail(const char* value, int failure = -1) {
-        { std::lock_guard<std::mutex> lock(mutex); error = value; message = value; }
-        code = failure; failed = true; changed.notify_all();
+        { std::lock_guard<std::mutex> lock(mutex); error = value; message = value;
+            code = failure; failed = true; rumble.clear(); }
+        changed.notify_all();
     }
 };
 // Core callbacks are process-global. An exclusive protocol lease prevents two
@@ -96,7 +99,17 @@ std::atomic<State*> active{nullptr};
 void stageStarting(int) {}
 void stageFailed(int, int code) { if (auto* state = active.load()) state->code = code; }
 void terminated(int code) {
-    if (auto* state = active.load()) { state->code = code; state->terminated = true; }
+    if (auto* state = active.load()) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->code = code; state->terminated = true; state->rumble.clear();
+    }
+}
+void rumble(unsigned short controller, unsigned short lowFrequency, unsigned short highFrequency) {
+    if (auto* state = active.load()) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->valid || state->stop || state->failed || state->terminated || !state->streamInUse) return;
+        state->rumble.put({controller, lowFrequency, highFrequency, 0, nowMs()});
+    }
 }
 void ignoreLog(const char*, ...) {}
 int videoSetup(int format, int width, int height, int fps, void*, int) {
@@ -279,6 +292,7 @@ public:
         if (!state_ || !state_->valid || !state_->paired || connection.rental.empty() ||
             connection.rental != state_->rental || state_->streamInUse.exchange(true)) return false;
         resumeOnly_ = connection.resumeOnly;
+        state_->rumble.clear();
         state_->stop = false; state_->failed = false; state_->terminated = false;
         state_->frames = 0; state_->audioFrames = 0; state_->videoDrops = 0; state_->audioDrops = 0;
         state_->inputAccepted = 0; state_->inputRejected = 0;
@@ -327,6 +341,13 @@ public:
     void observePlayback(const stream::PlaybackObservation&) override {}
     bool poll(stream::Packet& packet) override { return take(packet, false); }
     bool pollAudio(stream::Packet& packet) override { return take(packet, true); }
+    bool pollRumble(stream::Rumble& value) override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->valid || !state_->running || state_->stop || state_->failed || state_->terminated) {
+            state_->rumble.clear(); return false;
+        }
+        return state_->rumble.take(value);
+    }
     std::uint64_t queuedVideoAgeMs() const override {
         std::lock_guard<std::mutex> lock(state_->mutex);
         return state_->video.empty() ? 0 : nowMs() - state_->video.front().enqueueMs;
@@ -522,6 +543,7 @@ public:
     void close() override {
         if (!worker_.joinable()) return;
         state_->stop = true;
+        state_->rumble.clear();
         { std::lock_guard<std::mutex> lock(state_->apiMutex); if (state_->starting) LiInterruptConnection(); }
         // Cancel pending /applist, /launch or /resume as well as LiStartConnection.
         while (state_->streamInUse) {
@@ -530,6 +552,7 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         worker_.join();
+        state_->rumble.clear();
     }
 private:
     std::shared_ptr<State> state_;
@@ -595,6 +618,7 @@ private:
                 CONNECTION_LISTENER_CALLBACKS listeners{}; LiInitializeConnectionCallbacks(&listeners);
                 listeners.stageStarting = stageStarting; listeners.stageFailed = stageFailed;
                 listeners.connectionTerminated = terminated; listeners.logMessage = ignoreLog;
+                listeners.rumble = rumble;
                 active = state_.get();
                 { std::lock_guard<std::mutex> lock(state_->apiMutex);
                     if (!state_->stop && state_->valid && !Settings::instance().request_cancelled()) {
@@ -607,7 +631,7 @@ private:
                 if (result != 0) { if (!state_->stop) state_->fail("Moonlight connection failed", result); }
                 else {
                     started = true; state_->coreDiagnosticsReady = true; state_->running = true;
-                    { std::lock_guard<std::mutex> lock(state_->apiMutex); LiSendControllerArrivalEvent(0, 1, LI_CTYPE_XBOX, 0xffff, 0); }
+                    { std::lock_guard<std::mutex> lock(state_->apiMutex); LiSendControllerArrivalEvent(0, 1, LI_CTYPE_XBOX, 0xffff, LI_CCAP_RUMBLE); }
                     state_->status("Moonlight stream active: 720p30");
                     while (!state_->stop && !state_->terminated) {
                         const auto began = detail::steadyUs();
@@ -632,6 +656,7 @@ private:
                 state_->transportClosedMs = nowMs();
             }
             active = nullptr;
+            state_->rumble.clear();
         }
         state_->streamInUse = false;
         state_->changed.notify_all();

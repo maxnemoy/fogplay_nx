@@ -1,5 +1,6 @@
 #include "core/constants/storage_paths.hpp"
 #include "features/settings/presentation/settings_text.hpp"
+#include "features/settings/presentation/rumble_text.hpp"
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 
@@ -74,6 +75,41 @@ void ApplicationController::drawConnectionSettings() {
     if (!connectionSaveStatus_.empty() && connectionSaveStatus_ != uiText::Settings::ConnectionAutoSaveNotice &&
         connectionSaveStatus_ != uiText::Settings::ConnectionSaved)
         ui_.text(connectionSaveStatus_, area.x, 560, area.w, accent, false, 2);
+}
+
+void ApplicationController::changeRumbleSettings(const fog::rumble::Settings& value) {
+    if (!fog::rumble::valid(value)) return;
+    try {
+        fog::rumble::saveSettings(storagePaths::path(storagePaths::RumbleSettings), value);
+        rumbleSettings_ = value;
+        const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        rumble_.setMode(value.mode, nowMs);
+        rumbleSaveStatus_ = fog::rumble::text::Saved;
+        diagnostic(std::string("Rumble settings changed: mode=") + fog::rumble::modeId(value.mode));
+    } catch (...) {
+        rumbleSaveStatus_ = fog::rumble::text::SaveFailed;
+        diagnostic("Rumble settings save failed; previous mode retained.");
+    }
+    overlay_.setRumbleSettings(rumbleSettings_);
+    overlay_.setRumbleStatus(rumbleSaveStatus_);
+}
+
+void ApplicationController::inputRumbleSettings(u64 keys) {
+    if (keys & HidNpadButton_B) { screen_ = Screen::Settings; selection_ = 5; return; }
+    int direction = 0;
+    if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) direction = -1;
+    else if (keys & (HidNpadButton_Right | HidNpadButton_StickLRight | HidNpadButton_A)) direction = 1;
+    auto next = rumbleSettings_;
+    if (fog::rumble::adjust(next, direction)) changeRumbleSettings(next);
+}
+
+void ApplicationController::drawRumbleSettings() {
+    const auto area = ui_.content();
+    ui_.button(fog::rumble::text::label(rumbleSettings_.mode), {area.x, 154, area.w, 57}, true);
+    ui_.text(fog::rumble::text::description(rumbleSettings_.mode), area.x + 14, 240, area.w - 28, muted, false, 3);
+    ui_.text(fog::rumble::text::Shared, area.x + 14, 360, area.w - 28, muted, false, 2);
+    if (!rumbleSaveStatus_.empty()) ui_.text(rumbleSaveStatus_, area.x, 530, area.w, accent, false, 3);
 }
 
 }

@@ -2,6 +2,7 @@
 #include "core/domain/identity.hpp"
 #include "features/settings/domain/video_settings.hpp"
 #include "features/streaming/domain/remote_input.hpp"
+#include "features/streaming/domain/rumble.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -75,12 +76,17 @@ public:
     // Local queue/RTC acceptance, scoped to this transport generation. No remote input ACK exists.
     virtual std::string inputDiagnostics() const = 0;
     virtual bool pollVideoDiagnostic(std::string& event) = 0;
+    // Sanitized, bounded incoming control samples. final flushes pending counts.
+    virtual bool pollControlDiagnostic(std::string&, bool final = false) { (void)final; return false; }
     virtual bool waitingForVideoKeyframe() const = 0;
     virtual bool requestVideoKeyframe() = 0; // Best effort PLI on open video tracks; no transport reset.
     // Decoder recovery is independent of transport assembly and quality mode.
     // Keep requesting IDR until the owner successfully prepares decoded output.
     virtual void setDecoderWaitingForKeyframe(bool waiting) = 0;
     virtual bool sendGamepad(const Gamepad& state) = 0;
+    // Main-thread feedback drain. Adapters coalesce network callbacks; never
+    // touch controller hardware from a transport thread. Optional for fakes.
+    virtual bool pollRumble(Rumble&) { return false; }
     virtual bool sendInput(const fog::remote::Input& input) = 0;
     virtual void close() = 0;
 };

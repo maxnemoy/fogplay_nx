@@ -11,6 +11,8 @@ flags=(-std=c++17 -Wall -Wextra -Werror -pthread -DRTC_ENABLE_MEDIA=1 -DRTC_ENAB
 libs=(-Lthird_party/rtc/host/lib -Wl,--start-group -ldatachannel -ljuice -lusrsctp -lsrtp2 -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -Wl,--end-group)
 g++ "${flags[@]}" tests/incoming_control_tests.cpp -o work/incoming_control_tests
 ./work/incoming_control_tests | tee work/logs/incoming-control-tests.log
+g++ "${flags[@]}" tests/incoming_control_diagnostics_tests.cpp -o work/incoming_control_diagnostics_tests
+./work/incoming_control_diagnostics_tests | tee work/logs/incoming-control-diagnostics-tests.log
 g++ "${flags[@]}" tests/transport_history_tests.cpp -o work/transport_history_tests
 ./work/transport_history_tests | tee work/logs/transport-history-tests.log
 g++ "${flags[@]}" tests/route_snapshot_schedule_tests.cpp -o work/route_snapshot_schedule_tests

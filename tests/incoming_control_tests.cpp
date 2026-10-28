@@ -41,5 +41,35 @@ int main() {
     assert(Incoming::classify(R"({"id":"close"})").kind == Incoming::Kind::Close);
     assert(Incoming::classify(R"({"id":"error"})").kind == Incoming::Kind::Error);
     assert(Incoming::classify("{}").kind == Incoming::Kind::Ignored);
-    std::cout << "Incoming control classification, >702 burst, sparse stats times/revisions, ping, sanitization passed\n";
+    const Json vibration{{"id", "gamepad_notification"}, {"index", 0}, {"large_motor", 255}, {"small_motor", 128}};
+    const auto rumble = Incoming::classify(vibration.dump());
+    assert(rumble.kind == Incoming::Kind::Rumble && rumble.rumble.controller == 0);
+    assert(rumble.rumble.lowFrequency == 65535 && rumble.rumble.highFrequency == 32896);
+    assert(rumble.rumble.durationMs == 5100 && rumble.rumble.receivedAtMs == 0);
+    auto quiet = vibration; quiet["large_motor"] = 0; quiet["small_motor"] = 1;
+    const auto minimum = Incoming::classify(quiet.dump());
+    assert(minimum.kind == Incoming::Kind::Rumble && minimum.rumble.highFrequency == 257 && minimum.rumble.durationMs == 20);
+    quiet["small_motor"] = 0;
+    const auto stop = Incoming::classify(quiet.dump());
+    assert(stop.kind == Incoming::Kind::Rumble && stop.rumble.lowFrequency == 0 &&
+        stop.rumble.highFrequency == 0 && stop.rumble.durationMs == 0);
+    for (const auto* field : {"index", "large_motor", "small_motor"}) {
+        auto missing = vibration; missing.erase(field);
+        assert(Incoming::classify(missing.dump()).kind == Incoming::Kind::InvalidRumble);
+        for (const auto& invalid : Json::array({nullptr, true, "1", 1.0, -1, 256,
+                 std::uint64_t(18446744073709551615ULL), Json::object(), Json::array()})) {
+            auto malformed = vibration; malformed[field] = invalid;
+            const auto message = Incoming::classify(malformed.dump());
+            assert(message.kind == Incoming::Kind::InvalidRumble);
+            incoming.receive(message, 2200);
+        }
+    }
+    for (const auto index : {1, 255}) {
+        auto unsupported = vibration; unsupported["index"] = index;
+        assert(Incoming::classify(unsupported.dump()).kind == Incoming::Kind::InvalidRumble);
+    }
+    incoming.receive(rumble, 2200);
+    assert(incoming.diagnostics().find("incomingRumble=1 ") != std::string::npos);
+    assert(incoming.diagnostics().find("incomingInvalidRumble=27 ") != std::string::npos);
+    std::cout << "Incoming control classification, >702 burst, sparse stats times/revisions, ping, strict MTS rumble, sanitization passed\n";
 }

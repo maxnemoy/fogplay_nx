@@ -1,6 +1,7 @@
 #pragma once
 #include "core/domain/identity.hpp"
 #include "features/settings/domain/video_settings.hpp"
+#include "features/settings/domain/rumble_settings.hpp"
 #include <cstddef>
 #include <string>
 
@@ -8,8 +9,8 @@ struct SDL_Renderer;
 namespace fog::ui { class Ui; }
 
 namespace fog::stream {
-enum class OverlayMode { Closed, Menu, Mouse, Keyboard, ImageSettings, StopConfirm };
-enum class OverlayActionType { None, SendText, Enter, Tab, Backspace, Escape, StopSession, SettingsChanged, RequestKeyframe };
+enum class OverlayMode { Closed, Menu, Mouse, Keyboard, ImageSettings, StopConfirm, RumbleSettings };
+enum class OverlayActionType { None, SendText, Enter, Tab, Backspace, Escape, StopSession, SettingsChanged, RequestKeyframe, RumbleSettingsChanged };
 struct OverlayAction {
     OverlayActionType type = OverlayActionType::None;
     std::string text;
@@ -37,6 +38,9 @@ public:
     const video::Settings& videoSettings() const { return videoSettings_; }
     void setVideoStatus(const std::string& value) { videoStatus_ = value; }
     void setSaveStatus(const std::string& value) { saveStatus_ = value; }
+    void setRumbleSettings(const rumble::Settings& value) { rumbleSettings_ = value; }
+    const rumble::Settings& rumbleSettings() const { return rumbleSettings_; }
+    void setRumbleStatus(const std::string& value) { rumbleStatus_ = value; }
     OverlayAction select();
     OverlayAction back();
     // Coordinates in the UI's logical 1280x720 space. Activates only hit buttons.
@@ -48,6 +52,7 @@ public:
 private:
     void move(int horizontal, int vertical);
     OverlayAction adjustVideo(int direction);
+    OverlayAction adjustRumble(int direction);
     int firstImageSelection() const;
     int imageRowCount() const;
     std::string keyLabel(int index) const;
@@ -57,8 +62,10 @@ private:
     bool uppercase_ = false;
     std::string text_;
     video::Settings videoSettings_;
+    rumble::Settings rumbleSettings_;
     ProviderId provider_ = ProviderId::Mts;
     bool videoChangesEnabled_ = true;
     std::string videoStatus_, saveStatus_;
+    std::string rumbleStatus_;
 };
 }

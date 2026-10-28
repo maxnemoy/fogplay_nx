@@ -497,6 +497,76 @@ static std::uint64_t signalingCount(const std::string& diagnostics, const char* 
     assert(start != std::string::npos);
     return std::stoull(diagnostics.substr(start + key.size()));
 }
+static void rumbleLifecycle() {
+    {
+        Fixture fixture("0,0", false);
+        stream::Client client;
+        stream::Rumble vibration;
+        const auto endpoint = "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/";
+        const std::string pulse = R"({"id":"gamepad_notification","index":0,"large_motor":255,"small_motor":1})";
+        assert(!client.pollRumble(vibration));
+        assert(client.startForTesting("fixture", "abcde", endpoint));
+        client.receiveControlForTesting(pulse);
+        // Restart while feedback is still pending, without an explicit close.
+        assert(client.startForTesting("fixture", "abcdf", endpoint));
+        assert(!client.pollRumble(vibration));
+        client.receiveControlForTesting(pulse);
+        client.close();
+        client.receiveControlForTesting(pulse);
+        assert(!client.pollRumble(vibration));
+        assert(client.startForTesting("fixture", "abcdg", endpoint));
+        client.receiveControlForTesting(pulse);
+        client.failThenReceiveForTesting("{}", false);
+        client.pump();
+        assert(!client.error().empty() && !client.pollRumble(vibration));
+        client.receiveControlForTesting(pulse);
+        assert(!client.pollRumble(vibration));
+        client.close();
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "MTS rumble close, active restart, transport failure and late callback isolation passed\n";
+}
+static void controlDiagnosticsLifecycle() {
+    {
+        Fixture fixture("0,0", false);
+        stream::Client client;
+        const auto endpoint = "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/";
+        std::string event;
+        assert(!client.pollControlDiagnostic(event));
+        assert(client.startForTesting("fixture", "abcde", endpoint));
+        const std::string unknown = R"({"id":"controller_effect","payload":{"left":25,"right":10,"token":"secret-feedback-token"},"session":"secret-feedback-session"})";
+        client.receiveControlForTesting(unknown);
+        assert(client.pollControlDiagnostic(event));
+        assert(event.find("provider=mts") != std::string::npos && event.find("controller_effect") != std::string::npos);
+        assert(event.find("parsed=ignored") != std::string::npos && event.find("left") != std::string::npos);
+        assert(event.find("secret-feedback") == std::string::npos);
+        assert(!client.pollControlDiagnostic(event));
+        for (unsigned i = 0; i < 1000; ++i) client.receiveControlForTesting(unknown);
+        client.receiveControlForTesting(R"({"id":"gamepad_notification","index":0,"large_motor":255,"small_motor":128})");
+        client.receiveControlForTesting(R"({"id":"gamepad_notification","index":0,"large_motor":256,"small_motor":128})");
+        assert(client.error().empty());
+        client.close(); // Pending diagnostic samples survive teardown.
+        bool ignored = false, rumble = false, invalidRumble = false;
+        unsigned count = 0;
+        while (client.pollControlDiagnostic(event, true)) {
+            assert(++count <= 33 && event.find("secret-feedback") == std::string::npos);
+            ignored |= event.find("parsed=ignored") != std::string::npos;
+            rumble |= event.find("parsed=rumble") != std::string::npos;
+            invalidRumble |= event.find("parsed=invalid-rumble") != std::string::npos;
+        }
+        assert(ignored && rumble && invalidRumble);
+        assert(client.startForTesting("fixture", "abcdf", endpoint));
+        assert(!client.pollControlDiagnostic(event, true)); // New generation has its own counts.
+        client.receiveControlForTesting("{invalid-private-control");
+        client.pump();
+        assert(!client.error().empty());
+        assert(client.pollControlDiagnostic(event, true));
+        assert(event.find("parsed=invalid") != std::string::npos && event.find("private-control") == std::string::npos);
+        client.close();
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "MTS control diagnostic samples, redaction, coalescing and teardown retention passed\n";
+}
 static void signalingDiagnostics() {
     // Real loopback handshake, deliberately no remote init. Exercise each
     // tracked send's immediate/buffered/throwing result without paid services.
@@ -566,6 +636,8 @@ static void signalingDiagnostics() {
 
 int main(int argc, char** argv) {
     const bool turnOnly = argc == 2 && std::string(argv[1]) == "--turn-only";
+    if (!turnOnly) rumbleLifecycle();
+    if (!turnOnly) controlDiagnosticsLifecycle();
     if (!turnOnly) signalingDiagnostics();
     if (argc == 2 && std::string(argv[1]) == "--signaling-only") return 0;
     {
@@ -1312,6 +1384,8 @@ int main(int argc, char** argv) {
             const std::string suffix = attempt == 0 ? "abcde" : "abcdf";
             Fixture fixture("4000,4000",true,false,suffix,false,false,playStation);
             assert(client.startForTesting("fixture",suffix,"ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+            stream::Rumble vibration;
+            assert(!client.pollRumble(vibration)); // A new transport never exposes prior-generation feedback.
             assert(!client.configurePlayStation(!playStation));
             // Callback ping before sender publication must survive in a bounded
             // slot and transfer to the worker only after route authorization.
@@ -1328,6 +1402,48 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             assert(gotFrame && client.ready() && fixture.controlReady && fixture.pong);
+            const auto rumbleAt = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+            fixture.dc->send(R"({"id":"gamepad_notification","index":0,"large_motor":255,"small_motor":128})");
+            const auto feedbackAt = Clock::now();
+            while (client.diagnostics().find("incomingRumble=1 ") == std::string::npos &&
+                Clock::now() - feedbackAt < std::chrono::seconds(1)) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            assert(client.pollRumble(vibration)); // Actual authenticated SCTP callback, without a frame pump.
+            assert(vibration.lowFrequency == 65535 && vibration.highFrequency == 32896 && vibration.durationMs == 5100);
+            assert(vibration.receivedAtMs >= static_cast<std::uint64_t>(rumbleAt));
+            assert(!client.pollRumble(vibration));
+            std::string controlEvent;
+            bool loggedRumble = false;
+            while (client.pollControlDiagnostic(controlEvent, true)) {
+                if (controlEvent.find("parsed=rumble") != std::string::npos) {
+                    loggedRumble = true;
+                    assert(controlEvent.find("large_motor:255") != std::string::npos);
+                }
+            }
+            assert(loggedRumble);
+            fixture.dc->send(rtc::binary(8, std::byte{0x7f}));
+            const auto binaryAt = Clock::now();
+            bool loggedBinary = false;
+            while (!loggedBinary && Clock::now() - binaryAt < std::chrono::seconds(1)) {
+                while (client.pollControlDiagnostic(controlEvent, true))
+                    loggedBinary |= controlEvent.find("event=<binary> bytes=8") != std::string::npos;
+                if (!loggedBinary) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            assert(loggedBinary && client.error().empty());
+            for (unsigned n = 0; n < 1000; ++n)
+                client.receiveControlForTesting(Json{{"id", "gamepad_notification"}, {"index", 0},
+                    {"large_motor", n % 256}, {"small_motor", 1}}.dump());
+            client.receiveControlForTesting(R"({"id":"gamepad_notification","index":0,"large_motor":0,"small_motor":0})");
+            // Optional malformed packets neither terminate the stream nor replace a pending stop.
+            for (const auto* malformed : {
+                R"({"id":"gamepad_notification","index":0,"large_motor":1.0,"small_motor":1})",
+                R"({"id":"gamepad_notification","index":1,"large_motor":255,"small_motor":255})",
+                R"({"id":"gamepad_notification","index":0,"large_motor":256,"small_motor":0})"})
+                client.receiveControlForTesting(malformed);
+            assert(client.pollRumble(vibration) && vibration.lowFrequency == 0 && vibration.highFrequency == 0);
+            assert(!client.pollRumble(vibration) && client.error().empty());
+            assert(client.diagnostics().find("incomingRumble=1002 ") != std::string::npos);
+            assert(client.diagnostics().find("incomingInvalidRumble=3 ") != std::string::npos);
+            assert(client.diagnostics().find("eventOverflow=0") != std::string::npos);
             assert(client.inputDiagnostics().find("nativeDownQueued=0 ") != std::string::npos);
             const Json touch{{"id", "gamepad_touch"}, {"index", 0},
                 {"data", {{"type", 0x656}, {"finger", 0}, {"x", 0.25}, {"y", 0.75}}}};
@@ -1385,15 +1501,22 @@ int main(int argc, char** argv) {
                     fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
                 assert(fixture.neutral);
+                client.receiveControlForTesting(R"({"id":"gamepad_notification","index":0,"large_motor":255,"small_motor":0})");
                 assert(client.disconnectForRetry());
+                assert(!client.pollRumble(vibration));
                 assert(client.error().empty() && !client.ready() && !client.disconnected());
             } else {
+                client.receiveControlForTesting(R"({"id":"gamepad_notification","index":0,"large_motor":255,"small_motor":0})");
                 client.receiveControlForTesting(R"({"id":"close"})");
+                assert(!client.pollRumble(vibration)); // Terminal callback seals feedback before pump.
+                client.receiveControlForTesting(R"({"id":"gamepad_notification","index":0,"large_motor":255,"small_motor":0})");
+                assert(!client.pollRumble(vibration));
                 client.pump();
                 assert(!client.error().empty());
                 // Failed transports still own their final neutral until close.
                 assert(!client.configurePlayStation(!playStation));
                 client.close();
+                assert(!client.pollRumble(vibration));
             }
             for (unsigned tick=0; tick<20; ++tick) {
                 fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1582,8 +1705,9 @@ int main(int argc, char** argv) {
         assert(!client.ready() && !client.retryableError());
         const auto frozen = client.diagnostics();
         for (unsigned n = 0; n < 1000; ++n) client.receiveControlForTesting("{}");
-        assert(client.diagnostics().find("incomingIgnored=") != std::string::npos);
-        assert(client.diagnostics().substr(client.diagnostics().find("incomingIgnored=")) == frozen.substr(frozen.find("incomingIgnored=")));
+        const auto after = client.diagnostics();
+        assert(after.find("incomingIgnored=") != std::string::npos);
+        assert(after.substr(after.find("incomingIgnored=")) == frozen.substr(frozen.find("incomingIgnored=")));
         client.blockControlSendForTesting(false);
         client.close();
         for (unsigned n = 0; n < 20; ++n) { fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
