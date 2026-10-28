@@ -73,8 +73,8 @@ bool ApplicationController::closeTransport(bool final) noexcept {
         psSensors_.stop();
         try { logPlayStationInput(true); } catch (...) {}
     }
-    if (final) releaseMouse();
-    else mouseLeft_ = mouseRight_ = touchDrag_ = touchWasDown_ = false;
+    releaseMouse();
+    touchWasDown_ = false;
     videoRecovery_.reset();
     videoLossWaiting_ = false;
     loopTiming_.suspendPresentation();
@@ -117,12 +117,14 @@ bool ApplicationController::closeTransport(bool final) noexcept {
         if (!final && !retryAllowed) return false;
         stream_.reset();
     }
+    mouseButtons_.reset();
     media_.reset();
     return final || retryAllowed;
 }
 
 void ApplicationController::closeStream() noexcept {
     pairedVideoReconnectPending_ = false;
+    pairedTransportReconnectPending_ = false;
     transportReconnect_.cancel();
     closeTransport(true);
     streamRental_ = {};
@@ -137,6 +139,7 @@ void ApplicationController::closeStream() noexcept {
 
 bool ApplicationController::startTransport(bool resumeOnly) {
     // Transport replacement must not adopt, create, or reset rental ownership.
+    mouseButtons_.reset();
     videoRecovery_.reset();
     videoLossWaiting_ = false; firstFramePresented_ = false;
     loopTiming_.resetPresentationCounter();
@@ -181,26 +184,12 @@ bool ApplicationController::startTransport(bool resumeOnly) {
     return started;
 }
 
-void ApplicationController::retryTransport(const char* reason) {
-    // FH has no verified same-rental reconnect endpoint. Never re-launch or re-pair a paid PC on transport failure.
-    if (streamRental_.provider == fog::ProviderId::FogHub) { beginFinish("paired-transport-failed"); return; }
+void ApplicationController::recordTransportBreak() {
+    if (streamRental_.provider != fog::ProviderId::Mts) return;
     const bool wasRelay = relaySelection_.relay();
     if (relaySelection_.broken(std::chrono::steady_clock::now()))
         diagnostic("Transport break recorded; recentBreaks=" + std::to_string(relaySelection_.breaks()));
     if (!wasRelay && relaySelection_.relay()) diagnostic("Auto TURN selected after two breaks in 120s; retained until rental closes.");
-    if (screen_ != Screen::Streaming || !sessionPending_ || stopAfterTask_ ||
-        exitAfterStop_ || streamRental_.empty() || pending_.valid() ||
-        !transportReconnect_.retry(std::chrono::steady_clock::now())) {
-        beginFinish("transport-reconnect-exhausted");
-        return;
-    }
-    streamInputGate_.suspendVideo();
-    if (!closeTransport(false)) {
-        beginFinish("transport-retry-terminal"); return;
-    }
-    status_ = uiText::Stream::ReconnectStatus;
-    diagnostic("Transport recovery scheduled; reason=" + std::string(reason) +
-        " attemptsIn120s=" + std::to_string(transportReconnect_.attempts()) + " limit=3 rollingWindow=120s recoveryDeadline=90s");
 }
 
 void ApplicationController::startStream(const fog::RentalId& rental, bool createdFromCatalog,
@@ -208,6 +197,7 @@ void ApplicationController::startStream(const fog::RentalId& rental, bool create
     streamPlayStation_ = (rental.provider == fog::ProviderId::Mts && fog::isPlayStationComputerId(computer)) ||
         controllerSettings_.profile == ::stream::ControllerProfile::DualSense;
     pairedVideoReconnectPending_ = false;
+    pairedTransportReconnectPending_ = false;
     latency_.cancel();
     recentLaunch_.stream(createdFromCatalog);
     relaySelection_.reset(connectionSettings_);
@@ -279,9 +269,9 @@ void ApplicationController::feedStreamAudio(const stream::Packet& packet) {
     const auto ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
     audioQueueWaitMaxMs_ = std::max(audioQueueWaitMaxMs_, ms >= packet.enqueueMs ? ms-packet.enqueueMs : 0);
     const auto before = media_->audioPackets();
-    media_->audio(packet.data.data(), packet.data.size());
+    media_->audio(packet.data.data(), packet.data.size(), packet.enqueueMs);
     audioFeedTiming_.record(now);
-    if (!before) diagnostic("First Opus packet decoded and queued.");
+    if (!before && media_->audioPackets() > before) diagnostic("First Opus packet decoded.");
 }
 void ApplicationController::drainStreamAudio() {
     if (media_->workersRunning()) return;
@@ -319,6 +309,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         lastPumpAt_ = pumpAt;
         const auto transportStarted = std::chrono::steady_clock::now();
         stream_->pump();
+        retryMouseReleases();
         logIncomingControl();
         if (streamRental_.provider == fog::ProviderId::FogHub)
             overlay_.setVideoChangesEnabled(stream_->ready());
@@ -344,44 +335,11 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             diagnostic("Stream mutex: " + stream_->mutexDiagnostics(),4096);
             lastProtocolLog_ = pumpAt;
         }
-        if (!stream_->error().empty()) {
-            diagnostic("Stream error: " + safeText(stream_->error()));
-            if (stream_->retryableError()) retryTransport("transport-error");
-            else beginFinish("transport-fatal");
-            return;
-        }
-        if (stream_->disconnected() && streamRental_.provider == fog::ProviderId::FogHub) {
-            beginFinish("paired-transport-disconnected"); return;
-        }
-        if (stream_->disconnected() && !transportReconnect_.recovering()) {
-            transportReconnect_.disconnected(pumpAt);
-            suspendVideoInput();
-            diagnostic("Transport disconnected; waiting up to 5s before replacement; rental remains active.");
-        }
+        if (!stream_->error().empty()) diagnostic("Stream error: " + safeText(stream_->error()));
+        if (!handleTransportState(pumpAt)) return;
     }
-    const auto recoveryAction = transportReconnect_.poll(std::chrono::steady_clock::now());
-    if (recoveryAction == fog::stream::TransportReconnect::Action::Stop) {
-        beginFinish("transport-reconnect-deadline"); return;
-    }
-    if (recoveryAction == fog::stream::TransportReconnect::Action::CloseTransport) {
-        const bool wasRelay = relaySelection_.relay();
-        if (relaySelection_.broken(std::chrono::steady_clock::now()))
-            diagnostic("Transport break recorded after unresolved grace; recentBreaks=" + std::to_string(relaySelection_.breaks()));
-        if (!wasRelay && relaySelection_.relay()) diagnostic("Auto TURN selected after two breaks in 120s; retained until rental closes.");
-        streamInputGate_.suspendVideo();
-        if (!closeTransport(false)) {
-            beginFinish("transport-retry-terminal"); return;
-        }
-    }
-    if (recoveryAction == fog::stream::TransportReconnect::Action::StartTransport) {
-        diagnostic("Transport reconnect attempt=" + std::to_string(transportReconnect_.attempts()) + "/3 rollingWindow=120s");
-        if (!startTransport()) {
-            if (stream_->retryableError()) retryTransport("retry-start");
-            else beginFinish("transport-start-fatal");
-            return;
-        }
-    }
-    if (!stream_) return;
+    if (!advanceTransportRecovery(std::chrono::steady_clock::now())) return;
+    media_->checkAudioRecovery();
     const bool lossWaiting = stream_->waitingForVideoKeyframe();
     if (lossWaiting && !videoLossWaiting_) {
         loopTiming_.suspendPresentation();

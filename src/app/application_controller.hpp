@@ -22,6 +22,7 @@
 #include "features/streaming/domain/video_recovery.hpp"
 #include "features/streaming/domain/transport_reconnect.hpp"
 #include "features/streaming/domain/stream_input_gate.hpp"
+#include "features/streaming/domain/mouse_buttons.hpp"
 #include "features/streaming/domain/loop_timing.hpp"
 #include "core/logging/run_log.hpp"
 #include "features/streaming/domain/streaming_client.hpp"
@@ -137,6 +138,15 @@ private:
     bool startTransport(bool resumeOnly = false);
     bool requestPairedVideoReconnect();
     bool completePairedVideoReconnect();
+    void requestPairedTransportReconnect();
+    bool transportRecoveryAllowed() const;
+    void stopTransportRecovery(const char* reason);
+    void recordTransportBreak();
+    bool handleTransportState(std::chrono::steady_clock::time_point now);
+    bool advanceTransportRecovery(std::chrono::steady_clock::time_point now);
+    void requestTransportRecovery();
+    void completeTransportRecovery(fog::stream::TransportReconnect::Preparation preparation);
+    bool completePairedTransportReconnect();
     void retryTransport(const char* reason);
     void shutdownSession() noexcept;
     void syncPending();
@@ -162,6 +172,7 @@ private:
     SDL_Rect videoRect() const;
     bool sendRemote(const fog::remote::Input& command);
     void releaseMouse() noexcept;
+    void retryMouseReleases() noexcept;
     void neutralizeStreamInput();
     void suspendVideoInput();
     void overlayTransition();
@@ -221,6 +232,7 @@ private:
     std::unique_ptr<fog::PairedCheckoutGuard> paired_;
     bool pairedPending_ = false;
     bool pairedVideoReconnectPending_ = false;
+    bool pairedTransportReconnectPending_ = false;
     fog::rating::Presentation rating_;
     bool ratingFocusLost_ = false;
     fog::ProviderId loginProvider_ = fog::ProviderId::Mts;
@@ -294,7 +306,7 @@ private:
     bool menuObservationActive_ = false, menuFocused_ = false;
     std::chrono::steady_clock::time_point menuHeartbeatAt_{}, menuTransitionAt_{};
     bool touchWasDown_ = false, touchDrag_ = false;
-    bool mouseLeft_ = false, mouseRight_ = false;
+    fog::stream::MouseButtons mouseButtons_;
     float pointerX_ = 640.0f, pointerY_ = 360.0f;
     std::chrono::steady_clock::time_point mouseAt_{}, lastPointerSent_{}, overlayNoticeAt_{}, overlayHintAt_{};
     std::string overlayNotice_;

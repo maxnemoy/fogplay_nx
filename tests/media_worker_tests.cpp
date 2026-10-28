@@ -1,6 +1,7 @@
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/infrastructure/media_frame_queue.hpp"
 #include "features/streaming/domain/audio_latency_policy.hpp"
+#include "features/streaming/domain/audio_recovery.hpp"
 #include <SDL.h>
 #include <opus/opus.h>
 extern "C" {
@@ -120,6 +121,19 @@ public:
     void close() override {}
 };
 static std::atomic<bool> captureAudio{false};
+static std::atomic<int> failAudioQueue{0}, failAudioOpen{0}, failAudioDecode{0};
+extern "C" int __real_SDL_QueueAudio(SDL_AudioDeviceID, const void*, Uint32);
+extern "C" int __wrap_SDL_QueueAudio(SDL_AudioDeviceID device, const void* data, Uint32 size) {
+    const auto failures = failAudioQueue.load();
+    if (failures > 0) { --failAudioQueue; return -1; }
+    return __real_SDL_QueueAudio(device, data, size);
+}
+extern "C" SDL_AudioDeviceID __real_SDL_OpenAudioDevice(const char*, int, const SDL_AudioSpec*, SDL_AudioSpec*, int);
+extern "C" SDL_AudioDeviceID __wrap_SDL_OpenAudioDevice(const char* device, int capture,
+    const SDL_AudioSpec* wanted, SDL_AudioSpec* obtained, int changes) {
+    if (failAudioOpen > 0) { --failAudioOpen; return 0; }
+    return __real_SDL_OpenAudioDevice(device, capture, wanted, obtained, changes);
+}
 static std::mutex audioCaptureMutex;
 static std::vector<std::uint64_t> audioHashes;
 static std::uint64_t pcmHash(const opus_int16* pcm, int count) {
@@ -130,6 +144,7 @@ static std::uint64_t pcmHash(const opus_int16* pcm, int count) {
 extern "C" int __real_opus_decode(OpusDecoder*, const unsigned char*, opus_int32, opus_int16*, int, int);
 extern "C" int __wrap_opus_decode(OpusDecoder* decoder, const unsigned char* data, opus_int32 size,
     opus_int16* pcm, int frames, int fec) {
+    if (failAudioDecode > 0) { --failAudioDecode; return OPUS_INTERNAL_ERROR; }
     const int result = __real_opus_decode(decoder, data, size, pcm, frames, fec);
     if (captureAudio && result > 0) {
         std::lock_guard<std::mutex> lock(audioCaptureMutex); audioHashes.push_back(pcmHash(pcm, result));
@@ -370,14 +385,12 @@ static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units) {
     until([&] { return media.videoFrames() > beforeRecovery; });
     until([&] { return media.preparePresentation(); });
     check(media.audioQueueResets() == 0, "workers cleared queued audio");
+    const auto audioBeforeBad = media.audioPackets();
     client.push(Bytes(65537), true);
-    until([&] { return media.takeWorkerError(event); });
-    bool audioFailed = false;
-    try { std::rethrow_exception(event.error); }
-    catch (const fog::VideoDecodeError&) {}
-    catch (const std::runtime_error&) { audioFailed = true; }
-    check(audioFailed && event.hasPacket && event.packet.kind == stream::Kind::Audio,
-        "audio failure did not reach UI fatal-error path");
+    client.push(audio, true);
+    until([&] { return media.audioPackets() > audioBeforeBad; });
+    check(!media.takeWorkerError(event) && media.audioQueueResets() == 0,
+        "isolated corrupt audio packet stopped workers or reset audio");
     media.stopWorkers();
     check(!media.workersRunning(), "workers survived stop");
     const auto polls = client.polls.load();
@@ -385,6 +398,135 @@ static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units) {
     check(client.polls == polls, "transport accessed after worker join");
     for (unsigned i = 0; i < 8; ++i) { media.startWorkers(client, 30); media.stopWorkers(); }
     check(!wrongThread, "codec/scale/texture thread affinity violated");
+}
+static void audioRecoveryPolicy() {
+    using Recovery = fog::AudioRecovery;
+    const auto now = Recovery::Time{};
+    Recovery isolated;
+    isolated.badPacket(now);
+    check(!isolated.expired(now + 60s), "one corrupt packet armed a fatal recovery deadline");
+    Recovery policy;
+    check(!policy.badPacket(now) && !policy.badPacket(now + 1ms) && policy.badPacket(now + 2ms), "bad packet threshold changed");
+    check(policy.attempt(now + 2ms) == Recovery::Attempt::Reset, "first audio reset refused");
+    policy.resetCompleted();
+    check(policy.attempt(now + 100ms) == Recovery::Attempt::Wait, "audio reset backoff missing");
+    check(!policy.expired(now + 10001ms) && policy.expired(now + 10002ms), "audio deadline moved after reset");
+    policy.queued();
+    policy.failed(now + 11s);
+    check(policy.attempt(now + 11s) == Recovery::Attempt::Reset, "second audio reset refused");
+    policy.queued(); policy.failed(now + 12s);
+    check(policy.attempt(now + 12s) == Recovery::Attempt::Reset, "third audio reset refused");
+    policy.queued(); policy.failed(now + 13s);
+    check(policy.attempt(now + 13s) == Recovery::Attempt::Stop, "success replenished rolling audio reset budget");
+    policy.queued(); policy.failed(now + 73s);
+    check(policy.attempt(now + 73s) == Recovery::Attempt::Reset, "old reset attempts did not expire");
+}
+static void audioRecoverySync(SDL_Renderer* renderer) {
+    const auto audio = sound();
+    {
+        fog::Media media(renderer);
+        media.audio(audio.data(), audio.size());
+        media.audio(nullptr, 0);
+        media.audio(audio.data(), audio.size());
+        check(media.audioPackets() == 2 && media.audioQueueResets() == 0, "isolated malformed packet did not recover synchronously");
+        for (unsigned i = 0; i < 3; ++i) media.audio(nullptr, 0);
+        check(media.audioQueueResets() == 1, "repeated malformed packets did not reset/clear audio");
+        media.audio(audio.data(), audio.size());
+        check(media.audioPackets() == 3, "decoder reset lost following valid packet");
+        const auto stale = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()) - 1000;
+        media.audio(audio.data(), audio.size(), stale);
+        check(media.audioPackets() == 3, "synchronous recovery admitted pre-reset compressed backlog");
+    }
+    {
+        fog::Media media(renderer);
+        failAudioDecode = 1;
+        media.audio(audio.data(), audio.size());
+        media.audio(audio.data(), audio.size());
+        check(media.audioPackets() == 1 && media.audioQueueResets() == 1, "internal Opus failure did not recover");
+    }
+    {
+        fog::Media media(renderer);
+        failAudioQueue = 1; failAudioOpen = 1;
+        media.audio(audio.data(), audio.size());
+        check(media.audioDiagnostics().find("audio_recovery_pending=1") != std::string::npos, "output reopen failure was lost");
+        media.audio(audio.data(), audio.size());
+        check(media.audioPackets() == 1, "backoff admitted audio before output recovery");
+        std::this_thread::sleep_for(260ms);
+        media.audio(audio.data(), audio.size());
+        check(media.audioPackets() == 2 && media.audioDiagnostics().find("audio_recovery_pending=0") != std::string::npos,
+            "output reopen did not recover after backoff");
+    }
+    {
+        fog::Media media(renderer);
+        failAudioQueue = 10;
+        bool exhausted = false;
+        for (unsigned i = 0; i < 5 && !exhausted; ++i) {
+            try { media.audio(audio.data(), audio.size()); }
+            catch (const fog::AudioPlaybackError&) { exhausted = true; }
+            if (!exhausted) std::this_thread::sleep_for(260ms);
+        }
+        failAudioQueue = 0;
+        check(exhausted, "persistent output failure retried without a limit");
+    }
+    {
+        fog::Media media(renderer);
+        failAudioDecode = 1;
+        media.audio(audio.data(), audio.size());
+        media.checkAudioRecovery();
+        // No further audio is fed: the application-loop check must still end
+        // the episode on time while a healthy video stream could continue.
+        std::this_thread::sleep_for(10020ms);
+        bool exhausted = false;
+        try { media.checkAudioRecovery(); }
+        catch (const fog::AudioPlaybackError&) { exhausted = true; }
+        check(exhausted, "synchronous audio deadline waited for another incoming packet");
+    }
+}
+static void audioRecoveryWorkerBacklog(SDL_Renderer* renderer) {
+    Client client;
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    media.startWorkers(client, 30);
+    const auto audio = sound();
+    client.push(audio, true);
+    until([&] { return media.audioPackets() == 1; });
+    for (unsigned i = 0; i < 3; ++i) client.push(Bytes(65537), true);
+    client.push(audio, true);
+    until([&] { return media.audioDiagnostics().find("audio_recovery_discarded_packets=1") != std::string::npos; });
+    check(media.audioPackets() == 1, "worker recovery reintroduced pre-reset audio backlog");
+    std::this_thread::sleep_for(10ms);
+    client.push(audio, true);
+    until([&] { return media.audioPackets() == 2; });
+    fog::Media::WorkerError event;
+    check(!media.takeWorkerError(event), "worker repeated corrupt packets became prematurely fatal");
+    media.stopWorkers();
+}
+static void audioRecoveryWorker(SDL_Renderer* renderer, const std::vector<Bytes>& units) {
+    Client client;
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    media.startWorkers(client, 30);
+    const auto audio = sound();
+    // Persistent output failure terminates audio only after its reset budget;
+    // independent video continues decoding while those attempts are underway.
+    failAudioQueue = 10;
+    fog::Media::WorkerError event;
+    for (unsigned i = 0; i < 4; ++i) {
+        client.push(units[i]);
+        client.push(audio, true);
+        if (i < 3) {
+            until([&] { return media.audioPackets() >= i + 1; });
+            until([&] { return media.videoFrames() >= i + 1; });
+            check(!media.takeWorkerError(event), "audio error became fatal before reset budget exhausted");
+            std::this_thread::sleep_for(270ms);
+        }
+    }
+    until([&] { return media.takeWorkerError(event); });
+    bool exhausted = false;
+    try { std::rethrow_exception(event.error); }
+    catch (const fog::AudioPlaybackError&) { exhausted = true; }
+    check(exhausted && event.hasPacket && event.packet.kind == stream::Kind::Audio && media.videoFrames() >= 3,
+        "persistent audio failure lost typed fatal event or blocked video");
+    media.stopWorkers(); failAudioQueue = 0;
 }
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
@@ -395,9 +537,10 @@ int main(int argc, char** argv) {
     auto* renderer = surface ? SDL_CreateSoftwareRenderer(surface) : nullptr;
     if (!renderer) return 4;
     int result = 0;
-    try { pacing(); audioPolicy(); audioCatchup(renderer); workers(renderer, load(argv[1])); }
+    try { pacing(); audioPolicy(); audioRecoveryPolicy(); audioRecoverySync(renderer); audioCatchup(renderer);
+        const auto units = load(argv[1]); workers(renderer, units); audioRecoveryWorkerBacklog(renderer); audioRecoveryWorker(renderer, units); }
     catch (const std::exception& error) { blockSend = false; gate.notify_all(); std::cerr << error.what() << '\n'; result = 1; }
     SDL_DestroyRenderer(renderer); SDL_FreeSurface(surface); SDL_Quit();
-    if (!result) std::cout << "Media workers PASS: real 720p30 H264/Opus, blocked-codec UI/audio independence, affinity, H264 negotiation fallback, reset/codec commands and generations, video recovery/audio fatal errors, dequeue timings, bounded RTP pacing, repeated joined shutdown\n";
+    if (!result) std::cout << "Media workers PASS: real 720p30 H264/Opus, blocked-codec UI/audio independence, affinity, H264 negotiation fallback, reset/codec commands and generations, isolated/persistent audio recovery, decoder/output fault injection, dequeue timings, bounded RTP pacing, repeated joined shutdown\n";
     return result;
 }

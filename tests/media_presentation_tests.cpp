@@ -301,9 +301,14 @@ static void audioCounts(SDL_Renderer* renderer) {
     try { media.audio(bytes, packet.size()); } catch (const std::runtime_error&) { rejected = true; }
     // audioPackets counts successful Opus decoding, including suppressed PCM;
     // queue submission is a later stage and must not be mistaken for delivery.
-    check(rejected && media.audioPackets() == 5 && audioBytes == 3840,
-        "failed queue lost decoded packet count or submitted extra audio");
-    std::cout << "PASS audio observations: no sleeps, 40 ms threshold, priming, episode/refill/reset accounting, queue cap, queue failure\n";
+    check(!rejected && media.audioPackets() == 5 && audioBytes == 0 &&
+        media.audioQueueResets() == 2 && audioClears == 2 &&
+        media.audioDiagnostics().find("audio_recovery_attempts=1") != std::string::npos,
+        "failed queue lost decoded count or did not clear/recover audio independently");
+    media.audio(bytes, packet.size());
+    check(media.audioPackets() == 6 && audioBytes == 3840 && media.audioQueueResets() == 2,
+        "recovered output did not accept the next packet");
+    std::cout << "PASS audio observations: no sleeps, 40 ms threshold, priming, episode/refill/reset accounting, queue cap, isolated queue failure recovery\n";
     std::cout << media.audioDiagnostics() << '\n';
     mockAudio = false;
 }

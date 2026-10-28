@@ -2,6 +2,7 @@
 #include "app_selection.hpp"
 #include "frame_diagnostics.hpp"
 #include "resume_retry.hpp"
+#include "transport_retry.hpp"
 #include "controller_input.hpp"
 #include "features/streaming/application/remote_input.hpp"
 #include "features/streaming/infrastructure/rumble_mailbox.hpp"
@@ -60,8 +61,10 @@ struct State {
     std::atomic<bool> valid{true}, paired{false}, pairDone{false}, pairOK{false};
     std::atomic<bool> stop{false}, running{false}, starting{false}, streamInUse{false};
     std::atomic<bool> terminated{false}, failed{false}, decoderWaiting{true}, assemblyWaiting{true};
+    std::atomic<bool> fatalFailure{false}, retryableFailure{false};
     std::atomic<bool> coreDiagnosticsReady{false};
     std::atomic<int> code{0};
+    std::atomic<int> terminationCode{0};
     std::atomic<int> application{0};
     std::atomic<std::uint64_t> transportClosedMs{0};
     std::atomic<stream::VideoCodec> selectedCodec{stream::VideoCodec::H264};
@@ -89,9 +92,12 @@ struct State {
     bool claimLease() { bool expected = false; ownsLease = protocolClaimed.compare_exchange_strong(expected, true); return ownsLease; }
     void releaseLease() { if (ownsLease) { ownsLease = false; protocolClaimed = false; } }
     void status(const char* value) { std::lock_guard<std::mutex> lock(mutex); message = value; }
-    void fail(const char* value, int failure = -1) {
+    void fail(const char* value, int failure = -1, bool retryable = false) {
         { std::lock_guard<std::mutex> lock(mutex); error = value; message = value;
-            code = failure; failed = true; rumble.clear(); }
+            if (!terminated) code = failure;
+            retryableFailure = retryable;
+            if (!retryable) fatalFailure = true;
+            failed = true; rumble.clear(); }
         changed.notify_all();
     }
 };
@@ -104,7 +110,9 @@ void stageFailed(int, int code) { if (auto* state = active.load()) state->code =
 void terminated(int code) {
     if (auto* state = active.load()) {
         std::lock_guard<std::mutex> lock(state->mutex);
-        state->code = code; state->terminated = true; state->rumble.clear();
+        state->code = code; state->terminationCode = code;
+        if (!detail::retryableTransportError(code)) state->fatalFailure = true;
+        state->terminated = true; state->rumble.clear();
     }
 }
 void rumble(unsigned short controller, unsigned short lowFrequency, unsigned short highFrequency) {
@@ -146,7 +154,7 @@ void audioSample(char* bytes, int size) {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (state->audio.size() >= 20) { ++state->audioDrops; state->audio.pop_front(); }
         state->audio.push_back(std::move(packet)); ++state->audioFrames;
-    } catch (...) { state->failed = true; state->terminated = true; state->code = -900; }
+    } catch (...) { state->fatalFailure = true; state->failed = true; state->terminated = true; state->code = -900; }
 }
 bool copyFrame(const DECODE_UNIT& unit, std::vector<std::byte>& target) {
     constexpr std::size_t limit = 8 * 1024 * 1024;
@@ -196,7 +204,7 @@ void drainVideo(State& state) {
                 } else ++state.videoInvalid;
             } else if (!unit) ++state.videoInvalid;
             else ++state.videoWaitDrops;
-        } catch (...) { state.failed = true; state.terminated = true; state.code = -901; }
+        } catch (...) { state.fatalFailure = true; state.failed = true; state.terminated = true; state.code = -901; }
         if (result != DR_OK) {
             std::lock_guard<std::mutex> lock(state.mutex);
             ++state.videoDrops;
@@ -230,14 +238,24 @@ bool launch(State& state, bool resumeOnly) {
         // Every resume attempt refreshes this exact pinned host, without pairing
         // or changing the retained rental/app identity. Old RTSP URLs are private.
         delete[] state.host.serverInfo.rtspSessionUrl; state.host.serverInfo.rtspSessionUrl = nullptr;
+        moonlight_diagnostics::beginCommand(moonlight_diagnostics::CommandOperation::None);
         int code = gs_init(&state.host, state.endpoint);
+        moonlight_diagnostics::finishCommand(code, Settings::instance().request_cancelled());
+        const auto hostRead = moonlight_diagnostics::commandSnapshot();
         if (code != GS_OK || !state.host.paired) {
-            state.fail("Moonlight authenticated host unavailable", code); return false;
+            state.fail("Moonlight authenticated host unavailable", code, resumeOnly && code != GS_OK &&
+                detail::retryableHostRead(hostRead.curl,hostRead.http,hostRead.cancelled)); return false;
         }
         APP_LIST* raw = nullptr;
+        moonlight_diagnostics::beginCommand(moonlight_diagnostics::CommandOperation::None);
         code = gs_applist(&state.host, &raw);
+        moonlight_diagnostics::finishCommand(code, Settings::instance().request_cancelled());
+        const auto appRead = moonlight_diagnostics::commandSnapshot();
         std::unique_ptr<APP_LIST, decltype(&freeApps)> apps(raw, freeApps);
-        if (code != GS_OK) { state.fail("Moonlight application list unavailable", code); return false; }
+        if (code != GS_OK) {
+            state.fail("Moonlight application list unavailable", code, resumeOnly &&
+                detail::retryableHostRead(appRead.curl,appRead.http,appRead.cancelled)); return false;
+        }
         std::vector<Application> applications;
         for (auto* app = raw; app; app = app->next) {
             if (app->id <= 0 || !app->name) continue;
@@ -281,7 +299,7 @@ bool launch(State& state, bool resumeOnly) {
         const auto delay = std::chrono::milliseconds(Retry::backoffMs(attempt));
         if (!retry || attempt == attempts || Clock::now() + delay >= deadline ||
             state.stop || !state.valid || Settings::instance().request_cancelled()) {
-            if (!state.stop) state.fail(resumeOnly ? "Moonlight application resume failed" : "Moonlight application start failed", code);
+            if (!state.stop) state.fail(resumeOnly ? "Moonlight application resume failed" : "Moonlight application start failed", code, retry);
             return false;
         }
         state.status("Moonlight resume retry pending");
@@ -304,6 +322,8 @@ public:
         resumeOnly_ = connection.resumeOnly;
         state_->rumble.clear();
         state_->stop = false; state_->failed = false; state_->terminated = false;
+        state_->fatalFailure = false; state_->retryableFailure = false;
+        state_->code = 0; state_->terminationCode = 0;
         state_->frames = 0; state_->audioFrames = 0; state_->videoDrops = 0; state_->audioDrops = 0;
         state_->inputAccepted = 0; state_->inputRejected = 0; state_->inputIgnored = 0;
         state_->accelRateHz = 0; state_->gyroRateHz = 0; lastMotionMs_ = {};
@@ -367,18 +387,30 @@ public:
         return state_->video.empty() ? 0 : nowMs() - state_->video.front().enqueueMs;
     }
     std::size_t queuedVideoPackets() const override { std::lock_guard<std::mutex> lock(state_->mutex); return state_->video.size(); }
-    bool ready() const override { return state_ && state_->running; }
+    bool ready() const override { return state_ && state_->running && !state_->stop && !state_->failed && !state_->terminated; }
     std::string status() const override { std::lock_guard<std::mutex> lock(state_->mutex); return state_->message; }
     std::string error() const override { std::lock_guard<std::mutex> lock(state_->mutex); return state_->error; }
-    bool retryableError() const override { return false; } // Rental inspection must precede another host attempt.
+    bool retryableError() const override {
+        return state_ && !state_->stop && retryIdentityValid() && retryableFailure();
+    }
     bool disconnected() const override { return state_->terminated; }
+    stream::RecoveryState recoveryState() const override {
+        // A host callback is authoritative even before the worker publishes its
+        // error text. Terminal closure must never enter transient ICE grace.
+        if (state_->failed || state_->terminated)
+            return retryableError() ? stream::RecoveryState::RetryableFailure : stream::RecoveryState::TerminalFailure;
+        return stream::RecoveryState::Connected;
+    }
     bool disconnectForRetry() override {
-        // Explicit quality changes may resume this authenticated, still-live host.
-        // The controller must first revalidate the retained rental and endpoint.
-        const bool healthy = state_ && state_->valid && state_->paired && state_->running &&
-            !state_->failed && !state_->terminated && !state_->stop;
+        // Joining consumes this transport's single retry permission. The app
+        // must inspect the exact retained rental/endpoint before starting again.
+        const bool eligible = worker_.joinable() && state_ && !state_->stop && retryIdentityValid() &&
+            ((!state_->failed && !state_->terminated && state_->running) || retryableFailure());
         close();
-        return healthy && !state_->failed && !state_->terminated;
+        // A terminal callback may arrive during LiStopConnection(). Re-read its
+        // evidence after every core callback thread has joined.
+        return eligible && retryIdentityValid() && !state_->fatalFailure &&
+            ((!state_->failed && !state_->terminated) || retryableFailure());
     }
     std::string diagnostics() const override {
         moonlight_diagnostics::CommandSnapshot command;
@@ -412,7 +444,10 @@ public:
             " requestedFps=" + std::to_string(fog::video::DefaultFramesPerSecond) +
             " requestedMbps=" + std::to_string(settings_.bitrateMbps) +
             " inputAccepted=" + std::to_string(state_->inputAccepted.load()) +
-            " inputRejected=" + std::to_string(state_->inputRejected.load());
+            " inputRejected=" + std::to_string(state_->inputRejected.load()) +
+            " terminationCode=" + std::to_string(state_->terminationCode.load()) +
+            " retryableFailure=" + std::to_string(state_->retryableFailure.load()) +
+            " fatalFailure=" + std::to_string(state_->fatalFailure.load());
     }
     std::string transportTimings() const override {
         const auto& t = state_->trace;
@@ -577,6 +612,14 @@ private:
     std::array<std::uint64_t, 2> lastMotionMs_{};
     bool resumeOnly_ = false;
     std::thread worker_;
+    bool retryIdentityValid() const {
+        return state_->valid && state_->paired && state_->application > 0;
+    }
+    bool retryableFailure() const {
+        if (state_->fatalFailure) return false;
+        return state_->terminated ? detail::retryableTransportError(state_->terminationCode) :
+            state_->failed && state_->retryableFailure;
+    }
     FogMoonlightDiagnostics coreSnapshot() const {
         FogMoonlightDiagnostics result{};
         if (state_->coreDiagnosticsReady) FogMoonlightGetDiagnostics(&result);
@@ -676,7 +719,10 @@ private:
                 int result = -1;
                 if (state_->starting) result = LiStartConnection(&state_->host.serverInfo, &state_->config, &listeners, &video, &audio, nullptr, 0, nullptr, 0);
                 { std::lock_guard<std::mutex> lock(state_->apiMutex); state_->starting = false; }
-                if (result != 0) { if (!state_->stop) state_->fail("Moonlight connection failed", result); }
+                if (result != 0) {
+                    if (!state_->stop) state_->fail("Moonlight connection failed", result,
+                        resumeOnly_ && result != -1 && detail::retryableTransportError(result));
+                }
                 else {
                     started = true; state_->coreDiagnosticsReady = true;
                     { std::lock_guard<std::mutex> lock(state_->apiMutex);
@@ -692,7 +738,8 @@ private:
                         state_->trace.drain.add(detail::steadyUs() - began);
                         std::this_thread::sleep_for(std::chrono::milliseconds(3));
                     }
-                    if (state_->terminated) state_->fail("Moonlight host disconnected", state_->code);
+                    if (state_->terminated) state_->fail("Moonlight host disconnected", state_->terminationCode,
+                        detail::retryableTransportError(state_->terminationCode));
                 }
             }
         } catch (...) { state_->fail("Moonlight worker failed"); }

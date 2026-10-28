@@ -84,6 +84,7 @@ struct Repo final : RentalRepository {
     bool badPreparation = false, reviewRequired = false;
     std::optional<PairedPreparationStage> preparationStage;
     RepositoryErrorKind preparationKind = RepositoryErrorKind::InvalidResponse;
+    RepositoryErrorKind inspectionKind = RepositoryErrorKind::NetworkFailure;
     std::optional<RentalId> requiredRating;
     PairedEndpoint preparedEndpoint{"host.invalid", 47984, 47989};
     int creates = 0, inspections = 0, finishes = 0, reconnects = 0;
@@ -114,7 +115,7 @@ struct Repo final : RentalRepository {
         ++inspections;
         require(rental == id("rental"), "only exact returned rental inspected");
         if (inspectAction) inspectAction();
-        if (inspectThrows) throw RepositoryError(RepositoryErrorKind::NetworkFailure, "private detail");
+        if (inspectThrows) throw RepositoryError(inspectionKind, "private detail");
         if (finishes && missingAfterFinish) return {};
         auto result = evidence;
         if (finishes && finishTerminal) result.state = RentalInspectionState::Terminal;
@@ -189,6 +190,93 @@ void sameRentalStreamRefresh() {
       require(f.guard->poll().state == PairedCheckoutState::Terminal && !f.guard->unresolved() &&
           f.repo.finishes == 0 && f.repo.creates == 1 && f.pair.begins == 1,
           "fresh terminal evidence prevents a stream refresh without another paid operation"); }
+}
+void sameRentalResumeInspection() {
+    for (const auto kind : {RepositoryErrorKind::NetworkFailure, RepositoryErrorKind::Unavailable}) {
+        Fixture f;
+        require(f.create().state == PairedCheckoutState::Ready, "resume fixture starts paired and ready");
+        const auto original = f.disk.saved.record;
+        const auto writes = f.disk.writes;
+        const auto inspections = f.repo.inspections;
+        f.repo.inspectThrows = true; f.repo.inspectionKind = kind;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            const auto result = f.guard->inspectForResume();
+            require(result.state == PairedCheckoutState::Preparing && !result.endpoint &&
+                !result.stopRequested && result.rental == original.rental && result.preparationError == kind,
+                "temporary read-only failure clears stale resume permission and exposes fixed retry category");
+            require(result.message.find("private") == std::string::npos &&
+                f.disk.writes == writes && !f.disk.saved.record.stopRequested &&
+                f.disk.saved.record.account == original.account && f.disk.saved.record.computer == original.computer &&
+                f.disk.saved.record.rental == original.rental && f.guard->unresolved(),
+                "temporary inspection failure preserves durable identity and stop intent without journal mutation");
+        }
+        f.repo.inspectThrows = false;
+        const auto result = f.guard->inspectForResume();
+        require(result.state == PairedCheckoutState::Ready && result.endpoint && !result.preparationError &&
+            result.endpoint->host == f.repo.preparedEndpoint.host && f.repo.inspections == inspections + 3,
+            "fresh exact evidence restores permission after transient failures and clears stale diagnostics");
+        require(f.repo.creates == 1 && f.repo.reconnects == 0 && f.repo.finishes == 0 && f.pair.begins == 1,
+            "resume inspections never create, pair, reconnect or close the existing rental");
+    }
+    { Fixture f; f.create(); f.repo.evidence.state = RentalInspectionState::Preparing;
+      const auto waiting = f.guard->inspectForResume();
+      require(waiting.state == PairedCheckoutState::Preparing && !waiting.endpoint && !waiting.preparationError &&
+          !f.disk.saved.record.stopRequested && f.repo.finishes == 0,
+          "exact preparing rental is withheld without premature stop or stale endpoint");
+      f.repo.evidence.state = RentalInspectionState::Ready;
+      require(f.guard->inspectForResume().state == PairedCheckoutState::Ready && f.pair.begins == 1,
+          "preparing rental can become ready without pairing again"); }
+    for (int bad = 0; bad < 5; ++bad) {
+        Fixture f; f.create();
+        if (bad == 0) f.repo.evidence.rental = id("other");
+        if (bad == 1) f.repo.evidence.account = id("other");
+        if (bad == 2) f.repo.evidence.computer = id("other");
+        if (bad == 3) f.repo.evidence.state = RentalInspectionState::Unknown;
+        if (bad == 4) f.repo.evidence.endpoint->host = "changed.invalid";
+        const auto result = f.guard->inspectForResume();
+        require(result.state != PairedCheckoutState::Ready && result.state != PairedCheckoutState::Preparing &&
+            !result.endpoint && f.repo.creates == 1 && f.repo.reconnects == 0 && f.pair.begins == 1,
+            "foreign, unknown or changed-host evidence never authorizes resume or a retryable wait");
+        require(bad == 4 || (f.repo.finishes == 0 && f.disk.saved.record.stopRequested),
+            "ownership mismatch cannot authorize closing a foreign rental and retains stop intent");
+    }
+    { Fixture f; f.create(); ++f.repo.identity.generation; f.repo.inspectThrows = true;
+      const auto result = f.guard->inspectForResume();
+      require(result.state == PairedCheckoutState::RecoveryRequired && !result.endpoint &&
+          f.disk.saved.record.stopRequested && f.repo.finishes == 0,
+          "changed authentication generation cannot enter transient resume retry"); }
+    { Fixture f; f.create(); f.repo.inspectThrows = true;
+      f.repo.inspectAction = [&] { ++f.repo.identity.generation; };
+      const auto result = f.guard->inspectForResume();
+      require(result.state == PairedCheckoutState::RecoveryRequired && !result.endpoint &&
+          f.disk.saved.record.stopRequested && f.repo.finishes == 0,
+          "account generation change during failed inspection takes precedence over transient error"); }
+    { Fixture f; f.create(); f.repo.inspectAction = [&] { f.guard->requestStop(); };
+      require(f.guard->inspectForResume().state == PairedCheckoutState::Terminal && f.repo.finishes == 1 &&
+          f.repo.creates == 1 && f.pair.begins == 1,
+          "cancellation during successful resume inspection stops the exact owned rental"); }
+    { Fixture f; f.create(); f.repo.inspectThrows = true;
+      f.repo.inspectAction = [&] { f.guard->requestStop(); };
+      const auto result = f.guard->inspectForResume();
+      require(result.state == PairedCheckoutState::RecoveryRequired && result.stopRequested &&
+          !result.endpoint && f.disk.saved.record.stopRequested && f.repo.finishes == 0,
+          "cancellation during network failure remains a durable stop rather than retry permission"); }
+    { Fixture f; f.create(); f.repo.evidence.state = RentalInspectionState::Terminal;
+      require(f.guard->inspectForResume().state == PairedCheckoutState::Terminal && !f.guard->unresolved() &&
+          f.repo.finishes == 0 && f.repo.creates == 1 && f.pair.begins == 1,
+          "fresh terminal evidence clears ownership without resuming or closing again"); }
+    { Fixture f; f.create(); f.reset(); f.repo.inspectThrows = true;
+      require(f.guard->inspectForResume().state == PairedCheckoutState::RecoveryRequired &&
+          !f.guard->result().endpoint && f.repo.finishes == 0 && f.pair.begins == 1,
+          "journal-only recovery has no paired host and cannot retry automatic resume"); }
+    { Fixture f; f.create(); f.repo.inspectThrows = true;
+      require(f.guard->poll().state == PairedCheckoutState::RecoveryRequired &&
+          f.disk.saved.record.stopRequested && !f.guard->result().endpoint,
+          "ordinary poll retains fail-paid semantics on read-only network failure"); }
+    { Fixture f; f.create(); f.repo.inspectThrows = true; f.repo.inspectionKind = RepositoryErrorKind::InvalidResponse;
+      require(f.guard->inspectForResume().state == PairedCheckoutState::RecoveryRequired &&
+          f.disk.saved.record.stopRequested && !f.guard->result().endpoint,
+          "invalid provider response is refused rather than treated as a temporary network outage"); }
 }
 void beforeSubmitFailures() {
     { Fixture f; f.repo.preparationStage=PairedPreparationStage::FreshPairingLink;
@@ -488,7 +576,7 @@ void recoveryAndReconnect() {
 }
 int main() {
     try {
-        successAndStop(); sameRentalStreamRefresh(); beforeSubmitFailures(); unknownAndPartialCreation();
+        successAndStop(); sameRentalStreamRefresh(); sameRentalResumeInspection(); beforeSubmitFailures(); unknownAndPartialCreation();
         ownershipAndPairingFailures(); exactTerminationOnly(); recoveryAndReconnect();
         std::cout << "Paired checkout: " << assertions << " assertions passed\n";
         return 0;

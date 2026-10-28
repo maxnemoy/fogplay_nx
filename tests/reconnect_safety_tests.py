@@ -6,6 +6,8 @@ playback = (root / 'src/features/streaming/presentation/playback_controller.cpp'
 app = (root / 'src/app/application.cpp').read_text()
 inputs = (root / 'src/features/streaming/presentation/stream_input_controller.cpp').read_text()
 rental = (root / 'src/features/session/presentation/rental_controller.cpp').read_text()
+recovery = (root / 'src/features/streaming/presentation/transport_recovery_controller.cpp').read_text()
+paired = (root / 'src/features/streaming/presentation/paired_transport_recovery_controller.cpp').read_text()
 
 
 def method(source, name):
@@ -20,11 +22,14 @@ def method(source, name):
 
 
 transport = method(playback, 'startTransport')
-retry = method(playback, 'retryTransport')
+retry = method(recovery, 'retryTransport')
+advance = method(recovery, 'advanceTransportRecovery')
+state = method(recovery, 'handleTransportState')
+complete = method(recovery, 'completeTransportRecovery')
 pump = method(playback, 'pumpStream')
 close = method(playback, 'closeTransport')
 final = method(playback, 'closeStream')
-for glue in (transport, retry, pump, close):
+for glue in (transport, recovery, paired, pump, close):
     for forbidden in ('guard_.adopt', 'checkout_.create', 'startStream(', 'disarmExitHandling(',
                       'transportReconnect_.reset()', 'sessionPending_ = false', 'recentLaunch_.close()'):
         assert forbidden not in glue, forbidden
@@ -36,17 +41,15 @@ assert 'else if (!stream_->disconnectForRetry()) {\n                retryAllowed
 assert 'catch (...) { retryAllowed = false; }' in close
 assert 'return final || retryAllowed;' in close
 assert close.index('if (!final && !retryAllowed) return false;') < close.index('stream_.reset();')
-for site in (retry, pump):
-    assert 'if (!closeTransport(false)) {' in site
-    assert 'beginFinish("transport-retry-terminal"); return;' in site
+assert 'if (!closeTransport(false)) {' in retry
+assert 'stopTransportRecovery("transport-retry-terminal"); return;' in retry
 assert 'streamRental_ = {};' in final and 'transportReconnect_.cancel();' in final
 assert 'stream_ || transportReconnect_.recovering()' in app
 assert 'stream_ || !streamRental_.empty() || transportReconnect_.recovering()' in app
-assert pump.index('handleStreamOverlay(') < pump.index('transportReconnect_.poll(')
-assert pump.index('stream_->pump();') < pump.index('transportReconnect_.poll(')
-assert pump.index('stream_->retryableError()') < pump.index('transportReconnect_.poll(')
+assert pump.index('handleStreamOverlay(') < pump.index('advanceTransportRecovery(')
+assert pump.index('stream_->pump();') < pump.index('handleTransportState(') < pump.index('advanceTransportRecovery(')
 assert 'stream_->ready() && !stream_->disconnected()' in pump
-assert 'if (stream_->retryableError()) retryTransport(' in pump
+assert 'switch (stream_->recoveryState())' in state
 assert 'transportReconnect_.recovering() || videoRecovery_.active()' in pump
 assert 'return !transportReconnect_.recovering() && stream_' in inputs
 finish = method(rental, 'beginFinish')
@@ -59,10 +62,23 @@ assert 'if (sessionPending_ && !stopAfterTask_ && !focused)' in app
 assert 'beginFinish("focus-lost")' in app and 'beginFinish("application-exit")' in app
 print('Same-rental reconnect application safety boundaries passed (static only)')
 
-# FH transport failures always dispatch the website close; no RTC retry/relay state is entered.
-retry = method(playback, 'retryTransport')
-assert retry.index('streamRental_.provider == fog::ProviderId::FogHub') < retry.index('relaySelection_.broken')
-assert 'beginFinish("paired-transport-failed"); return;' in retry
-pump = method(playback, 'pumpStream')
-assert pump.index('beginFinish("paired-transport-disconnected")') < pump.index('transportReconnect_.disconnected(')
-print('FogHub transport failure/disconnection close routing passed (static only)')
+# Both providers execute the same state, retry, backoff, start and cancellation code.
+for shared in (retry, advance, state, complete):
+    assert 'ProviderId::' not in shared
+assert 'transportReconnect_.poll(now)' in advance
+assert 'requestTransportRecovery()' in advance
+assert 'neutralizeStreamInput();' in retry
+stop = method(recovery, 'stopTransportRecovery')
+assert stop.index('stopAfterTask_ = true;') < stop.index('beginFinish(')
+assert 'transportReconnect_.cancel();' in stop
+request = method(paired, 'requestPairedTransportReconnect')
+preflight = method(paired, 'completePairedTransportReconnect')
+assert 'paired_->inspectForResume()' in request
+assert 'result.rental == streamRental_' in preflight
+assert 'completeTransportRecovery(preparation)' in preflight
+assert 'startTransport(' not in paired and 'transportReconnect_.poll(' not in paired
+assert 'startTransport(true)' in complete
+assert complete.index('transportReconnect_.poll(') < complete.index('startTransport(true)')
+assert pump.index('retryMouseReleases();') > pump.index('stream_->pump();')
+assert 'mouseButtons_.reset();' in close
+print('Shared MTS/FH recovery, provider preflight and mouse release hooks passed (static only)')

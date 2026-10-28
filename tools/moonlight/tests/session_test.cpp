@@ -8,6 +8,8 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cerrno>
+#include <climits>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -22,6 +24,8 @@ std::atomic<int> stops{0}, launches{0}, interrupts{0};
 std::atomic<ConnListenerConnectionTerminated> terminateConnection{nullptr};
 std::atomic<ConnListenerRumble> rumbleConnection{nullptr};
 std::atomic<int> connectionResult{0};
+std::atomic<int> stopTermination{INT_MIN};
+std::atomic<int> hostReadFault{0}, appReadFault{0}, readFaultCurl{-1}, readFaultHttp{0};
 std::atomic<bool> rumbleDuringStart{false}, rumbleDuringStop{false};
 std::atomic<std::uint16_t> controllerCapabilities{0};
 std::atomic<int> currentApp{0}, listedApp{42};
@@ -90,6 +94,10 @@ int gs_init(PSERVER_DATA server, const std::string address) {
     ++refreshes;
     if (enforceResumeBudget) assert(Settings::instance().remaining_timeout_ms(25000) <= 6000);
     initializedEndpoint = address;
+    if (hostReadFault.exchange(0)) {
+        moonlight_diagnostics::commandHttp(readFaultCurl,readFaultHttp,1,true,false);
+        return GS_IO_ERROR;
+    }
     server->paired = !Settings::instance().pinned_key().empty();
     server->currentGame = currentApp;
     server->httpsPort = 59999; // Actual discovery, independent of base port.
@@ -106,6 +114,10 @@ int gs_pair(PSERVER_DATA server, char* pin) {
     server->paired = true; return GS_OK;
 }
 int gs_applist(PSERVER_DATA, PAPP_LIST* list) {
+    if (appReadFault.exchange(0)) {
+        moonlight_diagnostics::commandHttp(readFaultCurl,readFaultHttp,1,true,false);
+        return GS_IO_ERROR;
+    }
     *list = static_cast<APP_LIST*>(std::calloc(1, sizeof(APP_LIST)));
     (*list)->name = ::strdup(ambiguousApps ? "First" : "Desktop"); (*list)->id = listedApp;
     if (ambiguousApps) {
@@ -174,6 +186,8 @@ int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION config, PCONNEC
 }
 void LiStopConnection() {
     if (rumbleDuringStop) rumbleConnection.load()(0, 65535, 65535);
+    const auto terminal = stopTermination.exchange(INT_MIN);
+    if (terminal != INT_MIN) terminateConnection.load()(terminal);
     ++stops;
 }
 void LiInterruptConnection() { ++interrupts; }
@@ -199,6 +213,9 @@ int LiSendMouseButtonEvent(char, int button) { mouseButton = button; return 0; }
 int LiSendKeyboardEvent(short key, char, char) { keyCode = key; return 0; }
 int LiSendHighResScrollEvent(short amount) { wheelAmount = amount; return 0; }
 int LiSendUtf8TextEvent(const char*, unsigned int) { return 0; }
+uint32_t LiGetHostFeatureFlags() { return 0; }
+int LiSendControllerTouchEvent(uint8_t, uint8_t, uint32_t, float, float, float) { return LI_ERR_UNSUPPORTED; }
+int LiSendControllerMotionEvent(uint8_t, uint8_t, float, float, float) { return LI_ERR_UNSUPPORTED; }
 
 void rumbleScenarios(const std::filesystem::path& path) {
     moonlight::MoonlightSession session(path.string());
@@ -293,7 +310,8 @@ void retryScenarios(const std::filesystem::path& path) {
     client->close();
     // Persistent explicit refusals stop after exactly three attempts.
     faultCount = 20; before = resumeOnlyCalls.load();
-    assert(client->start({rental(),true})); eventually([&] { return !client->error().empty(); }); client->close();
+    assert(client->start({rental(),true})); eventually([&] { return !client->error().empty(); });
+    assert(client->retryableError() && client->disconnectForRetry());
     assert(resumeOnlyCalls == before + 3);
     assert(client->diagnostics().find("attempt=3") != std::string::npos);
     // Authentication, TLS, malformed XML and a rejected game session are terminal.
@@ -338,6 +356,101 @@ void retryScenarios(const std::filesystem::path& path) {
     enforceResumeBudget = false;
 }
 
+void networkRecoveryScenarios(const std::filesystem::path& path) {
+    using Recovery = stream::RecoveryState;
+    moonlight::MoonlightSession session(path.string());
+    currentApp = 0; listedApp = 42; ambiguousApps = false; failPair = false;
+    expectedVideoFormats = VIDEO_FORMAT_H264 | VIDEO_FORMAT_H265;
+    negotiatedFormat = VIDEO_FORMAT_H264; audioBurst = 1;
+    pair(session);
+    auto client = session.create(); assert(client);
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    assert(client->recoveryState() == Recovery::Connected);
+    const auto pairCount = pairs.load(), launchCount = launchOnlyCalls.load();
+    currentApp = 42;
+    for (const int code : {-1, ML_ERROR_NO_VIDEO_TRAFFIC, ML_ERROR_NO_VIDEO_FRAME,
+            ECONNRESET, ETIMEDOUT, ENETUNREACH}) {
+        terminateConnection.load()(code);
+        // Callback evidence is sufficient, even before the worker publishes error text.
+        assert(!client->ready() && client->retryableError());
+        assert(client->recoveryState() == Recovery::RetryableFailure);
+        eventually([&] { return !client->error().empty(); });
+        assert(client->recoveryState() == Recovery::RetryableFailure);
+        assert(client->disconnectForRetry()); // Also works after the worker finishes.
+        assert(!client->disconnectForRetry() && !client->retryableError());
+        assert(client->recoveryState() == Recovery::TerminalFailure); // Retry permission was consumed.
+        assert(client->start({rental(),true})); eventually([&] { return client->ready(); });
+        assert(client->recoveryState() == Recovery::Connected);
+        assert(pairs == pairCount && launchOnlyCalls == launchCount);
+    }
+    for (const int code : {ML_ERROR_GRACEFUL_TERMINATION, ML_ERROR_UNEXPECTED_EARLY_TERMINATION,
+            ML_ERROR_PROTECTED_CONTENT, ML_ERROR_FRAME_CONVERSION, -55}) {
+        terminateConnection.load()(code);
+        assert(!client->ready() && !client->retryableError());
+        assert(client->recoveryState() == Recovery::TerminalFailure);
+        assert(!client->disconnectForRetry());
+        assert(client->recoveryState() == Recovery::TerminalFailure);
+        assert(client->start({rental(),true})); eventually([&] { return client->ready(); });
+    }
+    // A later network notification cannot erase a prior terminal host refusal.
+    terminateConnection.load()(-55); terminateConnection.load()(-1);
+    assert(client->recoveryState() == Recovery::TerminalFailure);
+    assert(!client->retryableError() && !client->disconnectForRetry());
+    assert(client->start({rental(),true})); eventually([&] { return client->ready(); });
+    // Graceful termination arriving during join invalidates earlier retry permission.
+    stopTermination = ML_ERROR_GRACEFUL_TERMINATION; terminateConnection.load()(-1);
+    assert(!client->disconnectForRetry());
+    assert(client->diagnostics().find("terminationCode=0") != std::string::npos);
+    assert(client->recoveryState() == Recovery::TerminalFailure);
+    assert(client->start({rental(),true})); eventually([&] { return client->ready(); });
+    stopTermination = -55;
+    assert(!client->disconnectForRetry()); // Also invalidates a healthy quality change.
+    assert(client->diagnostics().find("terminationCode=-55") != std::string::npos);
+
+    // An acknowledged /resume followed by a known socket startup error is safe
+    // to inspect and resume again. Generic/unclassified setup failures are fatal.
+    for (const int code : {ETIMEDOUT, -1, -55}) {
+        connectionResult = code;
+        assert(client->start({rental(),true})); eventually([&] { return !client->error().empty(); });
+        assert(client->retryableError() == (code == ETIMEDOUT));
+        assert(client->recoveryState() == (code == ETIMEDOUT ? Recovery::RetryableFailure : Recovery::TerminalFailure));
+        assert(client->disconnectForRetry() == (code == ETIMEDOUT));
+    }
+    connectionResult = 0;
+    // Metadata is read-only, but a generic GS_IO_ERROR alone is not evidence of
+    // a network failure: TLS/auth/unknown failures must not receive retry permission.
+    for (const bool appList : {false,true}) {
+        for (const int curl : {7,28,56,60,-1,22}) {
+            readFaultCurl = curl; readFaultHttp = curl == 22 ? 503 : 0;
+            if (appList) appReadFault = 1; else hostReadFault = 1;
+            const auto before = resumeOnlyCalls.load();
+            assert(client->start({rental(),true})); eventually([&] { return !client->error().empty(); });
+            const bool network = curl == 7 || curl == 28 || curl == 56 || curl == 22;
+            assert(client->retryableError() == network);
+            assert(client->recoveryState() == (network ? Recovery::RetryableFailure : Recovery::TerminalFailure));
+            assert(client->disconnectForRetry() == network);
+            assert(resumeOnlyCalls == before);
+        }
+    }
+    // Metadata failures on initial launch and uncertain dispatched resume
+    // timeouts never authorize retry, even with an app retained from earlier.
+    hostReadFault = 1; readFaultCurl = 7; readFaultHttp = 0;
+    assert(client->start({rental()})); eventually([&] { return !client->error().empty(); });
+    assert(!client->retryableError() && !client->disconnectForRetry());
+    faultCount = 1; faultCurl = 28; faultHttp = 0; faultDispatched = true;
+    assert(client->start({rental(),true})); eventually([&] { return !client->error().empty(); });
+    assert(!client->retryableError() && !client->disconnectForRetry());
+    faultCount = 0; faultCurl = 22; faultHttp = 503;
+    assert(client->start({rental(),true})); eventually([&] { return client->ready(); });
+    terminateConnection.load()(-1); assert(client->disconnectForRetry());
+    currentApp = 43; listedApp = 43;
+    const auto before = resumeOnlyCalls.load();
+    assert(client->start({rental(),true})); eventually([&] { return !client->error().empty(); });
+    assert(!client->retryableError() && !client->disconnectForRetry());
+    assert(resumeOnlyCalls == before && pairs == pairCount && launchOnlyCalls == launchCount);
+    currentApp = 0; listedApp = 42;
+}
+
 int main() {
     const auto path = std::filesystem::temp_directory_path() / ("fogplay-moonlight-session-test-" + std::to_string(::getpid()));
     {
@@ -351,8 +464,9 @@ int main() {
         assert(initializedEndpoint == "[2001:db8::42]:54321");
         const auto firstIdentity = Settings::instance().key_dir();
         auto client = session.create(); assert(client);
-        assert(!client->configureRelay(true)); assert(!client->configurePlayStation(true));
-        assert(client->configureRelay(false) && client->configurePlayStation(false));
+        assert(!client->configureRelay(true));
+        assert(client->configureController(stream::ControllerProfile::DualSense));
+        assert(client->configureRelay(false) && client->configureController(stream::ControllerProfile::Xbox));
         fog::video::Settings video; assert(client->configureVideo(video));
         assert(client->selectedVideoCodec() == stream::VideoCodec::H264);
         assert(!client->start({{fog::ProviderId::FogHub, "other-rental"}}));
@@ -447,6 +561,7 @@ int main() {
         assert(failure.find("2001:db8") == std::string::npos && failure.find("1234") == std::string::npos);
     }
     retryScenarios(path / "resume-tests");
+    networkRecoveryScenarios(path / "network-recovery-tests");
     rumbleScenarios(path / "rumble-tests");
     std::filesystem::remove_all(path);
     std::cout << "Moonlight production lifecycle/input tests passed\n";

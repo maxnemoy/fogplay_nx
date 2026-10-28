@@ -13,7 +13,7 @@ done
 python3 tools/check-architecture.py
 bash tools/test/rumble.sh
 bash tools/test/rumble-settings.sh
-for suite in build-tools host repositories foghub-transport foghub-cookie-storage foghub-html foghub-rental-html foghub-repositories foghub-rentals foghub-review session-rating-ui paired_checkout paired-video-settings-controller paired-checkout-storage catalog-domain stream-input ps-sensors ps-native-input playstation-catalog artwork steam-artwork recent-games control-sender ice-snapshot stream timed-mutex loop-timing playback-drain media h264-rtp rtp-repair rtp-media hevc media-presentation decoder-diagnostics previews; do
+for suite in build-tools host repositories foghub-transport foghub-cookie-storage foghub-html foghub-rental-html foghub-repositories foghub-rentals foghub-review session-rating-ui paired_checkout paired-video-settings-controller paired-checkout-storage catalog-domain stream-input ps-sensors ps-native-input playstation-catalog artwork steam-artwork recent-games control-sender ice-snapshot stream timed-mutex loop-timing playback-drain media media-workers h264-rtp rtp-repair rtp-media hevc media-presentation decoder-diagnostics previews; do
     printf '\nRunning %s tests\n' "$suite"
     bash "tools/test/$suite.sh"
 done

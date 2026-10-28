@@ -3,6 +3,7 @@
 #include "features/streaming/domain/media_annexb.hpp"
 #include "features/streaming/domain/audio_queue_metrics.hpp"
 #include "features/streaming/domain/audio_latency_policy.hpp"
+#include "features/streaming/domain/audio_recovery.hpp"
 #include "features/streaming/infrastructure/media_decoder_diagnostics.hpp"
 #include "features/streaming/infrastructure/media_frame_queue.hpp"
 #include "features/streaming/infrastructure/video_image_diagnostics.hpp"
@@ -95,6 +96,11 @@ struct Media::Impl {
     std::uint64_t audioDiscardedPackets = 0, audioDiscardedFrames = 0;
     std::uint64_t audioStalePackets = 0, audioOverflowPackets = 0, audioCatchups = 0;
     bool audioCatchingUp = false;
+    AudioRecovery audioRecovery;
+    bool audioResetNeeded = false, audioOutputResetNeeded = false;
+    std::uint64_t audioBadPackets = 0, audioDecoderErrors = 0, audioOutputErrors = 0;
+    std::uint64_t audioRecoveryAttempts = 0, audioRecoveryFailures = 0, audioRecoveryDiscardedPackets = 0;
+    std::uint64_t audioResetAtMs = 0;
     std::atomic<bool> hw{false};
     bool ownsCallback = false;
     std::atomic<bool> waiting{false};
@@ -179,6 +185,7 @@ struct Media::Impl {
     }
     void decodeVideo(const std::byte* data, std::size_t size);
     void decodeAudio(const std::byte* data, std::size_t size, std::uint64_t enqueueMs = 0);
+    bool recoverAudio(DecoderClock::time_point now);
     void resetVideo();
     void changeCodec(::stream::VideoCodec codec);
     void runVideo(::stream::StreamingClient& client) noexcept;
@@ -268,20 +275,22 @@ struct Media::Impl {
         return text.data();
     }
     std::uint32_t observeAudioQueue() {
-        const auto bytes = SDL_GetQueuedAudioSize(audioDevice);
+        const auto bytes = audioDevice ? SDL_GetQueuedAudioSize(audioDevice) : 0;
         audioMetrics.observe(bytes, DecoderClock::now());
         return bytes;
     }
     std::string audioDiagnostics() {
         const auto bytes = observeAudioQueue();
-        std::array<char, 1280> text{};
+        std::array<char, 1792> text{};
         std::snprintf(text.data(), text.size(),
             "audio_packets=%llu audio_queued_ms=%llu audio_max_queued_ms=%llu "
             "audio_empty_observations=%llu audio_prolonged_empty_observations=%llu audio_empty_threshold_ms=40 "
             "audio_queue_resets=%llu audio_reset_discarded_ms=%llu "
             "audio_worker_queue_samples=%llu audio_worker_queue_wait_avg_us=%llu audio_worker_queue_wait_max_us=%llu "
             "audio_pcm_discarded_packets=%llu audio_pcm_discarded_ms=%llu audio_stale_packets=%llu "
-            "audio_overflow_packets=%llu audio_catchups=%llu audio_worker_refill_ms=40 audio_worker_max_ms=80 audio_worker_stale_ms=60",
+            "audio_overflow_packets=%llu audio_catchups=%llu audio_worker_refill_ms=40 audio_worker_max_ms=80 audio_worker_stale_ms=60 "
+            "audio_bad_packets=%llu audio_decoder_errors=%llu audio_output_errors=%llu audio_recovery_attempts=%llu "
+            "audio_recovery_failures=%llu audio_recovery_discarded_packets=%llu audio_recovery_pending=%d audio_recovery_limit=3/60s audio_recovery_deadline_ms=10000",
             static_cast<unsigned long long>(packets),
             static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(bytes)),
             static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.maximumBytes)),
@@ -296,7 +305,13 @@ struct Media::Impl {
             static_cast<unsigned long long>(audioDiscardedFrames * 1000 / detail::AudioLatencyPolicy::sampleRate),
             static_cast<unsigned long long>(audioStalePackets),
             static_cast<unsigned long long>(audioOverflowPackets),
-            static_cast<unsigned long long>(audioCatchups));
+            static_cast<unsigned long long>(audioCatchups),
+            static_cast<unsigned long long>(audioBadPackets),
+            static_cast<unsigned long long>(audioDecoderErrors),
+            static_cast<unsigned long long>(audioOutputErrors),
+            static_cast<unsigned long long>(audioRecoveryAttempts),
+            static_cast<unsigned long long>(audioRecoveryFailures),
+            static_cast<unsigned long long>(audioRecoveryDiscardedPackets), audioResetNeeded ? 1 : 0);
         return text.data();
     }
     int sendPacket() {
@@ -350,6 +365,9 @@ struct Media::Impl {
         int error = 0;
         opus = opus_decoder_create(48000, 2, &error);
         if (!opus || error != OPUS_OK) throw std::runtime_error(fog::constants::error::Stream::CannotInitializeOpusDecoder);
+        openAudioOutput();
+    }
+    void openAudioOutput() {
         SDL_AudioSpec wanted{}, obtained{};
         wanted.freq = 48000; wanted.format = AUDIO_S16SYS; wanted.channels = 2; wanted.samples = 960;
         audioDevice = SDL_OpenAudioDevice(nullptr, 0, &wanted, &obtained, 0);
@@ -571,6 +589,8 @@ void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
         bool hasPacket = false;
         try {
             if (paused) { idle(); continue; }
+            if (audioRecovery.expired(DecoderClock::now()))
+                throw AudioPlaybackError("Audio recovery deadline exhausted; stopping rental");
             observeAudioQueue();
             const auto now = DecoderClock::now();
             if (now >= nextSnapshot) {
@@ -702,12 +722,65 @@ void Media::resetVideoDecoder() {
 bool Media::waitingForVideoKeyframe() const {
     return impl_->waiting || (impl_->workers && (impl_->resetRequested || impl_->resetInProgress));
 }
+bool Media::Impl::recoverAudio(DecoderClock::time_point now) {
+    if (audioRecovery.expired(now))
+        throw AudioPlaybackError("Audio recovery deadline exhausted; stopping rental");
+    if (!audioResetNeeded) return true;
+    const auto decision = audioRecovery.attempt(now);
+    if (decision == AudioRecovery::Attempt::Stop)
+        throw AudioPlaybackError("Audio recovery reset budget exhausted; stopping rental");
+    if (decision == AudioRecovery::Attempt::Wait) return false;
+    ++audioRecoveryAttempts;
+    // Clear queued PCM before reopening output or changing predictive state.
+    const auto queued = observeAudioQueue();
+    if (audioDevice) SDL_ClearQueuedAudio(audioDevice);
+    audioMetrics.cleared(queued);
+    audioCatchingUp = false;
+    audioResetAtMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+    int error = 0;
+    auto* replacement = opus_decoder_create(48000, 2, &error);
+    if (!replacement || error != OPUS_OK) {
+        if (replacement) opus_decoder_destroy(replacement);
+        ++audioRecoveryFailures;
+        return false;
+    }
+    if (opus) opus_decoder_destroy(opus);
+    opus = replacement;
+    if (audioOutputResetNeeded) {
+        if (audioDevice) SDL_CloseAudioDevice(audioDevice);
+        audioDevice = 0;
+        try { openAudioOutput(); }
+        catch (...) { ++audioRecoveryFailures; return false; }
+    }
+    audioResetNeeded = audioOutputResetNeeded = false;
+    audioRecovery.resetCompleted();
+    return true;
+}
 void Media::Impl::decodeAudio(const std::byte* data, std::size_t size, std::uint64_t enqueueMs) {
-    if (!size || size > 65536) throw std::runtime_error(fog::constants::error::Stream::InvalidOpusPacket);
+    const auto now = DecoderClock::now();
+    if (!recoverAudio(now)) { ++audioRecoveryDiscardedPackets; return; }
+    // After a reset discard compressed packets captured before it. A worker
+    // drains these without reintroducing the failed episode's audio backlog.
+    if (enqueueMs && enqueueMs <= audioResetAtMs) { ++audioRecoveryDiscardedPackets; return; }
+    if (!data || !size || size > 65536) {
+        ++audioBadPackets;
+        if (audioRecovery.badPacket(now)) { audioResetNeeded = true; recoverAudio(now); }
+        return;
+    }
     std::array<opus_int16, 5760*2> pcm{};
     const int count = opus_decode(opus, reinterpret_cast<const unsigned char*>(data),
         static_cast<opus_int32>(size), pcm.data(), 5760, 0);
-    if (count < 0) throw std::runtime_error(fog::constants::error::Stream::OpusDecodingFailed);
+    if (count < 0) {
+        if (count == OPUS_INVALID_PACKET) {
+            ++audioBadPackets;
+            if (audioRecovery.badPacket(now)) audioResetNeeded = true;
+        } else {
+            ++audioDecoderErrors;
+            audioRecovery.failed(now); audioResetNeeded = true;
+        }
+        if (audioResetNeeded) recoverAudio(now);
+        return;
+    }
     // Drop stale queued audio after a scheduling stall instead of increasing latency.
     const auto queued = observeAudioQueue();
     if (!workers && queued > detail::AudioQueueMetrics::bytesPerSecond / 5) {
@@ -733,14 +806,24 @@ void Media::Impl::decodeAudio(const std::byte* data, std::size_t size, std::uint
     ++packets;
     if (!selected.frames) return;
     if (SDL_QueueAudio(audioDevice, pcm.data() + selected.skip * 2,
-        static_cast<Uint32>(selected.frames * 2 * sizeof(opus_int16))) != 0)
-        throw std::runtime_error(fog::constants::error::Stream::CannotQueueAudio);
+        static_cast<Uint32>(selected.frames * 2 * sizeof(opus_int16))) != 0) {
+        ++audioOutputErrors;
+        audioRecovery.failed(now); audioResetNeeded = audioOutputResetNeeded = true;
+        recoverAudio(now);
+        return;
+    }
     audioMetrics.queued(SDL_GetQueuedAudioSize(audioDevice), DecoderClock::now());
+    audioRecovery.queued();
 }
-void Media::audio(const std::byte* data, std::size_t size) {
+void Media::audio(const std::byte* data, std::size_t size, std::uint64_t enqueueMs) {
     impl_->requireApplicationThread();
     if (impl_->workers) throw std::logic_error("Media audio is owned by worker");
-    impl_->decodeAudio(data, size);
+    impl_->decodeAudio(data, size, enqueueMs);
+}
+void Media::checkAudioRecovery() const {
+    impl_->requireApplicationThread();
+    if (!impl_->workers && impl_->audioRecovery.expired(DecoderClock::now()))
+        throw AudioPlaybackError("Audio recovery deadline exhausted; stopping rental");
 }
 bool Media::preparePresentation() {
     auto& m = *impl_;

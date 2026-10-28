@@ -39,6 +39,10 @@ void ApplicationController::changeVideoSettings(const fog::video::Settings& valu
 }
 
 bool ApplicationController::requestPairedVideoReconnect() {
+    if (transportReconnect_.recovering() || pairedTransportReconnectPending_) {
+        videoSaveStatus_ += uiText::Settings::FogHubConnectingSavedNotice;
+        return false;
+    }
     // Additional edits while ownership verification runs share its one result;
     // the new transport picks up the latest saved codec/bitrate preferences.
     if (pairedVideoReconnectPending_) return true;

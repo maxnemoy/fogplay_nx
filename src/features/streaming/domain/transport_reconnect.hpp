@@ -3,7 +3,8 @@
 #include <chrono>
 
 namespace fog::stream {
-// Count actual replacement starts in a rolling two-minute window. Successful
+// Count recovery attempts in a rolling two-minute window: transport replacement
+// for MTS, or ownership inspection followed by resume for FH. Successful
 // playback ends recovery, but does not clear recent attempts. All deadlines use
 // the caller's monotonic clock.
 class TransportReconnect {
@@ -11,6 +12,7 @@ public:
     using Clock = std::chrono::steady_clock;
     using Time = Clock::time_point;
     enum class Action { Continue, CloseTransport, StartTransport, Stop };
+    enum class Preparation { Ready, Retry, Refused };
     static constexpr unsigned MaxAttempts = 3;
 
     void reset() { phase_ = Phase::Idle; attempts_ = 0; }

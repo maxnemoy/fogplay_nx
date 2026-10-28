@@ -55,6 +55,9 @@ public:
     PairedCheckoutResult create(const StartRentalRequest&);
     // Exactly one fresh inspection; a pending host is never paired/charged again.
     PairedCheckoutResult poll();
+    // Same verification for an already paired stream. A temporary read-only
+    // network failure returns Preparing so the caller can retry within its budget.
+    PairedCheckoutResult inspectForResume();
     // Explicit recovery/reconnect. Only a provider's distinct verified reconnect API is used.
     PairedCheckoutResult reconnect();
     PairedCheckoutResult stop();
@@ -65,6 +68,7 @@ public:
     // Safe from the UI thread. Bounded pairing/network calls observe this before the next step.
     void requestStop() noexcept { stopSignal_.store(true); }
 private:
+    PairedCheckoutResult pollImpl(bool retryTransient);
     void resetPreparationDiagnostics();
     bool sameAccount() const;
     bool validRecord() const;

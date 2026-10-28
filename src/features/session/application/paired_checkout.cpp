@@ -292,6 +292,12 @@ PairedCheckoutResult PairedCheckoutGuard::create(const StartRentalRequest& reque
     }
 }
 PairedCheckoutResult PairedCheckoutGuard::poll() {
+    return pollImpl(false);
+}
+PairedCheckoutResult PairedCheckoutGuard::inspectForResume() {
+    return pollImpl(true);
+}
+PairedCheckoutResult PairedCheckoutGuard::pollImpl(bool retryTransient) {
     resetPreparationDiagnostics();
     if (invalid_) return recovery("Rental journal is invalid");
     if (!pending_) return result_;
@@ -299,7 +305,28 @@ PairedCheckoutResult PairedCheckoutGuard::poll() {
     if (record_.rental.empty()) return recovery("Creation outcome unknown; do not retry creation");
     try {
         RentalInspection evidence;
-        if (!inspect(evidence)) return failPaid("Exact rental ownership could not be verified");
+        bool verified = false;
+        try {
+            verified = inspect(evidence);
+        } catch (const RepositoryError& error) {
+            // This exception boundary covers only the read-only inspection.
+            // Never turn a failed journal write or an uncertain mutation into
+            // permission to resume another stream.
+            if (!retryTransient || (error.kind() != RepositoryErrorKind::NetworkFailure &&
+                error.kind() != RepositoryErrorKind::Unavailable)) throw;
+            if (record_.stopRequested || stopSignal_.load()) return stopKnown();
+            if (!sameAccount()) return failPaid("Account changed during resume inspection");
+            if (!paired_ || !pairedEndpoint_)
+                return recovery("Explicit same-rental reconnect is required");
+            result_.state = PairedCheckoutState::Preparing;
+            result_.rental = record_.rental;
+            result_.stopRequested = false;
+            result_.endpoint.reset();
+            result_.preparationError = error.kind();
+            result_.message = "Waiting to verify the exact rental after a temporary network failure";
+            return result_;
+        }
+        if (!verified) return failPaid("Exact rental ownership could not be verified");
         if (evidence.state == RentalInspectionState::Terminal) return terminal();
         if (stopSignal_.load()) return stopKnown();
         if (!paired_) return recovery("Explicit same-rental reconnect is required");

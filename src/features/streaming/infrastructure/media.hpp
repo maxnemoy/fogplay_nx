@@ -21,6 +21,11 @@ private:
     int code_;
     bool recoverable_;
 };
+// Audio recovery exhausted its bounded budget. No packet/device text is logged.
+class AudioPlaybackError : public std::runtime_error {
+public:
+    explicit AudioPlaybackError(const char* message) : std::runtime_error(message) {}
+};
 // Texture and presentation methods belong to the constructing application thread.
 // Optional workers consume the transport's synchronized compressed queues.
 class Media {
@@ -43,7 +48,8 @@ public:
     Media& operator=(const Media&) = delete;
     // Client must outlive workers. Stop/join BEFORE closing/retrying transport.
     // Video errors pause decode until the application applies its recovery policy
-    // and resetVideoDecoder(); audio errors pause audio until teardown.
+    // and resetVideoDecoder(). Audio recovers independently; only an exhausted
+    // recovery budget or an unexpected failure pauses audio and reports an error.
     void startWorkers(::stream::StreamingClient& client, int fps);
     void stopWorkers() noexcept;
     bool workersRunning() const;
@@ -55,7 +61,12 @@ public:
     // Following packets are ignored until an IDR with matching VPS (HEVC), SPS and PPS arrives.
     void resetVideoDecoder();
     bool waitingForVideoKeyframe() const;
-    void audio(const std::byte* data, std::size_t size);
+    // Transport enqueue time permits stale compressed backlog to be discarded
+    // after audio recovery. Zero retains compatibility with direct callers.
+    void audio(const std::byte* data, std::size_t size, std::uint64_t enqueueMs = 0);
+    // Application loop: enforce the synchronous recovery deadline even when
+    // no new audio arrives. Workers enforce it on their own audio thread.
+    void checkAudioRecovery() const;
     // Synchronous: transfer/convert/upload latest batch output. With workers:
     // take a due converted frame and upload only. Codec transfer failures arrive
     // through takeWorkerError(). Always application thread; false if none due.

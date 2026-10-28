@@ -38,6 +38,7 @@ struct StreamConnection {
     // Only resume the already running app on the authenticated rental host.
     bool resumeOnly = false;
 };
+enum class RecoveryState { Connected, Disconnected, RetryableFailure, TerminalFailure };
 class StreamingClient {
 public:
     virtual ~StreamingClient() = default;
@@ -64,6 +65,12 @@ public:
     virtual std::string error() const = 0;
     virtual bool retryableError() const = 0; // Fixed transport failures/timeouts only; persists after teardown.
     virtual bool disconnected() const = 0; // Live peer or ICE Disconnected; application applies its grace period.
+    // A transient disconnection can recover on the current transport during
+    // grace. Failed/terminated adapters override when callbacks precede error text.
+    virtual RecoveryState recoveryState() const {
+        if (!error().empty()) return retryableError() ? RecoveryState::RetryableFailure : RecoveryState::TerminalFailure;
+        return disconnected() ? RecoveryState::Disconnected : RecoveryState::Connected;
+    }
     virtual bool disconnectForRetry() = 0; // False if pending terminal evidence forbids retry; otherwise release transports.
     // Fixed operation names and counters only; no remote fields or identifiers.
     virtual std::string diagnostics() const = 0;

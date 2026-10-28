@@ -135,6 +135,7 @@ void ApplicationController::handlePairedCheckout() {
         const auto details = pairing->diagnostics();
         if (!details.empty()) diagnostic("Paired client: " + safeText(details));
     }
+    if (completePairedTransportReconnect()) return;
     if (completePairedVideoReconnect()) return;
     checkoutAutoPoll_ = false;
     checkoutStatus_ = "FogHub: " + result.message;

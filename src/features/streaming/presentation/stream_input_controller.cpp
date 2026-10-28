@@ -82,13 +82,20 @@ bool ApplicationController::sendRemote(const fog::remote::Input& command) {
 }
 
 void ApplicationController::releaseMouse() noexcept {
-    try {
-        if (stream_) {
-            if (mouseLeft_) stream_->sendInput(fog::remote::mouseButton(false,0));
-            if (mouseRight_) stream_->sendInput(fog::remote::mouseButton(false,2));
-        }
-    } catch (...) { /* Best effort before the transport itself is closed. */ }
-    mouseLeft_ = mouseRight_ = touchDrag_ = false;
+    mouseButtons_.releaseAll();
+    retryMouseReleases();
+    touchDrag_ = false;
+}
+
+void ApplicationController::retryMouseReleases() noexcept {
+    mouseButtons_.retryReleases([this](bool down, int button) {
+        try {
+            // Releases must also work while input is suspended or a retry is
+            // being scheduled. A failed enqueue remains pending on this stream.
+            return stream_ && stream_->ready() &&
+                stream_->sendInput(fog::remote::mouseButton(down,button));
+        } catch (...) { return false; }
+    });
 }
 
 void ApplicationController::neutralizeStreamInput() {
@@ -245,14 +252,15 @@ void ApplicationController::updateMouse(PadState& pad,u64 held,u64 down,const Hi
     pointerY_ = std::clamp(pointerY_,static_cast<float>(rect.y),static_cast<float>(rect.y+rect.h-1));
     const bool left = (held & (HidNpadButton_A|HidNpadButton_ZR)) || touchDrag_;
     const bool right = (held & HidNpadButton_X) != 0;
-    const bool buttonsChanged = left != mouseLeft_ || right != mouseRight_;
+    const bool buttonsChanged = mouseButtons_.differs(left,right);
     if (buttonsChanged || now-lastPointerSent_ >= std::chrono::milliseconds(30)) {
         sendRemote(fog::remote::absoluteMouse(static_cast<int>(pointerX_)-rect.x,static_cast<int>(pointerY_)-rect.y,
             rect.w,rect.h,media_->videoWidth(),media_->videoHeight()));
         lastPointerSent_ = now;
     }
-    if (left != mouseLeft_) { sendRemote(fog::remote::mouseButton(left,0)); mouseLeft_ = left; }
-    if (right != mouseRight_) { sendRemote(fog::remote::mouseButton(right,2)); mouseRight_ = right; }
+    mouseButtons_.update(left,right,[this](bool pressed, int button) {
+        return sendRemote(fog::remote::mouseButton(pressed,button));
+    });
     if (down & HidNpadButton_L) sendRemote(fog::remote::wheel(-32));
     if (down & HidNpadButton_R) sendRemote(fog::remote::wheel(32));
 }
