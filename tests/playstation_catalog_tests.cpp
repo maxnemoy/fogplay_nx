@@ -31,6 +31,9 @@ void tests() {
         fog::isPlayStationComputerId(11575) && fog::isPlayStationComputerId(13025) &&
         fog::isPlayStationComputerId(7705) && fog::isPlayStationComputerId(5632) && fog::isPlayStationComputerId(5510), "exact whitelist IDs");
     require(!fog::isPlayStationComputerId(11574) && !fog::isPlayStationComputerId(0), "reject unknown IDs");
+    require(fog::isPlayStationComputerId(fog::EntityId{fog::ProviderId::Mts,"11573"}), "recognize MTS PS5 computer");
+    require(!fog::isPlayStationComputerId(fog::EntityId{fog::ProviderId::FogHub,"11573"}), "same FogHub ID must not enable automatic PlayStation profile");
+    require(!fog::isPlayStationComputerId(fog::EntityId{}), "missing computer ID does not force PlayStation profile");
     const auto parsed = fog::parsePlayStationComputers("<!-- <div class='computer-11573'> -->" + card());
     require(parsed.size() == 3, "all three computers retained");
     require(parsed[0].id.value == "11573" && parsed[1].id.value == "12921" && parsed[2].id.value == "11575", "stable mapping");

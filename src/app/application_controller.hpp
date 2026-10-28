@@ -151,7 +151,8 @@ private:
     void loadSessions();
     void recoverSession();
     void connectSession();
-    void startStream(const fog::RentalId& rental, bool createdFromCatalog = true);
+    void startStream(const fog::RentalId& rental, bool createdFromCatalog = true,
+                     const fog::EntityId& computer = {});
     void rememberDecodedGame() noexcept;
     void beginFinish(const char* reason = "rental-guard");
     void recoverVideoError(const fog::VideoDecodeError& error, const stream::Packet* packet);
@@ -249,6 +250,7 @@ private:
     fog::AutomaticComputers autoComputers_;
     bool detailsFromAutomatic_ = false;
     bool selectedPlayStation_ = false, streamPlayStation_ = false;
+    fog::EntityId selectedComputerId_;
     platform::PsSensors psSensors_;
     platform::Rumble rumble_;
     std::uint64_t rumbleLogAtMs_ = 0;

@@ -203,8 +203,10 @@ void ApplicationController::retryTransport(const char* reason) {
         " attemptsIn120s=" + std::to_string(transportReconnect_.attempts()) + " limit=3 rollingWindow=120s recoveryDeadline=90s");
 }
 
-void ApplicationController::startStream(const fog::RentalId& rental, bool createdFromCatalog) {
-    streamPlayStation_ = controllerSettings_.profile == ::stream::ControllerProfile::DualSense;
+void ApplicationController::startStream(const fog::RentalId& rental, bool createdFromCatalog,
+                                      const fog::EntityId& computer) {
+    streamPlayStation_ = (rental.provider == fog::ProviderId::Mts && fog::isPlayStationComputerId(computer)) ||
+        controllerSettings_.profile == ::stream::ControllerProfile::DualSense;
     pairedVideoReconnectPending_ = false;
     latency_.cancel();
     recentLaunch_.stream(createdFromCatalog);

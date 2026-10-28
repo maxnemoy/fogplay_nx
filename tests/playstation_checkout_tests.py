@@ -76,7 +76,7 @@ struct ApplicationController {
         Catalog& catalog() { return catalog_; }
     };
     std::shared_ptr<Provider> pairedServices_=std::make_shared<Provider>();
-    bool pairedPending_=false;
+    bool pairedPending_=false, ratingFocusLost_=false;
     fog::ProviderId loginProvider_=fog::ProviderId::Mts;
     struct Checkout {
         int calls=0;
@@ -91,6 +91,7 @@ struct ApplicationController {
     std::chrono::steady_clock::time_point playStationLoadedAt_=std::chrono::steady_clock::now();
     std::size_t selection_=0;
     fog::EntityId selectedGameId_=identity(987);
+    fog::EntityId selectedComputerId_;
     std::optional<int> selectedRecentGame_=987;
     std::string status_, checkoutStatus_;
     bool storageChecked=false, armed=false;
@@ -205,6 +206,7 @@ int main() {
         auto app=fixture(id); app.createSession();
         assert(app.armed && app.storageChecked && app.sessionPending_ && app.worker);
         assert(app.screen_==Screen::Checkout && app.selectedPlayStation_);
+        assert(app.selectedComputerId_==identity(id));
         const auto result=app.worker();
         assert(std::holds_alternative<VerifiedOffer>(result) && app.checkout_.calls==0);
         app.acceptCreateResult(result);
@@ -273,6 +275,7 @@ int main() {
         auto app=fixture(); app.screen_=Screen::Details; app.computers_=app.playStationComputers_;
         app.selectedPlayStation_=true; app.createSession();
         assert(!app.selectedPlayStation_ && app.worker);
+        assert(app.selectedComputerId_==identity(11573)); // PS5 identity survives ordinary catalog launch.
         app.worker();
         assert(app.checkout_.calls==1 && app.checkout_.request.gameId==identity(987) && app.checkout_.request.ownAccount);
         assert(app.recentLaunch_.value==987);

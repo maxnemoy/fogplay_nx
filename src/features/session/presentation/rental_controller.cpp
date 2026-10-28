@@ -170,7 +170,7 @@ void ApplicationController::handleCheckout() {
     checkoutAutoPoll_ = fog::checkoutNeedsAutomaticCheck(result);
     if (result.stopRequested) checkoutAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
     if (result.state == fog::CheckoutState::Ready && !stopAfterTask_ && !result.stopRequested) {
-        startStream(result.rentalId,!selectedPlayStation_); return;
+        startStream(result.rentalId,!selectedPlayStation_,selectedComputerId_); return;
     }
     if (!sessionPending_) {
         disarmExitHandling(); stopAfterTask_ = false;
@@ -258,6 +258,7 @@ void ApplicationController::createSession() {
     // Verify the same SD replacement path before any billable request.
     checkStorage();
     selectedPlayStation_ = playStation;
+    selectedComputerId_ = pc.id;
     order.gameId = playStation ? fog::EntityId{} : selectedGameId_;
     order.ownAccount = playStation ? false : ownSteam_;
     recentLaunch_.prepare(playStation ? std::nullopt : selectedRecentGame_);
@@ -319,7 +320,7 @@ void ApplicationController::connectSession() {
         }
         throw;
     }
-    startStream(rental,false);
+    startStream(rental,false,sessions_[selection_].computerId.value_or(fog::EntityId{}));
 }
 
 void ApplicationController::beginFinish(const char* reason) {
