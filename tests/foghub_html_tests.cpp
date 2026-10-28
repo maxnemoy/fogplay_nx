@@ -64,6 +64,19 @@ void loginAndAccount() {
     const auto account = fixture("account");
     const auto profile = parseAccount(account);
     check(profile.accountId == "login:fixture-user" && profile.displayName == "fixture-user");
+    const auto current = fixture("account-profile-synthetic");
+    check(parseAccount(current).accountId == profile.accountId);
+    check(parseAccount(current).displayName == profile.displayName);
+    rejects([&] { parseAccount(replace(current,"<title>Профиль</title>","<title>Ошибка</title>")); });
+    rejects([&] { parseAccount(replace(current,"<title>Профиль</title>","")); });
+    rejects([&] { parseAccount(replace(current,"</head>","<title>Профиль</title></head>")); });
+    rejects([&] { parseAccount(replace(current,"<h1></h1>","<h1>Ошибка</h1>")); });
+    rejects([&] { parseAccount(replace(current,"/site/logout","/site/other")); });
+    rejects([&] { parseAccount(replace(current,"<th>Логин</th>","<th>Другой</th>")); });
+    rejects([&] { parseAccount(replace(current,"fixture-user","<span>fixture-user</span>")); });
+    rejects([&] { parseAccount(replace(current,"</main>","<table class='detail-view'></table></main>")); });
+    rejects([&] { parseAccount(replace(current,"</main>","<div id='captcha'></div></main>")); });
+    check(parseAccount(replace(current,"secret-not-captured","<a>ignored</a>")).accountId == profile.accountId);
     const auto tabbedAccount = accountWithTabs(account);
     const auto tabbedProfile = parseAccount(tabbedAccount);
     check(tabbedProfile.accountId == profile.accountId && tabbedProfile.displayName == profile.displayName);
@@ -96,6 +109,29 @@ void history() {
     check(first.durationMinutes == "0" && first.amount == "0.00");
     check(page.rows[1].state == HistoryState::Finished && page.rows[1].finishedAt == "11:03");
     check(parseHistory(terminal).rows[0].state == HistoryState::Finished);
+    const auto rated = fixture("history-rated-synthetic");
+    const auto ratedPage = parseHistory(rated);
+    check(ratedPage.rows.size() == 1 && ratedPage.rows[0].state == HistoryState::Finished &&
+        ratedPage.rows[0].finishedAt == "12:03");
+    for (const auto* rating : {"1","2","3","4","5"}) {
+        check(parseHistory(replace(rated,"Оценка: 5",std::string("Оценка: ")+rating)).rows[0].state == HistoryState::Finished);
+    }
+    check(parseHistory(replace(rated,"Оценка: 5","Оценка:5")).rows[0].state == HistoryState::Finished);
+    check(parseHistory(replace(rated,"Оценка: 5<br>","Оценка: 5<br>Синтетический отзыв")).rows[0].state == HistoryState::Finished);
+    check(parseHistory(replace(rated,"Оценка: 5<br>","Оценка: 5<br>Первая строка<br>Вторая строка")).rows[0].state == HistoryState::Finished);
+    check(parseHistory(replace(rated,"Оценка: 5<br>","Оценка: 5<br>Оценка: 1<br>Текст отзыва")).rows[0].state == HistoryState::Finished);
+    rejects([&] { parseHistory(replace(rated,"Оценка: 5<br>","Оценка: 6<br>Оценка: 5<br>Текст отзыва")); });
+    rejects([&] { parseHistory(replace(rated,"Оценка: 5<br>","Текст отзыва<br>Оценка: 5")); });
+    rejects([&] { parseHistory(replace(rated,"Оценка: 5<br>","Оценка: 5<br><span>Текст</span>")); });
+    for (const auto* invalidRating : {"0","6","55","5?","unknown"})
+        rejects([&] { parseHistory(replace(rated,"Оценка: 5",std::string("Оценка: ")+invalidRating)); });
+    rejects([&] { parseHistory(replace(rated,"Оценка: 5","Unknown: 5")); });
+    rejects([&] { parseHistory(replace(rated,"Оценка: 5<br>","Оценка: 5")); });
+    rejects([&] { parseHistory(replace(rated,"12:00-12:03","12:00-?")); });
+    auto contradictoryRated = replace(replace(rated,"Завершена","Активна"),"12:00-12:03","12:00-?");
+    contradictoryRated = replace(contradictoryRated,"Бонус: 1мин.","<a href='/session/close?id=9000031'>Завершить</a>");
+    rejects([&] { parseHistory(contradictoryRated); });
+    check(parseHistory(replace(rated,"Завершена","Неизвестный статус")).rows[0].state == HistoryState::Unknown);
     auto unknown = replace(terminal, "<small>Завершена", "<small>Неизвестный статус");
     check(parseHistory(unknown).rows[0].state == HistoryState::Unknown);
     unknown = replace(active, "<small>Активна", "<small>Ожидание");

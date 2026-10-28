@@ -1,4 +1,5 @@
 #pragma once
+#include "core/domain/identity.hpp"
 #include "features/settings/domain/video_settings.hpp"
 #include <cstddef>
 #include <string>
@@ -30,6 +31,8 @@ public:
     void down();
     OverlayAction left();
     OverlayAction right();
+    void setProvider(ProviderId value);
+    void setVideoChangesEnabled(bool value) { videoChangesEnabled_ = value; }
     void setVideoSettings(const video::Settings& value) { videoSettings_ = value; }
     const video::Settings& videoSettings() const { return videoSettings_; }
     void setVideoStatus(const std::string& value) { videoStatus_ = value; }
@@ -45,6 +48,8 @@ public:
 private:
     void move(int horizontal, int vertical);
     OverlayAction adjustVideo(int direction);
+    int firstImageSelection() const;
+    int imageRowCount() const;
     std::string keyLabel(int index) const;
     OverlayMode mode_ = OverlayMode::Closed;
     int selection_ = 0;
@@ -52,6 +57,8 @@ private:
     bool uppercase_ = false;
     std::string text_;
     video::Settings videoSettings_;
+    ProviderId provider_ = ProviderId::Mts;
+    bool videoChangesEnabled_ = true;
     std::string videoStatus_, saveStatus_;
 };
 }

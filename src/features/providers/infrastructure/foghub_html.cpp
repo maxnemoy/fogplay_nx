@@ -3,6 +3,7 @@
 #endif
 #include "features/providers/infrastructure/foghub_html.hpp"
 #include "core/domain/repository_error.hpp"
+#include "features/session/domain/session_rating.hpp"
 #include <libxml/HTMLparser.h>
 #include <libxml/xpath.h>
 #include <arpa/inet.h>
@@ -330,6 +331,69 @@ void noRoutingOverride(xmlNode* node) {
     for (const auto* name : {"onclick", "onsubmit", "formaction", "formmethod", "formenctype", "formtarget", "data-method", "data-params"})
         require(!hasAttr(node, name));
 }
+bool verifyBonusChoice(xmlNode* form) {
+    const auto choices = select(form,".//select[@name='Pc[use_bonus]']");
+    require(choices.size() <= 1);
+    if (choices.empty()) return false;
+    auto* choice = choices.front();
+    require(!hasAttr(choice,"multiple") && !hasAttr(choice,"onchange") &&
+        (!hasAttr(choice,"size") || attr(choice,"size") == "1"));
+    const auto options = select(choice,"./option");
+    require(options.size() == 2 && select(choice,".//*").size() == 2);
+    require(attr(options[0],"value") == "0" && attr(options[1],"value") == "1");
+    for (auto* option : options) {
+        noRoutingOverride(option);
+        require(!hasAttr(option,"disabled") && !text(option).empty());
+    }
+    // With no explicit selection, HTML defaults to the first option (0).
+    // An unexpected spending default is not part of the verified form contract.
+    require(!hasAttr(options[1],"selected"));
+    return true;
+}
+bool verifiedSessionRating(xmlNode* cell) {
+    const auto small = select(cell,"./small");
+    if (small.size() != 1 || select(cell,"./*").size() != 1) return false;
+    const auto content = select(small.front(),"./div");
+    if (content.size() != 1 || select(small.front(),"./*").size() != 1) return false;
+    // Observed rated rows replace the review link with this fixed first line;
+    // Optional review lines follow the first break and are not state evidence.
+    // The server may render textarea newlines as additional direct br elements.
+    const auto breaks = select(content.front(),"./br");
+    if (breaks.empty() || select(content.front(),"./*").size() != breaks.size()) return false;
+    const auto line = firstLine(content.front());
+    const std::string prefix = "Оценка:";
+    if (line.rfind(prefix,0) != 0) return false;
+    const auto rating = trimmed(line.substr(prefix.size()));
+    return rating.size() == 1 && rating.front() >= '1' && rating.front() <= '5';
+}
+void rejectReviewRequired(xmlNode* root, const std::string& computerId) {
+    constexpr const char* notice = "Вы не можете играть на этом ПК: сперва оцените предыдущую игру через Foghub! Оценить";
+    xmlNode* blocker = nullptr;
+    for (auto* paragraph : select(root, "//main//form//p[contains(concat(' ',normalize-space(@class),' '),' text-danger ')]")) {
+        if (text(paragraph) != notice) continue;
+        require(!blocker);
+        blocker = paragraph;
+    }
+    if (!blocker) return;
+    auto* form = one(blocker, "ancestor::form[1]");
+    const auto base = "/pc/play?id=" + computerId;
+    const auto action = attr(form, "action");
+    require((action == base || action == base + "&resume=0") && lower(attr(form,"method")) == "post");
+    noRoutingOverride(form);
+    require(!hasAttr(form,"target") && !hasAttr(form,"enctype"));
+    auto* link = one(blocker, ".//a[@href]");
+    require(text(link) == "Оценить");
+    noRoutingOverride(link);
+    require(!hasAttr(link,"target") && !hasAttr(link,"download"));
+    const auto href = attr(link,"href");
+    require(!href.empty() && href.back() != '&');
+    const auto params = query(href, "/session/review");
+    require(params.size() == 2 && params.count("id") && params.count("fromPcId"));
+    identifier(params.at("id"));
+    identifier(params.at("fromPcId"));
+    require(params.at("fromPcId") == computerId);
+    throw SessionReviewRequired({ProviderId::FogHub,params.at("id")});
+}
 }
 
 MoonlightEndpoint parseMoonlightEndpoint(const std::string& value) {
@@ -387,6 +451,7 @@ std::string freshPairingLink(const std::string& html, const std::string& expecte
     identifier(expectedComputerId);
     auto doc = document(html);
     auto* root = rentalDocument(doc.get());
+    rejectReviewRequired(root, expectedComputerId);
     if (!select(root, "//form[.//input[@name='moonlight_url']]").empty()) return {};
     const auto expected = "/pc/play?id=" + expectedComputerId + "&resume=0";
     xmlNode* fresh = nullptr;
@@ -404,6 +469,7 @@ ConnectForm parseConnectForm(const std::string& html, const std::string& expecte
     identifier(expectedComputerId);
     auto doc = document(html);
     auto* root = rentalDocument(doc.get());
+    rejectReviewRequired(root, expectedComputerId);
     // Names/types/action/method are verified metadata. Form IDs, surrounding
     // headings and layout were not captured and must not be invented here.
     auto* form = one(root, "//form[.//input[@name='moonlight_url']]");
@@ -418,13 +484,15 @@ ConnectForm parseConnectForm(const std::string& html, const std::string& expecte
         require(!hasAttr(control, "disabled"));
         const auto name = attr(control, "name");
         if (name.empty()) continue;
-        require(tag(control, "input") && (name == "_csrf" || name == "moonlight_url" || name == "Pc[pin]"));
+        if (name == "Pc[use_bonus]") require(tag(control,"select"));
+        else require(tag(control, "input") && (name == "_csrf" || name == "moonlight_url" || name == "Pc[pin]"));
     }
     auto* csrf = one(form, ".//input[@name='_csrf']");
     auto* address = one(form, ".//input[@name='moonlight_url']");
     auto* pin = one(form, ".//input[@name='Pc[pin]']");
     require(lower(attr(csrf, "type")) == "hidden" && lower(attr(address, "type")) == "text" && lower(attr(pin, "type")) == "text");
     ConnectForm result;
+    result.hasBonusChoice = verifyBonusChoice(form);
     result.csrf = attr(csrf, "value");
     require(!result.csrf.empty() && result.csrf.size() <= 4096 && printable(result.csrf));
     result.actionPath = action;
@@ -486,15 +554,16 @@ LoginForm parseLogin(const std::string& html) {
 AccountPage parseAccount(const std::string& html) {
     auto doc = document(html);
     auto* main = mainNode(doc.get(), {}, true);
-    // Account tabs include empty h1 elements. Keep exactly one meaningful
-    // page title, without relaxing title checks for the other page types.
+    // The current profile uses the document title and empty tab headings;
+    // the older template has one meaningful "Информация" heading.
     std::size_t headings = 0;
     for (auto* heading : select(main, ".//h1")) {
         const auto title = text(heading);
         if (title.empty()) continue;
         require(title == "Информация" && ++headings == 1);
     }
-    require(headings == 1);
+    if (headings == 0)
+        require(text(one(xmlDocGetRootElement(doc.get()), "/html/head/title")) == "Профиль");
     auto* table = one(main, ".//table[contains(concat(' ',normalize-space(@class),' '),' detail-view ')]");
     std::string login;
     for (auto* row : select(table, ".//tr")) {
@@ -558,11 +627,13 @@ HistoryPage parseHistory(const std::string& html) {
         require(close.size() <= 1 && review.size() <= 1);
         for (auto* link : close) require(linkId(link, "/session/close") == row.id);
         for (auto* link : review) require(linkId(link, "/session/review") == row.id);
+        const bool rated = verifiedSessionRating(cells[5]);
         if (status == "Активна") {
-            require(row.finishedAt.empty() && close.size() == 1 && review.empty());
+            require(row.finishedAt.empty() && close.size() == 1 && review.empty() && !rated);
             row.state = HistoryState::Active;
         } else if (status == "Завершена") {
-            require(!row.finishedAt.empty() && close.empty() && review.size() == 1);
+            require(!row.finishedAt.empty() && close.empty() &&
+                ((review.size() == 1 && !rated) || (review.empty() && rated)));
             row.state = HistoryState::Finished;
         }
         page.rows.push_back(std::move(row));

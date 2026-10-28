@@ -1,4 +1,5 @@
 #include <Settings.hpp>
+#include <Diagnostics.hpp>
 #include <CryptoManager.hpp>
 #include <gamestream/http.h>
 #include <gamestream/errors.h>
@@ -24,8 +25,21 @@ int main(int argc, char** argv) {
     assert(http_request(argv[3], &response, HTTPRequestTimeoutMedium) != GS_OK); // Fail closed without a pin.
     const auto certificate = Data::read_from_file(argv[2]);
     assert(http_pin_certificate(certificate) == GS_OK);
+    moonlight_diagnostics::beginCommand(moonlight_diagnostics::CommandOperation::Resume);
     assert(http_request(argv[3], &response, HTTPRequestTimeoutMedium) == GS_OK);
+    auto numeric = moonlight_diagnostics::commandSnapshot();
+    assert(numeric.curl == 0 && numeric.http == 200 && numeric.dispatched && !numeric.cancelled);
+    moonlight_diagnostics::finishCommand(GS_OK,false);
     assert(std::string(reinterpret_cast<char*>(response.bytes()), response.size()) == "ClientOne");
+    moonlight_diagnostics::beginCommand(moonlight_diagnostics::CommandOperation::Resume);
+    assert(http_request(std::string(argv[3])+"&unavailable=1", &response, HTTPRequestTimeoutMedium) != GS_OK);
+    numeric = moonlight_diagnostics::commandSnapshot();
+    assert(numeric.curl == 22 && numeric.http == 503 && numeric.dispatched);
+    moonlight_diagnostics::finishCommand(GS_FAILED,false);
+    moonlight_diagnostics::beginCommand(moonlight_diagnostics::CommandOperation::Resume);
+    assert(http_request(argv[3], &response, HTTPRequestTimeoutMedium) == GS_OK);
+    assert(moonlight_diagnostics::commandSnapshot().http == 200); // Fresh transfer replaces the old 503.
+    moonlight_diagnostics::finishCommand(GS_OK,false);
     // A different server identity on another port must fail with the same pin.
     assert(http_request(argv[4], &response, HTTPRequestTimeoutMedium) != GS_OK);
     Settings::instance().set_key_dir(argv[5]);

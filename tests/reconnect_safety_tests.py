@@ -28,7 +28,8 @@ for glue in (transport, retry, pump, close):
     for forbidden in ('guard_.adopt', 'checkout_.create', 'startStream(', 'disarmExitHandling(',
                       'transportReconnect_.reset()', 'sessionPending_ = false', 'recentLaunch_.close()'):
         assert forbidden not in glue, forbidden
-assert 'stream_->start({streamRental_})' in transport
+assert 'stream_->start({streamRental_, resumeOnly})' in transport
+assert close.index('media_->stopWorkers()') < close.index('stream_->close()')
 assert 'streamRental_ = rental;' in method(playback, 'startStream')
 assert 'if (final) stream_->close();' in close
 assert 'else if (!stream_->disconnectForRetry()) {\n                retryAllowed = false;' in close

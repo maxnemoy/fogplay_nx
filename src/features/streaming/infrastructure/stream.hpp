@@ -45,6 +45,7 @@ public:
     bool disconnected() const override; // Live peer or ICE Disconnected; application applies its grace period.
     bool disconnectForRetry() override; // False if pending terminal evidence forbids retry; otherwise release transports.
     // Fixed operation names and counters only; no remote fields or identifiers.
+    // STOMP send acceptance is local (buffered included), not a broker receipt.
     std::string diagnostics() const override;
     // Application-thread lifetime stages; nested scopes are not additive.
     std::string transportTimings() const override;
@@ -70,6 +71,9 @@ public:
     // After destroying all Clients, before shutting down the platform socket runtime.
     static void cleanupRuntime();
 #ifdef FOG_STREAM_TESTING
+    // One-shot send fixture: reject before send, or report buffered after real
+    // loopback delivery. This method does not exist in the production build.
+    void overrideSignalingSendForTesting(bool enabled, bool reject);
     // Local fixture only. This method does not exist in the production build.
     bool startForTesting(const std::string& hash, const std::string& suffix,
                          const std::string& loopbackUrl);

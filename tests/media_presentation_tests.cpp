@@ -1,6 +1,7 @@
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/media_annexb.hpp"
 #include "features/streaming/domain/audio_queue_metrics.hpp"
+#include "features/streaming/infrastructure/video_image_diagnostics.hpp"
 #include <SDL.h>
 #include <opus/opus.h>
 extern "C" {
@@ -126,6 +127,65 @@ static void present(fog::Media& media, SDL_Renderer* renderer) {
     SDL_RenderPresent(renderer);
     media.presented();
 }
+static void imageSamples() {
+    using Sample = fog::detail::VideoImageSample;
+    // Odd-sized, tightly packed IYUV planes exercise chroma offsets and edges.
+    Bytes pixels(15 + 2 * 6, 128);
+    std::fill(pixels.begin(), pixels.begin() + 15, 16);
+    const auto black = Sample::inspect(pixels.data(), pixels.size(), 5, 3);
+    check(black.points == 15 && black.nearBlack() && black.yMean == 16,
+        "limited-range black/odd IYUV sample incorrect");
+    std::fill(pixels.begin(), pixels.begin() + 15, 0);
+    check(Sample::inspect(pixels.data(), pixels.size(), 5, 3).nearBlack(), "full-range black missed");
+    pixels[14] = 235;
+    check(!Sample::inspect(pixels.data(), pixels.size(), 5, 3).nearBlack(), "bright sample classified black");
+    pixels[14] = 16; pixels.back() = 255;
+    check(!Sample::inspect(pixels.data(), pixels.size(), 5, 3).nearBlack(), "low-luma saturated color classified black");
+    check(!Sample::inspect(pixels.data(), pixels.size()-1, 5, 3).points &&
+        !Sample::inspect(nullptr, 0, 5, 3).points && !Sample::inspect(pixels.data(), pixels.size(), 0, 3).points,
+        "invalid image read by sampler");
+    fog::detail::VideoImageDiagnostics stats;
+    stats.uploaded(black, 5, 3); stats.uploaded(black, 5, 3);
+    check(stats.blackRuns == 1 && stats.blackStreak == 2 && stats.unchangedStreak == 1, "black/unchanged run lost");
+    stats.uploaded(black, 3, 5);
+    check(stats.blackRuns == 2 && stats.blackStreak == 1 && stats.unchangedStreak == 0, "size change kept stale run");
+}
+static void blackImageMeasurements(SDL_Renderer* renderer, const Units& black, const Units& color) {
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    check(counter(media, "image_samples") == 0, "unprimed texture counted as black sample");
+    feed(media, black.front());
+    check(media.preparePresentation(), "black fixture upload missing");
+    check(counter(media, "image_near_black") == 1 && counter(media, "image_points") == 576 &&
+        counter(media, "image_samples") == 1 && counter(media, "image_presented_black_frames") == 0,
+        "decoded black image not sampled or prematurely presented");
+    present(media, renderer); present(media, renderer);
+    check(counter(media, "image_presented_black_frames") == 1 && counter(media, "image_presented_generation") == 1,
+        "black presentation counted redraw twice");
+    feed(media, black[1]);
+    failUpload = true;
+    bool failed = false;
+    try { media.preparePresentation(); } catch (const std::runtime_error&) { failed = true; }
+    check(failed && counter(media, "image_upload_errors") == 1 && counter(media, "image_samples") == 1,
+        "failed upload changed observed texture");
+    check(media.preparePresentation() && counter(media, "image_black_streak") == 2 &&
+        counter(media, "image_unchanged_streak") == 1, "repeat black frame streak missing");
+    feed(media, color.front());
+    check(media.preparePresentation() && counter(media, "image_near_black") == 0 &&
+        counter(media, "image_black_streak") == 0 && counter(media, "image_black_streak_max") == 2 &&
+        counter(media, "image_black_runs") == 1, "black recovery lost historical evidence");
+    failDraw = true;
+    failed = false;
+    try { media.draw(); } catch (const std::runtime_error&) { failed = true; }
+    media.presented();
+    check(failed && counter(media, "image_copy_errors") == 1 && counter(media, "image_presented_black") == 1,
+        "failed draw acknowledged new color image");
+    present(media, renderer);
+    check(counter(media, "image_presented_black") == 0 && counter(media, "image_presented_generation") == 3,
+        "color presentation did not update image evidence");
+    check(media.diagnostics().size() < 4000 && media.imageDiagnostics().find("image_sample_max_us=") != std::string::npos,
+        "image diagnostics exceed periodic log budget or lose sampling timing");
+    std::cout << "PASS image diagnostics: decoded black/color, repeats, failed upload/draw, retained texture, recovery\n";
+}
 static void presentationCounts(SDL_Renderer* renderer, const Units& units) {
     fog::Media media(renderer, stream::VideoCodec::H264, true);
     media.presented();
@@ -239,7 +299,10 @@ static void audioCounts(SDL_Renderer* renderer) {
     failQueue = true;
     bool rejected = false;
     try { media.audio(bytes, packet.size()); } catch (const std::runtime_error&) { rejected = true; }
-    check(rejected && media.audioPackets() == 4, "failed queue counted as delivered audio");
+    // audioPackets counts successful Opus decoding, including suppressed PCM;
+    // queue submission is a later stage and must not be mistaken for delivery.
+    check(rejected && media.audioPackets() == 5 && audioBytes == 3840,
+        "failed queue lost decoded packet count or submitted extra audio");
     std::cout << "PASS audio observations: no sleeps, 40 ms threshold, priming, episode/refill/reset accounting, queue cap, queue failure\n";
     std::cout << media.audioDiagnostics() << '\n';
     mockAudio = false;
@@ -354,7 +417,7 @@ static void test(SDL_Renderer* renderer, const Units& units, const Units& change
     std::cout << media.diagnostics() << '\n';
 }
 int main(int argc, char** argv) {
-    if (argc != 3) return 2;
+    if (argc != 4) return 2;
     SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
     SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) return 3;
@@ -364,6 +427,8 @@ int main(int argc, char** argv) {
     int result = 0;
     try {
         const auto units = load(argv[1]);
+        imageSamples();
+        blackImageMeasurements(renderer, load(argv[3]), units);
         test(renderer, units, load(argv[2]));
         presentationCounts(renderer, units);
         audioObservations();

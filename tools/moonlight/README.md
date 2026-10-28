@@ -97,6 +97,8 @@ prepared directory. Every replacement checks its expected occurrence count:
   and compare the authenticated pairing challenge with the received value.
 - Preserve actual error codes where upstream assigned boolean expressions.
 - Require explicit successful pairing, launch and cancellation acknowledgements.
+- Read `gamesession` for launch and `resume` for resume, preserving the original
+  command before host state changes; reject missing acknowledgements or session URLs.
 - Preserve the host's reported current app ID for ownership checks.
 - Derive a unique client ID from the probe certificate.
 - Remove verbose libcurl logging and omit formatted logger argument values.
@@ -145,9 +147,11 @@ hostname identity, so its exact public key authenticates TLS instead of PKI
 hostname/CA validation. The private LAN probe retains its separate opt-in
 unpinned policy. Debug payloads used for dispatch observation are discarded.
 
-The first production mode is 1280x720, 60fps, H.264, stereo Opus, with the saved
-bitrate applied before connection. It exposes the actual selected codec and
-fixed settings. RTC relay, adaptive quality, forced keyframe intervals,
+The FogHub production request is 1280x720, 30fps, stereo Opus, with the saved
+bitrate applied before connection. The saved H.265 preference advertises both
+HEVC Main and H.264 for host fallback; H.264 preference advertises H.264 only.
+The video setup callback records the actual negotiated codec and dimensions.
+RTC relay, adaptive quality, forced keyframe intervals,
 PlayStation emulation, touch and sensor reports are unsupported. Gamepad,
 absolute mouse, buttons, wheel, text and the app's Enter/Backspace/Tab/Escape
 keys use Li APIs under the input/teardown mutex. Desktop is preferred; hosts
@@ -157,9 +161,11 @@ arbitrary first-app choice and no `/cancel` request are made. An already active
 different application is never resumed or stopped.
 
 The worker copies complete video AUs while owning the Li pull-frame handle.
-Video is bounded to four AUs of at most 8 MiB each; overflow clears stale data,
-increments the decoder generation, and requests an IDR. Opus is a separate
-20-packet FIFO (at most 200 ms for the accepted 5/10 ms stereo formats).
+Video is bounded to four AUs of at most 8 MiB each; a full application queue
+leaves frames in the core's bounded queue and yields until the consumer has room.
+An invalid AU triggers decoder recovery and a fresh IDR. Opus is a separate
+20-packet FIFO (at most 200 ms for the accepted 5/10 ms stereo formats); at
+capacity it discards only the oldest packet before appending the new sample.
 The app's existing Media path performs decoding/presentation.
 
 `tools/moonlight/test.sh` runs deterministic lifecycle/input/app-selection tests
@@ -178,3 +184,108 @@ retains its explicitly trusted-local-network TLS policy. Production always
 enables pin enforcement. The Switch full-link check proves ABI/link completeness
 only; actual pairing, hardware decode/audio, controller delivery and cancellation
 latency require a device run.
+# Core video diagnostics
+
+`FogMoonlightDiagnostics.h` exposes `FogMoonlightGetDiagnostics()` without
+enabling upstream logs or accessing queue internals from the app. Counters reset
+at `LiStartConnection()` before any new core threads start, and remain available
+after stop. Fields are independently loaded with relaxed, lock-free 64-bit
+atomics; a snapshot is approximate across fields and across a connection reset.
+Use it only for the connection currently owned by the caller. Packet timestamps
+use the same clock as `LiGetMicroseconds()` (the pinned Switch core may fall back
+to wall time). Validate timestamp ordering. The first packet has no gap;
+the ongoing silence duration is computed by the app from `lastVideoPacketUs`.
+
+Receipt counters include UDP bytes before runt/decryption rejection. FEC complete
+blocks include blocks requiring no recovery; recovered packets count accepted
+reconstructed data shards. Failed blocks count incomplete/missing blocks and
+all known trailing blocks abandoned with a dropped frame (including received
+but rejected trailing blocks),
+excluding whole frames whose block count is unknown. A pending block is counted
+only when newer data makes the core abandon it; a silent final partial block
+isn't counted as failed at stop.
+Reconstruction failures count failed reconstruction attempts after enough shards
+arrive, including allocation/corruption failures. IDR requests count API calls,
+and IDR wait drops count fully assembled frames discarded while waiting for IDR.
+RTP processing duration aggregates measure only `RtpvAddPacket()` work, excluding
+UDP wait, allocation and decryption. Backward-clock samples are omitted and
+counted separately in `videoPacketProcessingInvalidTimes`.
+
+`videoReceiveCycle*` measures every complete receive-loop iteration, including
+timeouts, errors and rejected packets. `videoReceiveWait*` isolates the entire
+`recvUdpSocket()` call (poll/recv and internal retries); `videoReceiveWork*`
+is cycle time minus that wait. Work includes per-packet allocation, decryption,
+RTP/FEC processing and bookkeeping. Allocation and actual decryption calls also
+have their own count/total/max aggregates; stale encrypted packets skipped before
+decryption do not increment the decrypt count. Initial encrypted staging-buffer
+allocation before the loop is excluded. `videoReceiveLoopGap*` measures time
+between one iteration's explicit end and the next iteration's start, including
+diagnostic publication, the loop condition and scheduling. The first iteration
+has no gap sample. All are elapsed clock durations, so a preempted thread can
+increase either work or wait; these are not CPU-time or pure scheduler metrics.
+Invalid/backward samples are omitted and increment `videoReceiveTimingInvalidTimes`.
+The five-second application snapshot uses cumulative counters without receive-path
+logging or resets; cumulative maxima may have occurred in an earlier interval.
+
+Video UDP `SO_RCVBUF` diagnostics retain the original requested size, last
+successfully selected `setsockopt` argument, failed-attempt count and last numeric
+error. An unconditional release-build `getsockopt` records the actual OS-reported
+size separately, with explicit query success/error; unknown actual size is zero.
+The OS report can include bookkeeping and is not an estimated count of payload
+bytes. Audio sockets do not overwrite video diagnostics. No buffer request,
+fallback decrement, FEC algorithm or queue policy is changed.
+
+Decode queue pending/high are atomically mirrored while holding its existing
+mutex; queue destruction clears pending after users have joined. Flush operations
+count even empty flushes and report removed frame totals separately. Diagnostic
+reads neither lock nor touch the queue. Instrumentation is applied fail-closed to
+prepared copies of seven pinned core translation units; upstream sources stay
+unchanged. The build installs the header and verifies it with the dependency
+manifest. Both Switch smoke links call the API.
+
+Run `python3 tools/moonlight/tests/core_diagnostics_test.py` (also part of
+`tools/moonlight/test.sh`) for repeatable preparation, unchanged pinned source,
+patch rejection, concurrent counter snapshots, and the actual prepared queue's
+offer/poll/wait/flush/destruction paths under ASan/UBSan.
+The same test compiles the actual prepared receive loop with deterministic
+I/O/clocks to cover all eight early exits and normal processing, plus the actual
+prepared socket-buffer fallback with success, partial/all failure, query failure
+and an unrelated socket. These fixtures prove instrumentation paths, not hardware
+performance or the OS's real buffer capacity.
+
+### Bounded IDR recovery
+
+The pinned XITRIX core requests once after the first complete frame following
+loss, then falls back to another request after 120 dropped frames. At 30 fps
+that fallback alone can hold video for about four seconds while UDP reception
+continues. `recovery.py` keeps the original first-complete-frame gate, adds a
+500 ms retry deadline anchored to the latest API request, and only retries on
+complete frames already being discarded during IDR wait. Added retries are
+limited to two per second; original loss/decoder-triggered requests retain
+their upstream timing. The 120-drop escalation remains for incomplete frames
+and RFI escalation, coalesced with a recent request. No dependent frame is
+released early. The deadline uses internal monotonic time (Switch hardware ticks), so wall-clock
+adjustments have no effect. Atomic updates reject stale samples after thread
+preemption; connection start resets the deadline.
+
+The preparation also carries current official common-c's partial-IDR guard:
+losing an IDR that has already released the parser's wait must require a fresh
+IDR rather than reference invalidation. Pinned source files remain unchanged.
+
+Diagnostics distinguish API requests, actual control transactions and their
+local transport outcomes, completed IDR assembly, and parser wait release.
+`core_idr_wait_reason` records the entry cause: 1 initial, 2 dropped reference
+chain, 3 drop limit, 4 decode queue overflow, 5 decoder refresh, 6 frame gap,
+7 speculative FEC loss, 8 confirmed FEC loss, 9 corrupt packet sequence,
+10 invalid frame payload. Repeated drops retain the first cause/time.
+`core_idr_wait_age_us`, last/max wait duration and request/dispatch ages use the
+same validated core clock. Successful dispatch means local reliable transport
+acceptance, not proof that the host received the request or produced an IDR.
+
+The native recovery test includes the full prepared depacketizer, actual queue
+and exact prepared API/control transaction bodies. It exercises first-frame
+recovery, the 500 ms deadline, decoder request deadline reset, dense-frame
+coalescing, P-frame exclusion, IDR release, speculative/confirmed loss, ordinary
+RFI, partial-IDR loss, both control protocols, send failures, wall-clock rollback, stale out-of-order request/retry samples,
+and teardown followed by a new connection. These host tests do not establish
+Switch/network/host recovery latency.

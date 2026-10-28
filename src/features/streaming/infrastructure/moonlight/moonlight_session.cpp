@@ -1,7 +1,11 @@
 #include "moonlight_session.hpp"
 #include "app_selection.hpp"
+#include "frame_diagnostics.hpp"
+#include "resume_retry.hpp"
 #include "features/streaming/application/remote_input.hpp"
 #include <Settings.hpp>
+#include <Diagnostics.hpp>
+#include <FogMoonlightDiagnostics.h>
 #include <gamestream/client.h>
 #include <gamestream/errors.h>
 #include <switch.h>
@@ -54,15 +58,26 @@ struct State {
     std::atomic<bool> valid{true}, paired{false}, pairDone{false}, pairOK{false};
     std::atomic<bool> stop{false}, running{false}, starting{false}, streamInUse{false};
     std::atomic<bool> terminated{false}, failed{false}, decoderWaiting{true}, assemblyWaiting{true};
+    std::atomic<bool> coreDiagnosticsReady{false};
     std::atomic<int> code{0};
+    std::atomic<int> application{0};
+    std::atomic<std::uint64_t> transportClosedMs{0};
+    std::atomic<stream::VideoCodec> selectedCodec{stream::VideoCodec::H264};
+    std::atomic<int> negotiatedWidth{0}, negotiatedHeight{0}, negotiatedFps{0};
     std::atomic<std::uint64_t> frames{0}, audioFrames{0}, videoDrops{0}, audioDrops{0}, inputAccepted{0}, inputRejected{0};
     std::atomic<std::uint64_t> videoFullYields{0}, videoQueueHigh{0}, videoBatchMax{0}, videoQueueAgeMaxMs{0};
     std::atomic<std::uint64_t> videoInvalid{0}, videoWaitDrops{0}, videoResyncs{0};
+    detail::FrameDiagnostics trace;
     mutable std::mutex mutex, apiMutex;
     std::condition_variable changed;
     std::deque<stream::Packet> video, audio;
     std::string message = "Moonlight ready for pairing", error;
     std::uint64_t generation = 1;
+    moonlight_diagnostics::CommandSnapshot command;
+    moonlight_diagnostics::CommandSnapshot firstCommandFailure;
+    unsigned commandAttempt = 0;
+    unsigned commandFailures = 0;
+    std::uint64_t closedToResumeMs = 0;
     Clock::time_point pairingDeadline;
     State() { LiInitializeServerInformation(&host.serverInfo); LiInitializeStreamConfiguration(&config); }
     ~State() { delete[] host.serverInfo.rtspSessionUrl; releaseLease(); }
@@ -84,8 +99,13 @@ void terminated(int code) {
     if (auto* state = active.load()) { state->code = code; state->terminated = true; }
 }
 void ignoreLog(const char*, ...) {}
-int videoSetup(int format, int width, int height, int, void*, int) {
-    return format == VIDEO_FORMAT_H264 && width > 0 && width <= 1920 && height > 0 && height <= 1080 ? 0 : -1;
+int videoSetup(int format, int width, int height, int fps, void*, int) {
+    auto* state = active.load();
+    if (!state || (format != VIDEO_FORMAT_H264 && format != VIDEO_FORMAT_H265) ||
+        width <= 0 || width > 1920 || height <= 0 || height > 1080) return -1;
+    state->selectedCodec = format == VIDEO_FORMAT_H265 ? stream::VideoCodec::H265 : stream::VideoCodec::H264;
+    state->negotiatedWidth = width; state->negotiatedHeight = height; state->negotiatedFps = fps;
+    return 0;
 }
 int audioInit(int config, OPUS_MULTISTREAM_CONFIGURATION* opus, void*, int) {
     return opus && config == AUDIO_CONFIGURATION_STEREO && opus->sampleRate == 48000 &&
@@ -101,7 +121,7 @@ void audioSample(char* bytes, int size) {
         stream::Packet packet; packet.kind = stream::Kind::Audio; packet.enqueueMs = nowMs();
         packet.data.resize(static_cast<std::size_t>(size)); std::memcpy(packet.data.data(), bytes, size);
         std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->audio.size() >= 20) { state->audioDrops += state->audio.size(); state->audio.clear(); }
+        if (state->audio.size() >= 20) { ++state->audioDrops; state->audio.pop_front(); }
         state->audio.push_back(std::move(packet)); ++state->audioFrames;
     } catch (...) { state->failed = true; state->terminated = true; state->code = -900; }
 }
@@ -123,20 +143,29 @@ void drainVideo(State& state) {
     unsigned budget = 0;
     while (budget < 8 && !state.stop) {
         {
+            const auto lockStarted = detail::steadyUs();
             std::lock_guard<std::mutex> lock(state.mutex);
+            state.trace.queueLock.add(detail::steadyUs() - lockStarted);
             // This worker is the sole producer. Leave complete frames in the
             // core's bounded queue until the consumer has room, preserving FIFO.
             if (state.video.size() >= State::VideoCapacity) { ++state.videoFullYields; break; }
         }
-        if (!LiPollNextVideoFrame(&handle, &unit)) break;
+        if (!LiPollNextVideoFrame(&handle, &unit)) { ++state.trace.emptyPolls; break; }
         ++budget;
+        if (unit) state.trace.frame(static_cast<std::uint32_t>(unit->frameNumber), unit->frameType == FRAME_TYPE_IDR,
+            unit->fullLength, unit->receiveTimeUs, unit->enqueueTimeUs, LiGetMicroseconds(), unit->frameHostProcessingLatency);
         int result = DR_NEED_IDR;
         try {
             if (unit && (!state.assemblyWaiting || unit->frameType == FRAME_TYPE_IDR)) {
                 stream::Packet packet;
-                if (copyFrame(*unit, packet.data)) {
+                const auto copyStarted = detail::steadyUs();
+                const bool copied = copyFrame(*unit, packet.data);
+                state.trace.copy.add(detail::steadyUs() - copyStarted);
+                if (copied) {
                     packet.timestamp = unit->rtpTimestamp; packet.enqueueMs = nowMs();
+                    const auto lockStarted = detail::steadyUs();
                     std::lock_guard<std::mutex> lock(state.mutex);
+                    state.trace.queueLock.add(detail::steadyUs() - lockStarted);
                     state.assemblyWaiting = false;
                     packet.videoGeneration = state.generation;
                     state.video.push_back(std::move(packet)); ++state.frames; result = DR_OK;
@@ -154,7 +183,9 @@ void drainVideo(State& state) {
             }
             state.assemblyWaiting = true;
         }
+        const auto completeStarted = detail::steadyUs();
         LiCompleteVideoFrame(handle, result);
+        state.trace.completion.add(detail::steadyUs() - completeStarted);
         if (state.failed) break;
     }
     state.videoBatchMax = std::max(state.videoBatchMax.load(), static_cast<std::uint64_t>(budget));
@@ -162,26 +193,82 @@ void drainVideo(State& state) {
 void freeApps(APP_LIST* app) {
     while (app) { auto* next = app->next; std::free(app->name); std::free(app); app = next; }
 }
-bool launch(State& state) {
-    APP_LIST* raw = nullptr;
-    int code = gs_applist(&state.host, &raw);
-    std::unique_ptr<APP_LIST, decltype(&freeApps)> apps(raw, freeApps);
-    if (code != GS_OK) { state.fail("Moonlight application list unavailable", code); return false; }
-    std::vector<Application> applications;
-    for (auto* app = raw; app; app = app->next) {
-        if (app->id <= 0 || !app->name) continue;
-        applications.push_back({app->id, app->name});
-    }
-    const auto selected = selectApplication(applications);
-    if (!selected) { state.fail("Moonlight host has no unambiguous Desktop, Playnite or Steam launcher"); return false; }
-    if (state.host.currentGame != 0 && state.host.currentGame != *selected) {
-        state.fail("Moonlight host has another running application"); return false;
-    }
-    // Resume only the deterministic app on this exact authenticated rental host.
-    // Stopping the paid host belongs to its rental guard, never /cancel here.
-    code = gs_start_app(&state.host, &state.config, *selected, false, false, 1);
-    if (code != GS_OK) { state.fail("Moonlight application start failed", code); return false; }
+bool applicationRequestAborted(State& state) {
+    if (!state.stop && state.valid && !Settings::instance().request_cancelled()) return false;
+    if (!state.stop) state.fail("Moonlight application request cancelled or timed out");
     return true;
+}
+bool launch(State& state, bool resumeOnly) {
+    using Retry = detail::ResumeRetry;
+    const auto deadline = Clock::now() + std::chrono::milliseconds(Retry::BudgetMs);
+    const unsigned attempts = resumeOnly ? Retry::MaxAttempts : 1;
+    for (unsigned attempt = 1; attempt <= attempts; ++attempt) {
+        if (applicationRequestAborted(state)) return false;
+        // Every resume attempt refreshes this exact pinned host, without pairing
+        // or changing the retained rental/app identity. Old RTSP URLs are private.
+        delete[] state.host.serverInfo.rtspSessionUrl; state.host.serverInfo.rtspSessionUrl = nullptr;
+        int code = gs_init(&state.host, state.endpoint);
+        if (code != GS_OK || !state.host.paired) {
+            state.fail("Moonlight authenticated host unavailable", code); return false;
+        }
+        APP_LIST* raw = nullptr;
+        code = gs_applist(&state.host, &raw);
+        std::unique_ptr<APP_LIST, decltype(&freeApps)> apps(raw, freeApps);
+        if (code != GS_OK) { state.fail("Moonlight application list unavailable", code); return false; }
+        std::vector<Application> applications;
+        for (auto* app = raw; app; app = app->next) {
+            if (app->id <= 0 || !app->name) continue;
+            applications.push_back({app->id, app->name});
+        }
+        const auto selected = selectApplication(applications);
+        if (!selected) { state.fail("Moonlight host has no unambiguous Desktop, Playnite or Steam launcher"); return false; }
+        if (state.host.currentGame != 0 && state.host.currentGame != *selected) {
+            state.fail("Moonlight host has another running application"); return false;
+        }
+        if (resumeOnly && (state.host.currentGame != *selected || state.application != *selected)) {
+            state.fail("Moonlight quality reconnect refused: previous application is no longer active"); return false;
+        }
+        if (applicationRequestAborted(state)) return false;
+        // Clear even an early SDK setup failure; a stale 503 must never permit retry.
+        moonlight_diagnostics::beginCommand(resumeOnly ? moonlight_diagnostics::CommandOperation::Resume :
+            (state.host.currentGame ? moonlight_diagnostics::CommandOperation::Resume : moonlight_diagnostics::CommandOperation::Launch));
+        const auto closed = state.transportClosedMs.load();
+        const auto requestedAt = nowMs();
+        const auto closedToResume = resumeOnly && closed && requestedAt >= closed ? requestedAt - closed : 0;
+        code = gs_start_app(&state.host, &state.config, *selected, false, false, 1);
+        const auto command = moonlight_diagnostics::commandSnapshot();
+        { std::lock_guard<std::mutex> lock(state.mutex);
+            state.command = command; state.commandAttempt = attempt; state.closedToResumeMs = closedToResume;
+            if (code != GS_OK) {
+                if (state.commandFailures == 0) state.firstCommandFailure = command;
+                ++state.commandFailures;
+            }
+        }
+        if (applicationRequestAborted(state)) return false;
+        if (resumeOnly && Clock::now() >= deadline) {
+            state.fail("Moonlight application resume deadline exceeded"); return false;
+        }
+        if (code == GS_OK) {
+            if (!resumeOnly) state.application = *selected;
+            return true;
+        }
+        const bool retry = resumeOnly && command.operation == moonlight_diagnostics::CommandOperation::Resume &&
+            Retry::retryable(command.curl,command.http,command.xmlStatus,command.xmlResult,
+                command.dispatched,command.cancelled);
+        const auto delay = std::chrono::milliseconds(Retry::backoffMs(attempt));
+        if (!retry || attempt == attempts || Clock::now() + delay >= deadline ||
+            state.stop || !state.valid || Settings::instance().request_cancelled()) {
+            if (!state.stop) state.fail(resumeOnly ? "Moonlight application resume failed" : "Moonlight application start failed", code);
+            return false;
+        }
+        state.status("Moonlight resume retry pending");
+        const auto retryAt = Clock::now() + delay;
+        while (Clock::now() < retryAt) {
+            if (applicationRequestAborted(state)) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    return false;
 }
 class Client final : public stream::StreamingClient {
 public:
@@ -191,30 +278,39 @@ public:
         close();
         if (!state_ || !state_->valid || !state_->paired || connection.rental.empty() ||
             connection.rental != state_->rental || state_->streamInUse.exchange(true)) return false;
+        resumeOnly_ = connection.resumeOnly;
         state_->stop = false; state_->failed = false; state_->terminated = false;
         state_->frames = 0; state_->audioFrames = 0; state_->videoDrops = 0; state_->audioDrops = 0;
         state_->inputAccepted = 0; state_->inputRejected = 0;
         state_->videoFullYields = 0; state_->videoQueueHigh = 0; state_->videoBatchMax = 0; state_->videoQueueAgeMaxMs = 0;
         state_->videoInvalid = 0; state_->videoWaitDrops = 0; state_->videoResyncs = 0;
+        state_->trace.reset();
+        state_->coreDiagnosticsReady = false;
+        state_->selectedCodec = stream::VideoCodec::H264;
+        state_->negotiatedWidth = 0; state_->negotiatedHeight = 0; state_->negotiatedFps = 0;
         state_->decoderWaiting = true; state_->assemblyWaiting = true;
-        { std::lock_guard<std::mutex> lock(state_->mutex); state_->video.clear(); state_->audio.clear(); state_->error.clear(); ++state_->generation; }
-        state_->config.width = 1280; state_->config.height = 720; state_->config.fps = 60;
+        { std::lock_guard<std::mutex> lock(state_->mutex); state_->video.clear(); state_->audio.clear(); state_->error.clear();
+            state_->command = {}; state_->firstCommandFailure = {}; state_->commandFailures = 0;
+            state_->commandAttempt = 0; state_->closedToResumeMs = 0; ++state_->generation; }
+        state_->config.width = 1280; state_->config.height = 720; state_->config.fps = fog::video::DefaultFramesPerSecond;
         state_->config.bitrate = settings_.bitrateMbps * 1000;
         state_->config.packetSize = 1024; state_->config.streamingRemotely = STREAM_CFG_REMOTE;
         state_->config.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
         state_->config.supportedVideoFormats = VIDEO_FORMAT_H264;
+        if (settings_.codec == stream::VideoCodec::H265) state_->config.supportedVideoFormats |= VIDEO_FORMAT_H265;
         state_->config.clientRefreshRateX100 = 6000; state_->config.colorSpace = COLORSPACE_REC_709;
         state_->config.colorRange = COLOR_RANGE_LIMITED;
-        state_->status("Connecting Moonlight 720p60 H.264");
-        Settings::instance().reset_cancel(); Settings::instance().set_timeout_ms(25000);
+        state_->status("Connecting Moonlight 720p30");
+        Settings::instance().reset_cancel();
+        Settings::instance().set_timeout_ms(resumeOnly_ ? detail::ResumeRetry::BudgetMs : 25000);
         try { worker_ = std::thread(&Client::run, this); }
         catch (...) { state_->streamInUse = false; state_->fail("Cannot start Moonlight worker"); return false; }
         return true;
     }
     bool configureVideo(const fog::video::Settings& value) override {
         if (!fog::video::valid(value) || (state_ && state_->streamInUse)) return false;
-        // Saved app preferences may use H.265/RTC quality. This backend advertises
-        // its actual selected codec/status and only applies the requested bitrate.
+        // Codec preference and bitrate apply at connection setup; RTC presets and
+        // periodic PLI are not part of the Moonlight protocol.
         settings_ = value; return true;
     }
     bool configureRelay(bool enabled) override { return !enabled; }
@@ -222,8 +318,11 @@ public:
     bool updateVideoSettings(const fog::video::Settings& value) override {
         return value == settings_; // Live bitrate/quality/keyframe changes unsupported.
     }
-    stream::VideoCodec selectedVideoCodec() const override { return stream::VideoCodec::H264; }
-    std::string qualityStatus() const override { return "Moonlight 720p60 H.264 / " + std::to_string(settings_.bitrateMbps) + " Mbps; fixed at connect"; }
+    stream::VideoCodec selectedVideoCodec() const override { return state_->selectedCodec.load(); }
+    std::string qualityStatus() const override {
+        return "FogHub 720p30 / " + std::string(stream::videoCodecName(selectedVideoCodec())) +
+            " / " + std::to_string(settings_.bitrateMbps) + " Мбит/с (запрос)";
+    }
     void pump() override {}
     void observePlayback(const stream::PlaybackObservation&) override {}
     bool poll(stream::Packet& packet) override { return take(packet, false); }
@@ -238,27 +337,162 @@ public:
     std::string error() const override { std::lock_guard<std::mutex> lock(state_->mutex); return state_->error; }
     bool retryableError() const override { return false; } // Rental inspection must precede another host attempt.
     bool disconnected() const override { return state_->terminated; }
-    bool disconnectForRetry() override { close(); return false; }
+    bool disconnectForRetry() override {
+        // Explicit quality changes may resume this authenticated, still-live host.
+        // The controller must first revalidate the retained rental and endpoint.
+        const bool healthy = state_ && state_->valid && state_->paired && state_->running &&
+            !state_->failed && !state_->terminated && !state_->stop;
+        close();
+        return healthy && !state_->failed && !state_->terminated;
+    }
     std::string diagnostics() const override {
+        moonlight_diagnostics::CommandSnapshot command;
+        moonlight_diagnostics::CommandSnapshot firstFailure;
+        unsigned attempt, failures;
+        std::uint64_t closedToResume;
+        { std::lock_guard<std::mutex> lock(state_->mutex); command = state_->command; attempt = state_->commandAttempt;
+            firstFailure = state_->firstCommandFailure; failures = state_->commandFailures; closedToResume = state_->closedToResumeMs; }
+        const char* operation = command.operation == moonlight_diagnostics::CommandOperation::Resume ? "resume" :
+            command.operation == moonlight_diagnostics::CommandOperation::Launch ? "launch" : "none";
         return "Moonlight code=" + std::to_string(state_->code.load()) +
+            " command=" + operation + " attempt=" + std::to_string(attempt) +
+            " curl=" + std::to_string(command.curl) + " http=" + std::to_string(command.http) +
+            " xml=" + std::to_string(command.xmlStatus) + " xmlResult=" + std::to_string(command.xmlResult) +
+            " ackField=" + (command.operation == moonlight_diagnostics::CommandOperation::Resume ? "resume" : "gamesession") +
+            " ack=" + std::to_string(command.gameSession) +
+            " dispatched=" + std::to_string(command.dispatched) + " cancelled=" + std::to_string(command.cancelled) +
+            " commandElapsedMs=" + std::to_string(command.elapsedMs) + " httpElapsedMs=" + std::to_string(command.httpElapsedMs) +
+            " commandFailures=" + std::to_string(failures) + " firstFailureCurl=" + std::to_string(firstFailure.curl) +
+            " firstFailureHttp=" + std::to_string(firstFailure.http) + " firstFailureXml=" + std::to_string(firstFailure.xmlStatus) +
+            " firstFailureAck=" + std::to_string(firstFailure.gameSession) +
+            " closedToResumeMs=" + std::to_string(closedToResume) +
             " video=" + std::to_string(state_->frames.load()) + " audio=" + std::to_string(state_->audioFrames.load()) +
             " assemblyWaiting=" + std::to_string(state_->assemblyWaiting.load()) +
             " decoderWaiting=" + std::to_string(state_->decoderWaiting.load()) +
+            " codec=" + std::string(stream::videoCodecName(selectedVideoCodec())) +
+            " requestedCodec=" + std::string(stream::videoCodecName(settings_.codec)) +
+            " width=" + std::to_string(state_->negotiatedWidth.load()) +
+            " height=" + std::to_string(state_->negotiatedHeight.load()) +
+            " fps=" + std::to_string(state_->negotiatedFps.load()) +
+            " requestedFps=" + std::to_string(fog::video::DefaultFramesPerSecond) +
+            " requestedMbps=" + std::to_string(settings_.bitrateMbps) +
             " inputAccepted=" + std::to_string(state_->inputAccepted.load()) +
             " inputRejected=" + std::to_string(state_->inputRejected.load());
     }
-    std::string transportTimings() const override { return "Moonlight transport timing unavailable"; }
-    std::string videoDiagnostics() const override { return "Moonlight H264 pull renderer"; }
-    std::string gapDiagnostics() const override { return "Moonlight FEC managed by core"; }
+    std::string transportTimings() const override {
+        const auto& t = state_->trace;
+        const auto core = coreSnapshot();
+        const auto timing = [](const char* name, std::uint64_t count, std::uint64_t totalUs, std::uint64_t maxUs) {
+            return std::string(name) + "(n,avg_us,max_us)=" + std::to_string(count) + "," +
+                std::to_string(count ? totalUs / count : 0) + "," + std::to_string(maxUs);
+        };
+        return "Moonlight cumulative " + t.workerGap.text("worker_gap") + " | " + t.drain.text("drain") +
+            " | " + t.copy.text("copy") + " | " + t.completion.text("complete") +
+            " empty_polls=" + std::to_string(t.emptyPolls.load()) +
+            " | " + timing("rx_cycle", core.videoReceiveCycleCount, core.videoReceiveCycleTotalUs, core.videoReceiveCycleMaxUs) +
+            " " + timing("rx_wait", core.videoReceiveCycleCount, core.videoReceiveWaitTotalUs, core.videoReceiveWaitMaxUs) +
+            " " + timing("rx_work", core.videoReceiveCycleCount, core.videoReceiveWorkTotalUs, core.videoReceiveWorkMaxUs) +
+            " " + timing("rx_loop_gap", core.videoReceiveLoopGapCount, core.videoReceiveLoopGapTotalUs, core.videoReceiveLoopGapMaxUs) +
+            " " + timing("rx_alloc", core.videoReceiveAllocationCount, core.videoReceiveAllocationTotalUs, core.videoReceiveAllocationMaxUs) +
+            " " + timing("rx_decrypt", core.videoReceiveDecryptCount, core.videoReceiveDecryptTotalUs, core.videoReceiveDecryptMaxUs) +
+            " rx_invalid_times=" + std::to_string(core.videoReceiveTimingInvalidTimes) +
+            " | rcvbuf(requested,selected,actual)=" + std::to_string(core.videoReceiveBufferRequestedBytes) + "," +
+            std::to_string(core.videoReceiveBufferSelectedBytes) + "," + std::to_string(core.videoReceiveBufferActualBytes) +
+            " set_failures=" + std::to_string(core.videoReceiveBufferSetFailures) +
+            " last_set_error=" + std::to_string(core.videoReceiveBufferSetLastError) +
+            " query_ok=" + std::to_string(core.videoReceiveBufferQuerySucceeded) +
+            " query_error=" + std::to_string(core.videoReceiveBufferQueryError);
+    }
+    std::string videoDiagnostics() const override {
+        const auto& t = state_->trace;
+        const auto now = state_->coreDiagnosticsReady ? LiGetMicroseconds() : 0;
+        return "Moonlight " + std::string(stream::videoCodecName(selectedVideoCodec())) + " cumulative units=" + std::to_string(t.units.load()) +
+            " encoded_payload_bytes=" + std::to_string(t.payloadBytes.load()) + " idr=" + std::to_string(t.idrs.load()) +
+            " skipped_frame_numbers=" + std::to_string(t.skippedFrameNumbers.load()) +
+            " repeated_or_reordered=" + std::to_string(t.repeatedOrReordered.load()) +
+            " invalid_times=" + std::to_string(t.invalidTimes.load()) +
+            " last_unit_age_us=" + std::to_string(t.ageUs(now)) +
+            " | " + t.assembly.text("assembly") + " | " + t.coreAge.text("core_queue_age") +
+            " | " + t.arrivalGap.text("unit_gap") + " | " + t.hostProcessing.text("host_processing");
+    }
+    std::string gapDiagnostics() const override {
+        const auto core = coreSnapshot();
+        const auto now = state_->coreDiagnosticsReady ? LiGetMicroseconds() : 0;
+        return "Moonlight core cumulative available=" + std::to_string(state_->coreDiagnosticsReady.load()) +
+            " udp_video_packets=" + std::to_string(core.videoPacketsReceived) +
+            " udp_video_bytes=" + std::to_string(core.videoBytesReceived) +
+            " receive_errors=" + std::to_string(core.videoReceiveErrors) +
+            " decrypt_failures=" + std::to_string(core.videoDecryptFailures) +
+            " runt_packets=" + std::to_string(core.videoRuntPackets) +
+            " last_packet_age_us=" + std::to_string(core.lastVideoPacketUs && now >= core.lastVideoPacketUs ? now - core.lastVideoPacketUs : 0) +
+            " packet_gap_max_us=" + std::to_string(core.maxVideoPacketGapUs) +
+            " rtp_processing_n=" + std::to_string(core.videoPacketProcessingCount) +
+            " rtp_processing_avg_us=" + std::to_string(core.videoPacketProcessingCount ? core.videoPacketProcessingTotalUs / core.videoPacketProcessingCount : 0) +
+            " rtp_processing_max_us=" + std::to_string(core.videoPacketProcessingMaxUs) +
+            " rtp_processing_invalid_times=" + std::to_string(core.videoPacketProcessingInvalidTimes) +
+            " fec_blocks_complete=" + std::to_string(core.fecBlocksCompleted) +
+            " fec_blocks_failed=" + std::to_string(core.fecBlocksFailed) +
+            " fec_packets_recovered=" + std::to_string(core.fecPacketsRecovered) +
+            " fec_reconstruction_failures=" + std::to_string(core.fecReconstructionFailures) +
+            " rtp_reject_seq=" + std::to_string(core.videoPacketsRejectedSequence) +
+            " rtp_reject_frame=" + std::to_string(core.videoPacketsRejectedFrame) +
+            " rtp_reject_block=" + std::to_string(core.videoPacketsRejectedBlock) +
+            " rtp_reject_header=" + std::to_string(core.videoPacketsRejectedHeader) +
+            " rtp_reject_range=" + std::to_string(core.videoPacketsRejectedRange) +
+            " rtp_reject_duplicate=" + std::to_string(core.videoPacketsRejectedDuplicate) +
+            " rtp_reject_transition=" + std::to_string(core.videoPacketsRejectedTransition) +
+            " rtp_out_of_order=" + std::to_string(core.videoPacketsOutOfOrder) +
+            " rtp_gap_fill=" + std::to_string(core.videoPacketsGapFill) +
+            " rtp_observed_gap_packets=" + std::to_string(core.videoSequenceGapPackets) +
+            " fec_loss_predictions=" + std::to_string(core.fecSpeculativeLossPredictions) +
+            " fec_loss_mispredictions=" + std::to_string(core.fecSpeculativeLossMispredictions) +
+            " fec_speculation_resumes=" + std::to_string(core.fecSpeculativeModeResumes) +
+            " fec_oos_mode=" + std::to_string(core.fecOosMode) +
+            " fec_abandoned_current=" + std::to_string(core.fecAbandonedCurrentBlocks) +
+            " fec_abandoned_queued=" + std::to_string(core.fecAbandonedPacketsQueued) +
+            " fec_abandoned_data_expected=" + std::to_string(core.fecAbandonedDataExpected) +
+            " fec_abandoned_data_received=" + std::to_string(core.fecAbandonedDataReceived) +
+            " fec_abandoned_data_missing=" + std::to_string(core.fecAbandonedDataMissing) +
+            " fec_abandoned_parity_expected=" + std::to_string(core.fecAbandonedParityExpected) +
+            " fec_abandoned_parity_received=" + std::to_string(core.fecAbandonedParityReceived) +
+            " fec_abandoned_parity_missing=" + std::to_string(core.fecAbandonedParityMissing) +
+            " fec_abandoned_data_missing_max=" + std::to_string(core.fecAbandonedMissingDataMax) +
+            " fec_abandoned_parity_missing_max=" + std::to_string(core.fecAbandonedMissingParityMax) +
+            " core_idr_requests=" + std::to_string(core.idrRequests) +
+            " core_waiting_idr=" + std::to_string(core.waitingForIdr) +
+            " core_waiting_idr_drops=" + std::to_string(core.waitingForIdrDrops) +
+            " core_idr_wait_entries=" + std::to_string(core.idrWaitEntries) +
+            " core_idr_wait_reason=" + std::to_string(core.idrWaitReason) +
+            " core_idr_wait_age_us=" + std::to_string(core.waitingForIdr && core.idrWaitStartedUs && now >= core.idrWaitStartedUs ? now - core.idrWaitStartedUs : 0) +
+            " core_idr_wait_releases=" + std::to_string(core.idrWaitReleases) +
+            " core_idr_wait_last_us=" + std::to_string(core.idrWaitLastUs) +
+            " core_idr_wait_max_us=" + std::to_string(core.idrWaitMaxUs) +
+            " core_idr_wait_retries=" + std::to_string(core.idrWaitRetryRequests) +
+            " core_idr_drop_limit_requests=" + std::to_string(core.idrDropLimitRequests) +
+            " core_idr_request_age_us=" + std::to_string(core.lastIdrRequestUs && now >= core.lastIdrRequestUs ? now - core.lastIdrRequestUs : 0) +
+            " core_idr_dispatches=" + std::to_string(core.idrDispatches) +
+            " core_idr_dispatch_ok=" + std::to_string(core.idrDispatchSuccesses) +
+            " core_idr_dispatch_failed=" + std::to_string(core.idrDispatchFailures) +
+            " core_idr_dispatch_age_us=" + std::to_string(core.lastIdrDispatchUs && now >= core.lastIdrDispatchUs ? now - core.lastIdrDispatchUs : 0) +
+            " core_idr_frames_completed=" + std::to_string(core.idrFramesCompleted);
+    }
     std::string queueDiagnostics() const override {
+        const auto core = coreSnapshot();
         return "Moonlight video_drop=" + std::to_string(state_->videoDrops.load()) + " audio_drop=" + std::to_string(state_->audioDrops.load()) +
             " video_capacity=" + std::to_string(State::VideoCapacity) + " video_high=" + std::to_string(state_->videoQueueHigh.load()) +
             " video_full_yields=" + std::to_string(state_->videoFullYields.load()) + " video_batch_max=" + std::to_string(state_->videoBatchMax.load()) +
             " video_age_max_ms=" + std::to_string(state_->videoQueueAgeMaxMs.load()) +
             " invalid_frames=" + std::to_string(state_->videoInvalid.load()) + " waiting_idr_drops=" + std::to_string(state_->videoWaitDrops.load()) +
-            " invalid_resyncs=" + std::to_string(state_->videoResyncs.load());
+            " invalid_resyncs=" + std::to_string(state_->videoResyncs.load()) +
+            " core_pending=" + std::to_string(core.decodeQueuePending) +
+            " core_high=" + std::to_string(core.decodeQueueHigh) +
+            " core_overflows=" + std::to_string(core.decodeQueueOverflows) +
+            " core_flushes=" + std::to_string(core.decodeQueueFlushes) +
+            " core_flushed_frames=" + std::to_string(core.decodeQueueFlushedFrames);
     }
-    std::string mutexDiagnostics() const override { return "Moonlight mutex telemetry unavailable"; }
+    std::string mutexDiagnostics() const override {
+        return "Moonlight cumulative " + state_->trace.queueLock.text("worker_queue_lock");
+    }
     std::string dtlsDiagnostics() const override { return "Moonlight transport has no DTLS"; }
     std::string rtcpDiagnostics() const override { return "Moonlight feedback managed by core"; }
     std::string inputDiagnostics() const override { return "Moonlight input accepted=" + std::to_string(state_->inputAccepted.load()) + " rejected=" + std::to_string(state_->inputRejected.load()); }
@@ -300,7 +534,13 @@ public:
 private:
     std::shared_ptr<State> state_;
     fog::video::Settings settings_;
+    bool resumeOnly_ = false;
     std::thread worker_;
+    FogMoonlightDiagnostics coreSnapshot() const {
+        FogMoonlightDiagnostics result{};
+        if (state_->coreDiagnosticsReady) FogMoonlightGetDiagnostics(&result);
+        return result;
+    }
     bool accepted(int result) { if (result == 0) { ++state_->inputAccepted; return true; } return rejected(); }
     bool rejected() { ++state_->inputRejected; return false; }
     static short axis(float value) { return static_cast<short>(std::isfinite(value) ? std::clamp(value, -1.f, 1.f) * 32767.f : 0); }
@@ -347,12 +587,7 @@ private:
     void run() noexcept {
         bool started = false;
         try {
-            // Refresh signed metadata on reconnect; gs_init preserves this rental's
-            // certificate and pinned key. Release old RTSP allocation explicitly.
-            delete[] state_->host.serverInfo.rtspSessionUrl; state_->host.serverInfo.rtspSessionUrl = nullptr;
-            const int initialized = gs_init(&state_->host, state_->endpoint);
-            if (initialized != GS_OK || !state_->host.paired) state_->fail("Moonlight authenticated host unavailable", initialized);
-            else if (!state_->stop && launch(*state_) && !state_->stop) {
+            if (!state_->stop && launch(*state_, resumeOnly_) && !state_->stop) {
                 DECODER_RENDERER_CALLBACKS video{}; LiInitializeVideoCallbacks(&video);
                 video.setup = videoSetup; video.capabilities = CAPABILITY_PULL_RENDERER;
                 AUDIO_RENDERER_CALLBACKS audio{}; LiInitializeAudioCallbacks(&audio);
@@ -361,17 +596,25 @@ private:
                 listeners.stageStarting = stageStarting; listeners.stageFailed = stageFailed;
                 listeners.connectionTerminated = terminated; listeners.logMessage = ignoreLog;
                 active = state_.get();
-                { std::lock_guard<std::mutex> lock(state_->apiMutex); if (!state_->stop) { Settings::instance().reset_cancel(); state_->starting = true; } }
+                { std::lock_guard<std::mutex> lock(state_->apiMutex);
+                    if (!state_->stop && state_->valid && !Settings::instance().request_cancelled()) {
+                        Settings::instance().reset_cancel(); state_->starting = true;
+                    }
+                }
                 int result = -1;
                 if (state_->starting) result = LiStartConnection(&state_->host.serverInfo, &state_->config, &listeners, &video, &audio, nullptr, 0, nullptr, 0);
                 { std::lock_guard<std::mutex> lock(state_->apiMutex); state_->starting = false; }
                 if (result != 0) { if (!state_->stop) state_->fail("Moonlight connection failed", result); }
                 else {
-                    started = true; state_->running = true;
+                    started = true; state_->coreDiagnosticsReady = true; state_->running = true;
                     { std::lock_guard<std::mutex> lock(state_->apiMutex); LiSendControllerArrivalEvent(0, 1, LI_CTYPE_XBOX, 0xffff, 0); }
-                    state_->status("Moonlight stream active: 720p60 H.264");
+                    state_->status("Moonlight stream active: 720p30");
                     while (!state_->stop && !state_->terminated) {
-                        drainVideo(*state_); std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                        const auto began = detail::steadyUs();
+                        state_->trace.worker(began);
+                        drainVideo(*state_);
+                        state_->trace.drain.add(detail::steadyUs() - began);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(3));
                     }
                     if (state_->terminated) state_->fail("Moonlight host disconnected", state_->code);
                 }
@@ -386,6 +629,7 @@ private:
                 LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MOUSE_RIGHT);
                 for (short key : {short(0x0d), short(0x08), short(0x09), short(0x1b)}) LiSendKeyboardEvent(key, KEY_ACTION_UP, 0);
                 LiStopConnection();
+                state_->transportClosedMs = nowMs();
             }
             active = nullptr;
         }

@@ -28,7 +28,11 @@ struct ComputersPage { std::vector<ComputerRow> rows; std::string nextPath; std:
 // Derived only from the observed form field metadata, not a captured server
 // template. Keep the original validated value for submission; never log it.
 struct MoonlightEndpoint { std::string host; std::uint16_t port{0}; };
-struct ConnectForm { std::string csrf, actionPath, moonlightUrl; MoonlightEndpoint endpoint; };
+struct ConnectForm {
+    std::string csrf, actionPath, moonlightUrl;
+    MoonlightEndpoint endpoint;
+    bool hasBonusChoice = false; // Only the observed accumulation mode may be submitted.
+};
 struct LaunchSuccess { std::string rentalId; };
 enum class CloseMethod { Get };
 // GET is inferred from an ordinary href with no data-method. This DTO is not

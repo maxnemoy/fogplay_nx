@@ -38,6 +38,7 @@ private:
     std::string readRentalPage(const std::string& path);
     WebResponse submitPairing(const std::string& computer, const Query& fields, bool freshPair = false);
     WebResponse closeRental(const std::string& rental);
+    WebResponse submitSessionRating(const std::string& rental,const Query& fields);
     WebResponse get(const std::string& path, bool requiresAuth);
     UserProfile verifiedProfile();
     void invalidate(bool removeSaved);

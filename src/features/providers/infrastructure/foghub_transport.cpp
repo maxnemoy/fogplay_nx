@@ -1,4 +1,5 @@
 #include "features/providers/infrastructure/foghub_transport.hpp"
+#include "features/providers/infrastructure/foghub_review_html.hpp"
 
 #include "core/constants/app_info.hpp"
 #include "core/constants/resources.hpp"
@@ -106,12 +107,13 @@ bool numericId(std::string_view value) {
         std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
 }
 
-std::string formBody(const Query& fields) {
+std::string formBody(const Query& fields,bool review = false) {
     if (fields.empty() || fields.size() > 64) fail(TransportFailure::InvalidRequest);
     std::string form;
     for (const auto& field : fields) {
         if (!validFieldName(field.first) || field.second.size() > maxRequestBytes / 2 ||
-            !validText(field.second)) fail(TransportFailure::InvalidRequest);
+            !(review && field.first=="Review[message]" ? validSessionReviewMessage(field.second) : validText(field.second)))
+            fail(TransportFailure::InvalidRequest);
         if (!form.empty()) form += '&';
         form += encode(field.first) + '=' + encode(field.second);
         if (form.size() > maxRequestBytes) fail(TransportFailure::InvalidRequest);
@@ -209,19 +211,38 @@ public:
         return submitPairing(computer,fields,false);
     }
     WebResponse submitPairing(const std::string& computer, const Query& fields, bool freshPair) override {
-        if (!numericId(computer) || fields.size() != 3) fail(TransportFailure::InvalidRequest);
+        if (!numericId(computer) || fields.size() < 3 || fields.size() > 4) fail(TransportFailure::InvalidRequest);
         std::set<std::string> names;
         for (const auto& field : fields) {
             if (!names.insert(field.first).second ||
-                (field.first != "_csrf" && field.first != "moonlight_url" && field.first != "Pc[pin]") ||
+                (field.first != "_csrf" && field.first != "moonlight_url" && field.first != "Pc[pin]" && field.first != "Pc[use_bonus]") ||
                 field.second.empty()) fail(TransportFailure::InvalidRequest);
+            if (field.first == "Pc[use_bonus]" && field.second != "0") fail(TransportFailure::InvalidRequest);
             if (field.first == "Pc[pin]" && (field.second.size() != 4 ||
                 !std::all_of(field.second.begin(), field.second.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })))
                 fail(TransportFailure::InvalidRequest);
         }
+        if (!names.count("_csrf") || !names.count("moonlight_url") || !names.count("Pc[pin]"))
+            fail(TransportFailure::InvalidRequest);
         const auto form = formBody(fields);
         std::lock_guard<std::mutex> lock(mutex_);
         return request("/pc/play?id=" + computer + (freshPair ? "&resume=0" : ""), &form);
+    }
+
+    WebResponse submitSessionRating(const std::string& rental,const Query& fields) override {
+        if (!numericId(rental) || fields.size()!=3) fail(TransportFailure::InvalidRequest);
+        std::set<std::string> names;
+        for (const auto& field:fields) {
+            if (!names.insert(field.first).second) fail(TransportFailure::InvalidRequest);
+            if (field.first=="_csrf") { if(field.second.empty() || field.second.size()>4096) fail(TransportFailure::InvalidRequest); }
+            else if(field.first=="Review[rating]") {
+                if(field.second.size()!=1 || field.second[0]<'1' || field.second[0]>'5') fail(TransportFailure::InvalidRequest);
+            } else if(field.first=="Review[message]") { if(!validSessionReviewMessage(field.second)) fail(TransportFailure::InvalidRequest); }
+            else fail(TransportFailure::InvalidRequest);
+        }
+        const auto form=formBody(fields,true);
+        std::lock_guard<std::mutex> lock(mutex_);
+        return request("/session/review?id="+rental,&form);
     }
 
     WebResponse closeRental(const std::string& rental) override {
@@ -366,7 +387,7 @@ std::string canonicalReadPath(const std::string& input) {
     const auto path = input.substr(0, question);
     // Unlike generic list filters, these authenticated routes accept only the
     // exact observed PC query. No action/method aliases or extra fields.
-    if (path == "/pc/play" || path == "/pc/play-success") {
+    if (path == "/pc/play" || path == "/pc/play-success" || path == "/session/review") {
         const auto prefix = path + "?id=";
         if (input.rfind(prefix, 0) != 0) fail(TransportFailure::InvalidRequest);
         auto id = input.substr(prefix.size());

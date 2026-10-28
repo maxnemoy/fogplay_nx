@@ -44,6 +44,9 @@ public:
     virtual WebResponse closeRental(const std::string&) {
         throw TransportError(TransportFailure::Unsupported);
     }
+    virtual WebResponse submitSessionRating(const std::string&,const Query&) {
+        throw TransportError(TransportFailure::Unsupported);
+    }
     virtual std::vector<std::string> cookies() = 0;
     virtual void restoreCookies(const std::vector<std::string>& cookies) = 0;
     virtual void clearCookies() = 0;

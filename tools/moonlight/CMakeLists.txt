@@ -43,18 +43,26 @@ set_target_properties(MbedTLS::mbedcrypto PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES "${RTC_PREFIX}/include"
   INTERFACE_LINK_LIBRARIES "${MOONLIGHT_TLS_LIBRARIES}")
 add_subdirectory("${UPSTREAM}/extern/moonlight-common-c" moonlight-common-c)
-# Replace exactly the lifecycle translation unit; leave the checkout untouched.
+# Replace only explicitly prepared translation units; leave the pinned checkout untouched.
 get_target_property(MOONLIGHT_SOURCES moonlight-common-c SOURCES)
-list(LENGTH MOONLIGHT_SOURCES MOONLIGHT_SOURCE_COUNT)
-list(FILTER MOONLIGHT_SOURCES EXCLUDE REGEX "(^|/)Connection\\.c$")
-list(LENGTH MOONLIGHT_SOURCES MOONLIGHT_FILTERED_COUNT)
-math(EXPR EXPECTED_COUNT "${MOONLIGHT_SOURCE_COUNT} - 1")
-if(NOT MOONLIGHT_FILTERED_COUNT EQUAL EXPECTED_COUNT)
-  message(FATAL_ERROR "Expected exactly one upstream Connection.c source")
-endif()
+set(PREPARED_CORE_SOURCES Connection VideoStream RtpVideoQueue VideoDepacketizer ControlStream LinkedBlockingQueue PlatformSockets)
+foreach(name IN LISTS PREPARED_CORE_SOURCES)
+  list(LENGTH MOONLIGHT_SOURCES MOONLIGHT_SOURCE_COUNT)
+  list(FILTER MOONLIGHT_SOURCES EXCLUDE REGEX "(^|/)${name}\\.c$")
+  list(LENGTH MOONLIGHT_SOURCES MOONLIGHT_FILTERED_COUNT)
+  math(EXPR EXPECTED_COUNT "${MOONLIGHT_SOURCE_COUNT} - 1")
+  if(NOT MOONLIGHT_FILTERED_COUNT EQUAL EXPECTED_COUNT)
+    message(FATAL_ERROR "Expected exactly one upstream ${name}.c source")
+  endif()
+endforeach()
 set_property(TARGET moonlight-common-c PROPERTY SOURCES "${MOONLIGHT_SOURCES}")
-target_sources(moonlight-common-c PRIVATE "${PREPARED}/core/Connection.c")
-target_include_directories(moonlight-common-c PRIVATE "${UPSTREAM}/extern/moonlight-common-c/src")
+foreach(name IN LISTS PREPARED_CORE_SOURCES)
+  target_sources(moonlight-common-c PRIVATE "${PREPARED}/core/${name}.c")
+endforeach()
+target_sources(moonlight-common-c PRIVATE "${CMAKE_CURRENT_LIST_DIR}/FogMoonlightDiagnostics.c"
+  "${CMAKE_CURRENT_LIST_DIR}/FogMoonlightRecovery.c")
+target_include_directories(moonlight-common-c PRIVATE
+  "${UPSTREAM}/extern/moonlight-common-c/src" "${CMAKE_CURRENT_LIST_DIR}")
 target_sources(moonlight-common-c PRIVATE "${CMAKE_CURRENT_LIST_DIR}/signal-switch.c")
 add_library(gamestream STATIC
   "${PREPARED}/libgamestream/client.cpp"
@@ -84,9 +92,11 @@ add_custom_command(TARGET gamestream POST_BUILD
     --nm "${CMAKE_NM}" --objcopy "${CMAKE_OBJCOPY}" --ranlib "${CMAKE_RANLIB}"
   VERBATIM)
 add_executable(moonlight-link-smoke link-smoke.cpp)
+target_include_directories(moonlight-link-smoke PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
 target_link_libraries(moonlight-link-smoke PRIVATE gamestream)
 # Pull in both implementations and the app's cookie API in a complete Switch link.
 add_executable(moonlight-curl-coexist-smoke link-smoke.cpp curl-coexist-smoke.c)
+target_include_directories(moonlight-curl-coexist-smoke PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
 target_link_directories(moonlight-curl-coexist-smoke BEFORE PRIVATE
   "${ROOT}/third_party/ffmpeg-diag/switch/lib" "${RTC_PREFIX}/lib"
   "$ENV{DEVKITPRO}/portlibs/switch/lib" "$ENV{DEVKITPRO}/libnx/lib" "${PRIVATE_PREFIX}/lib")

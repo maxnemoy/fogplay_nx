@@ -89,8 +89,8 @@ struct Setup {
     Auth auth{session};
     Account account{session};
     fog::foghub::Catalog catalog{session};
-    void login() {
-        web.responses.push_back({"/site/login",html(fixture("login.html"))}); web.profile();
+    void login(std::string page=fixture("account.html")) {
+        web.responses.push_back({"/site/login",html(fixture("login.html"))}); web.profile(std::move(page));
         const auto result=auth.begin({"fixture-user","fixture-password"});
         assert(result.step==AuthStep::Success && auth.authenticated()); assert(web.posts==1);
     }
@@ -101,6 +101,17 @@ template<class F> void error(RepositoryErrorKind kind,F&& action) {
     assert(seen);
 }
 void loginAndProfile() {
+    const auto current=fixture("account-profile-synthetic.html");
+    Setup modern; modern.login(current);
+    assert(modern.store.saved && modern.store.saved->account=="login:fixture-user");
+    modern.web.profile(current,"123.45");
+    assert(modern.account.profile().balance->minorUnits==12345);
+    Setup restored; restored.store.saved=modern.store.saved; restored.web.profile(current);
+    assert(restored.auth.restore().restored && restored.auth.authenticated() && restored.web.posts==0);
+    auto wrongOwner=current; replace(wrongOwner,"fixture-user","another-user");
+    restored.web.profile(wrongOwner);
+    error(RepositoryErrorKind::NotAuthenticated,[&]{restored.account.profile();});
+    assert(!restored.auth.authenticated() && !restored.store.saved);
     Setup s; assert(s.auth.capabilities().method==LoginMethod::Credentials);
     s.login(); assert(s.auth.auth().account==AccountId({ProviderId::FogHub,"login:fixture-user"}));
     assert(s.store.saved && s.store.saved->account==s.auth.auth().account.value);

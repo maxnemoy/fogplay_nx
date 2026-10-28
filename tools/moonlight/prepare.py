@@ -11,8 +11,10 @@ DEST = BASE / "prepared"
 for directory in ("libgamestream", "crypto"):
     shutil.copytree(SOURCE / directory, DEST / directory, dirs_exist_ok=True)
 (DEST / "core").mkdir(parents=True, exist_ok=True)
-shutil.copy2(BASE / "moonlight-switch/extern/moonlight-common-c/src/Connection.c",
-             DEST / "core/Connection.c")
+for name in ("Connection.c", "VideoStream.c", "RtpVideoQueue.c",
+             "VideoDepacketizer.c", "ControlStream.c", "LinkedBlockingQueue.c", "PlatformSockets.c"):
+    shutil.copy2(BASE / "moonlight-switch/extern/moonlight-common-c/src" / name,
+                 DEST / "core" / name)
 
 
 def replace(file, old, new, count=1):
@@ -160,11 +162,15 @@ replace("libgamestream/http.cpp", "    CURLcode res = curl_easy_perform(curl);",
     const std::string transport = url.compare(0, 8, "https://") == 0 ? "https" : "http";
     moonlight_diagnostics::emit("HTTP begin operation=" + operation + " transport=" + transport);
     const auto started = std::chrono::steady_clock::now();
+    moonlight_diagnostics::httpDispatched = false;
     CURLcode res = curl_easy_perform(curl);
     long responseCode = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &responseCode);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();
+    moonlight_diagnostics::commandHttp(static_cast<int>(res),responseCode,
+        static_cast<std::uint64_t>(elapsed),moonlight_diagnostics::httpDispatched,
+        Settings::instance().request_cancelled());
     moonlight_diagnostics::emit("HTTP end operation=" + operation + " transport=" + transport +
         " curl=" + std::to_string(static_cast<int>(res)) + " http=" + std::to_string(responseCode) +
         " elapsed_ms=" + std::to_string(elapsed));""")
@@ -205,3 +211,56 @@ replace("libgamestream/http.cpp", """    mem->memory = (char*)realloc(mem->memor
 
 from production import apply
 apply(DEST)
+
+# Preserve only numeric command outcomes. Never copy request URLs, XML bodies,
+# status messages or gs_error() into a diagnostic snapshot.
+replace("libgamestream/http.cpp",
+        '    if (type == CURLINFO_HEADER_OUT && context) Settings::instance().pairing_dispatched();',
+        '''    if (type == CURLINFO_HEADER_OUT) moonlight_diagnostics::httpDispatched = true;
+    if (type == CURLINFO_HEADER_OUT && context) Settings::instance().pairing_dispatched();''')
+replace("libgamestream/http.cpp",
+        '        gs_set_error("HTTP request cancelled or deadline reached");',
+        '''        moonlight_diagnostics::commandHttp(42,0,0,false,true);
+        gs_set_error("HTTP request cancelled or deadline reached");''')
+replace("libgamestream/xml.cpp", '#include "xml.h"', '#include "xml.h"\n#include "Diagnostics.hpp"')
+replace("libgamestream/xml.cpp", '                *status = atoi(atts[i + 1]);',
+        '''                *status = atoi(atts[i + 1]);
+                moonlight_diagnostics::commandXmlStatusText(atts[i + 1]);''')
+client = DEST / "libgamestream/client.cpp"
+text = client.read_text()
+start = text.index("int gs_start_app(")
+end = text.index("int gs_quit_app(",start)
+command = text[start:end]
+command = command.replace('    Data rand = Data::random_bytes(16);',
+        '''    const bool resuming = server->currentGame != 0;
+    moonlight_diagnostics::beginCommand(!resuming ?
+        moonlight_diagnostics::CommandOperation::Launch : moonlight_diagnostics::CommandOperation::Resume);
+    Data rand = Data::random_bytes(16);''',1)
+if command.count('xml_search(data, "gamesession", &result)') != 1:
+    raise RuntimeError("Pinned GameStream acknowledgement boundary changed")
+command = command.replace('xml_search(data, "gamesession", &result)',
+        'xml_search(data, resuming ? "resume" : "gamesession", &result)',1)
+if command.count('if (xml_search(data, "sessionUrl0", &result) == GS_OK)') != 1:
+    raise RuntimeError("Pinned GameStream session URL boundary changed")
+command = command.replace('if (xml_search(data, "sessionUrl0", &result) == GS_OK)',
+        'if (xml_search(data, "sessionUrl0", &result) == GS_OK && !result.empty())',1)
+command = command.replace('    if ((ret = xml_status(data)) != GS_OK) {',
+        '''    ret = xml_status(data);
+    moonlight_diagnostics::commandXmlResult(ret);
+    if (ret != GS_OK) {''',1)
+command = command.replace('    if (result != "1") {',
+        '''    moonlight_diagnostics::commandGameSession(result == "1" ? 1 : result == "0" ? 0 : -1);
+    if (result != "1") {''',1)
+command = command.replace('exit:\n    return ret;',
+        '''exit:
+    moonlight_diagnostics::finishCommand(ret,Settings::instance().request_cancelled());
+    return ret;''',1)
+if command.count("beginCommand(") != 1 or command.count("finishCommand(") != 1 or command.count("commandXmlResult(") != 1:
+    raise RuntimeError("Pinned GameStream command diagnostic boundary changed")
+client.write_text(text[:start] + command + text[end:])
+
+from diagnostics import apply as apply_diagnostics
+apply_diagnostics(DEST)
+
+from recovery import apply as apply_recovery
+apply_recovery(DEST)

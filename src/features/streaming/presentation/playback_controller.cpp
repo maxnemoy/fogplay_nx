@@ -57,6 +57,7 @@ void ApplicationController::logOutputTimings(bool final) {
 
 bool ApplicationController::closeTransport(bool final) noexcept {
     bool retryAllowed = true;
+    if (media_) media_->stopWorkers();
     if (streamPlayStation_) {
         try { releasePlayStationInput(); } catch (...) {}
         psSensors_.stop();
@@ -78,7 +79,7 @@ bool ApplicationController::closeTransport(bool final) noexcept {
             logOutputTimings(true);
             diagnostic("Stream transport final: " + stream_->transportTimings(),4096);
             if (media_) {
-                diagnostic("Video decoder final: " + media_->diagnostics(),2048);
+                diagnostic("Video decoder final: " + media_->diagnostics(),4096);
                 diagnostic("Audio playback final: " + media_->audioDiagnostics(),2048);
             }
         } catch (...) { retryAllowed = false; } // Cleanup must continue; an uncertain retry must stop.
@@ -108,6 +109,7 @@ bool ApplicationController::closeTransport(bool final) noexcept {
 }
 
 void ApplicationController::closeStream() noexcept {
+    pairedVideoReconnectPending_ = false;
     transportReconnect_.cancel();
     closeTransport(true);
     streamRental_ = {};
@@ -120,7 +122,7 @@ void ApplicationController::closeStream() noexcept {
     streamInputGate_.reset();
 }
 
-bool ApplicationController::startTransport() {
+bool ApplicationController::startTransport(bool resumeOnly) {
     // Transport replacement must not adopt, create, or reset rental ownership.
     videoRecovery_.reset();
     videoLossWaiting_ = false; firstFramePresented_ = false;
@@ -146,15 +148,21 @@ bool ApplicationController::startTransport() {
     diagnostic(rtcTransport ? std::string("Transport ICE policy: ") + (relaySelection_.relay() ? "relay" : "all") : "Moonlight direct transport; RTC relay policy unavailable");
     auto streamSettings = videoSettings_;
     if (!rtcTransport) {
-        streamSettings.codec = stream::VideoCodec::H264;
+        if (!fog::Media::supportsH265()) streamSettings.codec = stream::VideoCodec::H264;
         streamSettings.quality = 0; streamSettings.keyframeSeconds = 0;
     }
     if (!stream_->configureVideo(streamSettings))
         throw std::runtime_error("Invalid video configuration; stopping rental");
+    overlay_.setProvider(streamRental_.provider);
+    overlay_.setVideoChangesEnabled(rtcTransport);
     overlay_.setVideoSettings(streamSettings);
     overlay_.setSaveStatus(videoSaveStatus_);
     lastStreamState_.clear(); lastStreamDiagnostics_.clear();
-    const bool started = stream_->start({streamRental_});
+    const bool started = stream_->start({streamRental_, resumeOnly});
+    if (started && !rtcTransport) {
+        media_->startWorkers(*stream_, fog::video::DefaultFramesPerSecond);
+        diagnostic("FH media workers started: independent video/audio; paced presentation fps=30");
+    }
     streamStarted_ = lastVideo_ = lastMediaLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
     return started;
 }
@@ -182,6 +190,7 @@ void ApplicationController::retryTransport(const char* reason) {
 }
 
 void ApplicationController::startStream(const fog::RentalId& rental, bool createdFromCatalog) {
+    pairedVideoReconnectPending_ = false;
     latency_.cancel();
     recentLaunch_.stream(createdFromCatalog);
     relaySelection_.reset(connectionSettings_);
@@ -258,6 +267,7 @@ void ApplicationController::feedStreamAudio(const stream::Packet& packet) {
     if (!before) diagnostic("First Opus packet decoded and queued.");
 }
 void ApplicationController::drainStreamAudio() {
+    if (media_->workersRunning()) return;
     const auto started = std::chrono::steady_clock::now();
     stream::Packet packet;
     // Independent bounded audio slice, including when video exhausts its budget.
@@ -292,6 +302,8 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         lastPumpAt_ = pumpAt;
         const auto transportStarted = std::chrono::steady_clock::now();
         stream_->pump();
+        if (streamRental_.provider == fog::ProviderId::FogHub)
+            overlay_.setVideoChangesEnabled(stream_->ready());
         transportPumpTiming_.record(transportStarted);
         transportWorkUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now()-transportStarted).count());
@@ -368,6 +380,22 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     }
     if (videoRecovery_.expired(std::chrono::steady_clock::now()))
         throw std::runtime_error("Video recovery deadline reached; stopping rental");
+    if (media_->workersRunning()) {
+        fog::Media::WorkerError failure;
+        if (media_->takeWorkerError(failure)) {
+            try { std::rethrow_exception(failure.error); }
+            catch (const fog::VideoDecodeError& error) {
+                recoverVideoError(error, failure.hasPacket ? &failure.packet : nullptr);
+            }
+        }
+        const auto generation = media_->workerVideoGeneration();
+        if (generation && generation != lastVideoGeneration_) {
+            lastVideoGeneration_ = generation;
+            loopTiming_.suspendPresentation();
+            suspendVideoInput();
+            diagnostic("Video chain resync: worker generation=" + std::to_string(generation));
+        }
+    }
     drainStreamAudio();
     stream::Packet packet;
     int drained = 0;
@@ -381,7 +409,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     if (drainBudget.catchup()) ++catchupWindows_;
     // Keep compressed references in FIFO order. Bound both work time and the
     // number of video frames before input, presentation, and audio get a turn.
-    while (true) {
+    while (!media_->workersRunning()) {
         const auto elapsedUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now()-drainStarted).count());
         const auto yield = drainBudget.yield(elapsedUs);
@@ -523,7 +551,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         diagnostic("Video RTP: " + stream_->videoDiagnostics(),4096);
         diagnostic("Video gaps: " + stream_->gapDiagnostics(),4096);
         diagnostic("Media queue: " + stream_->queueDiagnostics(),2048);
-        diagnostic("Video decoder: " + media_->diagnostics(),2048);
+        diagnostic("Video decoder: " + media_->diagnostics(),4096);
         diagnostic("Audio playback: " + media_->audioDiagnostics(),2048);
         logOutputTimings(false);
         const auto timings = playbackTimings();

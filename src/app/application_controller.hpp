@@ -26,6 +26,7 @@
 #include "features/streaming/domain/streaming_client.hpp"
 #include "features/session/application/checkout.hpp"
 #include "features/session/application/paired_checkout.hpp"
+#include "features/session/presentation/session_rating.hpp"
 #include "core/storage/storage.hpp"
 #include "app/presentation/ui.hpp"
 #include "features/catalog/infrastructure/artwork.hpp"
@@ -80,8 +81,8 @@ inline constexpr SDL_Color white{234, 238, 245, 255};
 inline constexpr SDL_Color muted{163, 178, 200, 255};
 inline constexpr SDL_Color accent{107, 216, 190, 255};
 
-enum class Screen { Profile, Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails };
-enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation, PairedCreate, PairedPoll, PairedStop, ProviderProfile, ProviderForget };
+enum class Screen { Profile, Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails, SessionRating };
+enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation, PairedCreate, PairedPoll, PairedStop, ProviderProfile, ProviderForget, SessionRatingLoad, SessionRatingSubmit };
 
 struct RestoredProviders {
     bool mts = false, foghub = false;
@@ -93,7 +94,8 @@ struct VerifiedOffer { fog::StartRentalRequest request; };
 struct ChangedOffer { std::vector<fog::Computer> computers; };
 using TaskResult = std::variant<std::monostate, RestoredProviders, fog::RestoreAuthResult, fog::AuthResult,
     fog::UserProfile, fog::GameDetail, fog::Page<fog::Computer>, std::vector<fog::HistoryEntry>,
-    std::vector<fog::Rental>, fog::FinishResult, RecoveryResult, VerifiedOffer, ChangedOffer>;
+    std::vector<fog::Rental>, fog::FinishResult, RecoveryResult, VerifiedOffer, ChangedOffer,
+    std::optional<fog::SessionRatingForm>, fog::SessionRatingResult>;
 
 // Main-thread presentation coordinator. Workers are joined before their state is read.
 class ApplicationController {
@@ -109,6 +111,13 @@ private:
     void refreshProfile();
     RestoredProviders restoreProviders();
     void handlePairedCheckout();
+    bool openSessionRating(std::optional<fog::RentalId> rental = std::nullopt);
+    bool offerSessionRating(const fog::PairedCheckoutResult& result);
+    void completeSessionRatingLoad(std::optional<fog::SessionRatingForm> form);
+    void completeSessionRatingSubmit(const fog::SessionRatingResult& result);
+    void submitSessionRating();
+    void inputSessionRating(u64 keys);
+    void drawSessionRating();
     bool pairedPending() const { return pairedPending_; }
     void armExitHandling();
     void disarmExitHandling();
@@ -120,7 +129,9 @@ private:
     void dispatchPlayStationInput(bool allowed);
     void releasePlayStationInput();
     bool closeTransport(bool final) noexcept;
-    bool startTransport();
+    bool startTransport(bool resumeOnly = false);
+    bool requestPairedVideoReconnect();
+    bool completePairedVideoReconnect();
     void retryTransport(const char* reason);
     void shutdownSession() noexcept;
     void syncPending();
@@ -148,6 +159,9 @@ private:
     void neutralizeStreamInput();
     void suspendVideoInput();
     void overlayTransition();
+    void traceStreamMenu(const char* event, u64 held = 0, u64 down = 0);
+    void observeStreamMenuInput(bool focused, u64 held, u64 down);
+    void streamMenuPresented(bool videoDrawn);
     void changeVideoSettings(const fog::video::Settings& value, bool live);
     void inputImageSettings(u64 keys);
     void drawImageSettings();
@@ -195,6 +209,9 @@ private:
     Services* pairedServices_ = nullptr;
     std::unique_ptr<fog::PairedCheckoutGuard> paired_;
     bool pairedPending_ = false;
+    bool pairedVideoReconnectPending_ = false;
+    fog::rating::Presentation rating_;
+    bool ratingFocusLost_ = false;
     fog::ProviderId loginProvider_ = fog::ProviderId::Mts;
     std::optional<fog::UserProfile> mtsProfile_, foghubProfile_;
     fog::Catalog catalog_;
@@ -252,6 +269,13 @@ private:
     std::string videoSaveStatus_ = uiText::Settings::AutoSaveNotice;
     std::string connectionSaveStatus_ = uiText::Settings::ConnectionAutoSaveNotice;
     fog::stream::StreamInputGate streamInputGate_;
+    // Main-thread diagnostics. Only the menu chord is observed; remote input/text is excluded.
+    std::uint64_t menuPolls_ = 0, menuHandlers_ = 0, menuTransitions_ = 0;
+    std::uint64_t menuPaints_ = 0, menuPresents_ = 0, menuPaintedTransition_ = 0, menuPresentedTransition_ = 0;
+    std::uint64_t menuSuppressedTransition_ = 0;
+    u64 menuHeld_ = 0;
+    bool menuObservationActive_ = false, menuFocused_ = false;
+    std::chrono::steady_clock::time_point menuHeartbeatAt_{}, menuTransitionAt_{};
     bool touchWasDown_ = false, touchDrag_ = false;
     bool mouseLeft_ = false, mouseRight_ = false;
     float pointerX_ = 640.0f, pointerY_ = 360.0f;

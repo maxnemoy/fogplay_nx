@@ -31,7 +31,11 @@ struct Gamepad {
     float rightTrigger = 0;
     float leftTrigger = 0;
 };
-struct StreamConnection { fog::EntityId rental; };
+struct StreamConnection {
+    fog::EntityId rental;
+    // Only resume the already running app on the authenticated rental host.
+    bool resumeOnly = false;
+};
 class StreamingClient {
 public:
     virtual ~StreamingClient() = default;

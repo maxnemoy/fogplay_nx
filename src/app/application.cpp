@@ -2,6 +2,7 @@
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 #include "app/application.hpp"
+#include "features/session/presentation/session_rating_text.hpp"
 
 namespace uiText = ::fog::constants::ui;
 namespace storagePaths = ::fog::constants::storage;
@@ -144,9 +145,12 @@ void ApplicationController::run() {
         bool quit = false;
         while (SDL_PollEvent(&event)) if (event.type == SDL_QUIT) quit = true;
         padUpdate(&pad);
-        const auto down = focused ? padGetButtonsDown(&pad) : 0;
+        const auto rawDown = padGetButtonsDown(&pad);
+        const auto rawHeld = padGetButtons(&pad);
+        observeStreamMenuInput(focused,rawHeld,rawDown);
+        const auto down = focused ? rawDown : 0;
         auto uiDown = fog::controller::mapUiButtons(down,controllerSettings_,faceMasks);
-        const auto held = focused ? padGetButtons(&pad) : 0;
+        const auto held = focused ? rawHeld : 0;
         if (quit || ((down & HidNpadButton_Plus) && !sessionPending_)) {
             if (!sessionPending_) break;
             exitAfterStop_ = true; stopAfterTask_ = true;
@@ -168,6 +172,7 @@ void ApplicationController::run() {
             }
             // Queue focus loss before consuming a ready checkout, so a background
             // completion cannot briefly open RTC/media instead of stopping the rental.
+            if (sessionPending_ && !focused) ratingFocusLost_ = true;
             if (sessionPending_ && !stopAfterTask_ && !focused) {
                 diagnostic("Stop trigger: lost application focus; state=" + std::to_string(static_cast<int>(appletGetFocusState())));
                 stopAfterTask_ = true; if (paired_) paired_->requestStop(); if (!pending_.valid()) beginFinish("focus-lost");
@@ -229,6 +234,13 @@ void ApplicationController::poll() {
     TaskResult data;
     try { data = pending_.get(); }
     catch (...) {
+        if (kind == Task::SessionRatingLoad || kind == Task::SessionRatingSubmit) {
+            if (kind == Task::SessionRatingLoad) rating_.loadFailed(fog::rating::text::LoadFailed);
+            else rating_.submitFailed(fog::rating::text::SubmitFailed);
+            status_.clear();
+            diagnostic("FH rating request failed; form and response details omitted.");
+            return;
+        }
         if (kind == Task::RestoreAuth) {
             screen_ = Screen::Consent; loginReturn_ = Screen::Games;
             status_ = ui_.controllerHints(uiText::Profile::RestoreFailedHint);
@@ -286,13 +298,20 @@ void ApplicationController::poll() {
         return;
     }
     if (kind == Task::ProviderForget) {
-        if (loginProvider_ == fog::ProviderId::FogHub) foghubProfile_.reset(); else mtsProfile_.reset();
+        if (loginProvider_ == fog::ProviderId::FogHub) { foghubProfile_.reset(); rating_ = {}; }
+        else mtsProfile_.reset();
         screen_ = Screen::Profile; status_ = uiText::Profile::SignedOut; return;
     }
     if (kind == Task::ProviderProfile) {
         const auto profile = std::get<fog::UserProfile>(std::move(data));
         if (loginProvider_ == fog::ProviderId::FogHub) foghubProfile_ = profile; else mtsProfile_ = profile;
         screen_ = Screen::Profile; status_.clear(); return;
+    }
+    if (kind == Task::SessionRatingLoad) {
+        completeSessionRatingLoad(std::get<std::optional<fog::SessionRatingForm>>(std::move(data))); return;
+    }
+    if (kind == Task::SessionRatingSubmit) {
+        completeSessionRatingSubmit(std::get<fog::SessionRatingResult>(data)); return;
     }
     if (kind == Task::PairedCreate && std::holds_alternative<VerifiedOffer>(data)) {
         syncPending();

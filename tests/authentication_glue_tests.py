@@ -28,6 +28,8 @@ harness = r'''
 #include "features/account/domain/account_repository.hpp"
 #include "features/session/application/session.hpp"
 #include "core/constants/ui_text.hpp"
+#include "features/session/presentation/session_rating.hpp"
+#include "features/session/presentation/session_rating_text.hpp"
 #include <algorithm>
 #include <cassert>
 #include <functional>
@@ -91,10 +93,12 @@ struct VerifiedOffer {FakeOrder request;};
 struct ChangedOffer {std::vector<fog::Computer> computers;};
 using TaskResult=std::variant<std::monostate,RestoredProviders,fog::AuthResult,fog::UserProfile,
     fog::GameDetail,fog::Page<fog::Computer>,std::vector<fog::HistoryEntry>,std::vector<fog::Rental>,
-    fog::FinishResult,RecoveryResult,VerifiedOffer,ChangedOffer>;
+    fog::FinishResult,RecoveryResult,VerifiedOffer,ChangedOffer,
+    std::optional<fog::SessionRatingForm>,fog::SessionRatingResult>;
 struct FakePaired {void create(const FakeOrder&) {} void bindAuthenticatedAccount() {} void stop() {}};
 struct FakeCheckout {int result() {return 0;} void create(const FakeOrder&) {}};
 struct ApplicationController {
+    fog::rating::Presentation rating_;
     FakeAuth auth_;
     FakeAccount account_;
     FakeAuth& loginAuth() {return auth_;}
@@ -124,6 +128,8 @@ struct ApplicationController {
     void syncPending() {} void disarmExitHandling() {} void armExitHandling() {}
     void beginFinish(const char* ="") {} void logCheckoutResult(Task) {} void handleCheckout() {}
     void handlePairedCheckout() {} void recoverSession() {} void loadHistory() {} void loadPlayStation() {}
+    void completeSessionRatingLoad(std::optional<fog::SessionRatingForm>) {}
+    void completeSessionRatingSubmit(const fog::SessionRatingResult&) {}
     void setCaptcha(const fog::AuthResult&) {}
     void refreshProfile();void beginLogin();void start(Task,std::function<TaskResult()>);void poll();
     void frame() {

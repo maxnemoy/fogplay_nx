@@ -634,12 +634,33 @@ struct Client::Impl {
     std::deque<std::string> finalVideoEvents;
     const char* operation = "idle";
     unsigned offers = 0, candidatesReceived = 0, emptyCandidates = 0, heartbeatsSent = 0;
+    // Application-thread counters. A non-throwing WebSocket send is local
+    // acceptance; false means buffered, never a broker receipt or rejection.
+    struct SignalingSendCounts {
+        std::uint64_t attempts = 0, accepted = 0, buffered = 0, rejected = 0;
+        std::string text(const char* name) const {
+            return std::string(" ") + name + "Attempts=" + std::to_string(attempts) +
+                " " + name + "LocalAccepted=" + std::to_string(accepted) +
+                " " + name + "Buffered=" + std::to_string(buffered) +
+                " " + name + "Rejected=" + std::to_string(rejected);
+        }
+    } subscribeSends, enabledSends;
+    std::uint64_t wsMessages = 0, stompFrames = 0, stompConnectedFrames = 0;
+    std::uint64_t stompMessageFrames = 0, stompErrorFrames = 0, stompOtherFrames = 0, signalInitMessages = 0;
+#ifdef FOG_STREAM_TESTING
+    SignalingSendCounts* testSignalingSend = nullptr;
+    bool testSignalingReject = false;
+#endif
     std::string diagnostics() const {
         return routeDiagnostics() + " " + finalIceDiagnostics + " operation=" + operation + " offers=" + std::to_string(offers) +
             " candidates=" + std::to_string(candidatesReceived) + " emptyCandidates=" + std::to_string(emptyCandidates) +
             " hbOutMs=" + std::to_string(heartbeat.count()) + " hbInMs=" + std::to_string(incomingHeartbeat.count()) +
             " hbSent=" + std::to_string(heartbeatsSent) +
             " wsAgeMs=" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - lastWs).count()) +
+            " wsMessages=" + std::to_string(wsMessages) + " stompFrames=" + std::to_string(stompFrames) +
+            " stompConnected=" + std::to_string(stompConnectedFrames) + " stompMessage=" + std::to_string(stompMessageFrames) +
+            " stompError=" + std::to_string(stompErrorFrames) + " stompOther=" + std::to_string(stompOtherFrames) +
+            " signalInit=" + std::to_string(signalInitMessages) + subscribeSends.text("subscribe") + enabledSends.text("enabled") +
             controlDiagnostics() +
             transportDiagnostics();
     }
@@ -658,16 +679,38 @@ struct Client::Impl {
         catch (const std::runtime_error&) { throw TransportError(reason, true); }
         // Logic/size errors and allocation failures are not transport recovery.
     }
-    void sendSignaling(const std::string& frame) {
+    void sendSignaling(const std::string& frame, SignalingSendCounts* counts = nullptr) {
         if (closingForRetry) return;
-        transportSend([&] { ws->send(frame); }, "Signaling send failed");
+        if (counts) ++counts->attempts;
+        try {
+            transportSend([&] {
+#ifdef FOG_STREAM_TESTING
+                const bool overridden = counts && testSignalingSend == counts;
+                if (overridden) {
+                    testSignalingSend = nullptr;
+                    if (testSignalingReject) throw std::runtime_error("Fixture signaling send rejected");
+                }
+#endif
+                bool immediate = ws->send(frame);
+#ifdef FOG_STREAM_TESTING
+                if (overridden) immediate = false;
+#endif
+                if (counts) {
+                    ++counts->accepted;
+                    if (!immediate) ++counts->buffered;
+                }
+            }, "Signaling send failed");
+        } catch (...) {
+            if (counts) ++counts->rejected;
+            throw;
+        }
     }
-    void signal(const Json& payload) {
+    void signal(const Json& payload, SignalingSendCounts* counts = nullptr) {
         if (!ws || !ws->isOpen() || !stompConnected) throw TransportError(fog::constants::error::Stream::SignalingUnavailable, true);
         if (ws->bufferedAmount() > 256 * 1024) throw TransportError(fog::constants::error::Stream::SignalingBackpressure, true);
         const auto frame = protocol::frame("SEND", {{"destination", "/topic/" + hash + "/server"},
                   {"content-type", "application/json"}, {"client-hash", clientHash}}, payload.dump());
-        sendSignaling(frame);
+        sendSignaling(frame, counts);
     }
     std::string controlDiagnostics() const {
         const auto out = controlSender ? controlSender->snapshot() : finalControl;
@@ -1001,7 +1044,7 @@ struct Client::Impl {
     void message(const Json& message) {
         operation = "signal.envelope";
         const auto id = message.at("id").get<std::string>();
-        if (id == "init") createPeer(message);
+        if (id == "init") { ++signalInitMessages; createPeer(message); }
         else if (id == "offer") {
             operation = "offer.envelope";
             const auto encoded = message.at("data").get<std::string>();
@@ -1085,12 +1128,15 @@ struct Client::Impl {
                        {"heart-beat", "4000,4000"}, {"host", "remoteplay.mts.ru"}}));
             break;
         case EventType::WsData: {
+            ++wsMessages;
             operation = "stomp.parse";
             lastWs = Clock::now();
             std::string frameTransportFailure;
             for (const auto& frame : parser.feed(event.text)) {
+                ++stompFrames;
                 try {
                 if (frame.command == "CONNECTED") {
+                    ++stompConnectedFrames;
                     if (stompConnected) throw TransportError(fog::constants::error::Stream::DuplicateSTOMPConnection);
                     stompConnected = true;
                     const auto hb = frame.headers.find("heart-beat");
@@ -1111,11 +1157,14 @@ struct Client::Impl {
                         incomingHeartbeat = incoming == 0 ? std::chrono::milliseconds(0) : std::chrono::milliseconds(std::max(4000, incoming));
                     }
                     sendSignaling(protocol::frame("SUBSCRIBE", {{"destination", "/topic/" + clientHash + "/client"},
-                               {"ack", "auto"}, {"id", "nx-" + suffix}}));
-                    signal({{"id", "enabled"}, {"client_hash", clientHash}});
+                               {"ack", "auto"}, {"id", "nx-" + suffix}}), &subscribeSends);
+                    signal({{"id", "enabled"}, {"client_hash", clientHash}}, &enabledSends);
                     state = "Waiting for remote host";
-                } else if (frame.command == "MESSAGE") { operation = "signal.json"; message(Json::parse(frame.body)); }
-                else if (frame.command == "ERROR") throw TransportError(fog::constants::error::Stream::STOMPRejectedStream);
+                } else if (frame.command == "MESSAGE") {
+                    ++stompMessageFrames; operation = "signal.json"; message(Json::parse(frame.body));
+                } else if (frame.command == "ERROR") {
+                    ++stompErrorFrames; throw TransportError(fog::constants::error::Stream::STOMPRejectedStream);
+                } else ++stompOtherFrames;
                 } catch (const TransportError& error) {
                     if (!error.retryable) throw;
                     if (frameTransportFailure.empty()) frameTransportFailure = error.what();
@@ -1234,6 +1283,10 @@ bool Client::start(const std::string& hash, const std::string& suffix, const std
     return startEndpoint(hash, suffix, caPath, "wss://remoteplay.mts.ru/ws/");
 }
 #ifdef FOG_STREAM_TESTING
+void Client::overrideSignalingSendForTesting(bool enabled, bool reject) {
+    impl_->testSignalingSend = enabled ? &impl_->enabledSends : &impl_->subscribeSends;
+    impl_->testSignalingReject = reject;
+}
 bool Client::startForTesting(const std::string& hash, const std::string& suffix, const std::string& url) {
     if (url.rfind("ws://127.0.0.1:", 0) != 0) return false;
     return startEndpoint(hash, suffix, "unused-loopback.pem", url);

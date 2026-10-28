@@ -4,6 +4,7 @@
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 #include "features/playstation/presentation/catalog_view.hpp"
+#include "features/session/presentation/session_rating_text.hpp"
 #include <iomanip>
 #include <sstream>
 
@@ -31,6 +32,8 @@ bool routineStatus(const std::string& value) {
 
 void ApplicationController::drawStreamOverlay() {
     using Mode = fog::stream::OverlayMode;
+    const bool tracePaint = menuPaintedTransition_ != menuTransitions_;
+    if (tracePaint) traceStreamMenu("paint-begin");
     if (overlay_.mode() == Mode::Mouse) {
         const int x = static_cast<int>(pointerX_), y = static_cast<int>(pointerY_);
         SDL_SetRenderDrawColor(rt_.renderer,0,0,0,255);
@@ -55,6 +58,11 @@ void ApplicationController::drawStreamOverlay() {
         text(uiText::Stream::RecoveringVideo,20,8,accent,1240);
     } else if (!overlayNotice_.empty() && std::chrono::steady_clock::now()-overlayNoticeAt_ < std::chrono::seconds(4)) {
         box(0,0,1280,45,{23,32,46,255}); text(overlayNotice_,20,8,accent,1240);
+    }
+    ++menuPaints_;
+    if (tracePaint) {
+        traceStreamMenu("paint-complete");
+        menuPaintedTransition_ = menuTransitions_;
     }
 }
 
@@ -93,6 +101,7 @@ void ApplicationController::draw() {
         fog::stream::LoopTiming::Scope presentScope(loopTiming_, fog::stream::LoopTiming::Stage::Present);
         SDL_RenderPresent(rt_.renderer);
         media_->presented();
+        streamMenuPresented(true);
         presentTiming_.record(presentStarted);
         presentScope.finish();
         loopTiming_.presented(media_->presentedFrames(),
@@ -117,7 +126,16 @@ void ApplicationController::draw() {
     if (screen_ == Screen::Profile) {
         chrome.title = "ПРОФИЛЬ";
         chrome.hints = sessionPending_ ? "A — вход / обновить · R — проверить аренду · B — назад" :
-            selection_ ? "A — вход / обновить · X — выйти · B — назад" : "A — вход / обновить · X — выйти · R — аренды · B — назад";
+            selection_ ? "A — вход / обновить · R — оценить сеанс · X — выйти · B — назад" : "A — вход / обновить · X — выйти · R — аренды · B — назад";
+    }
+    if (screen_ == Screen::SessionRating) {
+        chrome.title = fog::rating::text::Title;
+        chrome.hints = rating_.state() == fog::rating::State::Submitting ? fog::rating::text::Sending :
+            rating_.state() == fog::rating::State::Loading ? fog::rating::text::LoadingHint :
+            rating_.state() == fog::rating::State::LoadFailed ? fog::rating::text::RetryHint :
+            rating_.state() == fog::rating::State::Sent || rating_.state() == fog::rating::State::None ?
+                fog::rating::text::DoneHint : fog::rating::text::ChoiceHint;
+        chrome.section = fog::ui::Section::PlayStation;
     }
     if (screen_ == Screen::History) { chrome.title = uiText::Profile::HistoryTitle; chrome.section = fog::ui::Section::History; }
     if (screen_ == Screen::Settings || screen_ == Screen::ImageSettings || screen_ == Screen::ConnectionSettings) {
@@ -140,7 +158,9 @@ void ApplicationController::draw() {
     if (auth_.authenticated() && authSaveFailed_) chrome.subtitle.clear();
     ui_.frame(chrome);
     const auto area = ui_.content();
-    if (screen_ == Screen::Profile) {
+    if (screen_ == Screen::SessionRating) {
+        drawSessionRating();
+    } else if (screen_ == Screen::Profile) {
         for (std::size_t index=0; index<2; ++index) {
             const auto provider = index ? fog::ProviderId::FogHub : fog::ProviderId::Mts;
             auto* service = providerServices(provider);
@@ -266,10 +286,11 @@ void ApplicationController::draw() {
 
     } else if ((screen_ == Screen::PlayStation || screen_ == Screen::PlayStationDetails) && !playStationError_.empty())
         ui_.status(playStationError_,false,true);
-    else if (screen_ != Screen::Genres && (pending_.valid() || !routineStatus(status_)))
+    else if (screen_ != Screen::Genres && screen_ != Screen::SessionRating && (pending_.valid() || !routineStatus(status_)))
         ui_.status(pending_.valid() ? uiText::Common::Loading : status_, pending_.valid());
     if (screen_ == Screen::Streaming) drawStreamOverlay();
     SDL_RenderPresent(rt_.renderer);
+    streamMenuPresented(false);
     fogplay::diagnostics::firstUiFramePresented();
 }
 

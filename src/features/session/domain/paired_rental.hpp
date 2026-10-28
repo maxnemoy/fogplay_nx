@@ -3,8 +3,41 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <utility>
 
 namespace fog {
+enum class PairedPreparationStage {
+    None, Validation, ComputerPreview, AccountHistory, IdleBaseline, ConnectionPage,
+    FreshPairingLink, FreshPairingPage, ConnectionForm, AccountRecheck
+};
+inline const char* pairedPreparationStageName(PairedPreparationStage stage) {
+    switch (stage) {
+        case PairedPreparationStage::None: return "none";
+        case PairedPreparationStage::Validation: return "validation";
+        case PairedPreparationStage::ComputerPreview: return "computer-preview";
+        case PairedPreparationStage::AccountHistory: return "account-history";
+        case PairedPreparationStage::IdleBaseline: return "idle-baseline";
+        case PairedPreparationStage::ConnectionPage: return "connection-page";
+        case PairedPreparationStage::FreshPairingLink: return "fresh-pairing-link";
+        case PairedPreparationStage::FreshPairingPage: return "fresh-pairing-page";
+        case PairedPreparationStage::ConnectionForm: return "connection-form";
+        case PairedPreparationStage::AccountRecheck: return "account-recheck";
+    }
+    return "unknown";
+}
+// Carries only a fixed stage/category; provider response and exception text are
+// deliberately discarded at the preparation boundary.
+class PairedPreparationError final : public RepositoryError {
+public:
+    PairedPreparationError(PairedPreparationStage stage,RepositoryErrorKind kind,
+            std::optional<RentalId> requiredRating = std::nullopt)
+        : RepositoryError(kind,"Paired rental preparation failed"),stage_(stage),requiredRating_(std::move(requiredRating)) {}
+    PairedPreparationStage stage() const noexcept { return stage_; }
+    const std::optional<RentalId>& requiredRating() const noexcept { return requiredRating_; }
+private:
+    PairedPreparationStage stage_;
+    std::optional<RentalId> requiredRating_;
+};
 // In-memory transport address only. Never serialize endpoints or preparation handles.
 struct PairedEndpoint {
     std::string host;

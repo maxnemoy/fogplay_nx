@@ -18,6 +18,9 @@ try:
                for path in sorted((root / "tools/moonlight").rglob("*"))
                if path.is_file() and "__pycache__" not in path.parts}
     assert manifest["tools"] == current
+    for name, expected in manifest["diagnostic_headers"].items():
+        assert digest(prefix / "include" / name) == expected
+    assert "FogMoonlightDiagnostics.h" in manifest["diagnostic_headers"]
     for name, expected in manifest["libraries"].items():
         assert digest(prefix / "lib" / name) == expected
     for name in ("libgamestream.a", "libmoonlight-common-c.a", "libmoonlight-curl.a", "libenet.a"):

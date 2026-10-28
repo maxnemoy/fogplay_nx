@@ -1,5 +1,6 @@
 #include "features/providers/infrastructure/foghub_html.hpp"
 #include "core/domain/repository_error.hpp"
+#include "features/session/domain/session_rating.hpp"
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -30,6 +31,7 @@ std::string replace(std::string value, const std::string& from, const std::strin
 void rejects(const std::function<void()>& action, RepositoryErrorKind expected = RepositoryErrorKind::InvalidResponse) {
     try { action(); }
     catch (const RepositoryError& error) {
+        if (error.kind() != expected) throw std::runtime_error("Unexpected repository error category: " + std::to_string(static_cast<int>(error.kind())) + " expected " + std::to_string(static_cast<int>(expected)) + " at check " + std::to_string(checks));
         check(error.kind() == expected);
         const std::string message = error.what();
         check(message.find("synthetic-csrf") == std::string::npos && message.find("192.0.2.42") == std::string::npos);
@@ -103,6 +105,58 @@ void success() {
         rejects([&] { parseLaunchSuccess(replace(html, "</body>", "<a href='" + std::string(link) + "'>Other</a></body>"), "42", path); });
     rejects([&] { parseLaunchSuccess(fixture("login"), "42", path); }, RepositoryErrorKind::NotAuthenticated);
 }
+void reviewRequired() {
+    const auto html = fixture("connect-review-required-synthetic");
+    rejects([&] { freshPairingLink(html,"42"); },RepositoryErrorKind::ReviewRequired);
+    rejects([&] { parseConnectForm(html,"42"); },RepositoryErrorKind::ReviewRequired);
+    try { (void)freshPairingLink(html,"42"); }
+    catch (const SessionReviewRequired& error) {
+        check(error.rental() == RentalId({ProviderId::FogHub,"9000042"}));
+        check(std::string(error.what()).find("9000042") == std::string::npos);
+    }
+    for (const auto& link : {"/session/review?id=9000042&fromPcId=43", "/session/review?id=0&fromPcId=42",
+        "/session/review?id=9000042&fromPcId=042", "/session/review?id=9000042",
+        "/session/review?id=9000042&fromPcId=42&other=1", "/session/review?id=9000042&fromPcId=42&fromPcId=42",
+        "/session/review?id=9000042&fromPcId=42&",
+        "https://evil.example/session/review?id=9000042&fromPcId=42"}) {
+        const auto changed = replace(html,"/session/review?id=9000042&amp;fromPcId=42",link);
+        rejects([&] { freshPairingLink(changed,"42"); });
+        rejects([&] { parseConnectForm(changed,"42"); });
+    }
+    rejects([&] { freshPairingLink(replace(html,"href=","onclick='unsafe()' href="),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"href=","data-method='post' href="),"42"); });
+    rejects([&] { parseConnectForm(replace(html,">Оценить</a>",">Оценить</a><a href='/session/review?id=9000043&amp;fromPcId=42'>Оценить</a>"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"/pc/play?id=42","/pc/play?id=43"),"42"); });
+    const auto unknown = replace(html,"сперва оцените предыдущую игру через Foghub!","попробуйте позже!");
+    rejects([&] { freshPairingLink(unknown,"42"); });
+    rejects([&] { parseConnectForm(unknown,"42"); });
+    rejects([&] { parseConnectForm(replace(html,"text-danger","other"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"<form method=","<div method="),"42"); });
+}
+void bonusChoice() {
+    const auto html = fixture("connect-bonus-metadata-synthetic");
+    check(parseConnectForm(html,"42").hasBonusChoice);
+    check(!parseConnectForm(fixture("connect-metadata-synthetic"),"42").hasBonusChoice);
+    check(parseConnectForm(replace(html," selected",""),"42").hasBonusChoice);
+    check(parseConnectForm(replace(html,"/pc/play?id=42","/pc/play?id=42&amp;resume=0"),"42").hasBonusChoice);
+    for (const auto& control : {"name=\"Pc[use_bonus]\" multiple", "name=\"Pc[use_bonus]\" disabled",
+        "name=\"Pc[use_bonus]\" size=\"2\"", "name=\"Pc[use_bonus]\" onchange=\"x()\"",
+        "name=\"Pc[use_bonus]\" formmethod=\"get\"",
+        "name=\"Pc[use_bonus]\" onclick=\"x()\"", "name=\"Pc[use_bonus]\" form=\"other\"",
+        "name=\"Pc[unknown]\""})
+        rejects([&] { parseConnectForm(replace(html,"name=\"Pc[use_bonus]\"",control),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"<option value=\"0\" selected>","<option value=\"1\" selected>"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"<option value=\"1\">","<option value=\"0\">"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"<option value=\"1\">","<option value=\"2\">"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"<option value=\"1\">","<option value=\"1\" selected>"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"<option value=\"0\" selected>","<option value=\"0\" selected disabled>"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"<option value=\"1\">","<option value=\"1\" data-method=\"post\">"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"</select>","<option value='2'>Unknown</option></select>"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"</select>","</select><select name='Pc[use_bonus]'><option value='0'>Accumulate</option><option value='1'>Spend</option></select>"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"</select>","</select><input name='Pc[use_bonus]' value='0'>"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"</select>","</select><input name='unknown' value='0'>"),"42"); });
+    rejects([&] { parseConnectForm(replace(html,"Накапливать бонусы",""),"42"); });
+}
 void closeActions() {
     const auto html = fixture("history-active");
     const auto close = parseCloseAction(html, "9000002");
@@ -135,7 +189,7 @@ void computerPreview() {
 }
 int main() {
     try {
-        endpoints(); forms(); success(); closeActions(); computerPreview();
+        endpoints(); forms(); success(); reviewRequired(); bonusChoice(); closeActions(); computerPreview();
         std::cout << "FogHub rental HTML parser tests passed (" << checks << " checks)\n";
         return 0;
     } catch (const std::exception& error) {

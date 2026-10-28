@@ -491,8 +491,83 @@ struct Fixture {
 };
 }
 
+static std::uint64_t signalingCount(const std::string& diagnostics, const char* name) {
+    const auto key = std::string(name) + "=";
+    const auto start = diagnostics.find(key);
+    assert(start != std::string::npos);
+    return std::stoull(diagnostics.substr(start + key.size()));
+}
+static void signalingDiagnostics() {
+    // Real loopback handshake, deliberately no remote init. Exercise each
+    // tracked send's immediate/buffered/throwing result without paid services.
+    for (unsigned mode = 0; mode < 5; ++mode) {
+        {
+            Fixture fixture("0,0", false);
+            stream::Client client;
+            assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+            const bool enabled = mode == 2 || mode == 4;
+            const bool rejected = mode >= 3;
+            if (mode) client.overrideSignalingSendForTesting(enabled, rejected);
+            const auto began = Clock::now();
+            while (!fixture.enabled && client.error().empty() && Clock::now() - began < std::chrono::seconds(2)) {
+                fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const auto before = client.diagnostics();
+            assert(signalingCount(before, "wsMessages") == 1 && signalingCount(before, "stompFrames") == 1);
+            assert(signalingCount(before, "stompConnected") == 1 && signalingCount(before, "signalInit") == 0);
+            assert(signalingCount(before, "stompMessage") == 0 && signalingCount(before, "stompError") == 0 &&
+                signalingCount(before, "stompOther") == 0);
+            assert(signalingCount(before, "subscribeAttempts") == 1);
+            assert(signalingCount(before, "subscribeLocalAccepted") == (mode == 3 ? 0 : 1));
+            assert(signalingCount(before, "subscribeBuffered") == (mode == 1 ? 1 : 0));
+            assert(signalingCount(before, "subscribeRejected") == (mode == 3 ? 1 : 0));
+            assert(signalingCount(before, "enabledAttempts") == (mode == 3 ? 0 : 1));
+            assert(signalingCount(before, "enabledLocalAccepted") == (rejected ? 0 : 1));
+            assert(signalingCount(before, "enabledBuffered") == (mode == 2 ? 1 : 0));
+            assert(signalingCount(before, "enabledRejected") == (mode == 4 ? 1 : 0));
+            assert(before.find("fixture") == std::string::npos && before.find("/topic/") == std::string::npos);
+            if (rejected) {
+                assert(!client.error().empty() && client.retryableError() && !fixture.enabled);
+                assert(client.error().find("Fixture") == std::string::npos);
+            } else {
+                assert(fixture.subscribed && fixture.enabled && client.error().empty());
+                assert(client.status() == "Waiting for remote host");
+                // Receive counters distinguish heartbeat/partial input from
+                // complete parsed commands without retaining any remote text.
+                fixture.ws->send(stream::protocol::frame("RECEIPT", {{"receipt-id", "private-receipt"}}, "private-body"));
+                const auto message = stream::protocol::frame("MESSAGE", {}, R"({"id":"private-unknown-message"})");
+                fixture.ws->send(message.substr(0, 10));
+                fixture.ws->send(message.substr(10));
+                fixture.ws->send(std::string("\n"));
+                const auto receivedAt = Clock::now();
+                while (signalingCount(client.diagnostics(), "wsMessages") < 5 && Clock::now() - receivedAt < std::chrono::seconds(2)) {
+                    fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                const auto received = client.diagnostics();
+                assert(signalingCount(received, "wsMessages") == 5 && signalingCount(received, "stompFrames") == 3);
+                assert(signalingCount(received, "stompMessage") == 1 && signalingCount(received, "stompOther") == 1);
+                assert(received.find("private") == std::string::npos && client.error().empty());
+                fixture.ws->send(stream::protocol::frame("ERROR", {}, "private-error"));
+                const auto errorAt = Clock::now();
+                while (client.error().empty() && Clock::now() - errorAt < std::chrono::seconds(2)) {
+                    fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+                assert(!client.error().empty() && !client.retryableError());
+                assert(signalingCount(client.diagnostics(), "stompError") == 1);
+                assert(client.diagnostics().find("private") == std::string::npos && client.error().find("private") == std::string::npos);
+            }
+            client.close();
+            assert(signalingCount(client.diagnostics(), "stompConnected") == 1); // retained after stop
+        }
+        stream::Client::cleanupRuntime();
+    }
+    std::cout << "Safe STOMP diagnostics: handshake acceptance/buffering/rejection, partial frames, commands, silence, terminal errors and redaction passed\n";
+}
+
 int main(int argc, char** argv) {
     const bool turnOnly = argc == 2 && std::string(argv[1]) == "--turn-only";
+    if (!turnOnly) signalingDiagnostics();
+    if (argc == 2 && std::string(argv[1]) == "--signaling-only") return 0;
     {
         Feedback feedback;
         auto compound = rtc::make_message(rtc::RtcpRr::SizeWithReportBlocks(1), rtc::Message::Control);
@@ -633,6 +708,7 @@ int main(int argc, char** argv) {
         }
         assert(client.ready() && fixture.answered && fixture.controlReady && fixture.pong && fixture.pressed);
         const auto route = client.diagnostics();
+        assert(signalingCount(route, "signalInit") == 1 && signalingCount(route, "stompMessage") > 0);
         assert(route.find(turn ? "requested=relay actual=turn" : "requested=all actual=direct") != std::string::npos);
         assert(route.find("fixture-user") == std::string::npos && route.find("fixture-password") == std::string::npos);
         assert(route.find("127.0.0.1") == std::string::npos);
@@ -1454,8 +1530,12 @@ int main(int argc, char** argv) {
         assert(!client.disconnectForRetry());
         assert(Clock::now() - failedAt < std::chrono::milliseconds(200));
         assert(!client.ready() && !client.retryableError());
-        assert(client.error() == (failureMode == 2 ? "Remote control closed" :
-            "ICE snapshot in flight; ending rental before transport cleanup"));
+        const std::string expectedError = failureMode == 2 ? "Remote control closed" :
+            "ICE snapshot in flight; ending rental before transport cleanup";
+        if (client.error() != expectedError)
+            std::cerr << "Blocked ICE assertion stage=" << stage << " failureMode=" << failureMode <<
+                " actual=" << client.error() << " " << client.rtcpDiagnostics() << '\n';
+        assert(client.error() == expectedError);
         const auto frozen = client.diagnostics();
         for (unsigned n = 0; n < 1000; ++n) client.receiveControlForTesting("{}");
         const auto after = client.diagnostics();

@@ -1,5 +1,6 @@
 #include "client.h"
 #include "Settings.hpp"
+#include "FogMoonlightDiagnostics.h"
 
 #ifdef MOONLIGHT_CURL_COEXIST_SMOKE
 extern "C" int moonlight_check_app_curl(void);
@@ -10,6 +11,8 @@ int main(int argc, char**) {
     SERVER_DATA server{};
     STREAM_CONFIGURATION configuration{};
     LiInitializeStreamConfiguration(&configuration);
+    FogMoonlightDiagnostics diagnostics{};
+    FogMoonlightGetDiagnostics(&diagnostics);
     if (argc == 42) {
 #ifdef MOONLIGHT_CURL_COEXIST_SMOKE
         if (moonlight_check_app_curl() != 0)

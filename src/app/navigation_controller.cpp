@@ -17,6 +17,7 @@ void ApplicationController::moveGrid(u64 keys, std::size_t count, std::size_t co
 
 void ApplicationController::input(u64 keys) {
     if (screen_ == Screen::Streaming) return;
+    if (screen_ == Screen::SessionRating) { inputSessionRating(keys); return; }
     if (screen_ == Screen::StopConfirm) {
         if (keys & HidNpadButton_A) beginFinish("stop-confirm");
         else if (keys & HidNpadButton_B) screen_ = Screen::Streaming;
@@ -37,6 +38,8 @@ void ApplicationController::input(u64 keys) {
             start(Task::ProviderForget,[this] { loginAuth().forget(); return std::monostate{}; });
         } else if ((keys & HidNpadButton_R) && loginProvider_ == fog::ProviderId::Mts) loadSessions();
         else if ((keys & HidNpadButton_R) && pairedPending_) recoverSession();
+        else if ((keys & HidNpadButton_R) && loginProvider_ == fog::ProviderId::FogHub && !sessionPending_)
+            openSessionRating();
         return;
     }
     if (screen_ == Screen::Checkout) {

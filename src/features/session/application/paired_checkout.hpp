@@ -37,6 +37,9 @@ struct PairedCheckoutResult {
     bool stopRequested = false;
     std::optional<PairedEndpoint> endpoint; // Ephemeral; never journaled.
     std::string message;
+    PairedPreparationStage preparationStage = PairedPreparationStage::None;
+    std::optional<RepositoryErrorKind> preparationError = std::nullopt;
+    std::optional<RentalId> requiredRating = std::nullopt; // Verified blocker target, never logged.
 };
 // One serialized worker owns this bounded synchronous coordinator.
 // No destructor network requests, no create retry, no manual PIN entry.
@@ -62,6 +65,7 @@ public:
     // Safe from the UI thread. Bounded pairing/network calls observe this before the next step.
     void requestStop() noexcept { stopSignal_.store(true); }
 private:
+    void resetPreparationDiagnostics();
     bool sameAccount() const;
     bool validRecord() const;
     void persist();

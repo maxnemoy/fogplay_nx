@@ -8,29 +8,6 @@ namespace storagePaths = ::fog::constants::storage;
 
 namespace fogplay {
 
-void ApplicationController::changeVideoSettings(const fog::video::Settings& value, bool live) {
-    if (live && streamRental_.provider == fog::ProviderId::FogHub) {
-        auto active = videoSettings_; active.codec = stream::VideoCodec::H264; active.quality = 0; active.keyframeSeconds = 0;
-        overlay_.setVideoSettings(active);
-        overlay_.setSaveStatus("FogHub: H.264 720p60; меняйте битрейт до подключения. Качество/PLI недоступны.");
-        return;
-    }
-    videoSettings_ = value;
-    bool saved = false;
-    try {
-        fog::video::saveSettings(storagePaths::path(storagePaths::VideoSettings), videoSettings_);
-        saved = true;
-    } catch (...) { diagnostic("Video settings save failed; no settings payload logged."); }
-    videoSaveStatus_ = saved ? uiText::Settings::Saved : uiText::Settings::NotSaved;
-    if (live) {
-        const bool requested = stream_ && stream_->updateVideoSettings(videoSettings_);
-        videoSaveStatus_ += requested ? uiText::Settings::RequestSentNotice :
-            uiText::Settings::RequestNotSentNotice;
-    }
-    overlay_.setVideoSettings(videoSettings_);
-    overlay_.setSaveStatus(videoSaveStatus_);
-}
-
 void ApplicationController::inputImageSettings(u64 keys) {
     if (keys & HidNpadButton_B) { screen_ = Screen::Settings; selection_ = 0; return; }
     if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) selection_ = (selection_ + 3) % 4;
@@ -64,6 +41,7 @@ void ApplicationController::drawImageSettings() {
         ui_.button(labels[i], {area.x, y, area.w, 57}, selection_ == i);
         ui_.text(hints[i], area.x + 14, y + 65, area.w - 28, muted);
     }
+    ui_.text(uiText::Settings::FogHubVideoDescription, area.x, 570, area.w, muted);
     if (!videoSaveStatus_.empty() && videoSaveStatus_ != uiText::Settings::AutoSaveNotice &&
         videoSaveStatus_ != uiText::Settings::Saved)
         ui_.text(videoSaveStatus_, area.x, 596, area.w, accent, false, 2);

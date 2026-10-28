@@ -13,6 +13,9 @@ public:
     explicit Rentals(Session& session) : session_(session),scope_(session.auth()) {}
     AuthData auth() const override { return session_.auth(); }
     bool pairedLaunchSupported() const noexcept override { return true; }
+    bool sessionRatingSupported() const noexcept override { return true; }
+    std::optional<SessionRatingForm> ratingForm(const std::optional<RentalId>& = std::nullopt) override;
+    SessionRatingResult submitRating(const SessionRatingRequest&) override;
     PairedPreparation preparePairedRental(const StartRentalRequest&) override;
     PairedLaunchReceipt createPairedRental(const EntityId& preparation,const std::string& pin) override;
     PairedLaunchReceipt createPairedRental(const EntityId&,const std::string&,
@@ -40,6 +43,8 @@ private:
     Session& session_;
     AuthData scope_;
     std::optional<Pending> pending_;
+    struct RatingPending { RentalId rental; EntityId handle,computer; AuthData owner; };
+    std::optional<RatingPending> ratingPending_;
     bool unresolvedCreate_ = false;
     std::optional<RentalId> unresolvedRental_;
     std::set<std::string> closeAttempts_;

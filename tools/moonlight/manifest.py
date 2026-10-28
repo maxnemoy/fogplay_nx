@@ -37,6 +37,9 @@ manifest = {
         if path.is_file() and "__pycache__" not in path.parts
     },
     "libraries": {path.name: digest(path) for path in sorted((PREFIX / "lib").glob("*.a"))},
+    "diagnostic_headers": {
+        "FogMoonlightDiagnostics.h": digest(PREFIX / "include/FogMoonlightDiagnostics.h"),
+    },
     "curl": json.loads((PREFIX / "curl-build.json").read_text()),
     "portlibs": {
         name: digest(Path("/opt/devkitpro/portlibs/switch/lib") / name)

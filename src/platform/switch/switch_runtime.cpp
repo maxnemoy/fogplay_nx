@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <vector>
 #include <sys/stat.h>
 
 namespace fogplay::platform {
@@ -134,6 +135,13 @@ void Runtime::initServices() {
     StartupStage services("services");
     showStartup(fog::constants::ui::Startup::ConnectingServices);
     {
+        // libnx initializes applet before main(). Older firmware or applet modes
+        // may reject this preference; networking startup remains available.
+        const Result wirelessPriority = appletSetWirelessPriorityMode(AppletWirelessPriorityMode_OptimizedForWlan);
+        diagnostic("WLAN priority mode=OptimizedForWlan result=" + std::to_string(wirelessPriority) +
+            " success=" + std::to_string(R_SUCCEEDED(wirelessPriority)));
+    }
+    {
         StartupStage stage("sockets");
         SocketInitConfig config = *socketGetDefaultInitConfig();
         config.num_bsd_sessions = 12;
@@ -186,6 +194,7 @@ Runtime::~Runtime() {
 }
 
 std::optional<std::string> keyboard(const char* title, const std::string& initial, int maximum, bool password) {
+    if (maximum < 1 || maximum > 500) throw std::invalid_argument("Invalid software keyboard length");
     diagnostic(std::string("Keyboard open requested; password=") + (password ? "1" : "0"));
     // App controls can map physical B to Confirm. The system applet uses the
     // native layout, where B cancels; do not carry the activating press into it.
@@ -204,6 +213,11 @@ std::optional<std::string> keyboard(const char* title, const std::string& initia
         }
         svcSleepThread(10000000);
     }
+    struct Output {
+        std::vector<char> bytes;
+        bool sensitive;
+        ~Output() { if (sensitive) for (volatile char& value : bytes) value = 0; }
+    } output{std::vector<char>(static_cast<std::size_t>(maximum) * 4 + 1),password};
     SwkbdConfig config{};
     const Result created = swkbdCreate(&config, 0);
     diagnostic("Keyboard create result=" + std::to_string(created));
@@ -214,17 +228,14 @@ std::optional<std::string> keyboard(const char* title, const std::string& initia
     swkbdConfigSetInitialText(&config, initial.c_str());
     swkbdConfigSetStringLenMax(&config, static_cast<u32>(maximum));
     swkbdConfigSetReturnButtonFlag(&config, false);
-    char result[512]{};
-    const Result rc = swkbdShow(&config, result, sizeof(result));
+    const Result rc = swkbdShow(&config, output.bytes.data(), output.bytes.size());
     swkbdClose(&config);
     diagnostic("Keyboard show result=" + std::to_string(rc));
     // libnx uses this for a non-confirmed applet close as well as abnormal exit.
     // Retain its numeric result for diagnosis; it is not proof of a user cancel.
     if (rc == MAKERESULT(Module_Libnx, LibnxError_LibAppletBadExit)) return std::nullopt;
     checkResult(rc, "Software keyboard display");
-    const std::string text(result);
-    if (password) for (volatile char& value : result) value = 0;
-    return text;
+    return std::string(output.bytes.data());
 }
 
 void fatalScreen(const std::string& message) {

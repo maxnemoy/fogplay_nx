@@ -29,7 +29,7 @@ constexpr Result MAKERESULT(int module,int description){return module+(descripti
 struct PadState{}; struct SwkbdConfig{};
 std::vector<std::string> logs; std::vector<u64> held;
 size_t position=0; int shows=0,closes=0,sleeps=0; bool focused=true,passwordPreset=false;
-Result createRc=0,showRc=0;
+Result createRc=0,showRc=0; size_t outputSize=0; std::string outputText="synthetic-private-value";
 void diagnostic(std::string message){logs.push_back(message);}
 void padInitializeDefault(PadState*){}
 void padUpdate(PadState*){}
@@ -45,10 +45,10 @@ void swkbdConfigSetHeaderText(SwkbdConfig*,const char*){}
 void swkbdConfigSetInitialText(SwkbdConfig*,const char*){}
 void swkbdConfigSetStringLenMax(SwkbdConfig*,u32){}
 void swkbdConfigSetReturnButtonFlag(SwkbdConfig*,bool){}
-Result swkbdShow(SwkbdConfig*,char* result,size_t){++shows; assert(position>=held.size());std::strcpy(result,"synthetic-private-value");return showRc;}
+Result swkbdShow(SwkbdConfig*,char* result,size_t size){++shows;outputSize=size;assert(position>=held.size());assert(outputText.size()+1<=size);std::strcpy(result,outputText.c_str());return showRc;}
 void swkbdClose(SwkbdConfig*){++closes;}
 std::optional<std::string> keyboard(const char*,const std::string&,int,bool=false);
-void reset(){logs.clear();held.clear();position=0;shows=closes=sleeps=0;focused=true;passwordPreset=false;createRc=showRc=0;}
+void reset(){logs.clear();held.clear();position=0;shows=closes=sleeps=0;focused=true;passwordPreset=false;createRc=showRc=0;outputText="synthetic-private-value";outputSize=0;}
 '''
 cases = r'''
 int main(){
@@ -60,6 +60,8 @@ int main(){
  assert(logs.back()=="Keyboard show result=77");
  reset();createRc=88;failed=false;try{keyboard("Login","",128);}catch(...){failed=true;}assert(failed&&shows==0&&closes==0);
  reset();showRc=MAKERESULT(Module_Libnx,LibnxError_LibAppletBadExit);assert(!keyboard("Login","",128));assert(closes==1);
+ reset();outputText.clear();for(int i=0;i<200;++i)outputText+="Я";assert(keyboard("Comment","",200)==outputText);assert(outputSize==801);
+ for(const int bad:{0,-1,501}){reset();failed=false;try{keyboard("Bound","",bad);}catch(...){failed=true;}assert(failed&&shows==0);}
  reset();held={HidNpadButton_B};focused=false;assert(!keyboard("Login","",128));assert(shows==0);
  std::cout<<"Software keyboard real helper: release-before-launch, success, private input, creation/show errors and non-confirmed close PASS\n";
 }

@@ -13,7 +13,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         name = dict(self.connection.getpeercert()["subject"][0])["commonName"]
         body = name.encode()
-        self.send_response(200)
+        self.send_response(503 if "unavailable=1" in self.path else 200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

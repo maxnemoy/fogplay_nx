@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8"></head><body>
+<form action="/site/logout" method="post"><input type="hidden" name="_csrf" value="synthetic-logout"></form>
+<main id="main" role="main"><h1>Оцените игру:</h1>
+<form id="review-form" action="/session/review?id=9000002" method="post">
+<input type="hidden" name="_csrf" value="synthetic-review-csrf">
+<input type="hidden" name="Review[rating]" value="">
+<input type="radio" name="Review[rating]" value="5" checked>
+<input type="radio" name="Review[rating]" value="4">
+<input type="radio" name="Review[rating]" value="3">
+<input type="radio" name="Review[rating]" value="2">
+<input type="radio" name="Review[rating]" value="1">
+<textarea name="Review[message]" maxlength="2000"></textarea>
+<button type="button">Синтетический шаблон</button><button type="submit">Отправить</button>
+</form></main></body></html>

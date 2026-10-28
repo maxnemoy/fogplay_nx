@@ -37,6 +37,11 @@ std::string baseline() {
     page.erase(start,end+5-start);
     return replace(std::move(page),"1–2 из 2","1–1 из 1");
 }
+std::string withRatedPrevious(std::string page) {
+    return replace(std::move(page),
+        "<a class=\"btn btn-sm btn-warning\" href=\"/session/review?id=9000001\" pjax=\"0\">Оценить</a>",
+        "<small><div>Оценка: 5<br>Синтетический отзыв</div></small>");
+}
 WebResponse html(std::string body) { return {200,std::move(body),{},"text/html; charset=UTF-8"}; }
 struct FakeWeb final : WebTransport {
     std::string profile = fixture("account"), currentHistory = baseline();
@@ -50,10 +55,16 @@ struct FakeWeb final : WebTransport {
     unsigned failHistoryAt = 0;
     bool loseCreate = false, loseClose = false, failCreatedHistory = false;
     bool previousClient = false, freshSubmitted = false;
+    std::string failPath;
+    bool unexpectedFailure = false;
     Query fields;
     std::function<void()> historyReadAction;
     std::function<void(const Query&)> submitAction;
     WebResponse get(const std::string& path) override {
+        if (path == failPath) {
+            if (unexpectedFailure) throw std::runtime_error("private synthetic response and endpoint");
+            throw TransportError(TransportFailure::Network);
+        }
         if (path == "/user/info") return html(profile);
         if (path == "/user/balance") return {200,"{\"balance\":\"250.00\"}",{},"application/json"};
         if (path == "/session/list") {
@@ -125,6 +136,40 @@ template<class Action> void rejects(RepositoryErrorKind kind,Action&& action) {
     }
     assert(rejected);
 }
+template<class Action> void stagedFailure(PairedPreparationStage stage,RepositoryErrorKind kind,Action&& action) {
+    bool rejected=false;
+    try { action(); }
+    catch (const PairedPreparationError& error) {
+        rejected=true;
+        assert(error.stage()==stage && error.kind()==kind);
+        assert(std::string(error.what())=="Paired rental preparation failed");
+    }
+    assert(rejected);
+}
+void preparationDiagnostics() {
+    { Setup s; s.web.currentHistory=fixture("history-rated-synthetic");
+      assert(!s.prepare().id.empty() && s.web.posts==0 && s.web.closes==0); }
+    { Setup s; s.web.failPath="/pc/preview?id=42";
+      stagedFailure(PairedPreparationStage::ComputerPreview,RepositoryErrorKind::NetworkFailure,[&] { s.prepare(); });
+      assert(s.web.posts==0 && s.web.closes==0); }
+    { Setup s; s.web.failPath="/pc/preview?id=42"; s.web.unexpectedFailure=true;
+      stagedFailure(PairedPreparationStage::ComputerPreview,RepositoryErrorKind::InternalFailure,[&] { s.prepare(); }); }
+    { Setup s; s.web.failHistoryAt=1;
+      stagedFailure(PairedPreparationStage::AccountHistory,RepositoryErrorKind::NetworkFailure,[&] { s.prepare(); }); }
+    { Setup s; s.web.currentHistory=history(true);
+      stagedFailure(PairedPreparationStage::IdleBaseline,RepositoryErrorKind::ActiveRentalExists,[&] { s.prepare(); });
+      assert(s.web.posts==0 && s.web.closes==0 && s.web.successReads==0); }
+    { Setup s; s.web.currentHistory=replace(history(true),"<small>Активна","<small>Unverified");
+      stagedFailure(PairedPreparationStage::IdleBaseline,RepositoryErrorKind::OutcomeUnknown,[&] { s.prepare(); }); }
+    { Setup s; s.web.failPath="/pc/play?id=42";
+      stagedFailure(PairedPreparationStage::ConnectionPage,RepositoryErrorKind::NetworkFailure,[&] { s.prepare(); }); }
+    { Setup s; s.web.connect="<!doctype html><html><body><form method='post'><input name='_csrf'></form></body></html>";
+      stagedFailure(PairedPreparationStage::FreshPairingLink,RepositoryErrorKind::InvalidResponse,[&] { s.prepare(); }); }
+    { Setup s; s.web.previousClient=true; s.web.failPath="/pc/play?id=42&resume=0";
+      stagedFailure(PairedPreparationStage::FreshPairingPage,RepositoryErrorKind::NetworkFailure,[&] { s.prepare(); }); }
+    { Setup s; s.web.connect=replace(s.web.connect,"name=\"Pc[pin]\"","name=\"unknown\"");
+      stagedFailure(PairedPreparationStage::ConnectionForm,RepositoryErrorKind::InvalidResponse,[&] { s.prepare(); }); }
+}
 void happyAndExactIds() {
     Setup s;
     const auto prepared=s.prepare();
@@ -151,6 +196,15 @@ void happyAndExactIds() {
     rejects(RepositoryErrorKind::Unsupported,[&]{s.rentals.preparePairedReconnect(receipt.rental);});
 }
 void preparationGuards() {
+    Setup bonus; bonus.web.connect=fixture("connect-bonus-metadata-synthetic");
+    assert(!bonus.create().rental.empty() && bonus.web.posts==1 && bonus.web.fields.size()==4 &&
+        bonus.web.fields.back()==Query::value_type("Pc[use_bonus]","0"));
+    Setup freshBonus; freshBonus.web.connect=fixture("connect-bonus-metadata-synthetic"); freshBonus.web.previousClient=true;
+    assert(!freshBonus.create().rental.empty() && freshBonus.web.freshSubmitted &&
+        freshBonus.web.fields.back()==Query::value_type("Pc[use_bonus]","0"));
+    Setup review; review.web.connect=fixture("connect-review-required-synthetic");
+    rejects(RepositoryErrorKind::ReviewRequired,[&] { review.prepare(); });
+    assert(review.web.posts==0 && review.web.closes==0 && review.web.successReads==0);
     Setup expiredPair; const auto expired=expiredPair.prepare();
     rejects(RepositoryErrorKind::InvalidRequest,[&] {
         expiredPair.rentals.createPairedRental(expired.id,"0123",[] { return false; });
@@ -165,7 +219,7 @@ void preparationGuards() {
     const auto customPort=custom.prepare();
     assert(customPort.endpoint.httpPort==54321 && customPort.endpoint.httpsPort==0 && custom.web.posts==0);
     Setup active; active.web.currentHistory=history(true);
-    rejects(RepositoryErrorKind::OutcomeUnknown,[&]{active.prepare();}); assert(active.web.posts==0);
+    rejects(RepositoryErrorKind::ActiveRentalExists,[&]{active.prepare();}); assert(active.web.posts==0);
     Setup unknown; unknown.web.currentHistory=replace(history(true),"<small>Активна","<small>Unverified");
     rejects(RepositoryErrorKind::OutcomeUnknown,[&]{unknown.prepare();}); assert(unknown.web.posts==0);
     Setup incomplete; incomplete.web.currentHistory=replace(baseline(),"1–1 из 1","1–1 из 2");
@@ -180,7 +234,7 @@ void preparationGuards() {
     rejects(RepositoryErrorKind::NotAuthenticated,[&]{account.rentals.createPairedRental(prepared.id,"0123");});
     assert(account.web.posts==0 && !account.session.authenticated());
     Setup changed; const auto handle=changed.prepare(); changed.web.currentHistory=history(true);
-    rejects(RepositoryErrorKind::OutcomeUnknown,[&]{changed.rentals.createPairedRental(handle.id,"0123");}); assert(changed.web.posts==0);
+    rejects(RepositoryErrorKind::ActiveRentalExists,[&]{changed.rentals.createPairedRental(handle.id,"0123");}); assert(changed.web.posts==0);
 }
 void unknownCreateNeverRetries() {
     Setup s; const auto prepared=s.prepare(); s.web.loseCreate=true;
@@ -304,6 +358,30 @@ struct CheckoutSetup {
 };
 void automaticCheckoutEndToEnd() {
     { CheckoutSetup s;
+      s.adapter.web.currentHistory=withRatedPrevious(baseline());
+      s.adapter.web.afterCreate=withRatedPrevious(history(true));
+      s.adapter.web.afterClose=withRatedPrevious(history(false));
+      const auto result=s.create();
+      assert(result.state==PairedCheckoutState::Ready && result.rental.value=="9000042" &&
+          s.adapter.web.posts==1 && s.pair.begins==1 && s.pair.completes==1 && s.adapter.web.closes==0);
+      assert(s.guard->stop().state==PairedCheckoutState::Terminal && s.adapter.web.closes==1 &&
+          s.adapter.web.posts==1 && !s.disk.saved.pending && !s.guard->unresolved()); }
+    { CheckoutSetup s; s.adapter.web.currentHistory=history(true);
+      const auto result=s.create();
+      assert(result.state==PairedCheckoutState::RecoveryRequired && result.rental.empty() &&
+          result.preparationStage==PairedPreparationStage::IdleBaseline &&
+          result.preparationError==RepositoryErrorKind::ActiveRentalExists);
+      assert(result.message=="В аккаунте есть активная сессия. Проверьте её на сайте сервиса перед новым подключением.");
+      assert(s.adapter.web.posts==0 && s.adapter.web.closes==0 && s.pair.begins==0 &&
+          !s.disk.saved.pending && !s.guard->unresolved()); }
+    { CheckoutSetup s; s.adapter.web.connect=fixture("connect-review-required-synthetic");
+      const auto result=s.create();
+      assert(result.state==PairedCheckoutState::RecoveryRequired && result.rental.empty() &&
+          result.message=="Оцените предыдущую сессию на сайте сервиса и повторите подключение." &&
+          result.requiredRating==std::optional<RentalId>(RentalId{ProviderId::FogHub,"9000042"}));
+      assert(s.adapter.web.posts==0 && s.adapter.web.closes==0 && s.pair.begins==0 &&
+          s.pair.completes==0 && !s.disk.saved.pending && !s.guard->unresolved()); }
+    { CheckoutSetup s;
       assert(s.create().state==PairedCheckoutState::Ready);
       // stop() first verifies history, then the adapter independently fetches
       // its close-action evidence. Failure in this second read sent no close.
@@ -353,6 +431,6 @@ void automaticCheckoutEndToEnd() {
 }
 }
 int main() {
-    happyAndExactIds(); preparationGuards(); unknownCreateNeverRetries(); partialReceiptAndOwnership(); closeFreshnessAndNoReplay(); automaticCheckoutEndToEnd();
+    happyAndExactIds(); preparationDiagnostics(); preparationGuards(); unknownCreateNeverRetries(); partialReceiptAndOwnership(); closeFreshnessAndNoReplay(); automaticCheckoutEndToEnd();
     std::cout << "FogHub paired rental adapter offline tests passed\n";
 }

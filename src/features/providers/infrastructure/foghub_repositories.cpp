@@ -321,6 +321,10 @@ WebResponse Session::closeRental(const std::string& rental) {
     if (!authenticated()) fail(RepositoryErrorKind::NotAuthenticated,"FogHub sign-in required");
     return transportCall([&]{ return transport_.closeRental(rental); });
 }
+WebResponse Session::submitSessionRating(const std::string& rental,const Query& fields) {
+    if (!authenticated()) fail(RepositoryErrorKind::NotAuthenticated,"FogHub sign-in required");
+    return transportCall([&]{ return transport_.submitSessionRating(rental,fields); });
+}
 std::string Session::readPublic(const std::string& path) {
     const auto response = get(path,false); htmlResponse(response); return response.body;
 }

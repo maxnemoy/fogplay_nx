@@ -1,6 +1,7 @@
 #pragma once
 #include "features/session/domain/service_models.hpp"
 #include "features/session/domain/paired_rental.hpp"
+#include "features/session/domain/session_rating.hpp"
 #include "features/auth/domain/auth_repository.hpp"
 #include <vector>
 
@@ -11,6 +12,14 @@ public:
     virtual ~RentalRepository() = default;
     virtual AuthData auth() const = 0;
     virtual bool pairedLaunchSupported() const noexcept { return false; }
+    virtual bool sessionRatingSupported() const noexcept { return false; }
+    // No target discovers the latest owned finished session still awaiting a rating.
+    virtual std::optional<SessionRatingForm> ratingForm(const std::optional<RentalId>& = std::nullopt) {
+        throw RepositoryError(RepositoryErrorKind::Unsupported,"Session rating is unsupported");
+    }
+    virtual SessionRatingResult submitRating(const SessionRatingRequest&) {
+        throw RepositoryError(RepositoryErrorKind::Unsupported,"Session rating is unsupported");
+    }
     virtual PairedPreparation preparePairedRental(const StartRentalRequest&) { throw RepositoryError(RepositoryErrorKind::Unsupported, "Paired launch is unsupported"); }
     virtual PairedLaunchReceipt createPairedRental(const EntityId&, const std::string&) { throw RepositoryError(RepositoryErrorKind::Unsupported, "Paired launch is unsupported"); }
     // The callback is ephemeral, never retained, and must be checked after any

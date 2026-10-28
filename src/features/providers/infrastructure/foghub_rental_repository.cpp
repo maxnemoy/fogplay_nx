@@ -1,4 +1,5 @@
 #include "features/providers/infrastructure/foghub_rental_repository.hpp"
+#include "features/providers/infrastructure/foghub_review_html.hpp"
 #include <algorithm>
 #include <atomic>
 
@@ -32,7 +33,7 @@ void Rentals::validateId(const EntityId& id) {
 void Rentals::synchronize() {
     const auto current = session_.auth();
     if (!sameAuth(current,scope_)) {
-        pending_.reset(); closeAttempts_.clear(); observedComputers_.clear(); pairedEndpoints_.clear();
+        pending_.reset(); ratingPending_.reset(); closeAttempts_.clear(); observedComputers_.clear(); pairedEndpoints_.clear();
         unresolvedCreate_ = false; unresolvedRental_.reset(); scope_ = current;
     }
     if (!session_.authenticated() || current.state != AuthState::Authenticated ||
@@ -42,6 +43,8 @@ void Rentals::synchronize() {
 std::set<std::string> Rentals::idleBaseline(const Session::OwnHistory& history) {
     std::set<std::string> baseline;
     for (const auto& row : history.rows) {
+        if (row.state == HistoryState::Active)
+            fail(RepositoryErrorKind::ActiveRentalExists,"FogHub has an active rental");
         if (!terminal(row)) fail(RepositoryErrorKind::OutcomeUnknown,"FogHub has an active or unverified rental");
         baseline.insert(row.id);
     }
@@ -78,33 +81,51 @@ RentalInspection Rentals::inspection(const Session::OwnHistory& history,const Re
     return result;
 }
 PairedPreparation Rentals::preparePairedRental(const StartRentalRequest& request) {
-    validateId(request.computerId); synchronize();
-    if (request.ownAccount || !request.offerId.empty())
-        fail(RepositoryErrorKind::Unsupported,"FogHub launch options are unsupported");
-    if (!request.gameId.empty()) validateId(request.gameId);
-    if (unresolvedCreate_) fail(RepositoryErrorKind::OutcomeUnknown,"FogHub creation outcome requires reconciliation");
-    // Replace any old preparation immediately, including when a fresh read fails.
-    pending_.reset();
-    const auto computer = parseComputerPreview(session_.readPublic("/pc/preview?id="+request.computerId.value),request.computerId.value);
-    if (!computer.fhAvailable || computer.pricePerHour.empty())
-        fail(RepositoryErrorKind::Unavailable,"FogHub computer is not currently available for paired launch");
-    const auto history = session_.ownHistory();
-    auto baseline = idleBaseline(history);
-    auto page = session_.readRentalPage("/pc/play?id="+request.computerId.value);
-    const auto freshLink = freshPairingLink(page,request.computerId.value);
-    if (!freshLink.empty()) page = session_.readRentalPage(freshLink);
-    auto form = parseConnectForm(page,request.computerId.value);
-    if (!freshLink.empty() && form.actionPath != freshLink)
-        fail(RepositoryErrorKind::InvalidResponse,"FogHub fresh pairing action changed");
-    const auto address = endpoint(form.endpoint);
-    if (!sameAuth(history.owner,session_.auth())) fail(RepositoryErrorKind::NotAuthenticated,"FogHub account changed");
-    EntityId handle{ProviderId::FogHub,"pair-"+std::to_string(++handleSequence)};
-    pending_ = Pending{handle,request.computerId,history.owner,std::move(form),std::move(baseline),
-        // Discovery/dispatch may consume 15s and the fresh account/history
-        // preflight may consume a bounded HTTPS call. This is a local one-use
-        // lease, not a claim about the server CSRF token lifetime.
-        std::chrono::steady_clock::now()+std::chrono::seconds(120)};
-    return {handle,request.computerId,address,{}};
+    auto stage = PairedPreparationStage::Validation;
+    try {
+        validateId(request.computerId); synchronize();
+        if (request.ownAccount || !request.offerId.empty())
+            fail(RepositoryErrorKind::Unsupported,"FogHub launch options are unsupported");
+        if (!request.gameId.empty()) validateId(request.gameId);
+        if (unresolvedCreate_) fail(RepositoryErrorKind::OutcomeUnknown,"FogHub creation outcome requires reconciliation");
+        // Replace any old preparation immediately, including when a fresh read fails.
+        pending_.reset();
+        stage = PairedPreparationStage::ComputerPreview;
+        const auto computer = parseComputerPreview(session_.readPublic("/pc/preview?id="+request.computerId.value),request.computerId.value);
+        if (!computer.fhAvailable || computer.pricePerHour.empty())
+            fail(RepositoryErrorKind::Unavailable,"FogHub computer is not currently available for paired launch");
+        stage = PairedPreparationStage::AccountHistory;
+        const auto history = session_.ownHistory();
+        stage = PairedPreparationStage::IdleBaseline;
+        auto baseline = idleBaseline(history);
+        stage = PairedPreparationStage::ConnectionPage;
+        auto page = session_.readRentalPage("/pc/play?id="+request.computerId.value);
+        stage = PairedPreparationStage::FreshPairingLink;
+        const auto freshLink = freshPairingLink(page,request.computerId.value);
+        if (!freshLink.empty()) {
+            stage = PairedPreparationStage::FreshPairingPage;
+            page = session_.readRentalPage(freshLink);
+        }
+        stage = PairedPreparationStage::ConnectionForm;
+        auto form = parseConnectForm(page,request.computerId.value);
+        if (!freshLink.empty() && form.actionPath != freshLink)
+            fail(RepositoryErrorKind::InvalidResponse,"FogHub fresh pairing action changed");
+        const auto address = endpoint(form.endpoint);
+        stage = PairedPreparationStage::AccountRecheck;
+        if (!sameAuth(history.owner,session_.auth())) fail(RepositoryErrorKind::NotAuthenticated,"FogHub account changed");
+        EntityId handle{ProviderId::FogHub,"pair-"+std::to_string(++handleSequence)};
+        pending_ = Pending{handle,request.computerId,history.owner,std::move(form),std::move(baseline),
+            // Discovery and the fresh account/history preflight consume bounded
+            // calls. This is a one-use local lease, not a server CSRF lifetime.
+            std::chrono::steady_clock::now()+std::chrono::seconds(120)};
+        return {handle,request.computerId,address,{}};
+    } catch (const SessionReviewRequired& error) {
+        throw PairedPreparationError(stage,error.kind(),error.rental());
+    } catch (const RepositoryError& error) {
+        throw PairedPreparationError(stage,error.kind());
+    } catch (...) {
+        throw PairedPreparationError(stage,RepositoryErrorKind::InternalFailure);
+    }
 }
 PairedLaunchReceipt Rentals::createPairedRental(const EntityId& handle,const std::string& pin) {
     return createPairedRental(handle,pin,[] { return true; });
@@ -125,7 +146,8 @@ PairedLaunchReceipt Rentals::createPairedRental(const EntityId& handle,const std
         fail(RepositoryErrorKind::OutcomeUnknown,"FogHub history changed before creation");
     if (std::chrono::steady_clock::now() >= pending.expires)
         fail(RepositoryErrorKind::InvalidRequest,"FogHub preparation has expired");
-    const Query fields{{"_csrf",pending.form.csrf},{"moonlight_url",pending.form.moonlightUrl},{"Pc[pin]",pin}};
+    Query fields{{"_csrf",pending.form.csrf},{"moonlight_url",pending.form.moonlightUrl},{"Pc[pin]",pin}};
+    if (pending.form.hasBonusChoice) fields.emplace_back("Pc[use_bonus]","0");
     bool allowed = false;
     try { allowed = canSubmit && canSubmit(); } catch (...) {}
     if (!allowed) throw PairedSubmissionCancelled();
@@ -241,5 +263,93 @@ CreationReceipt Rentals::createOrder(const StartRentalRequest&) {
 }
 RentalPreparation Rentals::orderStatus(const CreationId&) {
     fail(RepositoryErrorKind::Unsupported,"FogHub does not support MTS order status");
+}
+std::optional<SessionRatingForm> Rentals::ratingForm(const std::optional<RentalId>& requested) {
+    if (requested) validateId(*requested);
+    synchronize(); ratingPending_.reset();
+    const auto history=session_.ownHistory();
+    if (!sameAuth(history.owner,scope_) || !sameAuth(history.owner,session_.auth()))
+        fail(RepositoryErrorKind::NotAuthenticated,"FogHub account changed");
+    const HistoryRow* selected=nullptr;
+    std::optional<int> score;
+    std::string latest;
+    bool ambiguous=false;
+    // Parse each bounded history page once, including for a long prior-run history.
+    std::map<std::size_t,std::map<std::string,std::optional<int>>> pageRatings;
+    for (const auto& row:history.rows) {
+        if (requested && row.id!=requested->value) continue;
+        if (!terminal(row)) {
+            if (requested) fail(RepositoryErrorKind::InvalidRequest,"Only finished sessions can be rated");
+            continue;
+        }
+        const auto page=history.rowPages.find(row.id);
+        if (page==history.rowPages.end() || page->second>=history.pages.size())
+            fail(RepositoryErrorKind::InvalidResponse,"FogHub review history is incomplete");
+        auto ratings=pageRatings.find(page->second);
+        if(ratings==pageRatings.end()) ratings=pageRatings.emplace(page->second,sessionHistoryRatings(history.pages[page->second])).first;
+        const auto entry=ratings->second.find(row.id);
+        if(entry==ratings->second.end()) fail(RepositoryErrorKind::InvalidResponse,"FogHub review row is missing");
+        const auto rating=entry->second;
+        if (requested) { selected=&row; score=rating; break; }
+        if (rating) continue;
+        // The verified history date is DD.MM.YYYY HH:mm. Do not assume row or ID order.
+        const auto& time=row.startedAt;
+        if (time.size()!=16) fail(RepositoryErrorKind::InvalidResponse,"FogHub review date is invalid");
+        const auto key=time.substr(6,4)+time.substr(3,2)+time.substr(0,2)+time.substr(11,5);
+        if (!selected || key>latest) { selected=&row;latest=key;ambiguous=false; }
+        else if(key==latest) ambiguous=true;
+    }
+    if (ambiguous) fail(RepositoryErrorKind::InvalidResponse,"Latest FogHub review is ambiguous");
+    if (!selected) {
+        if(requested) fail(RepositoryErrorKind::InvalidRequest,"Finished FogHub session was not found");
+        return std::nullopt;
+    }
+    const RentalId rental{ProviderId::FogHub,selected->id};
+    const EntityId computer{ProviderId::FogHub,selected->computerId}; validateId(computer);
+    SessionRatingForm result; result.rental=rental;result.computerName=selected->computerName;
+    result.sessionDate=selected->startedAt;
+    result.alreadyRated=score.has_value();result.existingScore=score;
+    if(score) return result;
+    (void)parseSessionReviewForm(session_.readRentalPage("/session/review?id="+rental.value),rental.value);
+    if(!sameAuth(history.owner,session_.auth())) fail(RepositoryErrorKind::NotAuthenticated,"FogHub account changed");
+    result.preparation={ProviderId::FogHub,"review-"+std::to_string(++handleSequence)};
+    result.commentSupported=true;result.commentMaxLength=2000;
+    ratingPending_=RatingPending{rental,result.preparation,computer,history.owner};
+    return result;
+}
+SessionRatingResult Rentals::submitRating(const SessionRatingRequest& request) {
+    validateId(request.rental); synchronize();
+    if(request.score<1 || request.score>5 || !validSessionReviewMessage(request.comment))
+        fail(RepositoryErrorKind::InvalidRequest,"Invalid session rating or comment");
+    if(!ratingPending_ || ratingPending_->handle!=request.preparation || ratingPending_->rental!=request.rental ||
+        !sameAuth(ratingPending_->owner,session_.auth()))
+        fail(RepositoryErrorKind::InvalidRequest,"FogHub review preparation has expired");
+    const auto pending=*ratingPending_;
+    const auto before=session_.ownHistory();
+    const auto* row=find(before,request.rental);
+    if(!sameAuth(before.owner,pending.owner) || !row || !terminal(*row) || row->computerId!=pending.computer.value)
+        fail(RepositoryErrorKind::InvalidResponse,"FogHub review ownership changed");
+    const auto score=sessionHistoryRating(before.pages.at(before.rowPages.at(row->id)),row->id);
+    if(score) {
+        if(*score!=request.score) fail(RepositoryErrorKind::InvalidRequest,"FogHub session already has a different rating");
+        ratingPending_.reset(); return {request.rental,*score};
+    }
+    // Fetch a fresh CSRF after editing. No form URL/token is exposed to presentation.
+    const auto form=parseSessionReviewForm(session_.readRentalPage("/session/review?id="+request.rental.value),request.rental.value);
+    if(!sameAuth(pending.owner,session_.auth())) fail(RepositoryErrorKind::NotAuthenticated,"FogHub account changed");
+    const Query fields{{"_csrf",form.csrf},{"Review[rating]",std::to_string(request.score)},{"Review[message]",request.comment}};
+    // One dispatch per explicit action. HTTP acknowledgement is insufficient;
+    // even a lost response can be reconciled by the exact owned history row.
+    try { (void)session_.submitSessionRating(request.rental.value,fields); }
+    catch (...) { /* Reconcile a possibly accepted request without replaying it. */ }
+    try {
+        const auto after=session_.ownHistory();
+        const auto* confirmed=find(after,request.rental);
+        if(sameAuth(after.owner,pending.owner) && confirmed && terminal(*confirmed) && confirmed->computerId==pending.computer.value) {
+            const auto rating=sessionHistoryRating(after.pages.at(after.rowPages.at(confirmed->id)),confirmed->id);
+            if(rating && *rating==request.score) {ratingPending_.reset();return {request.rental,*rating};}
+        }
+    } catch (...) { /* Preserve an unknown submission outcome with a fixed error. */ }
+    fail(RepositoryErrorKind::OutcomeUnknown,"FogHub rating could not be confirmed");
 }
 }

@@ -80,6 +80,13 @@ void Overlay::openMenu() { text_.clear(); mode_ = OverlayMode::Menu; selection_ 
 void Overlay::close() { text_.clear(); mode_ = OverlayMode::Closed; selection_ = 0; }
 void Overlay::up() { move(0, -1); }
 void Overlay::down() { move(0, 1); }
+int Overlay::firstImageSelection() const { return provider_ == ProviderId::FogHub ? 0 : 1; }
+int Overlay::imageRowCount() const { return provider_ == ProviderId::FogHub ? 4 : 6; }
+void Overlay::setProvider(ProviderId value) {
+    if (provider_ == value) return;
+    provider_ = value;
+    if (mode_ == OverlayMode::ImageSettings) selection_ = firstImageSelection();
+}
 OverlayAction Overlay::left() {
     if (mode_ == OverlayMode::ImageSettings) return adjustVideo(-1);
     move(-1, 0); return {};
@@ -89,6 +96,13 @@ OverlayAction Overlay::right() {
     move(1, 0); return {};
 }
 OverlayAction Overlay::adjustVideo(int direction) {
+    if (mode_ == OverlayMode::ImageSettings && provider_ == ProviderId::FogHub) {
+        if (!videoChangesEnabled_) return {};
+        if (selection_ < 0 || selection_ > 1) return {};
+        const auto field = selection_ == 0 ? video::Field::Codec : video::Field::Bitrate;
+        return video::adjust(videoSettings_, field, direction) ?
+            OverlayAction{OverlayActionType::SettingsChanged, {}} : OverlayAction{};
+    }
     if (mode_ != OverlayMode::ImageSettings || selection_ < 1 || selection_ > 3) return {};
     const std::array<video::Field, 3> fields{video::Field::Quality, video::Field::Bitrate, video::Field::Keyframes};
     return video::adjust(videoSettings_, fields[static_cast<std::size_t>(selection_ - 1)], direction) ?
@@ -99,7 +113,8 @@ void Overlay::move(int horizontal, int vertical) {
         const int step = vertical != 0 ? vertical : horizontal;
         selection_ = (selection_ + step + 5) % 5;
     } else if (mode_ == OverlayMode::ImageSettings) {
-        selection_ = 1 + (selection_ - 1 + vertical + 5) % 5;
+        const int first = firstImageSelection(), count = imageRowCount() - first;
+        selection_ = first + (selection_ - first + vertical + count) % count;
     } else if (mode_ == OverlayMode::StopConfirm) {
         selection_ = 1 - selection_;
     } else if (mode_ == OverlayMode::Keyboard) {
@@ -145,7 +160,7 @@ OverlayAction Overlay::select() {
         switch (selection_) {
             case 0: mode_ = OverlayMode::Mouse; break;
             case 1: mode_ = OverlayMode::Keyboard; text_.clear(); break;
-            case 2: mode_ = OverlayMode::ImageSettings; selection_ = 1; return {};
+            case 2: mode_ = OverlayMode::ImageSettings; selection_ = firstImageSelection(); return {};
             case 3: mode_ = OverlayMode::StopConfirm; selection_ = 1; return {};
             case 4: close(); return {};
         }
@@ -154,8 +169,8 @@ OverlayAction Overlay::select() {
         if (selection_ == 0) { close(); return {OverlayActionType::StopSession, {}}; }
         mode_ = OverlayMode::Menu; selection_ = 3;
     } else if (mode_ == OverlayMode::ImageSettings) {
-        if (selection_ == 4) return {OverlayActionType::RequestKeyframe, {}};
-        if (selection_ == 5) return back();
+        if (selection_ == imageRowCount() - 2) return {OverlayActionType::RequestKeyframe, {}};
+        if (selection_ == imageRowCount() - 1) return back();
         return adjustVideo(1);
     } else if (mode_ == OverlayMode::Keyboard) {
         if (selection_ < 48) appendText(keyLabel(selection_));
@@ -192,7 +207,8 @@ OverlayAction Overlay::touch(int x, int y) {
     if (mode_ == OverlayMode::Menu) {
         for (int i = 0; i < 5; ++i) if (contains(menuButton(i), x, y)) { selection_ = i; return select(); }
     } else if (mode_ == OverlayMode::ImageSettings) {
-        for (int i = 1; i < 6; ++i) if (contains(imageButton(i), x, y)) { selection_ = i; return select(); }
+        for (int i = firstImageSelection(); i < imageRowCount(); ++i)
+            if (contains(imageButton(i), x, y)) { selection_ = i; return select(); }
     } else if (mode_ == OverlayMode::Keyboard) {
         for (int i = 0; i < KeyboardKeyCount; ++i) if (contains(keyRect(i), x, y)) { selection_ = i; return select(); }
     } else if (mode_ == OverlayMode::StopConfirm) {
@@ -218,15 +234,26 @@ void Overlay::paint(ui::Ui& ui, SDL_Renderer* renderer) const {
     } else if (mode_ == OverlayMode::ImageSettings) {
         ui.panel({140, 15, 1000, 690});
         ui.text(uiText::Stream::ImageSettingsTitle, 174, 42, 932, White, true);
-        ui.text(ui.controllerHints(uiText::Stream::ImageSettingsHint), 174, 96, 932, Muted);
-        const std::array<std::string, 6> labels{
+        const bool foghub = provider_ == ProviderId::FogHub;
+        const auto* hint = foghub ? (videoChangesEnabled_ ? uiText::Stream::FogHubImageSettingsHint :
+            uiText::Stream::FogHubImageConnectingHint) : uiText::Stream::ImageSettingsHint;
+        ui.text(ui.controllerHints(hint), 174, 96, 932, Muted);
+        const std::array<std::string, 6> mtsLabels{
             uiText::Settings::CodecPrefix + fog::ui::videoCodecLabel(videoSettings_) + uiText::Settings::BeforeConnectionSuffix,
             uiText::Settings::QualityPrefix + fog::ui::videoQualityLabel(videoSettings_),
             uiText::Settings::BitrateLimitPrefix + std::to_string(videoSettings_.bitrateMbps) + uiText::Common::MegabitsSuffix,
             uiText::Settings::KeyframesPrefix + fog::ui::videoKeyframeLabel(videoSettings_),
             uiText::Stream::RequestKeyframe, uiText::Common::Back};
-        for (int i = 0; i < 6; ++i) ui.button(labels[static_cast<std::size_t>(i)], imageButton(i), selection_ == i, i != 0);
-        ui.text(uiText::Stream::BitrateNotice, 174, 523, 932, Muted);
+        const std::array<std::string, 4> foghubLabels{
+            uiText::Settings::CodecPrefix + fog::ui::videoCodecLabel(videoSettings_),
+            uiText::Settings::BitrateLimitPrefix + std::to_string(videoSettings_.bitrateMbps) + uiText::Common::MegabitsSuffix,
+            uiText::Stream::RequestKeyframe, uiText::Common::Back};
+        for (int i = 0; i < imageRowCount(); ++i) {
+            const auto index = static_cast<std::size_t>(i);
+            const bool enabled = foghub ? (i >= 2 || videoChangesEnabled_) : i != 0;
+            ui.button(foghub ? foghubLabels[index] : mtsLabels[index], imageButton(i), selection_ == i, enabled);
+        }
+        ui.text(foghub ? uiText::Settings::FogHubVideoDescription : uiText::Stream::BitrateNotice, 174, 523, 932, Muted);
         ui.text(videoStatus_, 174, 559, 932, White, false, 2);
         ui.text(saveStatus_, 174, 630, 932, Muted, false, 2);
     } else if (mode_ == OverlayMode::StopConfirm) {

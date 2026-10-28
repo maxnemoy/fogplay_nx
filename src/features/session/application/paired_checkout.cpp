@@ -1,4 +1,5 @@
 #include "features/session/application/paired_checkout.hpp"
+#include "core/constants/error_text.hpp"
 #include <algorithm>
 
 namespace fog {
@@ -15,6 +16,18 @@ bool validEndpoint(const PairedEndpoint& endpoint) {
                 (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':'; });
 }
 constexpr auto preparingLimit = std::chrono::seconds(90);
+const char* preparationFailureMessage(RepositoryErrorKind kind) {
+    switch (kind) {
+        case RepositoryErrorKind::ReviewRequired:
+            return constants::error::Session::ReviewRequiredBeforeConnection;
+        case RepositoryErrorKind::ActiveRentalExists:
+            return constants::error::Session::ActiveRentalBeforeConnection;
+        case RepositoryErrorKind::Unavailable:
+            return constants::error::Session::PreparationUnavailable;
+        default:
+            return "Rental preparation or pairing failed before submission";
+    }
+}
 }
 PairedCheckoutGuard::PairedCheckoutGuard(RentalRepository& api, PairingClient& pairing,
         PairingPinGenerator& pins, std::unique_ptr<PairedCheckoutJournal> journal, Clock clock)
@@ -53,6 +66,11 @@ bool PairedCheckoutGuard::validRecord() const {
 bool PairedCheckoutGuard::sameAccount() const {
     const auto auth = api_.auth();
     return auth.authenticated() && auth.account == record_.account && auth.generation == generation_;
+}
+void PairedCheckoutGuard::resetPreparationDiagnostics() {
+    result_.preparationStage = PairedPreparationStage::None;
+    result_.preparationError.reset();
+    result_.requiredRating.reset();
 }
 void PairedCheckoutGuard::persist() {
     if (!journal_) throw JournalError("Rental journal is unavailable");
@@ -165,6 +183,7 @@ PairedCheckoutResult PairedCheckoutGuard::cancelUnsubmitted() {
     return result_;
 }
 PairedCheckoutResult PairedCheckoutGuard::create(const StartRentalRequest& request) {
+    resetPreparationDiagnostics();
     if (pending_ || invalid_) return recovery("Resolve the recorded rental before creating another");
     stopSignal_.store(false);
     pairing_.cancelAndJoin();
@@ -246,6 +265,26 @@ PairedCheckoutResult PairedCheckoutGuard::create(const StartRentalRequest& reque
         paired_ = true;
         pairedEndpoint_ = prepared.endpoint;
         return poll();
+    } catch (const SessionReviewRequired& error) {
+        pairing_.cancelAndJoin();
+        result_.preparationError = RepositoryErrorKind::ReviewRequired;
+        if (pending_) return failPaid("Rental preparation or pairing failed");
+        result_.requiredRating = error.rental();
+        return recovery(preparationFailureMessage(RepositoryErrorKind::ReviewRequired));
+    } catch (const PairedPreparationError& error) {
+        pairing_.cancelAndJoin();
+        result_.preparationStage = error.stage();
+        result_.preparationError = error.kind();
+        if (pending_) return failPaid("Rental preparation or pairing failed");
+        if (error.kind() == RepositoryErrorKind::ReviewRequired) result_.requiredRating = error.requiredRating();
+        return recovery(preparationFailureMessage(error.kind()));
+    } catch (const RepositoryError& error) {
+        pairing_.cancelAndJoin();
+        result_.preparationError = error.kind();
+        // Once submission is possible, preserve the existing paid-rental stop
+        // path regardless of a provider error's category. Never surface payloads.
+        if (pending_) return failPaid("Rental preparation or pairing failed");
+        return recovery(preparationFailureMessage(error.kind()));
     } catch (...) {
         pairing_.cancelAndJoin();
         if (pending_) return failPaid("Rental preparation or pairing failed");
@@ -253,6 +292,7 @@ PairedCheckoutResult PairedCheckoutGuard::create(const StartRentalRequest& reque
     }
 }
 PairedCheckoutResult PairedCheckoutGuard::poll() {
+    resetPreparationDiagnostics();
     if (invalid_) return recovery("Rental journal is invalid");
     if (!pending_) return result_;
     if (record_.stopRequested || stopSignal_.load()) return stopKnown();
@@ -292,6 +332,7 @@ PairedCheckoutResult PairedCheckoutGuard::poll() {
     } catch (...) { return failPaid("Rental inspection failed"); }
 }
 PairedCheckoutResult PairedCheckoutGuard::reconnect() {
+    resetPreparationDiagnostics();
     if (!pending_ || invalid_ || record_.rental.empty())
         return recovery("No exact recorded rental is available for reconnect");
     stopSignal_.store(false);
@@ -343,11 +384,13 @@ PairedCheckoutResult PairedCheckoutGuard::reconnect() {
     }
 }
 PairedCheckoutResult PairedCheckoutGuard::stop() {
+    resetPreparationDiagnostics();
     if (invalid_) return recovery("Rental journal is invalid; do not guess a rental ID");
     if (!pending_) return result_;
     return stopKnown();
 }
 PairedCheckoutResult PairedCheckoutGuard::bindAuthenticatedAccount() {
+    resetPreparationDiagnostics();
     if (invalid_) return recovery("Rental journal is invalid; do not guess a rental ID");
     if (!pending_) return result_;
     pairing_.cancelAndJoin();

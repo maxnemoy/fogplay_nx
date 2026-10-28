@@ -123,6 +123,9 @@ inline constexpr char PlayStationRefreshCancelled[] = "PlayStation refresh cance
 }
 
 namespace Session {
+inline constexpr char ReviewRequiredBeforeConnection[] = "Оцените предыдущую сессию на сайте сервиса и повторите подключение.";
+inline constexpr char ActiveRentalBeforeConnection[] = "В аккаунте есть активная сессия. Проверьте её на сайте сервиса перед новым подключением.";
+inline constexpr char PreparationUnavailable[] = "Подготовка подключения сейчас недоступна. Повторите попытку позже.";
 inline constexpr char AnotherRentalIsPendingRecoveryResolveItFirst[] = "Another rental is pending recovery; resolve it first";
 inline constexpr char CannotEstablishOwnershipOfRecordedRental[] = "Cannot establish ownership of recorded rental";
 inline constexpr char CannotReadPendingSessionJournalPreserveItForRecovery[] = "Cannot read pending session journal; preserve it for recovery";

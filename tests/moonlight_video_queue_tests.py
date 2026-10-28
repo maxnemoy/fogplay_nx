@@ -22,8 +22,16 @@ def extract_function(signature):
 
 capacity = re.search(r'static constexpr std::size_t VideoCapacity = \d+;', source)
 assert capacity, 'Moonlight State must declare its bounded video queue capacity'
+for signature in ('std::string videoDiagnostics()', 'std::string gapDiagnostics()'):
+    diagnostic = extract_function(signature)
+    # Upstream initializes its clock lazily. UI diagnostics must not call it
+    # before the core worker has initialized the clock and published readiness.
+    gated_clock = r'state_->coreDiagnosticsReady\s*\?\s*LiGetMicroseconds\(\)\s*:\s*0'
+    assert len(re.findall(gated_clock, diagnostic)) == 1, signature + ' must gate the core clock'
+    assert 'LiGetMicroseconds' not in re.sub(gated_clock, '', diagnostic), signature + ' has an ungated core clock read'
 harness = r'''
 #include "features/streaming/domain/streaming_client.hpp"
+#include "features/streaming/infrastructure/moonlight/frame_diagnostics.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -39,11 +47,20 @@ harness = r'''
 
 constexpr int DR_OK = 0, DR_NEED_IDR = -1;
 constexpr int FRAME_TYPE_IDR = 1, FRAME_TYPE_PFRAME = 2;
+namespace detail = moonlight::detail;
+std::uint64_t fakeClockUs = 1000000;
+std::uint64_t LiGetMicroseconds() { return fakeClockUs++; }
+// Deliberately use a different epoch and rate to catch mixing duration and DU clocks.
+std::uint64_t fakeSteadyClockUs = 9000000000000;
+std::uint64_t nowSteadyUs() { const auto value = fakeSteadyClockUs; fakeSteadyClockUs += 7; return value; }
 struct BUFFER_ENTRY { BUFFER_ENTRY* next; char* data; int length; };
 struct DECODE_UNIT {
     int fullLength, frameType;
     std::uint32_t rtpTimestamp;
     BUFFER_ENTRY* bufferList;
+    std::uint32_t frameNumber;
+    std::uint64_t receiveTimeUs, enqueueTimeUs;
+    std::uint16_t frameHostProcessingLatency;
 };
 using PDECODE_UNIT = DECODE_UNIT*;
 struct Frame {
@@ -52,7 +69,8 @@ struct Frame {
     DECODE_UNIT unit;
     explicit Frame(unsigned id, bool keyframe) : bytes{char(id), char(id + 1)},
         second{nullptr, &bytes[1], 1}, first{&second, &bytes[0], 1},
-        unit{2, keyframe ? FRAME_TYPE_IDR : FRAME_TYPE_PFRAME, id, &first} {}
+        unit{2, keyframe ? FRAME_TYPE_IDR : FRAME_TYPE_PFRAME, id, &first,
+            id, 900000 + id * 100, 900050 + id * 100, 7} {}
 };
 using VIDEO_FRAME_HANDLE = Frame*;
 struct State {
@@ -65,6 +83,7 @@ struct State {
     std::mutex mutex;
     std::deque<stream::Packet> video;
     std::uint64_t generation = 42;
+    detail::FrameDiagnostics trace;
 };
 struct FakeCore {
     std::deque<std::unique_ptr<Frame>> pending;
@@ -98,9 +117,12 @@ void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int result) {
 std::uint64_t nowMs() { return 123456; }
 '''.replace('CAPACITY_DECLARATION', capacity.group())
 harness += extract_function('bool copyFrame(') + '\n'
-harness += extract_function('void drainVideo(') + '\n'
+harness += extract_function('void drainVideo(').replace('detail::steadyUs()', 'nowSteadyUs()') + '\n'
 harness += r'''
-void resetCore() { assert(!core.inFlight); core = FakeCore{}; }
+void resetCore() {
+    assert(!core.inFlight); core = FakeCore{};
+    fakeClockUs = 1000000; fakeSteadyClockUs = 9000000000000;
+}
 void consume(State& state, unsigned first, unsigned count, std::uint64_t generation) {
     std::lock_guard<std::mutex> lock(state.mutex);
     assert(state.video.size() >= count);
@@ -214,6 +236,24 @@ void startupRequiresIdr() {
     assert(state.videoResyncs == 0 && state.generation == 42 && !state.assemblyWaiting);
     assert(core.completed[0].second == DR_NEED_IDR && core.completed[1].second == DR_OK);
 }
+void diagnosticsObserveActualDrain() {
+    resetCore(); State state;
+    core.add(1, true); core.add(2);
+    drainVideo(state);
+    const auto& trace = state.trace;
+    assert(trace.units == 2 && trace.payloadBytes == 4 && trace.idrs == 1);
+    assert(trace.invalidTimes == 0 && trace.skippedFrameNumbers == 0 && trace.repeatedOrReordered == 0);
+    assert(trace.assembly.count == 2 && trace.assembly.totalUs == 100 && trace.assembly.maxUs == 50);
+    assert(trace.coreAge.count == 2 && trace.coreAge.totalUs == 199601 && trace.coreAge.maxUs == 99850);
+    assert(trace.hostProcessing.count == 2 && trace.hostProcessing.totalUs == 1400);
+    assert(trace.arrivalGap.count == 1 && trace.arrivalGap.totalUs == 1);
+    assert(trace.lastUnitUs == 1000001 && fakeClockUs == 1000002);
+    assert(trace.copy.count == 2 && trace.copy.totalUs == 14);
+    assert(trace.completion.count == 2 && trace.completion.totalUs == 14);
+    assert(trace.queueLock.count == 5 && trace.queueLock.totalUs == 35 && trace.emptyPolls == 1);
+    consume(state, 1, 2, 42);
+    assertHealthy(state, 2);
+}
 int main() {
     assert(State::VideoCapacity == 4);
     burstPreservesFifo();
@@ -222,7 +262,8 @@ int main() {
     oneInvocationHasFiniteBudget();
     invalidFrameWaitsForIdr();
     startupRequiresIdr();
-    std::cout << "Moonlight video queue: 6 scenarios PASS (real copyFrame/drainVideo, fake core, real Packet)\n";
+    diagnosticsObserveActualDrain();
+    std::cout << "Moonlight video queue: 7 scenarios PASS (real copyFrame/drainVideo/FrameDiagnostics, fake core, real Packet)\n";
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fog-moonlight-video-') as directory:

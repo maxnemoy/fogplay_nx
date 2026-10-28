@@ -5,6 +5,7 @@
 #include <string>
 
 namespace fog::video {
+inline constexpr int DefaultFramesPerSecond = 30;
 struct Settings {
     ::stream::VideoCodec codec = ::stream::VideoCodec::H265;
     int bitrateMbps = 20;

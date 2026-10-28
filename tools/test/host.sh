@@ -64,3 +64,7 @@ python3 tests/software_keyboard_tests.py | tee work/logs/software-keyboard-tests
 python3 tests/playback_decoder_waiting_tests.py | tee work/logs/playback-decoder-waiting-tests.log
 
 python3 tests/moonlight_video_queue_tests.py | tee work/logs/moonlight-video-queue-tests.log
+
+bash tools/test/moonlight-frame-diagnostics.sh
+
+bash tools/test/media-workers.sh

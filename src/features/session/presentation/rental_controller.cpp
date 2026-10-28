@@ -127,11 +127,15 @@ void ApplicationController::handlePairedCheckout() {
     diagnostic("Paired checkout: provider=FH state=" + std::to_string(static_cast<int>(result.state)) +
         " rentalPresent=" + std::to_string(!result.rental.empty()) +
         " stopRequested=" + std::to_string(result.stopRequested) +
-        " unresolved=" + std::to_string(pairedPending_) + " message=" + safeText(result.message));
+        " unresolved=" + std::to_string(pairedPending_) +
+        " preparationStage=" + fog::pairedPreparationStageName(result.preparationStage) +
+        " preparationError=" + (result.preparationError ? fog::repositoryErrorKindName(*result.preparationError) : "none") +
+        " message=" + safeText(result.message));
     if (auto* pairing = pairedServices_ ? pairedServices_->pairing() : nullptr) {
         const auto details = pairing->diagnostics();
         if (!details.empty()) diagnostic("Paired client: " + safeText(details));
     }
+    if (completePairedVideoReconnect()) return;
     checkoutAutoPoll_ = false;
     checkoutStatus_ = "FogHub: " + result.message;
     status_ = checkoutStatus_;
@@ -141,6 +145,7 @@ void ApplicationController::handlePairedCheckout() {
         disarmExitHandling(); screen_ = Screen::PlayStation;
         status_ = result.state == fog::PairedCheckoutState::Terminal ?
             "FogHub: завершение аренды подтверждено." : checkoutStatus_;
+        offerSessionRating(result);
         return;
     }
     if (result.state == fog::PairedCheckoutState::Ready && !stopAfterTask_ && !result.stopRequested) {
@@ -209,6 +214,7 @@ void ApplicationController::createPairedSession(const fog::Computer& pc) {
         loginProvider_ = fog::ProviderId::FogHub; loginReturn_ = Screen::PlayStationDetails; screen_ = Screen::Consent; return;
     }
     checkStorage(); armExitHandling(); sessionPending_ = true; stopAfterTask_ = false;
+    ratingFocusLost_ = false;
     selectedPlayStation_ = false;
     screen_ = Screen::Checkout; checkoutStatus_ = "FogHub: проверяем доступность и тариф…";
     fog::StartRentalRequest request; request.computerId = pc.id;

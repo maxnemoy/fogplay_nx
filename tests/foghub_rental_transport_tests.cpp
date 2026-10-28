@@ -79,12 +79,23 @@ int main() {
     assert(capturedForm=="_csrf=synthetic%26a%3Db&moonlight_url=192.0.2.42%3A47989&Pc%5Bpin%5D=0123");
     rejects(TransportFailure::Network,[&]{transport->submitPairing("42",fields,true);});
     assert(performed==reads+2 && url=="https://foghub.ru/pc/play?id=42&resume=0" && method=="POST");
+    auto bonusFields=fields; bonusFields.emplace_back("Pc[use_bonus]","0");
+    rejects(TransportFailure::Network,[&]{transport->submitPairing("42",bonusFields);});
+    assert(performed==reads+3 && method=="POST" &&
+        capturedForm=="_csrf=synthetic%26a%3Db&moonlight_url=192.0.2.42%3A47989&Pc%5Bpin%5D=0123&Pc%5Buse_bonus%5D=0");
+    rejects(TransportFailure::Network,[&]{transport->submitPairing("42",bonusFields,true);});
+    assert(performed==reads+4 && url=="https://foghub.ru/pc/play?id=42&resume=0" &&
+        capturedForm.find("Pc%5Buse_bonus%5D=0")!=std::string::npos);
     const auto posts=performed;
     for (const auto& id : {"", "0", "042", "42&other=1"})
         rejects(TransportFailure::InvalidRequest,[&]{transport->submitPairing(id,fields);});
     for (const auto& invalid : {fog::Query{{"_csrf","x"},{"_csrf","x"},{"Pc[pin]","0123"}},
         fog::Query{{"_csrf","x"},{"moonlight_url","host:1"},{"Pc[pin]","abcd"}},
-        fog::Query{{"_csrf","x"},{"moonlight_url","host:1"},{"Pc[pin]","0123"},{"extra","1"}}})
+        fog::Query{{"_csrf","x"},{"moonlight_url","host:1"},{"Pc[pin]","0123"},{"extra","1"}},
+        fog::Query{{"_csrf","x"},{"moonlight_url","host:1"},{"Pc[pin]","0123"},{"Pc[use_bonus]","1"}},
+        fog::Query{{"_csrf","x"},{"moonlight_url","host:1"},{"Pc[use_bonus]","0"}},
+        fog::Query{{"_csrf","x"},{"Pc[pin]","0123"},{"Pc[use_bonus]","0"}},
+        fog::Query{{"_csrf","x"},{"moonlight_url","host:1"},{"Pc[pin]","0123"},{"Pc[use_bonus]","0"},{"Pc[use_bonus]","0"}}})
         rejects(TransportFailure::InvalidRequest,[&]{transport->submitPairing("42",invalid);});
     assert(performed==posts);
     rejects(TransportFailure::Network,[&]{transport->closeRental("9000042");});
@@ -92,5 +103,28 @@ int main() {
     rejects(TransportFailure::InvalidRequest,[&]{transport->closeRental("9000042");});
     rejects(TransportFailure::InvalidRequest,[&]{transport->closeRental("9000042&other=1");});
     assert(performed==posts+1);
+    const auto reviewStart=performed;
+    rejects(TransportFailure::Network,[&]{transport->get("/session/review?id=9000042");});
+    assert(performed==reviewStart+1 && url=="https://foghub.ru/session/review?id=9000042" && method=="GET");
+    for(const auto& path:{"/session/review","/session/review?id=0","/session/review?id=09000042",
+        "/session/review?id=%39","/session/review?id=9000042&fromPcId=42","/session/review?id=9000042&"})
+        rejects(TransportFailure::InvalidRequest,[&]{transport->get(path);});
+    assert(performed==reviewStart+1);
+    const fog::Query rating{{"_csrf","synthetic&a=b"},{"Review[rating]","4"},{"Review[message]","line1\nстрока2 &+="}};
+    rejects(TransportFailure::Network,[&]{transport->submitSessionRating("9000042",rating);});
+    assert(performed==reviewStart+2 && url=="https://foghub.ru/session/review?id=9000042" && method=="POST");
+    assert(capturedForm=="_csrf=synthetic%26a%3Db&Review%5Brating%5D=4&Review%5Bmessage%5D=line1%0A%D1%81%D1%82%D1%80%D0%BE%D0%BA%D0%B02%20%26%2B%3D");
+    for(const auto& id:{"","0","09000042","9000042&fromPcId=42"})
+        rejects(TransportFailure::InvalidRequest,[&]{transport->submitSessionRating(id,rating);});
+    for(const auto& invalid:{fog::Query{{"_csrf","x"},{"Review[rating]","0"},{"Review[message]",""}},
+        fog::Query{{"_csrf","x"},{"Review[rating]","6"},{"Review[message]",""}},
+        fog::Query{{"_csrf",""},{"Review[rating]","4"},{"Review[message]",""}},
+        fog::Query{{"_csrf","x"},{"Review[rating]","4"}},
+        fog::Query{{"_csrf","x"},{"Review[rating]","4"},{"_method","POST"}},
+        fog::Query{{"_csrf","x"},{"Review[rating]","4"},{"Review[rating]","5"}},
+        fog::Query{{"_csrf","x"},{"Review[rating]","4"},{"Review[message]",std::string(2001,'a')}},
+        fog::Query{{"_csrf","x"},{"Review[rating]","4"},{"Review[message]",std::string("a\0b",3)}}})
+        rejects(TransportFailure::InvalidRequest,[&]{transport->submitSessionRating("9000042",invalid);});
+    assert(performed==reviewStart+2);
     std::cout << "FogHub rental transport offline tests passed\n";
 }
