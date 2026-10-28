@@ -14,10 +14,15 @@ struct Harness {
     Profile profile = Profile::Low;
     bool refresh = true, overload = false, staticSource = false, send = true;
     unsigned presentedPerTick = 3, decodedPerTick = 3, supersededPerTick = 0;
+    unsigned workPerFrameUs = 3000;
+    double sourceFps = 30;
     unsigned audioDroppedPerTick = 0, audioUnderrunsPerTick = 0;
-    Harness() {
+    explicit Harness(int framesPerSecond = 30) {
+        sourceFps = framesPerSecond;
+        presentedPerTick = decodedPerTick = static_cast<unsigned>(framesPerSecond / 10);
+        assert(controller.configureFramesPerSecond(framesPerSecond));
         sample.width = 1920; sample.height = 1080;
-        readTelemetry(server,Json{{"preset", "LOW"}, {"fps", 30}}, now);
+        readTelemetry(server,Json{{"preset", "LOW"}, {"fps", sourceFps}}, now);
         controller.enable(true, now);
         controller.observe(now, sample, server);
     }
@@ -39,10 +44,10 @@ struct Harness {
             if (!staticSource) {
                 sample.frames += presentedPerTick; sample.decodedFrames += decodedPerTick;
                 sample.supersededFrames += supersededPerTick;
-                sample.workUs += overload ? 100000 : decodedPerTick * 3000;
+                sample.workUs += overload ? 100000 : decodedPerTick * workPerFrameUs;
             }
             sample.audioDropped += audioDroppedPerTick; sample.audioUnderruns += audioUnderrunsPerTick;
-            if (refresh && now % 2000 == 0) readTelemetry(server,Json{{"preset", wireProfile(profile)}, {"fps", 30}}, now);
+            if (refresh && now % 2000 == 0) readTelemetry(server,Json{{"preset", wireProfile(profile)}, {"fps", sourceFps}}, now);
             const auto action = controller.observe(now, sample, server);
             if (action != Action::None) {
                 actions.push_back(action);
@@ -57,6 +62,33 @@ struct Harness {
     }
 };
 int main() {
+    {
+        Harness h(60); assert(!h.controller.configureFramesPerSecond(0));
+        assert(!h.controller.configureFramesPerSecond(144));
+        h.advance(32);
+        assert(h.actions == std::vector<Action>{Action::Enhance});
+        assert(h.controller.diagnostics().find("autoTargetFps=60") != std::string::npos);
+    }
+    {
+        // At a 60 FPS request, presenting 30 of 60 decoded FPS is sustained
+        // delivery loss even if no superseded counter was supplied.
+        Harness h(60); h.profile = Profile::High; h.presentedPerTick = 3;
+        h.advance(6); assert(h.actions == std::vector<Action>{Action::Degrade});
+    }
+    {
+        // A 16ms decode with only 30 FPS delivered has exhausted the 60 FPS
+        // per-frame budget without yet saturating the complete CPU window.
+        Harness h(60); h.profile = Profile::High;
+        h.presentedPerTick = h.decodedPerTick = 3; h.workPerFrameUs = 16000;
+        h.advance(6); assert(h.actions == std::vector<Action>{Action::Degrade});
+    }
+    {
+        // A real 30 FPS source may be delivered entirely in a requested 60 FPS
+        // mode. That is neither local loss nor evidence of decoder overload.
+        Harness h(60); h.profile = Profile::High; h.sourceFps = 30;
+        h.presentedPerTick = h.decodedPerTick = 3;
+        h.advance(40); assert(h.actions.empty());
+    }
     {
         Telemetry actualWire;
         readTelemetry(actualWire,Json{{"preset","LOW"},{"fps",30}}, 100);

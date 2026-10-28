@@ -11,7 +11,7 @@ namespace stream {
 // capacity for releases even when ordinary commands saturate the queue.
 class ControlQueue {
 public:
-    enum class Mode { Ordered, Gamepad, MouseMove, Pong, Release, GamepadEdge, GamepadRelease, TouchMove, Motion };
+    enum class Mode { Ordered, Gamepad, MouseMove, Pong, Release, GamepadEdge, GamepadRelease, TouchMove, Motion, GamepadNeutral };
     struct InputTrace {
         bool playStation = false, touchDown = false, touchEdge = false;
         std::uint64_t sequence = 0;
@@ -36,21 +36,28 @@ public:
                     break;
                 }
         }
+        // Edges can separate several analog snapshots. Reclaim only redundant
+        // analog entries when they consume the neutral reserve; every button
+        // transition and its relative order must remain deliverable.
+        if (mode == Mode::GamepadNeutral && !reserveNeutral(payload.size(), releasePayload.size())) {
+            ++rejected_; return false;
+        }
         auto replaced = queue_.end();
         if (mode == Mode::Gamepad || mode == Mode::Pong || mode == Mode::MouseMove || mode == Mode::TouchMove || mode == Mode::Motion) {
             for (auto it = queue_.end(); it != queue_.begin();) {
                 --it;
-                // A PS touchpad transition is an ordered boundary. A later
+                // Every gamepad button transition is an ordered boundary. A later
                 // analog snapshot must never replace a state before that edge.
-                if (mode == Mode::Gamepad && (it->mode == Mode::GamepadEdge || it->mode == Mode::GamepadRelease)) break;
+                if (mode == Mode::Gamepad && (it->mode == Mode::GamepadEdge || it->mode == Mode::GamepadRelease ||
+                    it->mode == Mode::GamepadNeutral)) break;
                 // A pointer position before a click must stay before that click.
                 if (mode == Mode::MouseMove && (it->mode == Mode::Ordered || it->mode == Mode::Release)) break;
                 if (mode == Mode::TouchMove && (it->mode == Mode::Ordered || it->mode == Mode::Release)) break;
                 if (it->mode == mode && ((mode != Mode::TouchMove && mode != Mode::Motion) || it->input == input)) { replaced = it; break; }
             }
         }
-        const bool gamepad = mode == Mode::Gamepad;
-        const bool release = mode == Mode::Release || mode == Mode::GamepadRelease;
+        const bool gamepad = mode == Mode::Gamepad || mode == Mode::GamepadNeutral;
+        const bool release = mode == Mode::Release || mode == Mode::GamepadRelease || mode == Mode::GamepadNeutral;
         const auto retainedCount = queue_.size() - (replaced == queue_.end() ? 0 : 1);
         const auto retainedBytes = bytes_ - (replaced == queue_.end() ? 0 : (replaced->payload.size() + replaced->release.size()));
         std::size_t stateBytes = 0, stateCount = 0;
@@ -108,6 +115,31 @@ public:
     }
     void clear() { queue_.clear(); bytes_ = 0; pending_ = false; }
 private:
+    bool reserveNeutral(std::size_t payloadBytes, std::size_t releaseBytes) {
+        if (payloadBytes > GamepadBytes || releaseBytes > MaxBytes - payloadBytes) return false;
+        const auto incomingBytes = payloadBytes + releaseBytes;
+        auto retainedCount = queue_.size(), retainedBytes = bytes_;
+        std::size_t removeStates = 0;
+        for (const auto& message : queue_) {
+            if (retainedCount < MaxMessages && incomingBytes <= MaxBytes - retainedBytes) break;
+            if (message.mode != Mode::Gamepad) continue;
+            --retainedCount;
+            retainedBytes -= message.payload.size() + message.release.size();
+            ++removeStates;
+        }
+        if (retainedCount >= MaxMessages || incomingBytes > MaxBytes - retainedBytes) return false;
+        // Validate the whole admission before erasing anything. An invalid or
+        // oversized neutral must leave the previously accepted queue intact.
+        for (auto it = queue_.begin(); it != queue_.end() && removeStates;) {
+            if (it->mode != Mode::Gamepad) { ++it; continue; }
+            if (it->trace.nativeInput < nativeCoalesced_.size()) ++nativeCoalesced_[it->trace.nativeInput];
+            bytes_ -= it->payload.size() + it->release.size();
+            it = queue_.erase(it);
+            --removeStates;
+            ++coalesced_;
+        }
+        return true;
+    }
     std::deque<Message> queue_;
     std::size_t bytes_ = 0;
     std::uint64_t began_ = 0, rejected_ = 0, coalesced_ = 0;

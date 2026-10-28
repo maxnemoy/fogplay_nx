@@ -19,7 +19,7 @@ constexpr SDL_Rect ConfirmBox{294, 215, 692, 290};
 constexpr int MenuItemCount = 6;
 constexpr int KeyX = 52, KeyY = 244, KeyStep = 98, RowStep = 65;
 SDL_Rect menuButton(int index) { return {408, 174 + index * 64, 464, 54}; }
-SDL_Rect imageButton(int index) { return {174, 142 + index * 62, 932, 53}; }
+SDL_Rect imageButton(int index) { return {174, 142 + index * 54, 932, 46}; }
 SDL_Rect rumbleButton(int index) { return {174, index ? 550 : 206, 932, index ? 58 : 62}; }
 SDL_Rect confirmButton(int index) { return {328 + index * 320, 412, 296, 58}; }
 SDL_Rect keyRect(int index) {
@@ -84,7 +84,7 @@ void Overlay::close() { text_.clear(); mode_ = OverlayMode::Closed; selection_ =
 void Overlay::up() { move(0, -1); }
 void Overlay::down() { move(0, 1); }
 int Overlay::firstImageSelection() const { return provider_ == ProviderId::FogHub ? 0 : 1; }
-int Overlay::imageRowCount() const { return provider_ == ProviderId::FogHub ? 4 : 6; }
+int Overlay::imageRowCount() const { return provider_ == ProviderId::FogHub ? 5 : 7; }
 void Overlay::setProvider(ProviderId value) {
     if (provider_ == value) return;
     provider_ = value;
@@ -102,14 +102,13 @@ OverlayAction Overlay::right() {
 }
 OverlayAction Overlay::adjustVideo(int direction) {
     if (mode_ == OverlayMode::ImageSettings && provider_ == ProviderId::FogHub) {
-        if (!videoChangesEnabled_) return {};
-        if (selection_ < 0 || selection_ > 1) return {};
-        const auto field = selection_ == 0 ? video::Field::Codec : video::Field::Bitrate;
-        return video::adjust(videoSettings_, field, direction) ?
+        if (selection_ < 0 || selection_ > 2 || (!videoChangesEnabled_ && selection_ != 2)) return {};
+        const std::array<video::Field, 3> fields{video::Field::Codec, video::Field::Bitrate, video::Field::FramesPerSecond};
+        return video::adjust(videoSettings_, fields[static_cast<std::size_t>(selection_)], direction) ?
             OverlayAction{OverlayActionType::SettingsChanged, {}} : OverlayAction{};
     }
-    if (mode_ != OverlayMode::ImageSettings || selection_ < 1 || selection_ > 3) return {};
-    const std::array<video::Field, 3> fields{video::Field::Quality, video::Field::Bitrate, video::Field::Keyframes};
+    if (mode_ != OverlayMode::ImageSettings || selection_ < 1 || selection_ > 4) return {};
+    const std::array<video::Field, 4> fields{video::Field::Quality, video::Field::Bitrate, video::Field::Keyframes, video::Field::FramesPerSecond};
     return video::adjust(videoSettings_, fields[static_cast<std::size_t>(selection_ - 1)], direction) ?
         OverlayAction{OverlayActionType::SettingsChanged, {}} : OverlayAction{};
 }
@@ -257,15 +256,17 @@ void Overlay::paint(ui::Ui& ui, SDL_Renderer* renderer) const {
         const auto* hint = foghub ? (videoChangesEnabled_ ? uiText::Stream::FogHubImageSettingsHint :
             uiText::Stream::FogHubImageConnectingHint) : uiText::Stream::ImageSettingsHint;
         ui.text(ui.controllerHints(hint), 174, 96, 932, Muted);
-        const std::array<std::string, 6> mtsLabels{
+        const std::array<std::string, 7> mtsLabels{
             uiText::Settings::CodecPrefix + fog::ui::videoCodecLabel(videoSettings_) + uiText::Settings::BeforeConnectionSuffix,
             uiText::Settings::QualityPrefix + fog::ui::videoQualityLabel(videoSettings_),
             uiText::Settings::BitrateLimitPrefix + std::to_string(videoSettings_.bitrateMbps) + uiText::Common::MegabitsSuffix,
             uiText::Settings::KeyframesPrefix + fog::ui::videoKeyframeLabel(videoSettings_),
+            uiText::Settings::FrameRatePrefix + fog::ui::videoFrameRateLabel(videoSettings_) + uiText::Settings::FrameRateNextConnectionSuffix,
             uiText::Stream::RequestKeyframe, uiText::Common::Back};
-        const std::array<std::string, 4> foghubLabels{
+        const std::array<std::string, 5> foghubLabels{
             uiText::Settings::CodecPrefix + fog::ui::videoCodecLabel(videoSettings_),
             uiText::Settings::BitrateLimitPrefix + std::to_string(videoSettings_.bitrateMbps) + uiText::Common::MegabitsSuffix,
+            uiText::Settings::FrameRatePrefix + fog::ui::videoFrameRateLabel(videoSettings_) + uiText::Settings::FrameRateNextConnectionSuffix,
             uiText::Stream::RequestKeyframe, uiText::Common::Back};
         for (int i = 0; i < imageRowCount(); ++i) {
             const auto index = static_cast<std::size_t>(i);

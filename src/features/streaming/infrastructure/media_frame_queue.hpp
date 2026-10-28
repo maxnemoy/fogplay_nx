@@ -1,4 +1,5 @@
 #pragma once
+#include "features/streaming/domain/frame_cadence.hpp"
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -21,7 +22,7 @@ public:
         frames_.clear();
         interval_ = std::chrono::nanoseconds(1000000000 / (fps > 0 ? fps : 30));
         initialized_ = false;
-        taken_ = false;
+        cadence_.configure(fps);
     }
     std::uint64_t push(Frame frame, std::uint32_t timestamp, Clock::time_point now) {
         if (!initialized_) {
@@ -58,7 +59,7 @@ public:
         if (frames_.empty() || frames_.front().due > now + tolerance) return false;
         // A fresh receive burst can rebase retained frame deadlines. Preserve
         // the established presentation cadence instead of immediately uploading.
-        if (taken_ && now + tolerance < nextPresentation_) return false;
+        if (!cadence_.due(now)) return false;
         // Skip only frames already late, retaining future presentation deadlines.
         while (frames_.size() > 1 && frames_[1].due <= now + tolerance) {
             frames_.pop_front(); ++dropped;
@@ -66,20 +67,16 @@ public:
         output = std::move(frames_.front()); frames_.pop_front();
         // Keep phase across slightly early/late VSYNCs. Anchoring every upload
         // to its actual time would turn a 33.2 ms pair of refreshes into 20 fps.
-        if (!taken_ || now > nextPresentation_ + interval_)
-            nextPresentation_ = now + interval_;
-        else nextPresentation_ += interval_;
-        taken_ = true;
+        cadence_.uploaded(now);
         return true;
     }
     std::size_t size() const { return frames_.size(); }
 private:
     std::deque<Frame> frames_;
     bool initialized_ = false;
-    bool taken_ = false;
+    FrameCadence cadence_;
     std::uint32_t lastTimestamp_ = 0;
     Clock::time_point nextDue_{};
-    Clock::time_point nextPresentation_{};
     std::chrono::nanoseconds interval_{33333333};
 };
 }

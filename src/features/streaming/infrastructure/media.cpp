@@ -4,6 +4,7 @@
 #include "features/streaming/domain/audio_queue_metrics.hpp"
 #include "features/streaming/domain/audio_latency_policy.hpp"
 #include "features/streaming/domain/audio_recovery.hpp"
+#include "features/streaming/domain/frame_cadence.hpp"
 #include "features/streaming/infrastructure/media_decoder_diagnostics.hpp"
 #include "features/streaming/infrastructure/media_frame_queue.hpp"
 #include "features/streaming/infrastructure/video_image_diagnostics.hpp"
@@ -80,6 +81,7 @@ struct Media::Impl {
     std::atomic<int> width{0}, height{0};
     std::atomic<int> textureWidth{0}, textureHeight{0};
     bool deferredPresentation = false, pending = false;
+    FrameCadence presentationCadence;
     DecoderClock::time_point pendingSince{};
     std::atomic<std::uint64_t> uploadedFrames{0}, supersededFrames{0};
     std::atomic<std::uint64_t> presentedFrames{0};
@@ -480,8 +482,10 @@ struct Media::Impl {
         requireApplicationThread();
         requireVideo();
         if (!pending) return false;
+        if (!presentationCadence.due(DecoderClock::now())) return false;
         auto output = convertPending();
         const bool result = upload(output);
+        presentationCadence.uploaded(DecoderClock::now());
         pixels = std::move(output.pixels);
         clearPending();
         return result;
@@ -677,6 +681,7 @@ bool Media::supportsH265() {
 void Media::Impl::changeCodec(::stream::VideoCodec codec) {
     auto& m = *this;
     if (m.videoCodec == codec) return;
+    if (!m.workers) m.presentationCadence.reset();
     if (codec == ::stream::VideoCodec::H265 && !supportsH265()) throw std::runtime_error(fog::constants::error::Stream::H265HardwareDecoderUnavailable);
     const bool requireHardware = m.hw;
     m.releaseVideo();
@@ -693,6 +698,7 @@ void Media::Impl::changeCodec(::stream::VideoCodec codec) {
 }
 void Media::Impl::resetVideo() {
     auto& m = *this;
+    if (!m.workers) m.presentationCadence.reset();
     const bool requireHardware = m.hw || m.videoCodec == ::stream::VideoCodec::H265;
     // Release old frame references and device context before opening another
     // hardware decoder: Switch decoder surfaces are a constrained resource.
@@ -704,6 +710,14 @@ void Media::Impl::resetVideo() {
     m.lastTrc = AVCOL_TRC_UNSPECIFIED; m.lastPrimaries = AVCOL_PRI_UNSPECIFIED;
     m.waiting = m.awaitingIdr = true;
     m.initVideo(requireHardware);
+}
+void Media::setPresentationFrameRate(int fps) {
+    auto& m = *impl_;
+    m.requireApplicationThread();
+    if (m.workers) throw std::logic_error("Cannot change presentation frame rate while media workers run");
+    if (fps != 30 && fps != 60) throw std::invalid_argument("Presentation frame rate must be 30 or 60");
+    m.presentationCadence.configure(fps);
+    m.workerFps = fps;
 }
 void Media::setVideoCodec(::stream::VideoCodec codec) {
     auto& m = *impl_;
@@ -894,7 +908,8 @@ int Media::videoWidth() const { return impl_->width; }
 int Media::videoHeight() const { return impl_->height; }
 std::string Media::diagnostics() const {
     impl_->requireApplicationThread();
-    if (!impl_->workers) return impl_->diagnostics() + " " + imageDiagnostics();
+    if (!impl_->workers) return impl_->diagnostics() + " async_workers=0 presentation_queue_limit=1 presentation_fps=" +
+        std::to_string(impl_->presentationCadence.configured() ? impl_->workerFps : 0) + " " + imageDiagnostics();
     std::string snapshot;
     {
         std::lock_guard<std::mutex> lock(impl_->snapshotMutex);

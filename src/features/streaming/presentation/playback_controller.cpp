@@ -118,6 +118,7 @@ bool ApplicationController::closeTransport(bool final) noexcept {
         stream_.reset();
     }
     mouseButtons_.reset();
+    gamepadSchedule_.reset();
     media_.reset();
     return final || retryAllowed;
 }
@@ -140,6 +141,7 @@ void ApplicationController::closeStream() noexcept {
 bool ApplicationController::startTransport(bool resumeOnly) {
     // Transport replacement must not adopt, create, or reset rental ownership.
     mouseButtons_.reset();
+    gamepadSchedule_.reset();
     videoRecovery_.reset();
     videoLossWaiting_ = false; firstFramePresented_ = false;
     loopTiming_.resetPresentationCounter();
@@ -170,6 +172,8 @@ bool ApplicationController::startTransport(bool resumeOnly) {
     }
     if (!stream_->configureVideo(streamSettings))
         throw std::runtime_error("Invalid video configuration; stopping rental");
+    activeFramesPerSecond_ = streamSettings.framesPerSecond;
+    media_->setPresentationFrameRate(activeFramesPerSecond_);
     overlay_.setProvider(streamRental_.provider);
     overlay_.setVideoChangesEnabled(rtcTransport);
     overlay_.setVideoSettings(streamSettings);
@@ -177,8 +181,8 @@ bool ApplicationController::startTransport(bool resumeOnly) {
     lastStreamState_.clear(); lastStreamDiagnostics_.clear();
     const bool started = stream_->start({streamRental_, resumeOnly});
     if (started && !rtcTransport) {
-        media_->startWorkers(*stream_, fog::video::DefaultFramesPerSecond);
-        diagnostic("FH media workers started: independent video/audio; paced presentation fps=30");
+        media_->startWorkers(*stream_, activeFramesPerSecond_);
+        diagnostic("FH media workers started: independent video/audio; paced presentation fps=" + std::to_string(activeFramesPerSecond_));
     }
     streamStarted_ = lastVideo_ = lastMediaLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
     return started;
@@ -223,6 +227,7 @@ void ApplicationController::startStream(const fog::RentalId& rental, bool create
         diagnostic("Stream setup begins; preparing video/audio and signaling.");
         diagnostic(std::string("Video preferences: codec=") + ::stream::videoCodecName(videoSettings_.codec) +
             " capMbps=" + std::to_string(videoSettings_.bitrateMbps) + " quality=" + std::to_string(videoSettings_.quality) +
+            " fps=" + std::to_string(videoSettings_.framesPerSecond) +
             " pliSeconds=" + std::to_string(videoSettings_.keyframeSeconds));
         armExitHandling();
         streamRental_ = rental;
@@ -310,6 +315,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         const auto transportStarted = std::chrono::steady_clock::now();
         stream_->pump();
         retryMouseReleases();
+        retryGamepadRelease();
         logIncomingControl();
         if (streamRental_.provider == fog::ProviderId::FogHub)
             overlay_.setVideoChangesEnabled(stream_->ready());
@@ -556,9 +562,8 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     if (!inputAllowed || (streamPlayStation_ && !psNativeInput_.contactsInitialized())) return;
     const auto inputNowMs=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
     const bool psTouching = streamPlayStation_ && psNativeInput_.click(inputNowMs,psTouchLastSubmitted_);
-    const bool psTouchEdge = streamPlayStation_ && psTouching != psTouchLastSubmitted_;
     if (transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ ||
-        (!psTouchEdge && now-lastInput_ < std::chrono::milliseconds(30)) || !stream_->ready()) return;
+        !stream_->ready()) return;
     stream::Gamepad gamepad;
     const std::array<u64,16> buttons{HidNpadButton_B,HidNpadButton_A,HidNpadButton_Y,HidNpadButton_X,
         HidNpadButton_L,HidNpadButton_R,HidNpadButton_ZL,HidNpadButton_ZR,HidNpadButton_Minus,HidNpadButton_Plus,
@@ -572,12 +577,13 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     gamepad.axes = {axis(left.x),-axis(left.y),axis(right.x),-axis(right.y)};
     gamepad.leftTrigger = (held & HidNpadButton_ZL) ? 1.0f : 0.0f;
     gamepad.rightTrigger = (held & HidNpadButton_ZR) ? 1.0f : 0.0f;
+    if (!gamepadSchedule_.due(gamepad, now)) return;
     const bool accepted = stream_->sendGamepad(gamepad);
+    if (accepted) gamepadSchedule_.accepted(gamepad, now);
     if (streamPlayStation_) {
         if (accepted) { ++psGamepadAccepted_; psTouchLastSubmitted_ = psTouching; }
         else ++psGamepadRejected_;
     }
-    lastInput_ = now;
 }
 
 }

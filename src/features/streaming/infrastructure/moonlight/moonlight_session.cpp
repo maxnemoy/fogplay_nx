@@ -337,7 +337,7 @@ public:
         { std::lock_guard<std::mutex> lock(state_->mutex); state_->video.clear(); state_->audio.clear(); state_->error.clear();
             state_->command = {}; state_->firstCommandFailure = {}; state_->commandFailures = 0;
             state_->commandAttempt = 0; state_->closedToResumeMs = 0; ++state_->generation; }
-        state_->config.width = 1280; state_->config.height = 720; state_->config.fps = fog::video::DefaultFramesPerSecond;
+        state_->config.width = 1280; state_->config.height = 720; state_->config.fps = settings_.framesPerSecond;
         state_->config.bitrate = settings_.bitrateMbps * 1000;
         state_->config.packetSize = 1024; state_->config.streamingRemotely = STREAM_CFG_REMOTE;
         state_->config.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
@@ -345,7 +345,7 @@ public:
         if (settings_.codec == stream::VideoCodec::H265) state_->config.supportedVideoFormats |= VIDEO_FORMAT_H265;
         state_->config.clientRefreshRateX100 = 6000; state_->config.colorSpace = COLORSPACE_REC_709;
         state_->config.colorRange = COLOR_RANGE_LIMITED;
-        state_->status("Connecting Moonlight 720p30");
+        state_->status(("Connecting Moonlight 720p" + std::to_string(settings_.framesPerSecond)).c_str());
         Settings::instance().reset_cancel();
         Settings::instance().set_timeout_ms(resumeOnly_ ? detail::ResumeRetry::BudgetMs : 25000);
         try { worker_ = std::thread(&Client::run, this); }
@@ -368,7 +368,7 @@ public:
     }
     stream::VideoCodec selectedVideoCodec() const override { return state_->selectedCodec.load(); }
     std::string qualityStatus() const override {
-        return "FogHub 720p30 / " + std::string(stream::videoCodecName(selectedVideoCodec())) +
+        return "FogHub 720p" + std::to_string(settings_.framesPerSecond) + " / " + std::string(stream::videoCodecName(selectedVideoCodec())) +
             " / " + std::to_string(settings_.bitrateMbps) + " Мбит/с (запрос)";
     }
     void pump() override {}
@@ -441,7 +441,7 @@ public:
             " width=" + std::to_string(state_->negotiatedWidth.load()) +
             " height=" + std::to_string(state_->negotiatedHeight.load()) +
             " fps=" + std::to_string(state_->negotiatedFps.load()) +
-            " requestedFps=" + std::to_string(fog::video::DefaultFramesPerSecond) +
+            " requestedFps=" + std::to_string(settings_.framesPerSecond) +
             " requestedMbps=" + std::to_string(settings_.bitrateMbps) +
             " inputAccepted=" + std::to_string(state_->inputAccepted.load()) +
             " inputRejected=" + std::to_string(state_->inputRejected.load()) +
@@ -730,7 +730,7 @@ private:
                             detail::controllerButtons(profile_), detail::controllerCapabilities(profile_));
                         state_->running = true;
                     }
-                    state_->status("Moonlight stream active: 720p30");
+                    state_->status(("Moonlight stream active: 720p" + std::to_string(settings_.framesPerSecond)).c_str());
                     while (!state_->stop && !state_->terminated) {
                         const auto began = detail::steadyUs();
                         state_->trace.worker(began);

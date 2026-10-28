@@ -39,14 +39,15 @@ void ApplicationController::drawControllerSettings() {
 
 void ApplicationController::inputImageSettings(u64 keys) {
     if (keys & HidNpadButton_B) { screen_ = Screen::Settings; selection_ = 0; return; }
-    if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) selection_ = (selection_ + 3) % 4;
-    if (keys & (HidNpadButton_Down | HidNpadButton_StickLDown)) selection_ = (selection_ + 1) % 4;
+    if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) selection_ = (selection_ + 4) % 5;
+    if (keys & (HidNpadButton_Down | HidNpadButton_StickLDown)) selection_ = (selection_ + 1) % 5;
     int direction = 0;
     if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) direction = -1;
     else if (keys & (HidNpadButton_Right | HidNpadButton_StickLRight | HidNpadButton_A)) direction = 1;
     if (!direction) return;
-    const std::array<fog::video::Field, 4> fields{
-        fog::video::Field::Codec, fog::video::Field::Quality, fog::video::Field::Bitrate, fog::video::Field::Keyframes};
+    const std::array<fog::video::Field, 5> fields{
+        fog::video::Field::Codec, fog::video::Field::Quality, fog::video::Field::Bitrate,
+        fog::video::Field::Keyframes, fog::video::Field::FramesPerSecond};
     auto value = videoSettings_;
     if (fog::video::adjust(value, fields[selection_], direction, fog::Media::supportsH265()))
         changeVideoSettings(value, false);
@@ -55,25 +56,27 @@ void ApplicationController::inputImageSettings(u64 keys) {
 
 void ApplicationController::drawImageSettings() {
     const auto area = ui_.content();
-    const std::array<std::string, 4> labels{
+    const std::array<std::string, 5> labels{
         uiText::Settings::CodecPrefix + fog::ui::videoCodecLabel(videoSettings_),
         uiText::Settings::QualityPrefix + fog::ui::videoQualityLabel(videoSettings_),
         uiText::Settings::BitrateLimitPrefix + std::to_string(videoSettings_.bitrateMbps) + uiText::Common::MegabitsSuffix,
-        uiText::Settings::KeyframesPrefix + fog::ui::videoKeyframeLabel(videoSettings_)};
-    const std::array<std::string, 4> hints{
+        uiText::Settings::KeyframesPrefix + fog::ui::videoKeyframeLabel(videoSettings_),
+        uiText::Settings::FrameRatePrefix + fog::ui::videoFrameRateLabel(videoSettings_)};
+    const std::array<std::string, 5> hints{
         fog::Media::supportsH265() ? uiText::Settings::H265ExperimentalNotice : uiText::Settings::H265Unavailable,
         uiText::Settings::QualityDescription,
         uiText::Settings::BitrateDescription,
-        uiText::Settings::KeyframeDescription};
+        uiText::Settings::KeyframeDescription,
+        uiText::Settings::FrameRateDescription};
     for (std::size_t i = 0; i < labels.size(); ++i) {
-        const int y = 145 + static_cast<int>(i) * 108;
-        ui_.button(labels[i], {area.x, y, area.w, 57}, selection_ == i);
-        ui_.text(hints[i], area.x + 14, y + 65, area.w - 28, muted);
+        const int y = 145 + static_cast<int>(i) * 84;
+        ui_.button(labels[i], {area.x, y, area.w, 49}, selection_ == i);
+        ui_.text(hints[i], area.x + 14, y + 54, area.w - 28, muted);
     }
-    ui_.text(uiText::Settings::FogHubVideoDescription, area.x, 570, area.w, muted);
+    ui_.text(uiText::Settings::FogHubVideoDescription, area.x, 578, area.w, muted);
     if (!videoSaveStatus_.empty() && videoSaveStatus_ != uiText::Settings::AutoSaveNotice &&
         videoSaveStatus_ != uiText::Settings::Saved)
-        ui_.text(videoSaveStatus_, area.x, 596, area.w, accent, false, 2);
+        ui_.text(videoSaveStatus_, area.x, 610, area.w, accent, false, 2);
 }
 
 void ApplicationController::inputConnectionSettings(u64 keys) {

@@ -31,6 +31,120 @@ struct Fake {
 };
 int main() {
     {
+        // All physical buttons, including both digital triggers, remain ordered
+        // while only the newest analog snapshot within each held state survives.
+        Fake fake; fake.block = true;
+        Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
+        sender.allow(true);
+        assert(sender.enqueueGamepad("in-flight", std::uint32_t{0})); fake.awaitEntry();
+        assert(sender.enqueueGamepad("button-down", std::uint32_t{1}));
+        for (unsigned n = 0; n < 100; ++n)
+            assert(sender.enqueueGamepad("held-" + std::to_string(n), std::uint32_t{1}));
+        assert(sender.enqueueGamepad("trigger-down", std::uint32_t{1} | (std::uint32_t{1} << 18)));
+        assert(sender.enqueueGamepad("button-up", std::uint32_t{1} << 18));
+        assert(sender.enqueueGamepad("trigger-up", std::uint32_t{0}));
+        const auto queued = sender.snapshot();
+        assert(queued.inFlight && queued.pending == 6 && queued.buttonQueuedEdges == 4 && queued.buttonRejectedEdges == 0);
+        assert(queued.psFrames == 0 && queued.gamepadCoalesced == 99);
+        fake.unblock(); fake.awaitSize(6); sender.stop();
+        assert((fake.sent == std::vector<std::string>{"in-flight", "button-down", "held-99", "trigger-down", "button-up", "trigger-up"}));
+    }
+    {
+        // Each of the 18 buttons and two triggers must preserve a short tap.
+        Fake fake;
+        Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
+        sender.block(true); sender.allow(true);
+        std::vector<std::string> expected;
+        for (unsigned bit = 0; bit < 20; ++bit) {
+            const auto down = "down-" + std::to_string(bit), up = "up-" + std::to_string(bit);
+            assert(sender.enqueueGamepad(down, std::uint32_t{1} << bit));
+            assert(sender.enqueueGamepad(up, std::uint32_t{0}));
+            expected.push_back(down); expected.push_back(up);
+        }
+        assert(sender.snapshot().pending == 40 && sender.snapshot().buttonQueuedEdges == 40);
+        sender.block(false); fake.awaitSize(40); sender.stop();
+        assert(fake.sent == expected);
+    }
+    {
+        // A full ordered/release budget still has room for a neutral gamepad.
+        Fake fake;
+        Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
+        sender.block(true); sender.allow(true);
+        assert(sender.enqueueGamepad("button-down", std::uint32_t{1}));
+        for (unsigned n = 0; n < 46; ++n) assert(sender.enqueue("ordered"));
+        for (unsigned n = 0; n < 16; ++n) assert(sender.enqueue("release", Mode::Release, std::to_string(n)));
+        assert(sender.snapshot().pending == 63);
+        assert(sender.enqueueGamepad("neutral", std::uint32_t{0}));
+        assert(sender.snapshot().pending == 64 && !sender.snapshot().stalled);
+        // An analog-only sample may be retried once room exists. Losing an edge
+        // instead publishes a stall, so the application cannot silently miss it.
+        assert(!sender.enqueueGamepad("periodic-neutral", std::uint32_t{0}));
+        assert(!sender.snapshot().stalled);
+        assert(!sender.enqueueGamepad("overflow-down", std::uint32_t{1}));
+        assert(sender.snapshot().stalled && sender.snapshot().buttonRejectedEdges == 1 && sender.snapshot().pending == 64);
+        sender.stop(); assert(fake.sent.empty());
+    }
+    {
+        // Analog snapshots from separate held-button segments must not consume
+        // the neutral slot. Preserve every edge while reclaiming a stale axis sample.
+        Fake fake;
+        Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
+        sender.block(true); sender.allow(true);
+        std::uint32_t buttons = 0xfffff;
+        assert(sender.enqueueGamepad("all-down", buttons));
+        std::vector<std::string> expected{"all-down"};
+        for (unsigned n = 0; n < 46; ++n) {
+            const auto text = "ordered-" + std::to_string(n);
+            assert(sender.enqueue(text)); expected.push_back(text);
+        }
+        assert(sender.enqueueGamepad("redundant-before-release", buttons));
+        for (unsigned bit = 0; bit < 8; ++bit) {
+            buttons &= ~(std::uint32_t{1} << bit);
+            const auto edge = "release-" + std::to_string(bit), analog = "analog-" + std::to_string(bit);
+            assert(sender.enqueueGamepad(edge, buttons)); expected.push_back(edge);
+            assert(sender.enqueueGamepad(analog, buttons)); expected.push_back(analog);
+        }
+        assert(sender.snapshot().pending == 64);
+        assert(sender.enqueueGamepad("full-neutral", std::uint32_t{0})); expected.push_back("full-neutral");
+        assert(sender.snapshot().pending == 64 && !sender.snapshot().stalled && sender.snapshot().gamepadCoalesced == 1);
+        sender.block(false); fake.awaitSize(expected.size()); sender.stop();
+        assert(fake.sent == expected);
+    }
+    {
+        // Byte saturation has the same neutral guarantee; oversize rejection
+        // must not erase accepted states before admission is known to succeed.
+        stream::ControlQueue queue;
+        const std::string large(64 * 1024, 'x');
+        assert(queue.push("down", Mode::GamepadEdge, {}, 0));
+        assert(queue.push(large, Mode::Ordered, {}, 0));
+        assert(queue.push(large, Mode::Ordered, {}, 0));
+        assert(queue.push(large, Mode::Gamepad, {}, 0));
+        assert(queue.push("up-one", Mode::GamepadRelease, {}, 0));
+        assert(queue.push(std::string(32 * 1024, 'y'), Mode::Gamepad, {}, 0));
+        const auto count = queue.size(), bytes = queue.bytes();
+        assert(!queue.push(large + "invalid", Mode::GamepadNeutral, {}, 0));
+        assert(queue.size() == count && queue.bytes() == bytes);
+        assert(queue.push(large, Mode::GamepadNeutral, {}, 0));
+        assert(queue.bytes() <= stream::ControlQueue::MaxBytes && queue.coalesced() == 1);
+        std::vector<Mode> modes;
+        while (!queue.empty()) { modes.push_back(queue.front().mode); queue.pop(0); }
+        assert((modes == std::vector<Mode>{Mode::GamepadEdge, Mode::Ordered, Mode::Ordered,
+            Mode::GamepadRelease, Mode::Gamepad, Mode::GamepadNeutral}));
+    }
+    {
+        Fake old, fresh;
+        Sender previous([] { return true; }, [&old](const auto& text) { old.send(text); });
+        previous.block(true); previous.allow(true);
+        assert(previous.enqueueGamepad("stale-down", std::uint32_t{1})); previous.stop("old-neutral");
+        assert(old.sent.empty());
+        Sender next([] { return true; }, [&fresh](const auto& text) { fresh.send(text); });
+        next.allow(true);
+        assert(next.enqueueGamepad("fresh-neutral", std::uint32_t{0})); fresh.awaitSize(1);
+        assert(next.snapshot().buttonQueuedEdges == 0);
+        assert(next.enqueueGamepad("fresh-down", std::uint32_t{1})); fresh.awaitSize(2); next.stop("fresh-up");
+        assert((fresh.sent == std::vector<std::string>{"fresh-neutral", "fresh-down", "fresh-up"}));
+    }
+    {
         Fake fake;
         Sender sender([] { return true; }, [&fake](const auto& text) { fake.send(text); });
         sender.block(true); sender.allow(true);

@@ -22,6 +22,7 @@ struct TestStream {
     std::string failure;
     std::optional<stream::RecoveryState> reportedState;
     int updates = 0;
+    fog::video::Settings updatedSettings;
     bool ready() const { return active; }
     bool disconnected() const { return lost; }
     std::string error() const { return failure; }
@@ -31,7 +32,7 @@ struct TestStream {
         if (!failure.empty()) return retryable ? stream::RecoveryState::RetryableFailure : stream::RecoveryState::TerminalFailure;
         return lost ? stream::RecoveryState::Disconnected : stream::RecoveryState::Connected;
     }
-    bool updateVideoSettings(const fog::video::Settings&) { ++updates; return true; }
+    bool updateVideoSettings(const fog::video::Settings& value) { ++updates; updatedSettings = value; return true; }
 };
 struct TestPaired {
     fog::PairedCheckoutResult value{fog::PairedCheckoutState::Ready,
@@ -112,6 +113,7 @@ public:
     std::future<TaskResult> pending_;
     fog::RentalId streamRental_{fog::ProviderId::FogHub,"owned"}, startedRental;
     fog::video::Settings videoSettings_, startedSettings;
+    int activeFramesPerSecond_ = fog::video::DefaultFramesPerSecond;
     TestOverlay overlay_;
     TestInputGate streamInputGate_;
     fog::stream::TransportReconnect transportReconnect_;

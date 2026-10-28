@@ -103,9 +103,18 @@ void ApplicationController::neutralizeStreamInput() {
     releasePlayStationInput();
     psTouchLastSubmitted_ = false;
     releaseMouse();
-    if (stream_) stream_->sendGamepad(stream::Gamepad{});
+    gamepadSchedule_.suspend([this](const stream::Gamepad& value) {
+        return stream_ && stream_->sendGamepad(value);
+    });
     touchWasDown_ = false;
     mouseAt_ = overlayHintAt_ = std::chrono::steady_clock::now();
+}
+
+void ApplicationController::retryGamepadRelease() noexcept {
+    gamepadSchedule_.retryRelease([this](const stream::Gamepad& value) {
+        try { return stream_ && stream_->ready() && stream_->sendGamepad(value); }
+        catch (...) { return false; }
+    });
 }
 
 void ApplicationController::stopRumble() noexcept {

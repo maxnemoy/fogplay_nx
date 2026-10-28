@@ -21,6 +21,7 @@ public:
         std::uint64_t sendCalls = 0, sendTotalUs = 0, sendMaxUs = 0;
         std::uint64_t waitCalls = 0, waitTotalUs = 0, waitMaxUs = 0, inFlightMs = 0, pongCoalesced = 0;
         std::uint64_t psFrames = 0, psAccepted = 0, psRejected = 0, gamepadCoalesced = 0;
+        std::uint64_t buttonQueuedEdges = 0, buttonRejectedEdges = 0;
         std::uint64_t touchQueuedDown = 0, touchQueuedUp = 0, touchRejectedDown = 0, touchRejectedUp = 0;
         std::uint64_t touchAttemptDown = 0, touchAttemptUp = 0, touchSentDown = 0, touchSentUp = 0;
         std::uint64_t touchFailedDown = 0, touchFailedUp = 0, touchDropped = 0;
@@ -43,22 +44,44 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return enqueueLocked(std::move(payload), mode, std::move(input), std::move(release));
     }
-    bool enqueueGamepad(std::string payload, bool touchDown) {
+    // The Switch has digital triggers. Bits 0..17 identify buttons, 18/19 the
+    // pressed triggers; sticks may change freely while this signature is equal.
+    bool enqueueGamepad(std::string payload, std::uint32_t buttons, bool playStation = false) {
         std::lock_guard<std::mutex> lock(mutex_);
-        ++stats_.psFrames;
-        const bool edge = touchDown != acceptedTouchDown_;
-        const auto sequence = ++psSequence_;
-        const auto mode = edge ? (touchDown ? Mode::GamepadEdge : Mode::GamepadRelease) : Mode::Gamepad;
-        const bool accepted = enqueueLocked(std::move(payload), mode, {}, {}, {true, touchDown, edge, sequence});
+        if (buttons & ~std::uint32_t{0xfffff}) return false;
+        if (playStation) ++stats_.psFrames;
+        const bool touchDown = playStation && (buttons & (std::uint32_t{1} << 17));
+        const bool touchEdge = playStation && touchDown != acceptedTouchDown_;
+        const bool edge = buttons != acceptedButtons_;
+        const auto sequence = playStation ? ++psSequence_ : 0;
+        const bool releases = (acceptedButtons_ & ~buttons) != 0;
+        const auto mode = !edge ? Mode::Gamepad : buttons == 0 ? Mode::GamepadNeutral :
+            releases ? Mode::GamepadRelease : Mode::GamepadEdge;
+        const bool accepted = enqueueLocked(std::move(payload), mode, {}, {}, {playStation, touchDown, touchEdge, sequence});
         if (accepted) {
-            ++stats_.psAccepted; stats_.lastQueuedSeq = sequence; psKnown_ = true;
-            if (edge) { if (touchDown) ++stats_.touchQueuedDown; else ++stats_.touchQueuedUp; }
-            acceptedTouchDown_ = touchDown;
+            acceptedButtons_ = buttons;
+            if (edge) ++stats_.buttonQueuedEdges;
+            if (playStation) {
+                ++stats_.psAccepted; stats_.lastQueuedSeq = sequence; psKnown_ = true;
+                if (touchEdge) { if (touchDown) ++stats_.touchQueuedDown; else ++stats_.touchQueuedUp; }
+                acceptedTouchDown_ = touchDown;
+            }
         } else {
-            ++stats_.psRejected;
-            if (edge) { if (touchDown) ++stats_.touchRejectedDown; else ++stats_.touchRejectedUp; }
+            if (edge) {
+                ++stats_.buttonRejectedEdges;
+                // An unqueueable edge cannot be replaced by a later physical
+                // release. Publish failure to the owner instead of losing a tap.
+                if (!stopping_ && failure_ == Failure::None) stalled_ = true;
+            }
+            if (playStation) {
+                ++stats_.psRejected;
+                if (touchEdge) { if (touchDown) ++stats_.touchRejectedDown; else ++stats_.touchRejectedUp; }
+            }
         }
         return accepted;
+    }
+    bool enqueueGamepad(std::string payload, bool touchDown) {
+        return enqueueGamepad(std::move(payload), touchDown ? (std::uint32_t{1} << 17) : 0, true);
     }
     bool enqueueNative(std::string payload, Mode mode, std::string input, std::string release, unsigned kind) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -328,6 +351,7 @@ private:
     bool transportActive_ = false;
     bool allowed_ = false, blocked_ = false, stopping_ = false, shutdownAllowed_ = false, inFlight_ = false;
     bool acceptedTouchDown_ = false, sentTouchDown_ = false, psKnown_ = false;
+    std::uint32_t acceptedButtons_ = 0;
     std::uint64_t psSequence_ = 0;
     std::uint64_t offsetMs_ = 0, inFlightAt_ = 0, pongRejected_ = 0;
     std::size_t inFlightBytes_ = 0, pongStreak_ = 0;

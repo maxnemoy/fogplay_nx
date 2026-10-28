@@ -102,6 +102,33 @@ int main() {
           c.changeVideoSettings(changed(c),true);
           require(c.stream_->updates == 1 && !c.pending_.valid() && c.finishes == 0,
               "MTS continues to use its existing live settings request"); }
+        for (const auto provider : {fog::ProviderId::Mts, fog::ProviderId::FogHub}) {
+            ApplicationController c; c.streamRental_.provider = provider;
+            auto fps = c.videoSettings_; fps.framesPerSecond = 60;
+            c.changeVideoSettings(fps,true);
+            require(saved.framesPerSecond == 60 && c.videoSettings_.framesPerSecond == 60 &&
+                c.activeFramesPerSecond_ == 30 && c.stream_->updates == 0 &&
+                !c.pending_.valid() && c.starts == 0 && c.finishes == 0,
+                "FPS-only edit persists for next connection without interrupting either provider");
+            require(c.videoSaveStatus_.find("60 FPS") != std::string::npos,
+                "pending FPS is explicit while active stream stays at its negotiated rate");
+            fps.bitrateMbps = 30; c.changeVideoSettings(fps,true);
+            if (provider == fog::ProviderId::Mts) {
+                require(c.stream_->updates == 1 && c.stream_->updatedSettings.framesPerSecond == 30 &&
+                    c.stream_->updatedSettings.bitrateMbps == 30 && saved.framesPerSecond == 60,
+                    "MTS live bitrate edit preserves active FPS and saved next-connection FPS");
+            } else {
+                c.joinInspection(); c.completePairedVideoReconnect();
+                require(c.starts == 1 && c.resumedOnly && c.startedSettings.framesPerSecond == 60,
+                    "explicit FH bitrate reconnect applies the latest saved FPS to the same rental");
+            }
+        }
+        { ApplicationController c; c.streamRental_.provider = fog::ProviderId::Mts;
+          c.activeFramesPerSecond_ = c.videoSettings_.framesPerSecond = 60;
+          auto next = c.videoSettings_; next.framesPerSecond = 30; next.quality = 2;
+          c.changeVideoSettings(next,true);
+          require(saved.framesPerSecond == 30 && c.stream_->updatedSettings.framesPerSecond == 60 &&
+              c.stream_->updatedSettings.quality == 2, "saving 30 never downgrades a live 60 FPS stream implicitly"); }
         require(saves > 0, "production settings persistence path exercised");
         std::cout << "Paired video settings controller: " << assertions << " assertions passed\n";
         return 0;

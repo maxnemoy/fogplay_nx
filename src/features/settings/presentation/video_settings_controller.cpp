@@ -1,5 +1,6 @@
 #include "core/constants/storage_paths.hpp"
 #include "features/settings/infrastructure/video_settings_storage.hpp"
+#include "features/settings/presentation/settings_text.hpp"
 #include "app/application_controller.hpp"
 
 namespace uiText = ::fog::constants::ui;
@@ -12,10 +13,11 @@ void ApplicationController::changeVideoSettings(const fog::video::Settings& valu
     const bool foghub = live && streamRental_.provider == fog::ProviderId::FogHub;
     const auto previous = videoSettings_;
     if (foghub) {
-        // The FH overlay owns codec/bitrate only. Its normalized transport
+        // The FH overlay owns codec/bitrate/FPS. Its normalized transport
         // settings must not erase the shared MTS quality or PLI preferences.
         videoSettings_.codec = value.codec;
         videoSettings_.bitrateMbps = value.bitrateMbps;
+        videoSettings_.framesPerSecond = value.framesPerSecond;
     } else {
         videoSettings_ = value;
     }
@@ -30,10 +32,18 @@ void ApplicationController::changeVideoSettings(const fog::video::Settings& valu
             if (requestPairedVideoReconnect()) videoSaveStatus_ += uiText::Settings::FogHubReconnectNotice;
         }
     } else if (live) {
-        const bool requested = stream_ && stream_->updateVideoSettings(videoSettings_);
-        videoSaveStatus_ += requested ? uiText::Settings::RequestSentNotice :
-            uiText::Settings::RequestNotSentNotice;
+        auto active = videoSettings_;
+        active.framesPerSecond = activeFramesPerSecond_;
+        auto old = previous;
+        old.framesPerSecond = activeFramesPerSecond_;
+        if (active != old) {
+            const bool requested = stream_ && stream_->updateVideoSettings(active);
+            videoSaveStatus_ += requested ? uiText::Settings::RequestSentNotice :
+                uiText::Settings::RequestNotSentNotice;
+        }
     }
+    if (live && videoSettings_.framesPerSecond != activeFramesPerSecond_)
+        videoSaveStatus_ += " · " + fog::ui::videoFrameRateLabel(videoSettings_) + uiText::Settings::FrameRateNextConnectionSuffix;
     overlay_.setVideoSettings(videoSettings_);
     overlay_.setSaveStatus(videoSaveStatus_);
 }

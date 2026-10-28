@@ -23,6 +23,7 @@
 #include "features/streaming/domain/transport_reconnect.hpp"
 #include "features/streaming/domain/stream_input_gate.hpp"
 #include "features/streaming/domain/mouse_buttons.hpp"
+#include "features/streaming/domain/gamepad_schedule.hpp"
 #include "features/streaming/domain/loop_timing.hpp"
 #include "core/logging/run_log.hpp"
 #include "features/streaming/domain/streaming_client.hpp"
@@ -173,6 +174,7 @@ private:
     bool sendRemote(const fog::remote::Input& command);
     void releaseMouse() noexcept;
     void retryMouseReleases() noexcept;
+    void retryGamepadRelease() noexcept;
     void neutralizeStreamInput();
     void suspendVideoInput();
     void overlayTransition();
@@ -288,6 +290,7 @@ private:
     std::unique_ptr<stream::StreamingClient> stream_;
     fog::stream::Overlay overlay_;
     fog::video::Settings videoSettings_;
+    int activeFramesPerSecond_ = fog::video::DefaultFramesPerSecond;
     fog::connection::Settings connectionSettings_;
     fog::connection::RelaySelection relaySelection_;
     fog::controller::Settings controllerSettings_;
@@ -307,6 +310,7 @@ private:
     std::chrono::steady_clock::time_point menuHeartbeatAt_{}, menuTransitionAt_{};
     bool touchWasDown_ = false, touchDrag_ = false;
     fog::stream::MouseButtons mouseButtons_;
+    fog::stream::GamepadSchedule gamepadSchedule_;
     float pointerX_ = 640.0f, pointerY_ = 360.0f;
     std::chrono::steady_clock::time_point mouseAt_{}, lastPointerSent_{}, overlayNoticeAt_{}, overlayHintAt_{};
     std::string overlayNotice_;
@@ -334,7 +338,7 @@ private:
     std::vector<fog::Rental> sessions_;
     bool sessionPending_ = false, exitLocked_ = false, exitAfterStop_ = false, shutdownDone_ = false;
     bool stopStartedOnExit_ = false;
-    std::chrono::steady_clock::time_point streamStarted_{}, lastVideo_{}, lastInput_{}, retryAt_{}, lastMediaLog_{};
+    std::chrono::steady_clock::time_point streamStarted_{}, lastVideo_{}, retryAt_{}, lastMediaLog_{};
     std::future<TaskResult> pending_;
     Task task_ = Task::RestoreAuth;
     Screen screen_ = Screen::Games;

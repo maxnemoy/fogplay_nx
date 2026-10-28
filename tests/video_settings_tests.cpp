@@ -25,25 +25,39 @@ int main() {
         const Settings defaults;
         require(loadSettings(path) == defaults, "absent file uses defaults");
         require(defaults.codec == ::stream::VideoCodec::H265 && defaults.bitrateMbps == 20 &&
-            defaults.quality == 0 && defaults.keyframeSeconds == 0, "documented defaults");
+            defaults.quality == 0 && defaults.keyframeSeconds == 0 && defaults.framesPerSecond == 30, "documented defaults");
         Settings savedH264;
         savedH264.codec = ::stream::VideoCodec::H264;
         saveSettings(path, savedH264);
         require(loadSettings(path).codec == ::stream::VideoCodec::H264, "saved H264 preserved despite new HEVC default");
         Settings selected;
         selected.codec = ::stream::VideoCodec::H265;
-        for (const int bitrate : Bitrates) for (const int interval : KeyframeIntervals) for (int quality = 0; quality < 5; ++quality) {
+        for (const int fps : FrameRates) for (const int bitrate : Bitrates) for (const int interval : KeyframeIntervals) for (int quality = 0; quality < 5; ++quality) {
             selected.bitrateMbps = bitrate; selected.keyframeSeconds = interval; selected.quality = quality;
+            selected.framesPerSecond = fps;
             saveSettings(path, selected);
             require(loadSettings(path) == selected, "roundtrip supported choices");
         }
         auto content = nlohmann::json::parse(std::ifstream(path));
+        require(content.at("version") == 2 && content.at("framesPerSecond") == 60, "new saves use version two with frame rate");
+        auto legacy = content; legacy["version"] = 1; legacy.erase("framesPerSecond");
+        std::ofstream(path) << legacy.dump();
+        auto migrated = selected; migrated.framesPerSecond = 30;
+        require(loadSettings(path) == migrated, "legacy file keeps all preferences and defaults to thirty FPS");
+        saveSettings(path, loadSettings(path));
+        require(nlohmann::json::parse(std::ifstream(path)).at("version") == 2, "legacy preferences migrate on next save");
+        auto missing = content; missing.erase("framesPerSecond");
+        std::ofstream(path) << missing.dump(); require(rejects(path), "version two requires explicit frame rate");
+        auto legacyExtra = content; legacyExtra["version"] = 1;
+        std::ofstream(path) << legacyExtra.dump(); require(rejects(path), "legacy version rejects new or unknown keys");
         const std::pair<const char*, nlohmann::json> invalid[]{
-            {"version", 2}, {"version", 1.0}, {"codec", "AV1"}, {"codec", 1},
+            {"version", 3}, {"version", 2.0}, {"codec", "AV1"}, {"codec", 1},
             {"bitrateMbps", 0}, {"bitrateMbps", 21}, {"bitrateMbps", 20.0},
             {"bitrateMbps", 4294967316ULL}, {"keyframeSeconds", -1}, {"keyframeSeconds", 1},
             {"keyframeSeconds", 4294967296ULL}, {"quality", -1}, {"quality", 5}, {"quality", true},
-            {"quality", 4294967296ULL}};
+            {"quality", 4294967296ULL}, {"framesPerSecond", 0}, {"framesPerSecond", 45},
+            {"framesPerSecond", 30.0}, {"framesPerSecond", true}, {"framesPerSecond", "60"},
+            {"framesPerSecond", 4294967326ULL}};
         for (const auto& entry : invalid) {
             auto corrupt = content; corrupt[entry.first] = entry.second; std::ofstream(path) << corrupt.dump();
             require(rejects(path), "invalid or overflowing values rejected");
@@ -73,6 +87,11 @@ int main() {
         require(adjust(value, Field::Quality, -1) && value.quality == 4, "quality backward wrap");
         require(adjust(value, Field::Bitrate, -1) && value.bitrateMbps == 15, "bitrate choice backward");
         require(adjust(value, Field::Keyframes, -1) && value.keyframeSeconds == 10, "keyframe choice backward");
+        require(adjust(value, Field::FramesPerSecond, 1) && value.framesPerSecond == 60, "frame rate switches to sixty");
+        require(adjust(value, Field::FramesPerSecond, -1) && value.framesPerSecond == 30, "frame rate switches back to thirty");
+        auto otherFps = value; otherFps.framesPerSecond = 60;
+        require(otherFps != value, "frame rate participates in equality");
+        otherFps.framesPerSecond = 45; require(!valid(otherFps), "only documented frame rates valid");
         require(!adjust(value, Field::Bitrate, 0) && !adjust(bad, Field::Quality, 1), "invalid and zero changes ignored");
         std::filesystem::remove_all(dir);
         std::cout << "Video settings tests passed: " << assertions << " assertions\n"; return 0;

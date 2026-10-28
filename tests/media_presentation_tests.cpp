@@ -16,6 +16,8 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <thread>
 
 using Bytes = std::vector<unsigned char>;
 using Units = std::vector<Bytes>;
@@ -421,6 +423,38 @@ static void test(SDL_Renderer* renderer, const Units& units, const Units& change
         "simulated hardware transfer error boundary\n";
     std::cout << media.diagnostics() << '\n';
 }
+static void pacedPresentation(SDL_Renderer* renderer, const Units& units) {
+    const auto expected = reference(renderer, units);
+    for (const int fps : {30, 60}) {
+        fog::Media media(renderer, stream::VideoCodec::H264, true);
+        bool rejected = false;
+        try { media.setPresentationFrameRate(45); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "unsupported presentation FPS was accepted");
+        media.setPresentationFrameRate(fps);
+        feed(media, units.front());
+        check(media.preparePresentation(), "first paced frame was delayed");
+        for (std::size_t i = 1; i < units.size(); ++i) feed(media, units[i]);
+        check(counter(media, "pending_frames") == 1 && media.uploadedFrames() == 1,
+            "paced synchronous burst accumulated pending surfaces or uploaded during decode");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+        while (!media.preparePresentation()) {
+            check(std::chrono::steady_clock::now() < deadline, "paced synchronous output never became due");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(media.uploadedFrames() == 2 && counter(media, "pending_frames") == 0 &&
+            snapshot(media, renderer) == expected.last,
+            "paced synchronous burst did not retain the actual newest decoded frame");
+        media.resetVideoDecoder();
+        feed(media, units.front());
+        check(media.preparePresentation(), "synchronous decoder reset retained presentation deadline");
+        media.setVideoCodec(stream::VideoCodec::H265);
+        media.setVideoCodec(stream::VideoCodec::H264);
+        feed(media, units.front());
+        check(media.preparePresentation(), "synchronous codec reset retained presentation deadline");
+    }
+    std::cout << "PASS paced synchronous presentation: 30/60 FPS, bounded latest frame, reset/codec phase\n";
+}
 int main(int argc, char** argv) {
     if (argc != 4) return 2;
     SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
@@ -436,6 +470,7 @@ int main(int argc, char** argv) {
         blackImageMeasurements(renderer, load(argv[3]), units);
         test(renderer, units, load(argv[2]));
         presentationCounts(renderer, units);
+        pacedPresentation(renderer, units);
         audioObservations();
         audioCounts(renderer);
     }

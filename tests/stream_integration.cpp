@@ -218,9 +218,12 @@ struct Fixture {
     stream::protocol::Parser parser;
     bool subscribed = false, enabled = false, answered = false, controlReady = false;
     bool pong = false, pressed = false, neutral = false, closed = false;
+    std::vector<int> gamepadButton0;
     unsigned burstPongs = 0;
     Json remoteControls = Json::array();
     std::string qualityCommand;
+    std::vector<Json> scales;
+    std::vector<std::string> configurationOrder;
     std::vector<std::string> adaptations;
     std::string qualityProfile = "LOW";
     bool confirmAdaptations = true;
@@ -243,6 +246,7 @@ struct Fixture {
     bool initializePeer;
     bool expectRelay;
     bool expectPlayStation;
+    int expectedFps = 30;
     bool rejectWebrtc = false;
     juice_server_t* turn = nullptr;
     std::string turnAddress;
@@ -367,7 +371,7 @@ struct Fixture {
             assert(j.at("iceTransportPolicy") == (expectRelay ? "relay" : "all"));
             assert(j.at("isPS") == expectPlayStation);
             if (rejectWebrtc) { signal({{"id", "init_webrtc_error"}}); return; }
-            assert(enabled && j.at("limit_fps") == 30 && j.at("gamepad") == true && j.at("control_only") == false);
+            assert(enabled && j.at("limit_fps") == expectedFps && j.at("gamepad") == true && j.at("control_only") == false);
             // Provider-style empty marker arrives before an offer. The old client
             // aborted here with JSON parse_error instead of continuing negotiation.
             signal({{"id", "offer"}, {"data", ""}});
@@ -439,8 +443,14 @@ struct Fixture {
                 }
                 else if (id.rfind("set_",0) == 0) {
                     qualityCommand = id;
+                    configurationOrder.push_back(id);
                     dc->send(Json{{"id","stats"},{"target_bitrate",18000000},{"preset",qualityProfile},
                                   {"fps",30},{"autoquality",true},{"server_codec",hevc ? "H265" : "H264"}}.dump());
+                }
+                else if (id == "apply_scale") {
+                    assert(j.size() == 3 && j.at("preset").is_number_unsigned() && j.at("enabled").is_boolean());
+                    scales.push_back(j);
+                    configurationOrder.push_back(id);
                 }
                 else if (id == "enhancequality" || id == "degradequality") {
                     assert(j.size() == 1); // Recovered protocol is id-only; no invented bitrate payload.
@@ -453,6 +463,7 @@ struct Fixture {
                 else if (id == "gamepad") {
                     assert(j.at("isPS") == expectPlayStation);
                     assert(j.at("state").at("buttons").size() == 18 && j.at("state").at("axes").size() == 4);
+                    gamepadButton0.push_back(j.at("state").at("buttons")[0].get<int>());
                     if (j.at("state").at("buttons")[0] == 1) pressed = true;
                     else if (pressed) neutral = true;
                 } else if (id == "gamepad_touch" || id == "gamepad_sensor" || id == "mousemove" || id == "mousedown" || id == "mouseup" ||
@@ -719,8 +730,11 @@ int main(int argc, char** argv) {
         fog::video::Settings settings;
         settings.codec = stream::VideoCodec::H265; // Fixture only offers H264: test safe fallback.
         settings.bitrateMbps = 15;
+        settings.framesPerSecond = fixture.expectedFps = round == 2 ? 60 : 30;
         assert(client.configureVideo(settings));
         auto invalid = settings; invalid.bitrateMbps = 0;
+        assert(!client.configureVideo(invalid));
+        invalid = settings; invalid.framesPerSecond = 144;
         assert(!client.configureVideo(invalid));
         assert(!client.updateVideoSettings(settings));
         assert(!client.startForTesting("fixture", "abcde", "wss://remoteplay.mts.ru/ws/"));
@@ -798,6 +812,41 @@ int main(int argc, char** argv) {
         assert(client.qualityStatus().find("18.0") != std::string::npos);
         assert(client.videoDiagnostics().find("serverPreset=LOW") != std::string::npos);
         assert(client.videoDiagnostics().find("statsCount=1") != std::string::npos);
+        if (round == 1) {
+            // The exact preset comes from the announced table, even when 720p
+            // is not at the usual index. Late repeated stats must not spam it.
+            const Json table = Json::array({Json::array({1920,1080}), Json::array({1600,900}), Json::array({1280,720})});
+            const auto announce = [&](const Json& resolutions) {
+                client.receiveControlForTesting(Json{{"id","stats"},{"resolutions",resolutions}}.dump());
+                for (unsigned tick = 0; tick < 20; ++tick) {
+                    fixture.pump(); client.pump(); fixture.sendMedia();
+                    stream::Packet packet; while (client.poll(packet)) {}
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            };
+            announce(table);
+            assert(fixture.scales.size() == 1 && fixture.scales[0].at("preset") == 2 && fixture.scales[0].at("enabled") == true);
+            assert(fixture.configurationOrder.size() >= 2 && fixture.configurationOrder.front() == "set_autoquality" &&
+                fixture.configurationOrder[1] == "apply_scale");
+            for (unsigned n = 0; n < 20; ++n)
+                client.receiveControlForTesting(Json{{"id","stats"},{"resolutions",table}}.dump());
+            announce(Json::array({Json::array({1920,1080}), Json::array({1024,576})}));
+            announce(table);
+            announce(Json::array({Json::array({1920,1080}), Json::array({1280.0,720})}));
+            announce(Json::array({Json::array({1920,1080}), Json::array({18446744073709551615ULL,720})}));
+            assert(fixture.scales.size() == 1 && client.error().empty());
+            announce(Json::array({Json::array({0,0}), Json::array({1280,720})}));
+            assert(fixture.scales.size() == 2 && fixture.scales[1].at("preset") == 1 && fixture.scales[1].at("enabled") == true);
+            announce(Json::array({Json::array({1280,720}), Json::array({1920,1080})}));
+            assert(fixture.scales.size() == 3 && fixture.scales[2].at("preset") == 0 && fixture.scales[2].at("enabled") == false);
+            announce(Json::array({Json::array({2560,1440}), Json::array({1280,720})}));
+            assert(fixture.scales.size() == 3 && client.error().empty());
+            assert(client.videoDiagnostics().find("scaleAttempts=3 scaleQueued=3 scaleRejected=0 scaleInvalidTables=2") != std::string::npos);
+            assert(!client.waitingForVideoKeyframe());
+            assert(client.videoDiagnostics().find("queueResync=0") != std::string::npos);
+            assert(fixture.qualityCommand == "set_autoquality");
+            std::cout << "MTS 720p probe: advertised preset, quality-first ordering, repeated/missing/malformed tables and request bound passed\n";
+        }
         if (turn) {
             const auto settleIce = [&client] {
                 const auto began = Clock::now();
@@ -998,6 +1047,7 @@ int main(int argc, char** argv) {
             // Inject only the RTC queue pressure decision; actual messages still
             // traverse this fixture's local SCTP channel when pressure clears.
             assert(!client.sendControl("{bad JSON") && client.error().empty());
+            const auto gamepadBeforePressure = fixture.gamepadButton0.size();
             client.blockControlForTesting(true);
             stream::Gamepad pad; pad.buttons[0] = 1;
             for (unsigned n=0; n<1000; ++n) assert(client.sendGamepad(pad));
@@ -1005,7 +1055,7 @@ int main(int argc, char** argv) {
             for (const auto& input : remoteInputs) assert(client.sendInput(input));
             client.pump();
             assert(client.ready() && client.error().empty());
-            assert(client.diagnostics().find("controlPending=11 ") != std::string::npos);
+            assert(client.diagnostics().find("controlPending=12 ") != std::string::npos);
             client.advanceControlForTesting(8000); client.pump();
             assert(client.ready() && client.error().empty()); // Old immediate-failure case.
             client.blockControlForTesting(false);
@@ -1018,6 +1068,8 @@ int main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             assert(client.error().empty() && fixture.remoteControls == twiceExpected && fixture.neutral);
+            assert(fixture.gamepadButton0.size() == gamepadBeforePressure + 2);
+            assert(fixture.gamepadButton0[gamepadBeforePressure] == 1 && fixture.gamepadButton0.back() == 0);
             assert(client.diagnostics().find("controlPending=0 ") != std::string::npos);
             // Authenticated SRTP burst: backpressure now keeps the complete
             // ordered backlog in the assembler instead of overflowing MaxVideo.
@@ -1106,6 +1158,10 @@ int main(int argc, char** argv) {
         assert(!client.configureVideo(settings));
         invalid = settings; invalid.codec = stream::VideoCodec::H264;
         assert(!client.updateVideoSettings(invalid)); // No renegotiation in a live rental.
+        invalid = settings; invalid.framesPerSecond = settings.framesPerSecond == 30 ? 60 : 30;
+        assert(!client.updateVideoSettings(invalid));
+        assert(client.videoDiagnostics().find("requestedFps=" + std::to_string(settings.framesPerSecond)) != std::string::npos);
+        assert(client.qualityStatus().find(std::to_string(settings.framesPerSecond) + " FPS") != std::string::npos);
         invalid = settings; invalid.keyframeSeconds = -1;
         assert(!client.updateVideoSettings(invalid));
         settings.bitrateMbps = 30; settings.quality = 3;

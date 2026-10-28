@@ -21,6 +21,8 @@ g++ "${flags[@]}" tests/stream_queue_tests.cpp -o work/stream_queue_tests
 ./work/stream_queue_tests | tee work/logs/stream-queue-tests.log
 g++ "${flags[@]}" tests/auto_quality_tests.cpp -o work/auto_quality_tests
 ./work/auto_quality_tests | tee work/logs/auto-quality-tests.log
+g++ "${flags[@]}" tests/resolution_scale_tests.cpp -o work/resolution_scale_tests
+./work/resolution_scale_tests | tee work/logs/resolution-scale-tests.log
 g++ "${flags[@]}" -DSTREAM_RTC_TESTS src/features/streaming/infrastructure/stream.cpp src/features/streaming/infrastructure/stream_protocol.cpp tests/stream_tests.cpp "${libs[@]}" -o work/stream_tests_rtc
 ./work/stream_tests_rtc | tee work/logs/stream-tests.log
 g++ "${flags[@]}" -DFOG_STREAM_TESTING src/features/streaming/infrastructure/stream.cpp src/features/streaming/infrastructure/stream_protocol.cpp src/features/streaming/application/remote_input.cpp tests/stream_integration.cpp -Wl,--wrap=sendto "${libs[@]}" -o work/stream_integration

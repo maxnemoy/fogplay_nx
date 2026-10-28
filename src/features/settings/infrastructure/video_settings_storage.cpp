@@ -45,8 +45,9 @@ Settings loadSettings(const std::string& path) {
     if (failed) throw std::runtime_error(fog::constants::error::Settings::CannotReadVideoSettings);
     const auto data = nlohmann::json::parse(bytes, nullptr, false);
     try {
-        if (!data.is_object() || data.size() != 5 ||
-            !data.at("version").is_number_integer() || data.at("version") != 1 ||
+        if (!data.is_object() || !data.at("version").is_number_integer() ||
+            !((data.at("version") == 1 && data.size() == 5) ||
+              (data.at("version") == 2 && data.size() == 6)) ||
             !data.at("codec").is_string() || !data.at("bitrateMbps").is_number_integer() ||
             !data.at("keyframeSeconds").is_number_integer() || !data.at("quality").is_number_integer())
             throw std::runtime_error(fog::constants::error::Internal::InvalidData);
@@ -63,16 +64,22 @@ Settings loadSettings(const std::string& path) {
         value.bitrateMbps = data.at("bitrateMbps").get<int>();
         value.keyframeSeconds = data.at("keyframeSeconds").get<int>();
         value.quality = data.at("quality").get<int>();
+        if (data.at("version") == 2) {
+            const auto& frames = data.at("framesPerSecond");
+            if (!frames.is_number_integer() || (frames != 30 && frames != 60))
+                throw std::runtime_error(fog::constants::error::Internal::InvalidData);
+            value.framesPerSecond = frames.get<int>();
+        }
         if (!valid(value)) throw std::runtime_error(fog::constants::error::Internal::InvalidData);
         return value;
     } catch (...) { throw std::runtime_error(fog::constants::error::Settings::InvalidVideoSettings); }
 }
 void saveSettings(const std::string& path, const Settings& value) {
     if (!valid(value)) throw std::runtime_error(fog::constants::error::Settings::CannotSaveInvalidVideoSettings);
-    const auto bytes = nlohmann::json{{"version", 1},
+    const auto bytes = nlohmann::json{{"version", 2},
         {"codec", value.codec == ::stream::VideoCodec::H265 ? "H265" : "H264"},
         {"bitrateMbps", value.bitrateMbps}, {"keyframeSeconds", value.keyframeSeconds},
-        {"quality", value.quality}}.dump() + "\n";
+        {"quality", value.quality}, {"framesPerSecond", value.framesPerSecond}}.dump() + "\n";
     replaceStorage(path, bytes);
 }
 }

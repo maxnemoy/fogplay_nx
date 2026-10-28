@@ -43,6 +43,9 @@ public:
     // Application thread. Reinitializes video state/cache while retaining audio.
     // With workers this schedules a command and immediately invalidates ready output.
     void setVideoCodec(::stream::VideoCodec codec);
+    // Application thread before workers: enable bounded presentation at 30/60
+    // FPS. Direct callers that omit this retain the legacy unpaced behavior.
+    void setPresentationFrameRate(int fps);
     ~Media();
     Media(const Media&) = delete;
     Media& operator=(const Media&) = delete;

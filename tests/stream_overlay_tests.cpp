@@ -77,6 +77,93 @@ void rumbleSettings() {
         }
     }
 }
+void imageSettings(fog::stream::Overlay& overlay) {
+    using namespace fog::stream;
+    overlay.openMenu(); overlay.down(); overlay.down(); overlay.select();
+    require(overlay.mode() == OverlayMode::ImageSettings && overlay.selection() == 1, "MTS image opens on editable quality");
+    require(overlay.videoSettings().codec == ::stream::VideoCodec::H265, "fresh overlay defaults to H265");
+    require(overlay.left().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 4,
+        "MTS quality backward wrap");
+    require(overlay.right().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 0,
+        "MTS quality wraps to auto");
+    overlay.down();
+    require(overlay.select().type == OverlayActionType::SettingsChanged && overlay.videoSettings().bitrateMbps == 30,
+        "MTS bitrate adjustment");
+    overlay.down();
+    require(overlay.right().type == OverlayActionType::SettingsChanged && overlay.videoSettings().keyframeSeconds == 2,
+        "MTS periodic keyframe adjustment");
+    overlay.down();
+    require(overlay.selection() == 4 && overlay.videoSettings().framesPerSecond == 30, "MTS exposes shared FPS row with thirty default");
+    require(overlay.right().type == OverlayActionType::SettingsChanged && overlay.videoSettings().framesPerSecond == 60,
+        "MTS frame rate selects sixty for next connection");
+    require(overlay.left().type == OverlayActionType::SettingsChanged && overlay.videoSettings().framesPerSecond == 30,
+        "MTS frame rate returns to thirty");
+    require(overlay.touch(200,142 + 4*54 + 8).type == OverlayActionType::SettingsChanged &&
+        overlay.videoSettings().framesPerSecond == 60, "MTS FPS touch selects sixty");
+    overlay.down();
+    require(overlay.select().type == OverlayActionType::RequestKeyframe, "MTS manual keyframe after FPS row");
+    overlay.down(); overlay.down();
+    require(overlay.selection() == 1, "MTS live navigation skips immutable codec");
+    const auto prior = overlay.videoSettings();
+    require(overlay.touch(200,170).type == OverlayActionType::None && overlay.videoSettings() == prior,
+        "MTS codec touch ignored during stream");
+    for (int i = 0; i < 50; ++i) {
+        overlay.up(); require(overlay.selection() >= 1 && overlay.selection() <= 6, "MTS image navigation bounded over seven rows");
+    }
+    overlay.back();
+    require(overlay.mode() == OverlayMode::Menu && overlay.selection() == 2, "image B restores menu item");
+    overlay.select(); overlay.touch(200,142 + 6*54 + 8);
+    require(overlay.mode() == OverlayMode::Menu && overlay.selection() == 2, "MTS touch back fits screen and restores menu item");
+
+    Overlay foghub; foghub.setProvider(fog::ProviderId::FogHub);
+    foghub.openMenu(); foghub.down(); foghub.down(); foghub.select();
+    require(foghub.mode() == OverlayMode::ImageSettings && foghub.selection() == 0, "FH image opens on editable codec");
+    const auto fhInitial = foghub.videoSettings();
+    foghub.setVideoChangesEnabled(false);
+    require(foghub.left().type == OverlayActionType::None && foghub.videoSettings() == fhInitial,
+        "FH connecting disables codec");
+    require(foghub.touch(200,142 + 54 + 8).type == OverlayActionType::None && foghub.videoSettings() == fhInitial,
+        "FH connecting disables bitrate");
+    require(foghub.touch(200,142 + 2*54 + 8).type == OverlayActionType::SettingsChanged &&
+        foghub.videoSettings().framesPerSecond == 60, "FH connecting allows FPS save for next connection");
+    require(foghub.touch(200,142 + 3*54 + 8).type == OverlayActionType::RequestKeyframe,
+        "FH connecting retains explicit keyframe action");
+    foghub.touch(200,142 + 4*54 + 8);
+    require(foghub.mode() == OverlayMode::Menu && foghub.selection() == 2, "FH connecting retains Back");
+    foghub.select(); foghub.setVideoChangesEnabled(true);
+    require(foghub.touch(200,170).type == OverlayActionType::SettingsChanged &&
+        foghub.videoSettings().codec == ::stream::VideoCodec::H264, "FH codec accepts touch");
+    require(foghub.right().type == OverlayActionType::SettingsChanged && foghub.videoSettings().codec == fhInitial.codec,
+        "FH codec toggles back");
+    foghub.down(); foghub.setProvider(fog::ProviderId::FogHub);
+    require(foghub.selection() == 1, "unchanged provider preserves selected field");
+    require(foghub.select().type == OverlayActionType::SettingsChanged && foghub.videoSettings().bitrateMbps == 30,
+        "FH bitrate editable");
+    require(foghub.videoSettings().quality == fhInitial.quality && foghub.videoSettings().keyframeSeconds == fhInitial.keyframeSeconds,
+        "FH adjustments preserve MTS-only preferences");
+    foghub.down();
+    require(foghub.select().type == OverlayActionType::SettingsChanged && foghub.videoSettings().framesPerSecond == 30,
+        "FH FPS row changes using A");
+    foghub.down();
+    require(foghub.select().type == OverlayActionType::RequestKeyframe, "FH manual keyframe after FPS row");
+    foghub.down(); foghub.down();
+    require(foghub.selection() == 0, "FH image navigation wraps over five rows");
+    require(foghub.touch(200,430).type == OverlayActionType::None && foghub.mode() == OverlayMode::ImageSettings,
+        "FH unused lower rows do not accept touch");
+    for (int i = 0; i < 20; ++i) {
+        foghub.up(); require(foghub.selection() >= 0 && foghub.selection() <= 4, "FH image navigation bounded");
+    }
+    foghub.touch(200,142 + 4*54 + 8);
+    require(foghub.mode() == OverlayMode::Menu && foghub.selection() == 2, "FH touch Back restores image menu item");
+    foghub.select(); foghub.setVideoChangesEnabled(false); foghub.setProvider(fog::ProviderId::Mts);
+    require(foghub.selection() == 1, "provider switch resets to MTS editable quality");
+    require(foghub.left().type == OverlayActionType::SettingsChanged && foghub.videoSettings().quality == 4,
+        "provider switch restores MTS quality behavior");
+    foghub.setProvider(fog::ProviderId::FogHub);
+    require(foghub.selection() == 0, "provider switch resets to FH codec");
+    foghub.back();
+    require(foghub.mode() == OverlayMode::Menu && foghub.selection() == 2, "FH controller Back restores menu item");
+}
 }
 int main() {
     using namespace fog::stream;
@@ -96,74 +183,7 @@ int main() {
         require(overlay.select().type == OverlayActionType::None && overlay.mode() == OverlayMode::Menu, "second A cannot end session");
         overlay.select(); overlay.left();
         require(overlay.select().type == OverlayActionType::StopSession && overlay.mode() == OverlayMode::Closed, "confirmed stop action");
-        overlay.openMenu(); overlay.down(); overlay.down(); overlay.select();
-        require(overlay.mode() == OverlayMode::ImageSettings && overlay.selection() == 1, "image settings opens on safe quality field");
-        require(overlay.videoSettings().codec == ::stream::VideoCodec::H265, "fresh overlay defaults to H265");
-        require(overlay.left().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 4, "left changes safe quality and reports action");
-        require(overlay.right().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 0, "quality wraps back to auto");
-        overlay.down();
-        require(overlay.select().type == OverlayActionType::SettingsChanged && overlay.videoSettings().bitrateMbps == 30, "requested cap adjustment action");
-        overlay.down();
-        require(overlay.right().type == OverlayActionType::SettingsChanged && overlay.videoSettings().keyframeSeconds == 2, "periodic PLI adjustment action");
-        overlay.down();
-        require(overlay.select().type == OverlayActionType::RequestKeyframe, "manual keyframe explicit action");
-        overlay.down(); overlay.down();
-        require(overlay.selection() == 1, "live navigation skips immutable codec");
-        const auto prior = overlay.videoSettings();
-        require(overlay.touch(200, 170).type == OverlayActionType::None && overlay.videoSettings() == prior, "codec touch is ignored during stream");
-        for (int i = 0; i < 50; ++i) { overlay.up(); require(overlay.selection() >= 1 && overlay.selection() <= 5, "live navigation bounded"); }
-        overlay.back();
-        require(overlay.mode() == OverlayMode::Menu && overlay.selection() == 2, "image B returns to originating menu item");
-        overlay.select(); overlay.touch(200, 495);
-        require(overlay.mode() == OverlayMode::Menu && overlay.selection() == 2, "image touch back returns to menu");
-        Overlay foghub;
-        foghub.setProvider(fog::ProviderId::FogHub);
-        foghub.openMenu(); foghub.down(); foghub.down(); foghub.select();
-        require(foghub.mode() == OverlayMode::ImageSettings && foghub.selection() == 0, "FH image settings opens on editable codec");
-        const auto fhInitial = foghub.videoSettings();
-        foghub.setVideoChangesEnabled(false);
-        require(foghub.left().type == OverlayActionType::None && foghub.videoSettings() == fhInitial,
-            "FH codec is disabled while transport connects");
-        require(foghub.touch(200, 240).type == OverlayActionType::None && foghub.videoSettings() == fhInitial,
-            "FH bitrate touch is disabled while transport connects");
-        require(foghub.touch(200, 300).type == OverlayActionType::RequestKeyframe,
-            "FH manual keyframe remains available while settings are disabled");
-        foghub.touch(200, 360);
-        require(foghub.mode() == OverlayMode::Menu && foghub.selection() == 2,
-            "FH Back remains available while transport connects");
-        foghub.select();
-        foghub.setVideoChangesEnabled(true);
-        foghub.touch(200, 170); foghub.touch(200, 170);
-        require(foghub.left().type == OverlayActionType::SettingsChanged && foghub.videoSettings().codec == ::stream::VideoCodec::H264,
-            "FH codec change reports settings action");
-        require(foghub.right().type == OverlayActionType::SettingsChanged && foghub.videoSettings().codec == fhInitial.codec,
-            "FH codec toggles back");
-        foghub.down(); foghub.setProvider(fog::ProviderId::FogHub);
-        require(foghub.selection() == 1, "setting unchanged provider preserves current field");
-        require(foghub.select().type == OverlayActionType::SettingsChanged && foghub.videoSettings().bitrateMbps == 30,
-            "FH bitrate change reports settings action");
-        require(foghub.videoSettings().quality == fhInitial.quality && foghub.videoSettings().keyframeSeconds == fhInitial.keyframeSeconds,
-            "FH codec and bitrate changes preserve MTS-only settings");
-        foghub.down();
-        require(foghub.select().type == OverlayActionType::RequestKeyframe, "FH offers manual keyframe request");
-        foghub.down(); foghub.down();
-        require(foghub.selection() == 0, "FH settings navigation wraps over four rows");
-        require(foghub.touch(200, 170).type == OverlayActionType::SettingsChanged, "FH codec accepts touch");
-        require(foghub.touch(200, 240).type == OverlayActionType::SettingsChanged, "FH bitrate accepts touch");
-        require(foghub.touch(200, 300).type == OverlayActionType::RequestKeyframe, "FH keyframe accepts touch");
-        require(foghub.touch(200, 430).type == OverlayActionType::None && foghub.mode() == OverlayMode::ImageSettings,
-            "FH hidden MTS rows do not accept touch");
-        for (int i = 0; i < 20; ++i) { foghub.up(); require(foghub.selection() >= 0 && foghub.selection() <= 3, "FH live navigation bounded"); }
-        foghub.touch(200, 360);
-        require(foghub.mode() == OverlayMode::Menu && foghub.selection() == 2, "FH touch back returns to image menu item");
-        foghub.select(); foghub.setVideoChangesEnabled(false); foghub.setProvider(fog::ProviderId::Mts);
-        require(foghub.selection() == 1, "switch to MTS resets image selection to editable quality");
-        require(foghub.left().type == OverlayActionType::SettingsChanged && foghub.videoSettings().quality == 4,
-            "MTS quality behavior restored after provider switch");
-        foghub.setProvider(fog::ProviderId::FogHub);
-        require(foghub.selection() == 0, "switch to FH resets image selection to codec");
-        foghub.back();
-        require(foghub.mode() == OverlayMode::Menu && foghub.selection() == 2, "FH controller back returns to image menu item");
+        imageSettings(overlay);
         keyboard(overlay);
         overlay.left(); require(overlay.selection() == 11, "keyboard left wraps in row");
         overlay.right(); require(overlay.selection() == 0, "keyboard right wraps in row");

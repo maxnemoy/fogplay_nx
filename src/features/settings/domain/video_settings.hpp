@@ -11,19 +11,22 @@ struct Settings {
     int bitrateMbps = 20;
     int keyframeSeconds = 0;
     int quality = 0;
+    int framesPerSecond = DefaultFramesPerSecond;
 };
-enum class Field { Codec, Quality, Bitrate, Keyframes };
+enum class Field { Codec, Quality, Bitrate, Keyframes, FramesPerSecond };
+inline constexpr std::array<int, 2> FrameRates{30, 60};
 inline constexpr std::array<int, 6> Bitrates{5, 10, 15, 20, 30, 40};
 inline constexpr std::array<int, 4> KeyframeIntervals{0, 2, 5, 10};
 inline bool valid(const Settings& value) {
     return (value.codec == ::stream::VideoCodec::H264 || value.codec == ::stream::VideoCodec::H265) &&
         std::find(Bitrates.begin(), Bitrates.end(), value.bitrateMbps) != Bitrates.end() &&
         std::find(KeyframeIntervals.begin(), KeyframeIntervals.end(), value.keyframeSeconds) != KeyframeIntervals.end() &&
+        std::find(FrameRates.begin(), FrameRates.end(), value.framesPerSecond) != FrameRates.end() &&
         value.quality >= 0 && value.quality <= 4;
 }
 inline bool operator==(const Settings& a, const Settings& b) {
     return a.codec == b.codec && a.bitrateMbps == b.bitrateMbps &&
-        a.keyframeSeconds == b.keyframeSeconds && a.quality == b.quality;
+        a.keyframeSeconds == b.keyframeSeconds && a.quality == b.quality && a.framesPerSecond == b.framesPerSecond;
 }
 inline bool operator!=(const Settings& a, const Settings& b) { return !(a == b); }
 inline bool adjust(Settings& value, Field field, int direction, bool allowH265 = true) {
@@ -46,6 +49,9 @@ inline bool adjust(Settings& value, Field field, int direction, bool allowH265 =
             value.keyframeSeconds = KeyframeIntervals[static_cast<std::size_t>((index + step + 4) % 4)];
             break;
         }
+        case Field::FramesPerSecond:
+            value.framesPerSecond = value.framesPerSecond == 30 ? 60 : 30;
+            break;
     }
     return value != before;
 }

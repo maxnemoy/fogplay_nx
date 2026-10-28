@@ -18,7 +18,7 @@ int main(int argc, char** argv) {
     if (!surface || !renderer || !font || !title) return 2;
     {
         fog::ui::Ui ui(renderer,font,title);
-        for (int mode=0; mode<17; ++mode) {
+        for (int mode=0; mode<19; ++mode) {
             SDL_SetRenderDrawColor(renderer,30,53,57,255);
             SDL_RenderClear(renderer);
             ui.text("Синтетический фон трансляции",30,10,1000);
@@ -40,6 +40,15 @@ int main(int argc, char** argv) {
                 overlay.setSaveStatus("Сохранено на SD. Применится при следующем подключении.");
                 if (mode==8) overlay.setVideoChangesEnabled(false);
             }
+            if (mode==17 || mode==18) {
+                if (mode==18) overlay.setProvider(fog::ProviderId::FogHub);
+                overlay.down(); overlay.down(); overlay.select();
+                overlay.down(); overlay.down();
+                if (mode==17) overlay.down();
+                overlay.right();
+                overlay.setVideoStatus(mode==17 ? "МТС · текущий поток: 30 FPS" : "FogHub · текущий поток: 30 FPS");
+                overlay.setSaveStatus("Сохранено на SD. 60 FPS — при следующем подключении.");
+            }
             if (mode>=9 && mode<14) {
                 overlay.up(); overlay.select();
                 overlay.setRumbleSettings({static_cast<fog::rumble::Mode>((mode - 9) % 4)});
@@ -57,7 +66,7 @@ int main(int argc, char** argv) {
                     {"Выйти из аккаунта","FogPlay NX","Удалить сохранённый вход с SD-карты"},
                     {fog::rumble::text::MenuLabel,fog::rumble::text::label(fog::rumble::Mode::DualBand),
                         fog::rumble::text::Description}},5);
-            } else if (mode>=14) {
+            } else if (mode>=14 && mode<=16) {
                 const fog::controller::Settings settings{mode!=16, mode==14 ?
                     ::stream::ControllerProfile::Xbox : ::stream::ControllerProfile::DualSense};
                 ui.setXboxLayout(settings.xbox);

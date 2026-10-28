@@ -40,6 +40,7 @@ short leftY = 0, wheelAmount = 0;
 unsigned char leftTrigger = 0;
 int videoReturned = 0;
 int expectedVideoFormats = VIDEO_FORMAT_H264 | VIDEO_FORMAT_H265;
+int expectedFps = 30;
 int negotiatedFormat = VIDEO_FORMAT_H264;
 int audioBurst = 1;
 std::uint32_t entropy = 1;
@@ -131,7 +132,7 @@ int gs_applist(PSERVER_DATA, PAPP_LIST* list) {
 }
 int gs_start_app(PSERVER_DATA server, PSTREAM_CONFIGURATION config, int app, bool, bool, int mask) {
     assert(app == 42 && mask == 1);
-    assert(config->width == 1280 && config->height == 720 && config->fps == 30);
+    assert(config->width == 1280 && config->height == 720 && config->fps == expectedFps);
     assert(config->supportedVideoFormats == expectedVideoFormats && config->bitrate == 20000);
     ++launches;
     const bool resume = server->currentGame != 0;
@@ -163,7 +164,7 @@ int gs_start_app(PSERVER_DATA server, PSTREAM_CONFIGURATION config, int app, boo
 }
 int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION config, PCONNECTION_LISTENER_CALLBACKS listeners,
     PDECODER_RENDERER_CALLBACKS video, PAUDIO_RENDERER_CALLBACKS audio, void*, int, void*, int) {
-    assert(config->fps == 30 && config->supportedVideoFormats == expectedVideoFormats);
+    assert(config->fps == expectedFps && config->supportedVideoFormats == expectedVideoFormats);
     terminateConnection = listeners->connectionTerminated;
     assert(listeners->rumble);
     rumbleConnection = listeners->rumble;
@@ -174,7 +175,7 @@ int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION config, PCONNEC
     assert(video->setup(negotiatedFormat, 1280, 0, 30, nullptr, 0) != 0);
     assert(video->setup(negotiatedFormat, 1921, 720, 30, nullptr, 0) != 0);
     assert(video->setup(negotiatedFormat, 1280, 1081, 30, nullptr, 0) != 0);
-    assert(video->setup(negotiatedFormat, 1280, 720, 30, nullptr, 0) == 0);
+    assert(video->setup(negotiatedFormat, 1280, 720, config->fps, nullptr, 0) == 0);
     OPUS_MULTISTREAM_CONFIGURATION opus{}; opus.sampleRate = 48000; opus.channelCount = 2;
     opus.streams = 1; opus.coupledStreams = 1; opus.mapping[1] = 1; opus.samplesPerFrame = 240;
     assert(audio->init(AUDIO_CONFIGURATION_STEREO, &opus, nullptr, 0) == 0);
@@ -451,6 +452,39 @@ void networkRecoveryScenarios(const std::filesystem::path& path) {
     currentApp = 0; listedApp = 42;
 }
 
+void frameRateScenarios(const std::filesystem::path& path) {
+    moonlight::MoonlightSession session(path.string());
+    currentApp = 0; listedApp = 42; ambiguousApps = false; failPair = false;
+    pair(session);
+    auto client = session.create(); assert(client);
+    for (const auto codec : {stream::VideoCodec::H264, stream::VideoCodec::H265}) {
+        for (const auto fps : {30, 60}) {
+            fog::video::Settings video; video.codec = codec; video.framesPerSecond = fps;
+            expectedVideoFormats = VIDEO_FORMAT_H264 | (codec == stream::VideoCodec::H265 ? VIDEO_FORMAT_H265 : 0);
+            expectedFps = fps;
+            negotiatedFormat = codec == stream::VideoCodec::H265 ? VIDEO_FORMAT_H265 : VIDEO_FORMAT_H264;
+            assert(client->configureVideo(video));
+            auto invalid = video; invalid.framesPerSecond = 144;
+            assert(!client->configureVideo(invalid));
+            assert(client->start({rental()})); eventually([&] { return client->ready(); });
+            const auto label = "720p" + std::to_string(fps);
+            assert(client->status().find(label) != std::string::npos);
+            assert(client->qualityStatus().find(label) != std::string::npos);
+            assert(client->diagnostics().find("fps=" + std::to_string(fps) + " requestedFps=" + std::to_string(fps)) != std::string::npos);
+            assert(client->updateVideoSettings(video));
+            auto changed = video; changed.framesPerSecond = fps == 30 ? 60 : 30;
+            assert(!client->configureVideo(changed) && !client->updateVideoSettings(changed));
+            assert(client->qualityStatus().find(label) != std::string::npos);
+            assert(client->disconnectForRetry());
+            currentApp = 42;
+            assert(client->start({rental(),true})); eventually([&] { return client->ready(); });
+            assert(client->qualityStatus().find(label) != std::string::npos);
+            client->close(); currentApp = 0;
+        }
+    }
+    expectedFps = 30;
+}
+
 int main() {
     const auto path = std::filesystem::temp_directory_path() / ("fogplay-moonlight-session-test-" + std::to_string(::getpid()));
     {
@@ -563,6 +597,7 @@ int main() {
     retryScenarios(path / "resume-tests");
     networkRecoveryScenarios(path / "network-recovery-tests");
     rumbleScenarios(path / "rumble-tests");
+    frameRateScenarios(path / "frame-rate-tests");
     std::filesystem::remove_all(path);
     std::cout << "Moonlight production lifecycle/input tests passed\n";
 }

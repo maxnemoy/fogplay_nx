@@ -2,6 +2,7 @@
 #include "features/streaming/infrastructure/media_frame_queue.hpp"
 #include "features/streaming/domain/audio_latency_policy.hpp"
 #include "features/streaming/domain/audio_recovery.hpp"
+#include "features/streaming/domain/frame_cadence.hpp"
 #include <SDL.h>
 #include <opus/opus.h>
 extern "C" {
@@ -232,6 +233,48 @@ static void pacing() {
     }
     check(uploaded >= 89 && uploaded <= 90, "60 Hz VSYNC jitter degraded anchored 30 fps pacing");
     std::cout << "Pacing: " << uploaded << " uploads / 180 jittered 60 Hz refreshes (30 fps target)\n";
+    queue.reset(60); dropped = 0;
+    queue.push({}, 0xfffffff0, now);
+    queue.push({}, 0xfffffff0 + std::uint32_t(1500), now);
+    queue.push({}, 0xfffffff0 + std::uint32_t(3000), now);
+    check(queue.take(frame, now, dropped) && !queue.take(frame, now + 15ms, dropped) &&
+        queue.take(frame, now + 17ms, dropped) && queue.take(frame, now + 34ms, dropped),
+        "sixty FPS RTP wrap or cadence failed");
+    queue.reset(60); dropped = 0;
+    for (int i = 0; i < 12; ++i) dropped += queue.push({}, i * 1500, now);
+    check(queue.size() == 3 && dropped == 9 && queue.take(frame, now, dropped) &&
+        !queue.take(frame, now + 15ms, dropped), "sixty FPS burst exceeded bound or bypassed cadence");
+    check(queue.take(frame, now + 1s, dropped) && dropped == 10 && queue.size() == 0,
+        "sixty FPS stall retained a stale queue");
+    queue.reset(60); uploaded = received = 0;
+    for (unsigned refresh = 0; refresh < 180; ++refresh) {
+        const auto refreshTime = now + std::chrono::nanoseconds(
+            static_cast<std::int64_t>(refresh) * 16666667 + jitter[refresh % jitter.size()]);
+        const auto arrival = now + std::chrono::nanoseconds(static_cast<std::int64_t>(received) * 16666667) - 5ms;
+        queue.push({}, received++ * 1500, arrival);
+        if (queue.take(frame, refreshTime, dropped)) ++uploaded;
+    }
+    check(uploaded == 180 && queue.size() == 0, "sixty FPS jitter accumulated frames or halved upload rate");
+    std::cout << "Pacing: " << uploaded << " uploads / 180 jittered 60 Hz refreshes (60 fps target)\n";
+
+    fog::FrameCadence cadence;
+    check(cadence.due(now) && cadence.due(now + 1ns), "legacy cadence unexpectedly paced callers");
+    for (const int fps : {30, 60}) {
+        cadence.configure(fps);
+        const auto interval = std::chrono::nanoseconds(1000000000 / fps);
+        check(cadence.due(now), "first synchronous frame was delayed");
+        cadence.uploaded(now);
+        check(!cadence.due(now + interval - 2ms) && cadence.due(now + interval - 1ms),
+            "synchronous cadence tolerance changed");
+        // A failed/empty probe does not reserve another presentation slot.
+        check(cadence.due(now + interval), "probe advanced cadence without upload");
+        cadence.uploaded(now + interval - 200us);
+        check(cadence.due(now + interval * 2 - 200us), "jitter moved synchronous cadence phase");
+        cadence.uploaded(now + 10s);
+        check(!cadence.due(now + 10s + interval - 2ms), "long stall caused an immediate extra synchronous upload");
+        cadence.reset();
+        check(cadence.due(now + 10s), "decoder reset retained old synchronous phase");
+    }
 }
 static std::uint64_t metric(const std::string& text, const char* name) {
     const auto at = text.find(std::string(name) + "=");
@@ -331,11 +374,17 @@ static void audioCatchup(SDL_Renderer* renderer) {
     std::cout << "Audio catchup: " << text << "; all " << expected.size()
         << " decoded PCM hashes match continuous reference Opus\n";
 }
-static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units) {
+static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units, int fps) {
     Client client;
     // Negotiation selects H264 although construction preferred H265.
     fog::Media media(renderer, stream::VideoCodec::H265, true);
-    media.startWorkers(client, 30);
+    media.setPresentationFrameRate(fps);
+    const auto previousHevcOpens = hevcOpens.load();
+    media.startWorkers(client, fps);
+    bool rejectedLiveRate = false;
+    try { media.setPresentationFrameRate(fps); }
+    catch (const std::logic_error&) { rejectedLiveRate = true; }
+    check(rejectedLiveRate, "running workers accepted an application-side FPS mutation");
     struct ReleaseGate {
         ~ReleaseGate() { blockSend = false; gate.notify_all(); }
     } releaseGate;
@@ -358,7 +407,9 @@ static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units) {
     check(media.draw() && media.uploadedFrames() == 1, "reset epoch lost new output or uploaded stale output");
     check(media.videoWidth() == 1280 && media.videoHeight() == 720, "720p worker output dimensions changed");
     check(media.diagnostics().find("codec=h264") != std::string::npos, "negotiated H264 fallback was ignored");
-    check(hevcOpens == 1, "latest codec command was ignored during blocked decode");
+    check(hevcOpens == previousHevcOpens, "latest codec command was ignored during blocked decode");
+    check(media.diagnostics().find("presentation_fps=" + std::to_string(fps)) != std::string::npos,
+        "configured worker frame rate missing from diagnostics");
     check(media.diagnostics().find("video_worker_queue_samples=0") == std::string::npos &&
         media.audioDiagnostics().find("audio_worker_queue_samples=0") == std::string::npos,
         "worker dequeue wait was not measured");
@@ -396,7 +447,7 @@ static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units) {
     const auto polls = client.polls.load();
     std::this_thread::sleep_for(10ms);
     check(client.polls == polls, "transport accessed after worker join");
-    for (unsigned i = 0; i < 8; ++i) { media.startWorkers(client, 30); media.stopWorkers(); }
+    for (unsigned i = 0; i < 8; ++i) { media.startWorkers(client, fps); media.stopWorkers(); }
     check(!wrongThread, "codec/scale/texture thread affinity violated");
 }
 static void audioRecoveryPolicy() {
@@ -538,7 +589,8 @@ int main(int argc, char** argv) {
     if (!renderer) return 4;
     int result = 0;
     try { pacing(); audioPolicy(); audioRecoveryPolicy(); audioRecoverySync(renderer); audioCatchup(renderer);
-        const auto units = load(argv[1]); workers(renderer, units); audioRecoveryWorkerBacklog(renderer); audioRecoveryWorker(renderer, units); }
+        const auto units = load(argv[1]); workers(renderer, units, 30); workers(renderer, units, 60);
+        audioRecoveryWorkerBacklog(renderer); audioRecoveryWorker(renderer, units); }
     catch (const std::exception& error) { blockSend = false; gate.notify_all(); std::cerr << error.what() << '\n'; result = 1; }
     SDL_DestroyRenderer(renderer); SDL_FreeSurface(surface); SDL_Quit();
     if (!result) std::cout << "Media workers PASS: real 720p30 H264/Opus, blocked-codec UI/audio independence, affinity, H264 negotiation fallback, reset/codec commands and generations, isolated/persistent audio recovery, decoder/output fault injection, dequeue timings, bounded RTP pacing, repeated joined shutdown\n";

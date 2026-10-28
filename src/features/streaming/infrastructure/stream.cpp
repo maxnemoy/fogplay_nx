@@ -14,6 +14,7 @@
 #include "features/streaming/infrastructure/timed_mutex.hpp"
 #include "features/streaming/infrastructure/stream_route.hpp"
 #include "features/streaming/domain/auto_quality.hpp"
+#include "features/streaming/domain/resolution_scale.hpp"
 #include "features/streaming/domain/route_snapshot_schedule.hpp"
 #include <functional>
 #include <limits>
@@ -29,6 +30,21 @@
 namespace stream {
 using Clock = std::chrono::steady_clock;
 using Json = protocol::Json;
+static std::optional<ResolutionScale::Table> resolutionTable(const Json& message) {
+    const auto entries = message.find("resolutions");
+    if (entries == message.end() || !entries->is_array() || entries->empty() ||
+        entries->size() > ResolutionScale::MaxEntries) return std::nullopt;
+    ResolutionScale::Table table;
+    table.reserve(entries->size());
+    for (const auto& entry : *entries) {
+        if (!entry.is_array() || entry.size() != 2 ||
+            !entry[0].is_number_integer() || !entry[1].is_number_integer() ||
+            entry[0] < 0 || entry[0] > 16384 || entry[1] < 0 || entry[1] > 16384) return std::nullopt;
+        table.push_back({entry[0].get<int>(), entry[1].get<int>()});
+    }
+    if (!ResolutionScale::valid(table)) return std::nullopt;
+    return table;
+}
 // Fixed-size, application-thread counters. Scopes can nest (events/quality may
 // flush control); measurements include waiting/preemption, not only CPU work.
 struct TransportStageTiming {
@@ -138,6 +154,9 @@ struct Client::Impl {
         MediaQueue media;
         TransportHistory transportHistory;
         IncomingControl incoming;
+        std::optional<ResolutionScale::Table> resolutions;
+        bool resolutionsPending = false;
+        std::uint64_t invalidResolutionTables = 0;
         IncomingControlDiagnostics incomingEvents;
         RumbleMailbox rumble;
         std::shared_ptr<AsyncControlSender> controlSender;
@@ -311,6 +330,14 @@ struct Client::Impl {
                 if (stopped) return;
                 lastControlMs = videoNow();
                 incoming.receive(message, lastControlMs + qualityTimeOffset);
+                if (message.kind == IncomingControl::Kind::Stats && message.data.contains("resolutions")) {
+                    if (auto table = resolutionTable(message.data)) {
+                        if (!resolutions || *resolutions != *table) {
+                            resolutions = std::move(table);
+                            resolutionsPending = true;
+                        }
+                    } else ++invalidResolutionTables;
+                }
                 try {
                     auto description = message.diagnostic;
                     const auto classification = std::string(" parsed=") + IncomingControl::kindName(message.kind);
@@ -592,6 +619,8 @@ struct Client::Impl {
     double receiveMbps = 0;
     quality::Telemetry serverStats;
     quality::Controller autoQuality;
+    ResolutionScale resolutionScale;
+    std::uint64_t invalidResolutionTables = 0;
     std::deque<std::string> qualityEvents;
     void qualityEvent(std::string event) {
         if (qualityEvents.size() >= 32) qualityEvents.pop_front();
@@ -604,10 +633,10 @@ struct Client::Impl {
         const auto now = qualityNow();
         char numbers[650];
         std::snprintf(numbers, sizeof(numbers),
-            " codec=%s requestedCodec=%s capMbps=%d quality=%d pliSeconds=%d receiveMbps=%.3f serverTargetMbps=%.3f targetAgeMs=%lld serverPreset=%s presetAgeMs=%lld statsCount=%llu statsAgeMs=%lld serverAuto=%d autoAgeMs=%lld serverFps=%.2f fpsAgeMs=%lld serverCodec=%s codecAgeMs=%lld qualityRequests=%u qualityPending=%d",
+            " codec=%s requestedCodec=%s capMbps=%d quality=%d pliSeconds=%d requestedFps=%d receiveMbps=%.3f serverTargetMbps=%.3f targetAgeMs=%lld serverPreset=%s presetAgeMs=%lld statsCount=%llu statsAgeMs=%lld serverAuto=%d autoAgeMs=%lld serverFps=%.2f fpsAgeMs=%lld serverCodec=%s codecAgeMs=%lld qualityRequests=%u qualityPending=%d",
             selectedCodec == VideoCodec::H265 ? "H265" : "H264",
             videoSettings.codec == VideoCodec::H265 ? "H265" : "H264", videoSettings.bitrateMbps,
-            videoSettings.quality, videoSettings.keyframeSeconds, receiveMbps,
+            videoSettings.quality, videoSettings.keyframeSeconds, videoSettings.framesPerSecond, receiveMbps,
             serverStats.targetMbps.known ? serverStats.targetMbps.value : -1,
             static_cast<long long>(serverStats.targetMbps.age(now)), quality::name(serverStats.profile.value),
             static_cast<long long>(serverStats.profile.age(now)), static_cast<unsigned long long>(serverStats.count),
@@ -616,7 +645,11 @@ struct Client::Impl {
             static_cast<long long>(serverStats.automatic.age(now)), serverStats.fps.known ? serverStats.fps.value : -1,
             static_cast<long long>(serverStats.fps.age(now)), serverStats.codec.known ? serverStats.codec.value.c_str() : "unknown",
             static_cast<long long>(serverStats.codec.age(now)), qualityRequests, qualityPending ? 1 : 0);
-        return std::string(numbers) + autoQuality.diagnostics();
+        return std::string(numbers) + autoQuality.diagnostics() +
+            " scaleTarget=1280x720 scaleAttempts=" + std::to_string(resolutionScale.attempts()) +
+            " scaleQueued=" + std::to_string(resolutionScale.accepted()) +
+            " scaleRejected=" + std::to_string(resolutionScale.rejected()) +
+            " scaleInvalidTables=" + std::to_string(invalidResolutionTables);
     }
     void readQualityStats(const quality::Telemetry& data) {
         // Each valid optional field owns its timestamp. Empty/malformed extensions
@@ -647,6 +680,21 @@ struct Client::Impl {
         } catch (const std::exception&) {
             // Keep retryable UI changes separate from terminal streaming errors.
         }
+    }
+    void applyResolution() {
+        // Quality is enqueued first on the same ordered control channel. The
+        // 720p probe preserves the chosen Auto/manual profile and never repeats
+        // merely because later stats or quality feedback arrive.
+        if (qualityPending || !channelOpen || !routeAllowed()) return;
+        const auto preset = resolutionScale.pending();
+        if (!preset) return;
+        bool accepted = false;
+        try { accepted = control(Json{{"id", "apply_scale"}, {"preset", *preset}, {"enabled", *preset != 0}}.dump()); }
+        catch (...) {}
+        resolutionScale.submitted(accepted);
+        qualityEvent("scaleEvent=request target=1280x720 preset=" + std::to_string(*preset) +
+            " enabled=" + std::to_string(*preset != 0) + " queued=" + std::to_string(accepted) +
+            " actual=observe-decoded-video");
     }
     std::string finalVideoDiagnostics, finalTransportDiagnostics, finalQueueDiagnostics, finalGapDiagnostics;
     std::string finalMutexDiagnostics;
@@ -1051,7 +1099,7 @@ struct Client::Impl {
         });
         state = "Waiting for offer";
         operation = "init.send-request";
-        signal({{"id", "init_webrtc"}, {"client_hash", clientHash}, {"limit_fps", 30},
+        signal({{"id", "init_webrtc"}, {"client_hash", clientHash}, {"limit_fps", videoSettings.framesPerSecond},
                 {"control_only", false}, {"iceTransportPolicy", relay ? "relay" : "all"}, {"gamepad", true}, {"isPS", playStation}});
     }
     void candidate(const Json& candidate) {
@@ -1436,6 +1484,7 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
     i.shared = std::make_shared<Impl::Shared>();
     i.started = i.lastWs = i.lastHeartbeat = i.lastPli = i.rateAt = Clock::now();
     i.running = true; i.state = "Opening signaling";
+    i.autoQuality.configureFramesPerSecond(i.videoSettings.framesPerSecond);
     i.autoQuality.enable(i.videoSettings.quality == 0, i.qualityNow());
     try {
         rtc::WebSocketConfiguration config;
@@ -1471,6 +1520,7 @@ void Client::pump() {
     { TransportStageScope timing{i.nackTiming}; i.shared->sendNacks(); }
     bool eventOverflow, callbackFailure, needsPli, statsPending;
     quality::Telemetry stats;
+    std::optional<ResolutionScale::Table> resolutions;
     Clock::time_point lastVideo;
     std::deque<Impl::Event> events;
     try {
@@ -1488,6 +1538,11 @@ void Client::pump() {
             i.rateKnown = true;
         }
         statsPending = i.shared->incoming.takeStats(stats, i.qualityNow());
+        i.invalidResolutionTables = i.shared->invalidResolutionTables;
+        if (i.shared->resolutionsPending) {
+            resolutions = i.shared->resolutions;
+            i.shared->resolutionsPending = false;
+        }
         for (const auto& event : i.shared->events)
             i.shared->eventDelayHighMs = std::max(i.shared->eventDelayHighMs, videoNow() - event.arrivedMs);
         events.swap(i.shared->events); i.shared->eventBytes = 0;
@@ -1521,6 +1576,11 @@ void Client::pump() {
             if (!transportFailure.empty()) throw TransportError(transportFailure.c_str(), true);
             if (!i.pendingTransportFailure.empty()) throw TransportError(i.pendingTransportFailure.c_str(), true);
             if (statsPending) i.readQualityStats(stats);
+            if (resolutions && i.resolutionScale.observe(std::move(*resolutions))) {
+                const auto preset = i.resolutionScale.preset();
+                i.qualityEvent("scaleEvent=table target=1280x720 preset=" +
+                    (preset ? std::to_string(*preset) : std::string("unavailable")));
+            }
         }
         if (i.closingForRetry) return;
         // New proof/state changes win over the unproven-route deadline, even
@@ -1540,6 +1600,7 @@ void Client::pump() {
             TransportStageScope timing{i.qualityTiming};
             i.openChannel(); // A pending channel may now have a verified TURN route.
             i.applyQuality();
+            i.applyResolution();
         }
         i.flushControl();
         const auto now = Clock::now();
@@ -1637,7 +1698,7 @@ bool Client::configureController(ControllerProfile profile) {
 }
 bool Client::updateVideoSettings(const fog::video::Settings& settings) {
     if (!impl_->running || !impl_->channelOpen || !fog::video::valid(settings) ||
-        settings.codec != impl_->videoSettings.codec) return false;
+        settings.codec != impl_->videoSettings.codec || settings.framesPerSecond != impl_->videoSettings.framesPerSecond) return false;
     const bool remoteChanged = settings.bitrateMbps != impl_->videoSettings.bitrateMbps ||
                                settings.quality != impl_->videoSettings.quality;
     impl_->videoSettings = settings;
@@ -1656,6 +1717,7 @@ std::string Client::qualityStatus() const {
     char rates[160];
     std::snprintf(rates, sizeof(rates), "%.1f Мбит/с", i.receiveMbps);
     std::string result = i.remoteSet ? (i.selectedCodec == VideoCodec::H265 ? "H.265" : "H.264") : "Кодек: подключение";
+    result += " · Запрос: " + std::to_string(i.videoSettings.framesPerSecond) + " FPS";
     result += " · Приём: " + (i.rateKnown ? std::string(rates) : std::string("ожидание"));
     const auto now = i.qualityNow();
     result += "\nСервер: " + std::string(quality::name(i.serverStats.profile.value));
@@ -1878,8 +1940,12 @@ bool Client::sendGamepad(const Gamepad& state) {
     try {
         if (impl_->controlSender->snapshot().stalled) { if (impl_->playStation) ++impl_->psUnavailableFrames; return false; }
         const auto payload = protocol::gamepad(state, impl_->playStation).dump();
-        if (impl_->playStation) return impl_->controlSender->enqueueGamepad(payload, state.buttons[17] != 0);
-        return impl_->control(payload, ControlQueue::Mode::Gamepad);
+        std::uint32_t buttons = 0;
+        for (std::size_t i = 0; i < state.buttons.size(); ++i)
+            if (state.buttons[i]) buttons |= std::uint32_t{1} << i;
+        if (std::isfinite(state.leftTrigger) && state.leftTrigger > 0) buttons |= std::uint32_t{1} << 18;
+        if (std::isfinite(state.rightTrigger) && state.rightTrigger > 0) buttons |= std::uint32_t{1} << 19;
+        return impl_->controlSender->enqueueGamepad(payload, buttons, impl_->playStation);
     }
     catch (const TransportError& error) {
         // Public send may run before pump. Examine queued terminal signaling first.
@@ -1899,7 +1965,8 @@ bool Client::sendControl(const std::string& json) {
     if (!data.is_object()) return false;
     auto mode = ControlQueue::Mode::Ordered;
     std::string input, release;
-    bool psGamepad = false, psTouchDown = false;
+    bool gamepad = false;
+    std::uint32_t gamepadButtons = 0;
     unsigned nativeInput = 0;
     const auto id = data.find("id");
     if (id != data.end() && id->is_string()) {
@@ -1943,13 +2010,23 @@ bool Client::sendControl(const std::string& json) {
             const auto playStation = data.find("isPS");
             if (playStation == data.end() || !playStation->is_boolean() || *playStation != impl_->playStation) return false;
             mode = ControlQueue::Mode::Gamepad;
-            if (impl_->playStation) {
-                const auto state = data.find("state");
-                if (state == data.end() || !state->is_object()) return false;
-                const auto buttons = state->find("buttons");
-                if (buttons == state->end() || !buttons->is_array() || buttons->size() != 18 || !(*buttons)[17].is_number()) return false;
-                psGamepad = true; psTouchDown = (*buttons)[17].get<double>() != 0;
+            const auto state = data.find("state");
+            if (state == data.end() || !state->is_object()) return false;
+            const auto buttons = state->find("buttons");
+            if (buttons == state->end() || !buttons->is_array() || buttons->size() != 18) return false;
+            for (std::size_t i = 0; i < buttons->size(); ++i) {
+                const auto& value = (*buttons)[i];
+                if (!value.is_number() || (value != 0 && value != 1)) return false;
+                if (value == 1) gamepadButtons |= std::uint32_t{1} << i;
             }
+            for (const auto& trigger : {std::pair<const char*, unsigned>{"leftTrigger", 18}, {"rightTrigger", 19}}) {
+                const auto value = state->find(trigger.first);
+                if (value == state->end() || !value->is_number()) return false;
+                const auto amount = value->get<double>();
+                if (!std::isfinite(amount) || amount < 0 || amount > 1) return false;
+                if (amount > 0) gamepadButtons |= std::uint32_t{1} << trigger.second;
+            }
+            gamepad = true;
         }
         else if (name == "mousemove") mode = ControlQueue::Mode::MouseMove;
         else if (name == "keyup" || name == "mouseup") mode = ControlQueue::Mode::Release;
@@ -1971,7 +2048,8 @@ bool Client::sendControl(const std::string& json) {
     try {
         if (nativeInput != 0) return impl_->controlSender && !impl_->controlSender->snapshot().stalled &&
             impl_->controlSender->enqueueNative(json, mode, input, release, nativeInput);
-        if (psGamepad) return impl_->controlSender && !impl_->controlSender->snapshot().stalled && impl_->controlSender->enqueueGamepad(json, psTouchDown);
+        if (gamepad) return impl_->controlSender && !impl_->controlSender->snapshot().stalled &&
+            impl_->controlSender->enqueueGamepad(json, gamepadButtons, impl_->playStation);
         return impl_->control(json, mode, input, release);
     }
     catch (const TransportError& error) {

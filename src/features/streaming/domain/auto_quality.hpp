@@ -66,6 +66,15 @@ enum class Action { None, Enhance, Degrade };
 inline const char* command(Action value) { return value == Action::Enhance ? "enhancequality" : "degradequality"; }
 class Controller {
 public:
+    bool configureFramesPerSecond(int value) {
+        if (value != 30 && value != 60) return false;
+        if (framesPerSecond_ != value) {
+            framesPerSecond_ = value;
+            sampled_ = stable_ = false;
+            queueWindows_ = deliveryWindows_ = audioWindows_ = 0;
+        }
+        return true;
+    }
     void enable(bool enabled, std::uint64_t now) {
         if (enabled_ == enabled) return;
         enabled_ = enabled; pending_ = Action::None; sampled_ = false; stable_ = false;
@@ -128,7 +137,8 @@ public:
         if (!server.profile.fresh(now)) { stable_ = false; queueWindows_ = deliveryWindows_ = audioWindows_ = 0; decide("profile-stale", now); return Action::None; }
         if (pending_ != Action::None) { stable_ = false; queueWindows_ = deliveryWindows_ = audioWindows_ = 0; decide("await-confirmation", now); return Action::None; }
         if (!dimensions) { stable_ = false; queueWindows_ = deliveryWindows_ = audioWindows_ = 0; decide("dimensions", now); return Action::None; }
-        const double expected = server.fps.fresh(now) ? std::min(30.0, server.fps.value) : 30.0;
+        const double expected = server.fps.fresh(now) ? std::min(static_cast<double>(framesPerSecond_), server.fps.value) : framesPerSecond_;
+        const double frameBudgetScale = 30.0 / framesPerSecond_;
         queueWindows_ = sustainedQueue ? std::min(queueWindows_ + 1, 2u) : 0;
         // Low source FPS alone may be a static scene. A local delivery shortfall
         // needs decoded supply or substantial measured superseding, and must
@@ -140,7 +150,7 @@ public:
         const bool audioLoss = audioDropped >= 2 || audioUnderruns >= 2;
         audioWindows_ = contiguous && !audioResets && audioLoss ? std::min(audioWindows_ + 1, 2u) : 0;
         const bool deliveryTrouble = deliveryWindows_ >= 2, audioTrouble = audioWindows_ >= 2;
-        const bool overloaded = decoded && (busy_ >= 0.85 || (workMs_ >= 30 && fps_ < expected * 0.8));
+        const bool overloaded = decoded && (busy_ >= 0.85 || (workMs_ >= 30 * frameBudgetScale && fps_ < expected * 0.8));
         const bool damaged = errors >= 2 || (errors && fps_ < expected * 0.8) ||
             missing >= 8 || recoveries >= 2 || pressure || queueWindows_ >= 2;
         if (overloaded || damaged || deliveryTrouble || audioTrouble) {
@@ -156,7 +166,7 @@ public:
             !superseded && !audioDropped && !audioUnderruns && !audioResets &&
             // Brief young batches are normal, but every healthy window
             // must demonstrate that old queued video was actually drained.
-            oldest <= 100 && !sustainedQueue && frames && fps_ >= expected * 0.85 && workMs_ <= 20 && busy_ < 0.65 &&
+            oldest <= 100 && !sustainedQueue && frames && fps_ >= expected * 0.85 && workMs_ <= 20 * frameBudgetScale && busy_ < 0.65 &&
             server.fps.fresh(now);
         if (!healthy) { stable_ = false; decide(contiguous ? "insufficient-headroom" : "recovery-window", now); return Action::None; }
         if (server.profile.value == Profile::High || server.profile.value == Profile::Ultra) {
@@ -182,8 +192,8 @@ public:
     double fps() const { return fps_; }
     std::string diagnostics() const {
         char out[640];
-        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u",
-            enabled_, reason_, pending(), fps_, decodedFps_, workMs_, busy_, attemptsUp_, attemptsDown_, downgradeStreak_,
+        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d autoTargetFps=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u",
+            enabled_, reason_, pending(), framesPerSecond_, fps_, decodedFps_, workMs_, busy_, attemptsUp_, attemptsDown_, downgradeStreak_,
             static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_);
         return out;
     }
@@ -244,6 +254,7 @@ private:
     bool lagging_ = false;
     std::uint64_t lagSince_ = 0, maxOldestVideoMs_ = 0;
     Sample base_;
+    int framesPerSecond_ = 30;
     double fps_ = 0, decodedFps_ = 0, workMs_ = 0, busy_ = 0;
     const char* reason_ = "manual";
     std::deque<std::string> events_;

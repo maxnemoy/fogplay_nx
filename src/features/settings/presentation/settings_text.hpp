@@ -18,6 +18,9 @@ inline std::string videoKeyframeLabel(const video::Settings& value) {
     return value.keyframeSeconds ? constants::ui::Settings::KeyframeIntervalPrefix + std::to_string(value.keyframeSeconds) +
         constants::ui::Settings::KeyframeIntervalSuffix : constants::ui::Settings::KeyframesOnLoss;
 }
+inline std::string videoFrameRateLabel(const video::Settings& value) {
+    return std::to_string(value.framesPerSecond) + " FPS";
+}
 inline std::string connectionModeLabel(const connection::Settings& value) {
     if (value.mode == connection::Mode::Auto) return constants::ui::Settings::AutoQuality;
     if (value.mode == connection::Mode::Relay) return constants::ui::Settings::RelayMode;
