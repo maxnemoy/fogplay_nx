@@ -69,6 +69,8 @@ public:
     }
     bool push(Packet packet, std::uint64_t now) {
         expireAudio(now);
+        // Queue residence starts after assembly. Preserve firstPacketMs through
+        // admission so repair/reordering remains part of receive-to-present age.
         packet.enqueueMs = now;
         const auto size = packet.data.size();
         if (packet.kind == Kind::Video) {

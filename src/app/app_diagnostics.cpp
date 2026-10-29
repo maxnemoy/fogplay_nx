@@ -10,13 +10,31 @@
 
 namespace fogplay::diagnostics {
 fog::RunLog runLog;
-PlaybackTiming diagnosticTiming;
 namespace {
+std::mutex diagnosticMutex;
+PlaybackTiming diagnosticTiming;
 bool logFailureReported = false, logStarted = false, uiPresented = false;
 std::chrono::steady_clock::time_point startupAt = std::chrono::steady_clock::now();
 std::mutex startupMutex;
 std::vector<std::string> startupLines;
 unsigned startupDropped = 0;
+}
+
+PlaybackTiming diagnosticTimingSnapshot() {
+    std::lock_guard<std::mutex> lock(diagnosticMutex);
+    return diagnosticTiming;
+}
+
+PlaybackTiming takeDiagnosticTiming() {
+    std::lock_guard<std::mutex> lock(diagnosticMutex);
+    const auto result = diagnosticTiming;
+    diagnosticTiming = {};
+    return result;
+}
+
+void resetDiagnosticTiming() {
+    std::lock_guard<std::mutex> lock(diagnosticMutex);
+    diagnosticTiming = {};
 }
 
 std::string safeText(std::string text, std::size_t maximum) {
@@ -42,7 +60,9 @@ void diagnostic(const std::string& text, std::size_t maximum) {
             return;
         }
     }
-    if (!runLog.append(line) && !logFailureReported) {
+    const bool accepted = runLog.append(line);
+    std::lock_guard<std::mutex> lock(diagnosticMutex);
+    if (!accepted && !logFailureReported) {
         logFailureReported = true;
         runLog.append("[log warning] " + runLog.error());
     }

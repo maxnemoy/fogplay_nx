@@ -1,4 +1,6 @@
 #pragma once
+#include "core/diagnostics/latency_histogram.hpp"
+#include "core/diagnostics/thread_observation.hpp"
 #include "features/streaming/infrastructure/control_queue.hpp"
 #include <chrono>
 #include <condition_variable>
@@ -46,7 +48,7 @@ public:
     }
     // The Switch has digital triggers. Bits 0..17 identify buttons, 18/19 the
     // pressed triggers; sticks may change freely while this signature is equal.
-    bool enqueueGamepad(std::string payload, std::uint32_t buttons, bool playStation = false) {
+    bool enqueueGamepad(std::string payload, std::uint32_t buttons, bool playStation = false, std::uint64_t sampledAtUs = 0) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (buttons & ~std::uint32_t{0xfffff}) return false;
         if (playStation) ++stats_.psFrames;
@@ -57,7 +59,7 @@ public:
         const bool releases = (acceptedButtons_ & ~buttons) != 0;
         const auto mode = !edge ? Mode::Gamepad : buttons == 0 ? Mode::GamepadNeutral :
             releases ? Mode::GamepadRelease : Mode::GamepadEdge;
-        const bool accepted = enqueueLocked(std::move(payload), mode, {}, {}, {playStation, touchDown, touchEdge, sequence});
+        const bool accepted = enqueueLocked(std::move(payload), mode, {}, {}, {playStation, touchDown, touchEdge, sequence, 0, sampledAtUs});
         if (accepted) {
             acceptedButtons_ = buttons;
             if (edge) ++stats_.buttonQueuedEdges;
@@ -94,7 +96,7 @@ public:
     }
 private:
     bool enqueueLocked(std::string payload, Mode mode, std::string input, std::string release,
-                       ControlQueue::InputTrace trace = {false, false, false, 0, 0}) {
+                       ControlQueue::InputTrace trace = {false, false, false, 0, 0, 0}) {
         if (stopping_ || stalled_ || failure_ != Failure::None) return false;
         if (mode == Mode::Pong) {
             if (payload.size() > 64 * 1024) { ++pongRejected_; return false; }
@@ -116,6 +118,11 @@ public:
     void allow(bool allowed) {
         std::lock_guard<std::mutex> lock(mutex_);
         allowed_ = allowed; condition_.notify_one();
+    }
+    std::string inputLatencyDiagnostics() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return "provider=MTS scope=rolling-5s boundary=pad-to-send-return accepted-only=1 " +
+            inputLatency_.text(fog::metrics::steadyNowUs());
     }
     Snapshot snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -191,11 +198,14 @@ private:
         try { send_(message.payload); }
         catch (const std::runtime_error&) { failure = Failure::Transport; }
         catch (...) { failure = Failure::Unexpected; }
+        const auto completedUs = fog::metrics::steadyNowUs();
         const auto elapsed = micros(Clock::now() - began);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ++stats_.sendCalls; stats_.sendTotalUs += elapsed;
             recordInputSend(message.trace, failure == Failure::None);
+            if (failure == Failure::None && message.trace.sampledAtUs && completedUs >= message.trace.sampledAtUs)
+                inputLatency_.record(completedUs - message.trace.sampledAtUs, completedUs);
             stats_.sendMaxUs = std::max(stats_.sendMaxUs, elapsed);
             if (failure == Failure::None) {
                 ++stats_.sent;
@@ -235,7 +245,7 @@ private:
             shutdownSend(neutral_, trace);
         }
     }
-    bool shutdownSend(const std::string& payload, ControlQueue::InputTrace trace = {false, false, false, 0, 0}) noexcept {
+    bool shutdownSend(const std::string& payload, ControlQueue::InputTrace trace = {false, false, false, 0, 0, 0}) noexcept {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             // A concurrent retry seal may revoke best-effort release permission.
@@ -283,6 +293,7 @@ private:
         }
     }
     void run() noexcept {
+        fog::diagnostics::observeThread("control-sender");
         try {
             std::unique_lock<std::mutex> lock(mutex_);
             while (!stopping_) {
@@ -346,6 +357,7 @@ private:
     std::deque<ControlQueue::Message> pongs_;
     std::map<std::string, ControlQueue::Message> held_;
     Snapshot stats_;
+    fog::metrics::LatencyHistogram inputLatency_;
     Failure failure_ = Failure::None;
     mutable bool stalled_ = false;
     bool transportActive_ = false;

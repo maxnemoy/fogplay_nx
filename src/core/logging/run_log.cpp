@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "core/logging/run_log.hpp"
+#include "core/diagnostics/thread_observation.hpp"
 #include <cerrno>
 #include <algorithm>
 #include <chrono>
@@ -332,6 +333,10 @@ bool RunLog::append(const std::string& preparedLine) noexcept {
     ready_.notify_one();
     return accepted && archiveHealthy() && mirrorHealthy();
 }
+void RunLog::requestFlush() noexcept {
+    { std::lock_guard<std::mutex> lock(mutex_); if (!running_ || stopping_) return; ++requestedBarrier_; }
+    ready_.notify_one();
+}
 bool RunLog::flush() noexcept {
     std::unique_lock<std::mutex> lock(mutex_);
     if (!running_ || stopping_) return false;
@@ -341,6 +346,7 @@ bool RunLog::flush() noexcept {
     return completedBarrier_ >= barrier && !errorOperation_ && !stats_.droppedLines && archiveHealthy() && mirrorHealthy();
 }
 void RunLog::writer() noexcept {
+        fog::diagnostics::observeThread("runlog");
     using Clock = std::chrono::steady_clock;
     std::size_t inFlightLines = 0;
     try {

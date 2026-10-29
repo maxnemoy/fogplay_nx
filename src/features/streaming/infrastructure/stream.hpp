@@ -58,6 +58,9 @@ public:
     std::string rtcpDiagnostics() const override;
     // Local queue/RTC acceptance, scoped to this transport generation. No remote input ACK exists.
     std::string inputDiagnostics() const override;
+    std::string inputLatencyDiagnostics() const override;
+    std::string serverPerformanceDiagnostics() const override;
+    std::string controlDeliveryDiagnostics() const override;
     bool pollVideoDiagnostic(std::string& event) override;
     bool pollControlDiagnostic(std::string& event, bool final = false) override;
     bool waitingForVideoKeyframe() const override;

@@ -82,10 +82,17 @@ void imageSettings(fog::stream::Overlay& overlay) {
     overlay.openMenu(); overlay.down(); overlay.down(); overlay.select();
     require(overlay.mode() == OverlayMode::ImageSettings && overlay.selection() == 1, "MTS image opens on editable quality");
     require(overlay.videoSettings().codec == ::stream::VideoCodec::H265, "fresh overlay defaults to H265");
-    require(overlay.left().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 4,
-        "MTS quality backward wrap");
-    require(overlay.right().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 0,
-        "MTS quality wraps to auto");
+    require(overlay.left().type == OverlayActionType::None && overlay.mode() == OverlayMode::QualitySelect &&
+        overlay.selection() == 0 && overlay.videoSettings().quality == 0, "MTS quality left opens picker without applying");
+    require(overlay.left().type == OverlayActionType::None && overlay.selection() == 4 &&
+        overlay.videoSettings().quality == 0, "quality backward wrap only changes candidate");
+    require(overlay.select().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 4,
+        "quality applies once after confirmation");
+    require(overlay.right().type == OverlayActionType::None && overlay.mode() == OverlayMode::QualitySelect &&
+        overlay.selection() == 4, "quality right reopens current value");
+    require(overlay.right().type == OverlayActionType::None && overlay.selection() == 0 &&
+        overlay.select().type == OverlayActionType::SettingsChanged && overlay.videoSettings().quality == 0,
+        "quality wraps to auto and applies only after confirmation");
     overlay.down();
     require(overlay.select().type == OverlayActionType::SettingsChanged && overlay.videoSettings().bitrateMbps == 30,
         "MTS bitrate adjustment");
@@ -157,17 +164,81 @@ void imageSettings(fog::stream::Overlay& overlay) {
     require(foghub.mode() == OverlayMode::Menu && foghub.selection() == 2, "FH touch Back restores image menu item");
     foghub.select(); foghub.setVideoChangesEnabled(false); foghub.setProvider(fog::ProviderId::Mts);
     require(foghub.selection() == 1, "provider switch resets to MTS editable quality");
-    require(foghub.left().type == OverlayActionType::SettingsChanged && foghub.videoSettings().quality == 4,
-        "provider switch restores MTS quality behavior");
+    require(foghub.left().type == OverlayActionType::None && foghub.mode() == OverlayMode::QualitySelect &&
+        foghub.videoSettings().quality == fhInitial.quality, "provider switch restores explicit MTS quality picker");
     foghub.setProvider(fog::ProviderId::FogHub);
-    require(foghub.selection() == 0, "provider switch resets to FH codec");
+    require(foghub.mode() == OverlayMode::ImageSettings && foghub.selection() == 0 &&
+        foghub.videoSettings().quality == fhInitial.quality, "provider switch cancels picker and resets to FH codec");
     foghub.back();
     require(foghub.mode() == OverlayMode::Menu && foghub.selection() == 2, "FH controller Back restores menu item");
+}
+void qualityPicker() {
+    using namespace fog::stream;
+    fog::video::Settings initial;
+    initial.quality = 3;
+    initial.bitrateMbps = 15;
+    initial.keyframeSeconds = 5;
+    initial.framesPerSecond = 60;
+    initial.codec = ::stream::VideoCodec::H264;
+    for (int entry = 0; entry < 4; ++entry) {
+        Overlay overlay; overlay.setVideoSettings(initial);
+        overlay.openMenu(); overlay.down(); overlay.down(); overlay.select();
+        const auto action = entry == 0 ? overlay.select() : entry == 1 ? overlay.left() :
+            entry == 2 ? overlay.right() : overlay.touch(200, 204);
+        require(action.type == OverlayActionType::None && overlay.mode() == OverlayMode::QualitySelect &&
+            overlay.selection() == 3 && overlay.videoSettings() == initial, "every quality entry opens HIGH without action");
+        overlay.down();
+        require(overlay.selection() == 4 && overlay.videoSettings() == initial, "HIGH to ULTRA navigation does not apply");
+        require(overlay.right().type == OverlayActionType::None && overlay.selection() == 0 &&
+            overlay.videoSettings() == initial, "ULTRA to AUTO navigation does not apply");
+        overlay.up();
+        require(overlay.selection() == 4 && overlay.left().type == OverlayActionType::None &&
+            overlay.selection() == 3 && overlay.videoSettings() == initial, "all directions only move candidate");
+        overlay.down(); overlay.right();
+        require(overlay.select().type == OverlayActionType::SettingsChanged && overlay.mode() == OverlayMode::ImageSettings &&
+            overlay.selection() == 1, "AUTO confirmation emits one change and returns to quality row");
+        auto expected = initial; expected.quality = 0;
+        require(overlay.videoSettings() == expected, "quality confirmation preserves every other setting");
+        require(overlay.select().type == OverlayActionType::None && overlay.select().type == OverlayActionType::None &&
+            overlay.videoSettings() == expected, "reconfirming current quality emits no redundant command");
+    }
+    for (int target = 0; target < 5; ++target) {
+        Overlay overlay; overlay.setVideoSettings(initial);
+        overlay.openMenu(); overlay.down(); overlay.down(); overlay.select(); overlay.select();
+        require(overlay.touch(0, 0).type == OverlayActionType::None && overlay.videoSettings() == initial &&
+            overlay.mode() == OverlayMode::QualitySelect, "outside quality touch ignored");
+        const auto action = overlay.touch(340, 238 + target * 64);
+        require(action.type == (target == initial.quality ? OverlayActionType::None : OverlayActionType::SettingsChanged) &&
+            overlay.videoSettings().quality == target && overlay.mode() == OverlayMode::ImageSettings && overlay.selection() == 1,
+            "touch commits the exact quality option without cycling");
+    }
+    for (int escape = 0; escape < 5; ++escape) {
+        Overlay overlay; overlay.setVideoSettings(initial);
+        overlay.openMenu(); overlay.down(); overlay.down(); overlay.select(); overlay.select(); overlay.right();
+        require(overlay.selection() == 4 && overlay.videoSettings() == initial, "cancel fixture has unapplied ULTRA candidate");
+        if (escape == 0) require(overlay.back().type == OverlayActionType::None &&
+            overlay.mode() == OverlayMode::ImageSettings && overlay.selection() == 1, "B cancels to image quality row");
+        else if (escape == 1) require(overlay.touch(340, 590).type == OverlayActionType::None &&
+            overlay.mode() == OverlayMode::ImageSettings, "touch cancel preserves quality");
+        else if (escape == 2) { overlay.close(); require(overlay.mode() == OverlayMode::Closed, "close discards picker candidate"); }
+        else if (escape == 3) { overlay.openMenu(); require(overlay.mode() == OverlayMode::Menu, "menu chord discards picker candidate"); }
+        else {
+            overlay.setProvider(fog::ProviderId::FogHub);
+            require(overlay.mode() == OverlayMode::ImageSettings && overlay.selection() == 0,
+                "provider change cancels pending MTS quality before any FH action");
+            overlay.setProvider(fog::ProviderId::Mts);
+            overlay.select();
+            require(overlay.mode() == OverlayMode::QualitySelect && overlay.selection() == 3,
+                "return to MTS starts from committed quality rather than stale candidate");
+        }
+        require(overlay.videoSettings() == initial, "every cancel path preserves original full settings");
+    }
 }
 }
 int main() {
     using namespace fog::stream;
     try {
+        qualityPicker();
         Overlay overlay;
         require(overlay.mode() == OverlayMode::Closed, "initially closed");
         require(!overlay.appendText("outside"), "only keyboard accepts text");

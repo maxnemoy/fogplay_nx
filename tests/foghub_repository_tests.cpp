@@ -1,4 +1,5 @@
 #include "features/providers/infrastructure/foghub_repositories.hpp"
+#include <nlohmann/json.hpp>
 #include "core/domain/repository_error.hpp"
 #include <cassert>
 #include <deque>
@@ -43,7 +44,7 @@ std::string secondGamesPage() {
     return page;
 }
 WebResponse html(std::string body) { return {200,std::move(body),{},"text/html; charset=UTF-8"}; }
-WebResponse balance(std::string value="250.00") { return {200,"{\"balance\":\""+value+"\"}",{},"application/json"}; }
+WebResponse balance(std::string value="250.00") { return {200,nlohmann::json{{"balance",value}}.dump(),{},"application/json"}; }
 struct FakeTransport final : WebTransport {
     struct Expected { std::string path; WebResponse response; };
     std::deque<Expected> responses;
@@ -85,7 +86,8 @@ struct MemoryStore final : CookieStore {
 struct Setup {
     FakeTransport web;
     MemoryStore store;
-    Session session{web,store};
+    std::vector<std::string> diagnostics;
+    Session session{web,store,[this](const std::string& message) { diagnostics.push_back(message); }};
     Auth auth{session};
     Account account{session};
     fog::foghub::Catalog catalog{session};
@@ -171,10 +173,106 @@ void historyAndAmounts() {
     error(RepositoryErrorKind::NotAuthenticated,[&]{s.account.history();}); assert(!s.auth.authenticated() && !s.store.saved);
     Setup filtered; filtered.login(); filtered.web.profile(); filtered.web.responses.push_back({"/session/list",html(fixture("history-reason-filter-empty.html"))});
     error(RepositoryErrorKind::InvalidResponse,[&]{filtered.account.history();});
-    for(const auto& invalid: {"nan","1e3","1.234","1,20","99999999999999999","1x"}) {
-        Setup bad; bad.store.saved=SavedCookies{"login:fixture-user",{"saved-cookie"}}; bad.web.profile(fixture("account.html"),invalid);
-        error(RepositoryErrorKind::InvalidResponse,[&]{bad.auth.restore();}); assert(bad.store.saved && !bad.auth.authenticated());
+}
+void optionalBalanceAndPrecision() {
+    for (const auto& value : std::vector<std::pair<std::string,std::int64_t>>{
+            {"123.45",12345},{"123.459999999999999999999",12345},{"0.009",0},
+            {"-0.001",-1},{"-1.234",-124},{"-1.2300",-123},{"1.2",120},
+            {"1000000000000.999",100000000000099LL}}) {
+        Setup s; s.login(); s.web.profile(fixture("account.html"),value.first);
+        const auto profile=s.account.profile();
+        assert(profile.balance && profile.balance->minorUnits==value.second);
+        assert(s.auth.authenticated() && s.store.saved);
+        const auto& diagnostic=s.diagnostics.back();
+        assert(diagnostic.find("status=available type=string length=")!=std::string::npos);
+        assert(diagnostic.find(value.first)==std::string::npos);
     }
+    for(const auto& invalid: {"nan","1e3","1,20","99999999999999999","1x","1.",".25","+1.00","1000000000001","-",""}) {
+        Setup bad; bad.store.saved=SavedCookies{"login:fixture-user",{"saved-cookie"}}; bad.web.profile(fixture("account.html"),invalid);
+        assert(bad.auth.restore().restored && bad.store.saved && bad.auth.authenticated());
+        bad.web.profile(fixture("account.html"),invalid);
+        assert(!bad.account.profile().balance && bad.auth.authenticated());
+        assert(bad.diagnostics.back().find("status=unavailable reason=invalid-response type=string length=")!=std::string::npos);
+    }
+    for (const auto& response : std::vector<WebResponse>{
+            {503,{},{},{}},{200,"<html>private-secret-body</html>",{},"text/html"},
+            {200,"private-secret-body",{},"application/json"},
+            {200,"{\"balance\":\"private-secret-body\"}",{},"application/json"},
+            {200,"{\"balance\":12.345}",{},"application/json"},
+            {200,"{\"balance\":null}",{},"application/json"},
+            {200,"{\"secret\":\"private-secret-body\"}",{},"application/json"}}) {
+        Setup s;
+        s.web.responses.push_back({"/site/login",html(fixture("login.html"))});
+        s.web.responses.push_back({"/user/info",html(fixture("account.html"))});
+        s.web.responses.push_back({"/user/balance",response});
+        assert(s.auth.begin({"fixture-user","fixture-password"}).step==AuthStep::Success);
+        assert(s.auth.authenticated() && s.store.saved);
+        s.web.responses.push_back({"/user/info",html(fixture("account.html"))});
+        s.web.responses.push_back({"/user/balance",response});
+        assert(!s.account.profile().balance && s.auth.authenticated());
+        for (const auto& message : s.diagnostics) {
+            assert(message.find("private-secret-body")==std::string::npos);
+            assert(message.find("fixture-")==std::string::npos && message.find("12.345")==std::string::npos);
+        }
+        s.web.profile();
+        assert(s.account.profile().balance && s.auth.authenticated());
+    }
+    Setup preciseLogin;
+    preciseLogin.web.responses.push_back({"/site/login",html(fixture("login.html"))});
+    preciseLogin.web.profile(fixture("account.html"),"123.45999");
+    assert(preciseLogin.auth.begin({"fixture-user","fixture-password"}).step==AuthStep::Success);
+    assert(preciseLogin.auth.authenticated() && preciseLogin.store.saved);
+    assert(preciseLogin.diagnostics.back()=="FogHub balance: status=available type=string length=9 decimal_digits=5");
+    preciseLogin.web.profile(fixture("account.html"),"0."+std::string(127,'0'));
+    assert(!preciseLogin.account.profile().balance && preciseLogin.auth.authenticated());
+    // Diagnostics are optional and a broken sink cannot undo a verified login.
+    FakeTransport web; MemoryStore store;
+    Session session{web,store,[](const std::string&) { throw std::runtime_error("private diagnostic failure"); }};
+    web.responses.push_back({"/site/login",html(fixture("login.html"))}); web.profile();
+    assert(session.login({"fixture-user","fixture-password"}).step==AuthStep::Success && session.authenticated());
+    Setup expired; expired.login();
+    expired.web.responses.push_back({"/user/info",html(fixture("account.html"))});
+    expired.web.responses.push_back({"/user/balance",{302,{},"/site/login",{}}});
+    error(RepositoryErrorKind::NotAuthenticated,[&]{expired.account.profile();});
+    assert(!expired.auth.authenticated() && !expired.store.saved);
+    Setup strict; strict.login(); strict.web.profile();
+    auto history=fixture("history-active.html"); replace(history,"0.00","0.001");
+    strict.web.responses.push_back({"/session/list",html(history)});
+    error(RepositoryErrorKind::InvalidResponse,[&]{strict.account.history();});
+}
+void groupedBalanceAmounts() {
+    // Matches the observed wire shape without preserving the actual account balance.
+    for (const auto& value : std::vector<std::pair<std::string,std::int64_t>>{
+            {"1,234.56",123456},{"1,234,567.89",123456789},{"12,345.6",1234560},
+            {"123,456",12345600},{"-1,234.567",-123457},{"-1,234.5600",-123456},
+            {"1,000,000,000,000.999",100000000000099LL}}) {
+        Setup s; s.web.responses.push_back({"/site/login",html(fixture("login.html"))});
+        s.web.profile(fixture("account.html"),value.first);
+        assert(s.auth.begin({"fixture-user","fixture-password"}).step==AuthStep::Success);
+        assert(s.auth.authenticated() && s.store.saved);
+        s.web.profile(fixture("account.html"),value.first);
+        const auto profile=s.account.profile();
+        assert(profile.balance && profile.balance->minorUnits==value.second && profile.balance->currency=="RUB");
+        assert(s.diagnostics.back().find(value.first)==std::string::npos);
+    }
+    for (const auto& invalid : {"1,23.45","12,34,567.89","1234,567.89",",123.45","123,.45",
+            "1,,234.56","1,234,","1,234.5,6","1,234,56","1.234,56","1 234.56",
+            "1\u00a0234.56","1,234.56 ","+1,234.56","1,234.56₽","RUB1,234.56","1,000,000,000,001.00"}) {
+        Setup s; s.login(); s.web.profile(fixture("account.html"),invalid);
+        assert(!s.account.profile().balance && s.auth.authenticated() && s.store.saved);
+        assert(s.diagnostics.back().find("status=unavailable reason=invalid-response")!=std::string::npos);
+    }
+    Setup restored; restored.store.saved=SavedCookies{"login:fixture-user",{"saved-cookie"}};
+    restored.web.profile(fixture("account.html"),"1,234.56");
+    assert(restored.auth.restore().restored && restored.auth.authenticated());
+    // Grouping support is restricted to balance; history remains an exact amount.
+    Setup strict; strict.login(); strict.web.profile();
+    auto history=fixture("history-active.html"); replace(history,"0.00","1,234.56");
+    strict.web.responses.push_back({"/session/list",html(history)});
+    error(RepositoryErrorKind::InvalidResponse,[&]{strict.account.history();});
+    // Limits apply to the original input, even if separators/leading zeros add no value.
+    strict.web.profile(fixture("account.html"),std::string(127,'0')+",000.00");
+    assert(!strict.account.profile().balance && strict.auth.authenticated());
 }
 void catalogs() {
     Setup s;
@@ -320,4 +418,4 @@ void authenticationPageDiagnostics() {
     assert(!expired.auth.authenticated() && expired.web.jar.empty());
 }
 }
-int main(){loginAndProfile();restoreAndFailures();securityAndStorage();historyAndAmounts();catalogs();pagedHistory();resizedPages();curatedComputers();publicCatalogWithoutAccountStorage();authenticationPageDiagnostics();std::cout<<"FogHub repository tests passed\n";}
+int main(){loginAndProfile();restoreAndFailures();securityAndStorage();historyAndAmounts();optionalBalanceAndPrecision();groupedBalanceAmounts();catalogs();pagedHistory();resizedPages();curatedComputers();publicCatalogWithoutAccountStorage();authenticationPageDiagnostics();std::cout<<"FogHub repository tests passed\n";}

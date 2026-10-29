@@ -1,3 +1,4 @@
+#include "core/diagnostics/thread_observation.hpp"
 #include "app/application_controller.hpp"
 
 namespace fogplay {
@@ -19,6 +20,7 @@ void ApplicationController::loadPlayStation() {
     auto featured = pairedServices_ ? pairedServices_->publicCatalog() : std::shared_ptr<fog::CatalogRepository>{};
     featuredRepository_ = featured;
     playStationPending_ = std::async(std::launch::async,[updates,repository,featured] {
+        fog::diagnostics::observeThread("playstation-catalog");
         struct Snapshots {
             std::mutex mutex;
             std::vector<fog::Computer> primary = fog::playStationComputerPlaceholders(), featured;
@@ -33,6 +35,7 @@ void ApplicationController::loadPlayStation() {
         };
         std::future<std::vector<fog::Computer>> featuredWork;
         if (featured) featuredWork = std::async(std::launch::async,[featured,updates,publish] {
+            fog::diagnostics::observeThread("playstation-featured");
             return featured->playStationComputers(
                 [publish](const std::vector<fog::Computer>& snapshot) { publish(true,snapshot); },
                 [updates] { return updates->cancelled(); });

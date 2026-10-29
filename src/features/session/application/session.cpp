@@ -68,6 +68,22 @@ bool SessionGuard::recoverMatchingSession() {
     observedActive_ = true;
     return true;
 }
+bool SessionGuard::restoreCheckoutOwnership(const AccountId& account, const RentalId& rental) {
+    const auto auth = api_.auth();
+    if (invalidJournal_ || !auth.authenticated() || account.empty() || account != auth.account ||
+        rental.empty() || rental.provider != account.provider || pendingRental_ != rental) return false;
+    // Only CheckoutGuard may supply its durable same-account attribution. This
+    // authorizes a targeted stop, but supplies no evidence of prior activation.
+    owned_ = true;
+    ownedAccount_ = account;
+    authGeneration_ = auth.generation;
+    return true;
+}
+void SessionGuard::acknowledgeCheckoutResolution(const AccountId& account, const RentalId& rental) {
+    if (!restoreCheckoutOwnership(account, rental))
+        throw std::logic_error(fog::constants::error::Session::ResolveSessionRecoveryBeforeAcknowledgingCheckout);
+    clearJournal();
+}
 void SessionGuard::clearJournal() {
     try { if (persistent_) journal_->clear(); }
     catch (...) {

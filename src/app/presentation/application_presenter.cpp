@@ -15,7 +15,8 @@ namespace uiText = ::fog::constants::ui;
 namespace fogplay {
 namespace {
 std::string profileBalance(const std::optional<fog::UserProfile>& profile) {
-    if (!profile || !profile->balance) return "Баланс не загружен";
+    if (!profile) return "Баланс не загружен";
+    if (!profile->balance) return "Баланс недоступен";
     std::ostringstream amount;
     amount << std::fixed << std::setprecision(2) << static_cast<double>(profile->balance->minorUnits)/100.0;
     return "Баланс: " + amount.str() + " " + profile->balance->currency;
@@ -101,8 +102,7 @@ void ApplicationController::draw() {
         overlayScope.finish();
         const auto presentStarted = std::chrono::steady_clock::now();
         fog::stream::LoopTiming::Scope presentScope(loopTiming_, fog::stream::LoopTiming::Stage::Present);
-        SDL_RenderPresent(rt_.renderer);
-        media_->presented();
+        media_->present();
         streamMenuPresented(true);
         presentTiming_.record(presentStarted);
         presentScope.finish();
@@ -272,8 +272,14 @@ void ApplicationController::draw() {
     } else if (screen_ == Screen::StopConfirm) {
         ui_.dialog({uiText::Server::FinishGameSessionTitle,uiText::Server::FinishRentalNotice,uiText::Server::FinishRental,uiText::Common::Continue,true,true});
     } else if (screen_ == Screen::Stopping || screen_ == Screen::Recovery) {
+        std::string hint = pairedPending_ ? status_ : ui_.controllerHints(uiText::Server::TerminationRecoveryHint);
+        if (recoveryPaused_) {
+            hint = uiText::Server::RecoveryPaused;
+            if (!pairedPending_ && !pending_.valid() && checkout_.unresolved()) hint += uiText::Server::RecoveryMtsManualHint;
+            hint = ui_.controllerHints(hint);
+        }
         ui_.dialog({uiText::Server::TerminationUnconfirmed,
-            pairedPending_ ? status_ : ui_.controllerHints(uiText::Server::TerminationRecoveryHint),uiText::Common::Check,"",true,true});
+            hint,uiText::Common::Check,"",true,true});
     } else if (screen_ == Screen::Streaming) {
         if (transportReconnect_.recovering())
             ui_.empty(uiText::Stream::Reconnecting,uiText::Stream::ReconnectNotice);
@@ -299,7 +305,8 @@ void ApplicationController::draw() {
     else if (screen_ != Screen::Genres && screen_ != Screen::SessionRating && (pending_.valid() || !routineStatus(status_)))
         ui_.status(pending_.valid() ? uiText::Common::Loading : status_, pending_.valid());
     if (screen_ == Screen::Streaming) drawStreamOverlay();
-    SDL_RenderPresent(rt_.renderer);
+    if (screen_ == Screen::Streaming && media_) media_->present();
+    else SDL_RenderPresent(rt_.renderer);
     streamMenuPresented(false);
     fogplay::diagnostics::firstUiFramePresented();
 }

@@ -50,6 +50,8 @@ public:
     void clearToken() noexcept;
     // May be called from the UI thread. Permanent cancellation for shutdown.
     void cancel() noexcept;
+    // Final process teardown also cancels the independent rental-cleanup client.
+    void cancelAll() noexcept;
 
 private:
     Json authPost(const std::string& endpoint, const Json& body);
@@ -66,6 +68,7 @@ private:
     std::string authStoragePath_;
     std::string authStorageError_;
     std::atomic_bool loggedIn_{false};
+    std::atomic_bool cancelledAll_{false};
     std::atomic<std::uint64_t> authGeneration_{0};
     AuthStep nextStep_ = AuthStep::Restart;
 };

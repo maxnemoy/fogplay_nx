@@ -1,0 +1,289 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Все игры</title></head><body><main id="main" class="flex-shrink-0" role="main">
+    <div class="container">
+                    <nav aria-label="breadcrumb"><ol id="w12" class="breadcrumb text-truncate"><li class="breadcrumb-item"><a href="/">Главная</a></li>
+<li class="breadcrumb-item active" aria-current="page">Все игры</li>
+</ol></nav>            <div class="game-index">
+
+    <!--<h1>Все игры</h1>!-->
+    <p>Выбирайте игру и компьютеры с ней</p>
+
+    <div id="p1" data-pjax-container="" data-pjax-push-state data-pjax-timeout="1000">    
+    
+    
+<div class="pc-game-search">
+    
+    <form id="search-form" action="/game/list" method="get" data-pjax="0">
+<input type="hidden" name="mode" value="0">    
+    <div class="row">
+        <div class="col-md-8 col-8">
+        <div class="form-group field-gamesearch-id">
+
+<div class="kv-plugin-loading loading-gamesearch-id"> </div><select id="gamesearch-id" class="form-control" name="GameSearch[id]" data-s2-options="s2options_fd268a17" data-krajee-select2="select2_9dbab697" style="width: 1px; height: 1px; visibility: hidden;">
+<option value="">Поиск по названию</option>
+</select>
+
+<div class="help-block"></div>
+</div>    
+        </div>               
+        
+        <div class="col-md-4 col-4">
+            <div class="form-group field-gamesearch-canplayfh">
+
+<select id="gamesearch-canplayfh" class="form-control" name="GameSearch[canPlayFH]">
+<option value="">FH и МТС</option>
+<option value="1">FH</option>
+</select>
+
+<div class="help-block"></div>
+</div>    
+        </div>
+
+        <!--
+        <div class="col-md-4 col-4">
+        <select class="form-control" name="sort">
+<option value="-date_release">По новизне</option>
+<option value="-pc_count">По количеству ПК ▼</option>
+<option value="pc_count">По количеству ПК ▲</option>
+<option value="-stat_amount">По популярности ▼</option>
+</select>    
+        </div>        
+        !-->
+
+        <!--<div class="col-md-2 col-12">
+            <div class="form-group">
+                <button type="submit" class="btn btn-primary">Search</button>            
+            </div>
+        </div>!-->
+    
+    </div>
+
+    </form>
+</div>
+
+    <nav id="w4" class="navbar-expand-md navbar bg rounded">
+<div class="container">
+
+<button type="button" class="navbar-toggler" data-bs-toggle="collapse" data-bs-target="#w4-collapse" aria-controls="w4-collapse" aria-expanded="false" aria-label="Переключить навигацию"><span class="navbar-toggler-icon"></span> Все</button>
+<div id="w4-collapse" class="collapse navbar-collapse">
+<ul id="w5" class="navbar-nav nav"><li class="nav-item"><a class="btn btn-light border border-2 bg-light border-secondary mt-2 me-1 mb-1 nav-link active" href="/game/list?mode=0">Все</a></li>
+<li class="nav-item"><a class="btn btn-light border border-2 bg-light border-secondary mt-2 me-1 mb-1 nav-link" href="/game/list?mode=2">Новые</a></li>
+<li class="nav-item"><a class="btn btn-light border border-2 bg-light border-secondary mt-2 me-1 mb-1 nav-link" href="/game/list?mode=1">Хиты</a></li>
+<li class="nav-item"><a class="btn btn-light border border-2 bg-light border-secondary mt-2 me-1 mb-1 nav-link" href="/game/list?mode=12">Ваше избранное</a></li>
+<li class="nav-item"><a class="btn btn-light border border-2 bg-light border-secondary mt-2 me-1 mb-1 nav-link" href="/game/list?mode=100">Подборки</a></li>
+<li class="dropdown nav-item"><a class="btn btn-light border border-2 bg-light border-secondary mt-2 me-1 mb-1 dropdown-toggle nav-link" href="#" data-bs-toggle="dropdown" role="button" aria-expanded="false">Жанры</a><div id="w6" class="dropdown-menu"><a class="dropdown-item" href="/game/list?mode=3">Экшены</a>
+<a class="dropdown-item" href="/game/list?mode=4">РПГ</a>
+<a class="dropdown-item" href="/game/list?mode=11">Для двоих</a>
+<a class="dropdown-item" href="/game/list?mode=5">Стратегии</a>
+<a class="dropdown-item" href="/game/list?mode=6">Гонки</a>
+<a class="dropdown-item" href="/game/list?mode=7">Приключенческие игры</a>
+<a class="dropdown-item" href="/game/list?mode=8">Казуальные игры</a>
+<a class="dropdown-item" href="/game/list?mode=9">Бесплатные</a>
+<a class="dropdown-item" href="/game/list?mode=10">Многопользовательские игры</a></div></li></ul></div>
+</div>
+</nav><div id="w2" class="list-view"><div class="summary">Отображается 1–24 из 5950 игр</div>
+<div class="row g-0 gap-0"><div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/4435490/50d218e79ead2650bc6b7360995cc8dd3fbe2c29/capsule_231x87.jpg?t=1792214069" alt="Call of Duty®: Modern Warfare® 4" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=18726&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">37</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=18726" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">122</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1091500/590e0988a2fb79f44d3e31e41fd4949eb76abc41/capsule_231x87.jpg?t=1769690377" alt="Cyberpunk 2077" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=1">RPG</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=6">Открытый мир</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=70&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">148</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=70" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">427</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2138330/3d2b6a051a7e2fc4ff654d95d6876c24d6dda13d/capsule_231x87.jpg?t=1784713876" alt="Cyberpunk 2077 + DLC" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=48">Ролевые игры</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=108&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">96</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=108" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">288</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3595270/05b8f73493348dfa9b6662dc13a6740929ea195b/capsule_231x87.jpg?t=1764711750" alt="Call of Duty®: Modern Warfare® III" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=8">Кооператив</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=1714&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">30</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=1714" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">72</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://avatars.mds.yandex.net/i?id=7cd4b923b3bfb05f79eaeeae26553116_l-13212321-images-thumbs&amp;n=13" alt="GTA RP Majestic" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=47">Приключенческие игры</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=52">Action</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=2812&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">18</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=2812" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">45</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2651280/379bd114fe5c23850555d1eb67fa8ac996bf702b/capsule_231x87.jpg?t=1763569811" alt="Marvel's Spider-Man 2" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=6">Открытый мир</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=509&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">103</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=509" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">310</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/3932890/2c6e1e35562ccc39bb34436d2ea1064710691d9d/capsule_231x87.jpg?t=1770712130" alt="Escape from tarkov" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=1">RPG</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=8">Кооператив</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=1199&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">40</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=1199" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">124</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1422450/88b400eca727f0547232b49b3e62827f07900c77/capsule_231x87.jpg?t=1769127177" alt="Deadlock" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=10">Для нескольких</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=1485&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">59</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=1485" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">123</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1174180/capsule_231x87.jpg?t=1759502961" alt="Red Dead Redemption 2" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=6">Открытый мир</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=95&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">118</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=95" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">365</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2531310/29904ca69ae022479d64207cc40ce549d0a68acb/capsule_231x87.jpg?t=1750959180" alt="The Last of Us™ Part II Remastered" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=9">Поддержка геймпада</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=105&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">115</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=105" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">339</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/271590/capsule_231x87.jpg?t=1765387725" alt="Grand Theft Auto V" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=47">Приключенческие игры</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=52">Action</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=93&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">17</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=93" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">17</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1643320/55f975278f3cdb1f021a092781e21197e2824934/capsule_231x87_alt_assets_6_russian.jpg?t=1776173087" alt="S.T.A.L.K.E.R. 2: Heart of Chernobyl" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=1">RPG</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=118&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">45</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=118" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">202</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1817070/capsule_231x87.jpg?t=1763569047" alt="Marvel's Spider-Man Remastered" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=47">Приключенческие игры</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=49">Казуальные игры</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=490&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">100</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=490" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">284</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><h5 class="text-danger" style="text-transform: uppercase; height:6.5rem">S.T.A.L.K.E.R. 2: Heart of Chernobyl - Ultimate Edition</h5></div>
+                        <div class="col-12 text-truncate"></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=122&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">43</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=122" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">163</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/4080220/b2e806003c348d3348774cddb10e5b31cd787ecf/capsule_231x87.jpg?t=1788235145" alt="EA SPORTS FC™ 27" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=28">Локальный кооператив</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=29">Симуляторы</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=37">Спорт</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=18293&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">39</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=18293" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">94</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1867240/11d3bb7607c5568c61108fe70e7c670b4940269e/capsule_231x87.jpg?t=1788959034" alt="WARDOGS" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=19">Инди</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=29">Симуляторы</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=18151&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">47</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=18151" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">113</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1086940/3dd81008e9c385caf68152450c22353f6a8abec9/capsule_231x87.jpg?t=1773079016" alt="Baldur's Gate 3" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=1">RPG</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=3">Фэнтези</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=461&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">155</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=461" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">368</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2183900/904dbb119e5e098b1506402cc3528b1f699ceb15/capsule_231x87_alt_assets_11_russian.jpg?t=1774004924" alt="Warhammer 40,000: Space Marine 2" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=1">RPG</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=3">Фэнтези</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=77&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">126</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=77" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">264</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://upload.wikimedia.org/wikipedia/commons/thumb/a/a4/Genshin_Impact_wordmark.svg/330px-Genshin_Impact_wordmark.svg.png" alt="Genshin Impact" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=130&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">31</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=130" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">150</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1888930/capsule_231x87.jpg?t=1750959031" alt="The Last of Us Part I" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=9">Поддержка геймпада</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=81&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">114</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=81" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">311</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><h5 class="text-danger" style="text-transform: uppercase; height:6.5rem">The Sims 4 Digital Deluxe Edition</h5></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=28">Локальный кооператив</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=29">Симуляторы</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=31">Бесплатные</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=255&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">77</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=255" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">152</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2537590/c992a0851b2714fdeaa65469ba5e7b8e60c06a96/capsule_231x87.jpg?t=1747324291" alt="Microsoft Flight Simulator 2024" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=6">Открытый мир</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=10">Для нескольких</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=1535&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">7</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=1535" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">34</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-light">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2000950/capsule_231x87.jpg?t=1678294805" alt="Call of Duty®: Modern Warfare®" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=5">Одиночные</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=8">Кооператив</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=7264&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">31</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=7264" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">60</a></div>                        
+                    </div>
+            </div>
+<div class="col-12 col-md-6 col-lg-3 border border-1 bg-white">
+                    <div class="row g-1 m-1 justify-content-between">
+                        <div class="col-12"><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/990080/4617336bf98ab04289173328838f18303673457f/capsule_231x87.jpg?t=1790708992" alt="Hogwarts Legacy" style="width: 100%"></div>
+                        <div class="col-12 text-truncate"><a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=1">RPG</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=2">Экшены</a> <a class="badge bg-primary me-2 text-decoration-none" href="/game/list?GameSearch%5BtagId%5D=3">Фэнтези</a></div>
+                        <div class="col-6"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=98&amp;mode=5" data-pjax="0"><small>Играть FH</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">98</a></div>
+                        <div class="col-6 text-end"><a class="btn btn-light border border-2 border-secondary" href="/game/preview?id=98" data-pjax="0"><small>Играть</small> <img src="/images/icons/desktop.png" width="16" height="16" alt="ПК">301</a></div>                        
+                    </div>
+            </div></div>
+<nav id="w3"><ul class="pagination"><li class="page-item prev disabled"><a class="page-link" href="/game/list?page=1&amp;per-page=24" data-page="0" tabindex="-1"><span aria-hidden="true">«</span></a></li>
+<li class="page-item active" aria-current="page"><a class="page-link" href="/game/list?page=1&amp;per-page=24" data-page="0">1</a></li>
+<li class="page-item"><a class="page-link" href="/game/list?page=2&amp;per-page=24" data-page="1">2</a></li>
+<li class="page-item"><a class="page-link" href="/game/list?page=3&amp;per-page=24" data-page="2">3</a></li>
+<li class="page-item"><a class="page-link" href="/game/list?page=4&amp;per-page=24" data-page="3">4</a></li>
+<li class="page-item"><a class="page-link" href="/game/list?page=5&amp;per-page=24" data-page="4">5</a></li>
+<li class="page-item"><a class="page-link" href="/game/list?page=6&amp;per-page=24" data-page="5">6</a></li>
+<li class="page-item"><a class="page-link" href="/game/list?page=7&amp;per-page=24" data-page="6">7</a></li>
+<li class="page-item next"><a class="page-link" href="/game/list?page=2&amp;per-page=24" data-page="1"><span aria-hidden="true">»</span></a></li></ul></nav></div></div>
+</div>    </div>
+</main>
+
+</body></html>

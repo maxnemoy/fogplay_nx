@@ -393,6 +393,7 @@ void queueBoundsAndNoIoOnCaller() {
     }
     // I/O is intentionally blocked: completing these enqueues proves the caller
     // never performs write/fsync/commit and is independent of SD completion.
+    log.requestFlush(); // A watchdog flush request must also return while storage is blocked.
     for (std::size_t i = 0; i < fog::RunLog::maxQueuedLines; ++i)
         require(log.append("pending " + std::to_string(i)), "caller enqueues while worker I/O blocked");
     require(!log.append("over capacity"), "line bound rejects excess");

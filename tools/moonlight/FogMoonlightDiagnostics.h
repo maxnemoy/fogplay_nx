@@ -138,6 +138,34 @@ typedef struct FogMoonlightDiagnostics {
 // No locks, allocation, logging, or internal queue reads are performed here.
 void FogMoonlightGetDiagnostics(FogMoonlightDiagnostics* snapshot);
 
+enum FogMoonlightEventKind {
+    FOG_EVENT_WAIT_ENTER = 1, FOG_EVENT_IDR_REQUEST, FOG_EVENT_IDR_DISPATCH,
+    FOG_EVENT_IDR_DISPATCH_RESULT, FOG_EVENT_FEC_FAILURE, FOG_EVENT_INTACT_FRAME,
+    FOG_EVENT_IDR_HEADER, FOG_EVENT_IDR_RECOGNIZED, FOG_EVENT_WAIT_EXIT,
+    FOG_EVENT_IDR_ASSEMBLED, FOG_EVENT_THREAD_START
+};
+typedef struct FogMoonlightEvent {
+    uint64_t sequence, connectionId, waitId, timeUs;
+    uint64_t kind, frameNumber, value;
+    uint64_t requests, intactFrames, fecFailures, totalsValid;
+    // Only THREAD_START uses these fields; signed values preserve OS sentinels.
+    int32_t threadCore, threadIdealCore, threadPriority;
+    uint32_t threadQueryErrors; // bit 0 affinity query; bit 1 priority query.
+    uint64_t threadAffinityMask;
+    char role[24];
+} FogMoonlightEvent;
+// requests/intactFrames/fecFailures count admitted observations in this wait's
+// keyed record. totalsValid=0 when no wait is associated or its record expired.
+// Any reported journal loss means totals/chain may be incomplete. Dispatch
+// results keep their dispatch's wait ID across concurrent wait transitions.
+// Best-effort bounded journal. The cursor is process-local, monotonic across
+// connections. Each event has a connection/wait ID; frameNumber is valid only
+// for frame events. value: reason / block count / dispatch success by kind.
+// Returns one stable event, or zero if empty/busy. missed includes overwritten
+// entries and producer contention; callers must report it, not infer no loss.
+// A short nonblocking atomic gate protects copies; never waits or allocates.
+int FogMoonlightReadEvent(uint64_t* cursor, FogMoonlightEvent* event, uint64_t* missed);
+
 #ifdef __cplusplus
 }
 #endif

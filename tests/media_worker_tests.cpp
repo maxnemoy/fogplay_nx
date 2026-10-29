@@ -69,6 +69,7 @@ public:
         packet.data = bytes; packet.videoGeneration = generation; packet.timestamp = timestamp;
         packet.enqueueMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count()) - 7;
+        packet.firstPacketMs = packet.enqueueMs - 43;
         (sound ? audio : video).push_back(std::move(packet));
     }
     void pushAudioBatch(const std::vector<Bytes>& packets, std::size_t first, std::size_t count, std::uint64_t ageMs) {
@@ -257,6 +258,125 @@ static void pacing() {
     check(uploaded == 180 && queue.size() == 0, "sixty FPS jitter accumulated frames or halved upload rate");
     std::cout << "Pacing: " << uploaded << " uploads / 180 jittered 60 Hz refreshes (60 fps target)\n";
 
+    // Real renderer jitter can exceed the legacy cadence's 1 ms tolerance.
+    // A VSYNC-paced caller must not apply a second, independent timing gate.
+    for (const bool displayPaced : {false, true}) {
+        Queue display; display.reset(60, displayPaced);
+        std::uint64_t discarded = 0;
+        unsigned supplied = 0, presented = 0;
+        constexpr std::array<std::int64_t, 10> refreshJitter{{0, 0, 0, 3000, -3000, 0, 0, 0, 0, 0}};
+        for (unsigned refresh = 0; refresh < 3600; ++refresh) {
+            const auto refreshTime = now + std::chrono::nanoseconds(static_cast<std::int64_t>(refresh) * 16666667) +
+                std::chrono::microseconds(refreshJitter[refresh % refreshJitter.size()]);
+            while (supplied < 3600) {
+                const auto ready = now + std::chrono::nanoseconds(static_cast<std::int64_t>(supplied) * 16666667) - 5ms;
+                if (ready > refreshTime) break;
+                Queue::Frame incoming; incoming.pixels = {static_cast<unsigned char>(supplied)};
+                discarded += display.push(std::move(incoming), supplied * 1500, ready); ++supplied;
+            }
+            if (display.take(frame, refreshTime, discarded)) {
+                if (displayPaced) check(frame.pixels.front() == static_cast<unsigned char>(presented),
+                    "display pacing skipped or reordered an available frame");
+                ++presented;
+            }
+        }
+        check(supplied == 3600 && display.size() == 0, "long render-jitter scenario did not drain supplied frames");
+        const auto stats = display.stats();
+        if (displayPaced) {
+            check(presented == 3600 && discarded == 0 && stats.taken == 3600 && stats.readyEmpty == 0 &&
+                stats.timingCadenceBlocked == 0 && stats.timingRtpBlocked == 0 && stats.takeStaleDrop == 0 &&
+                stats.timedLateCoalesce == 0 && stats.pushCapacityDrop == 0, "VSYNC jitter still loses sixty-FPS frames");
+        } else check(presented == 3240 && discarded == 360 && stats.timedLateCoalesce == 360 &&
+            stats.timingCadenceBlocked != 0, "legacy non-display-paced timing behavior changed");
+        std::cout << "Display queue: mode=" << displayPaced << " supplied=" << supplied << " shown=" << presented <<
+            " dropped=" << discarded << " (0,0,0,+3ms,-3ms render jitter)\n";
+    }
+    for (const auto amplitudeUs : {1000, 2000, 4000, 6000}) {
+        Queue display; display.reset(60, true);
+        const std::array<std::int64_t, 4> refreshJitter{{0, amplitudeUs, -amplitudeUs, 0}};
+        std::uint64_t discarded = 0;
+        unsigned supplied = 0, presented = 0;
+        // Receive completion is 5.2 ms after each source tick. The first
+        // refresh is naturally empty and establishes one frame of buffering.
+        for (unsigned refresh = 0; refresh <= 3600; ++refresh) {
+            const auto refreshTime = now + std::chrono::nanoseconds(static_cast<std::int64_t>(refresh) * 16666667) +
+                std::chrono::microseconds(refreshJitter[refresh % refreshJitter.size()]);
+            while (supplied < 3600) {
+                const auto ready = now + std::chrono::nanoseconds(static_cast<std::int64_t>(supplied) * 16666667) + 5200us;
+                if (ready > refreshTime) break;
+                discarded += display.push({}, supplied * 1500, ready); ++supplied;
+            }
+            const bool taken = display.take(frame, refreshTime, discarded);
+            if (refresh) check(taken, "renderer jitter lost a prepared frame after initial warmup");
+            if (taken) ++presented;
+        }
+        check(supplied == 3600 && presented == 3600 && discarded == 0 && display.size() == 0 &&
+            display.stats().readyEmpty == 1 && display.stats().pushCapacityDrop == 0 && display.stats().takeStaleDrop == 0,
+            "late-ready sixty-FPS supply accumulated or discarded frames under renderer jitter");
+        std::cout << "Display queue: readyOffsetUs=5200 jitterUs=" << amplitudeUs << " shown=" << presented <<
+            " dropped=" << discarded << " warmupEmpty=1\n";
+    }
+    {
+        Queue display; display.reset(60, true);
+        std::uint64_t discarded = 0;
+        for (unsigned i = 0; i < 12; ++i) {
+            Queue::Frame incoming; incoming.pixels = {static_cast<unsigned char>(i)};
+            discarded += display.push(std::move(incoming), i * 9000, now);
+        }
+        check(discarded == 9 && display.size() == Queue::capacity && display.stats().pushCapacityDrop == 9,
+            "display-paced burst escaped the three-frame bound");
+        for (unsigned i = 9; i < 12; ++i)
+            check(display.take(frame, now + std::chrono::milliseconds((i - 9) * 16), discarded) &&
+                frame.pixels.front() == i && frame.readyAt == now,
+                "display-paced queue manufactured RTP waits or reordered its retained burst");
+        check(discarded == 9 && display.stats().taken == 3 && display.stats().timingRtpBlocked == 0 &&
+            display.stats().timingCadenceBlocked == 0 && display.stats().timedLateCoalesce == 0,
+            "display-paced burst incorrectly used the timed queue policy");
+        const auto snapshot = display.stats();
+        display.reset(60);
+        check(!display.stats().displayPaced && display.stats().resets == snapshot.resets + 1 &&
+            display.stats().taken == snapshot.taken && display.stats().pushCapacityDrop == snapshot.pushCapacityDrop &&
+            snapshot.displayPaced && snapshot.resets == 1, "reset changed lifetime counters or an immutable stats snapshot");
+        check(!display.take(frame, now, discarded) && display.stats().readyEmpty == snapshot.readyEmpty + 1,
+            "empty-ready queue did not record its distinct reason");
+        display.reset(60, true);
+        check(display.stats().displayPaced, "explicit reset did not re-enable display pacing");
+        display.reset(30, true);
+        check(!display.stats().displayPaced && display.stats().framesPerSecond == 30,
+            "display-paced flag incorrectly bypassed thirty-FPS scheduling");
+        display.push({}, 0, now); display.push({}, 3000, now);
+        check(display.take(frame, now, discarded) && !display.take(frame, now + 31ms, discarded) &&
+            display.take(frame, now + 34ms, discarded), "thirty-FPS queue changed when display-paced flag was supplied");
+        check(display.stats().timingRtpBlocked > 0, "timed queue failed to distinguish an RTP deadline block");
+        auto maximum = snapshot;
+        maximum.readyEmpty = maximum.timingCadenceBlocked = maximum.timingRtpBlocked = maximum.pushCapacityDrop =
+            maximum.takeStaleDrop = maximum.timedLateCoalesce = maximum.taken = maximum.resets = ~std::uint64_t{0};
+        maximum.framesPerSecond = 2147483647;
+        const auto diagnostic = maximum.diagnostics();
+        check(diagnostic.size() <= 351 && diagnostic.find("resets=18446744073709551615") != std::string::npos &&
+            diagnostic.find('\n') == std::string::npos, "queue snapshot diagnostics exceeded its bound or lost a counter");
+    }
+    {
+        Queue display; display.reset(60, true);
+        std::uint64_t discarded = 0;
+        for (const int age : {50, 34, 10}) {
+            Queue::Frame incoming; incoming.pixels = {static_cast<unsigned char>(age)};
+            display.push(std::move(incoming), 0, now - std::chrono::milliseconds(age));
+        }
+        check(display.take(frame, now, discarded) && frame.pixels.front() == 10 && discarded == 2 &&
+            display.stats().takeStaleDrop == 2 && display.stats().timedLateCoalesce == 0 && display.size() == 0,
+            "display-paced stale front frames were retained or classified as timed coalescing");
+        const auto interval = std::chrono::nanoseconds(1000000000 / 60);
+        display.push({}, 0, now - interval * 2); display.push({}, 9000, now);
+        check(display.take(frame, now, discarded) && frame.readyAt == now - interval * 2 && discarded == 2,
+            "exact two-frame age boundary dropped a still-eligible frame");
+        check(display.take(frame, now + 1h, discarded) && frame.readyAt == now && discarded == 2,
+            "display pacing discarded the last available old frame");
+        display.push({}, 0, now + 20ms); display.push({}, 9000, now + 21ms);
+        check(display.take(frame, now, discarded) && frame.readyAt == now + 20ms && discarded == 2,
+            "backwards clock manufactured stale drops or readiness waits");
+    }
+
     fog::FrameCadence cadence;
     check(cadence.due(now) && cadence.due(now + 1ns), "legacy cadence unexpectedly paced callers");
     for (const int fps : {30, 60}) {
@@ -405,6 +525,17 @@ static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units, int
     until([&] { return media.videoFrames() >= 2 && !media.waitingForVideoKeyframe(); });
     until([&] { return media.preparePresentation(); });
     check(media.draw() && media.uploadedFrames() == 1, "reset epoch lost new output or uploaded stale output");
+    media.present();
+    const auto latency = media.latencyDiagnostics();
+    const std::string ageKey = "frameAge{samples=1 p50Us=";
+    const auto agePosition = latency.find(ageKey);
+    const std::string waitKey = "assembledQueueWait{samples=1 p50Us=";
+    const auto waitPosition = latency.find(waitKey);
+    check(agePosition != std::string::npos && waitPosition != std::string::npos &&
+        std::stoull(latency.substr(agePosition + ageKey.size())) >= 50000 &&
+        std::stoull(latency.substr(waitPosition + waitKey.size())) >= 7000 &&
+        latency.find("originMissesLifetime=0") != std::string::npos,
+        "worker conversion/ready queue lost frame receive age or assembled wait");
     check(media.videoWidth() == 1280 && media.videoHeight() == 720, "720p worker output dimensions changed");
     check(media.diagnostics().find("codec=h264") != std::string::npos, "negotiated H264 fallback was ignored");
     check(hevcOpens == previousHevcOpens, "latest codec command was ignored during blocked decode");

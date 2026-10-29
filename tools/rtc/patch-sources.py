@@ -478,3 +478,4 @@ runpy.run_path(str(root / 'tools/rtc/patch-dtls-ingress.py'), run_name='__main__
 
 runpy.run_path(str(root / 'tools/rtc/patch-rtcp-feedback.py'), run_name='__main__')
 runpy.run_path(str(root / 'tools/rtc/patch-media-send-diagnostics.py'), run_name='__main__')
+runpy.run_path(str(root / 'tools/rtc/patch-thread-observation.py'), run_name='__main__')

@@ -34,9 +34,11 @@ if [ "$PLATFORM" = host ]; then
   LOG="$ROOT/work/rtc/run-host.log"
   timeout 20 "$BUILD/rtc-link-smoke" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/loopback-build.log"
-  cmake --build "$BUILD" --target rtc-host-loopback -j "${JOBS:-8}" > "$LOG" 2>&1
+  cmake --build "$BUILD" --target rtc-host-loopback rtc-thread-observation-test -j "${JOBS:-8}" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/loopback-run.log"
   timeout 25 "$BUILD/rtc-host-loopback" > "$LOG" 2>&1
+  LOG="$ROOT/work/rtc/thread-observation-run.log"
+  timeout 25 "$BUILD/rtc-thread-observation-test" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/udp-budget-build.log"
   cmake --build "$BUILD" --target rtc-udp-budget-test rtc-ice-diagnostics-test rtc-dtls-queue-test rtc-dtls-diagnostics-test rtc-dtls-receive-test rtc-dtls-ingress-test rtc-media-send-diagnostics-test rtc-rtcp-feedback-test -j "${JOBS:-8}" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/udp-budget-run.log"

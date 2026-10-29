@@ -6,6 +6,7 @@ namespace uiText = ::fog::constants::ui;
 namespace fogplay {
 
 void ApplicationController::armExitHandling() {
+    if (exitAfterStop_ || shutdownDone_) return;
     checkResult(appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend), "Background stop support");
     if (!exitLocked_) { checkResult(appletLockExit(), "Session exit guard"); exitLocked_ = true; }
     checkResult(appletSetAutoSleepDisabled(true), "Session autosleep guard");
@@ -20,72 +21,38 @@ void ApplicationController::disarmExitHandling() {
 void ApplicationController::shutdownSession() noexcept {
     if (shutdownDone_) return;
     shutdownDone_ = true;
-    diagnostic("Application shutdown: checking owned rental cleanup.");
+    diagnostic("Application shutdown: cancelling work; unresolved recovery records retained.");
     if (sessionPending_) {
         stopAfterTask_ = true;
         if (paired_) paired_->requestStop();
     }
-    // Dispatch the owned rental stop before transport shutdown can wait for an
-    // in-flight control send. Its worker uses checkout/guard, not the transport.
-    if (sessionPending_ && !pending_.valid()) {
-        try { beginFinish("application-shutdown"); }
-        catch (...) { diagnostic("Shutdown stop dispatch failed; recovery records retained."); }
-    }
-    closeStream();
-    PadState shutdownPad;
-    padInitializeDefault(&shutdownPad);
-    bool exitChordReleased = false;
-    std::chrono::steady_clock::time_point exitChordAt{};
-    bool manualExit = false;
-    bool first = true;
-    auto retry = std::chrono::steady_clock::now();
-    while (sessionPending_ || pending_.valid()) {
-        appletMainLoop(); // OS exit grants only a bounded grace period, not immunity.
-        if (!pending_.valid() && std::chrono::steady_clock::now() >= retry) {
-            if (first) {
-                first = false;
-                try { armExitHandling(); }
-                catch (...) { diagnostic("Cannot re-arm exit guard; still attempting rental stop."); }
-            }
-            try {
-                syncPending();
-                if (!sessionPending_) break;
-                if (pairedPending_ || checkout_.unresolved() || guard_.ownsSession()) beginFinish("shutdown-owned-rental");
-                else if (auth_.authenticated()) recoverSession();
-            } catch (...) { diagnostic("Shutdown stop attempt failed; recovery records retained."); }
-            if (!sessionPending_ && !pending_.valid()) break;
-            diagnostic("SESSION STOP UNCONFIRMED: retaining network and recovery records; retry pending.");
-            retry = std::chrono::steady_clock::now() + std::chrono::seconds(exitAfterStop_ ? 1 : 10);
-        }
-        if (pending_.valid()) {
-            try { poll(); } catch (...) { diagnostic("Shutdown worker unresolved; recovery retained."); }
-            if (!sessionPending_ && !pending_.valid()) break;
-        }
-        if (appletGetFocusState() == AppletFocusState_InFocus) {
-            padUpdate(&shutdownPad);
-            const auto buttons = padGetButtons(&shutdownPad);
-            const auto chord = HidNpadButton_Plus | HidNpadButton_Minus;
-            if ((buttons & chord) != chord) { exitChordReleased = true; exitChordAt = {}; }
-            else if (exitChordReleased) {
-                if (exitChordAt == std::chrono::steady_clock::time_point{}) exitChordAt = std::chrono::steady_clock::now();
-                if (std::chrono::steady_clock::now() - exitChordAt >= std::chrono::seconds(3)) { manualExit = true; break; }
-            }
-            try {
-                SDL_SetRenderDrawColor(rt_.renderer, 12, 16, 28, 255);
-                SDL_RenderClear(rt_.renderer);
-                ui_.text(uiText::Server::TerminationUnconfirmed, 40, 240, 1200);
-                ui_.text(uiText::Server::StopRetryNotice, 40, 290, 1200);
-                ui_.text(uiText::Server::ManualExitHint, 40, 340, 1200);
-                ui_.text(uiText::Server::ManualExitWarning, 40, 390, 1200);
-                SDL_RenderPresent(rt_.renderer);
-            } catch (...) {}
-        }
-        svcSleepThread(100000000);
-    }
-    diagnostic(manualExit ? "Shutdown: explicit manual exit with unresolved rental; recovery records retained." :
-        "Shutdown: no unresolved rental remains.");
+    // Do not start/retry network requests after the OS requests exit. A worker
+    // still owns the guards until it is joined; retain its durable intent and
+    // cancel every HTTP client before any transport or future join.
     services_->cancel();
+    cancelPlayStation();
+    latency_.cancel();
+    if (catalogApi_) catalogApi_->cancel();
     disarmExitHandling();
+    closeStream();
+}
+
+void ApplicationController::pauseSessionRecovery() {
+    recoveryPaused_ = true;
+    checkoutAutoPoll_ = false;
+    screen_ = Screen::Recovery;
+    status_ = checkoutStatus_ = uiText::Server::RecoveryPaused;
+    disarmExitHandling();
+    diagnostic("Session recovery paused; attempts=" + std::to_string(stopRetry_.attempts()) + "; records retained; official account check required.");
+}
+
+void ApplicationController::retrySessionRecovery() {
+    if (pending_.valid() || exitAfterStop_ || shutdownDone_) return;
+    stopRetry_.reset();
+    recoveryPaused_ = false;
+    resetStopChecks_ = true;
+    if (!pairedPending_ && !checkout_.unresolved() && guard_.ownsSession()) beginFinish("manual-retry");
+    else recoverSession();
 }
 
 void ApplicationController::syncPending() {
@@ -141,13 +108,24 @@ void ApplicationController::handlePairedCheckout() {
     checkoutStatus_ = "FogHub: " + result.message;
     status_ = checkoutStatus_;
     if (!pairedPending_) {
+        stopRetry_.reset(); recoveryPaused_ = false;
         stopAfterTask_ = false;
-        if (sessionPending_) { recoverSession(); return; }
+        if (sessionPending_) {
+            if (!auth_.authenticated()) start(Task::RestoreAuth,[this] { return restoreProviders(); });
+            else recoverSession();
+            return;
+        }
         disarmExitHandling(); screen_ = Screen::PlayStation;
         status_ = result.state == fog::PairedCheckoutState::Terminal ?
             "FogHub: завершение аренды подтверждено." : checkoutStatus_;
         offerSessionRating(result);
         return;
+    }
+    if (result.stopRequested) {
+        stopAfterTask_ = true;
+        // failPaid() can initiate cleanup inside a provider operation. Include
+        // that first attempt in the same budget before scheduling any retry.
+        if (!stopRetry_.attempts()) stopRetry_.begin(std::chrono::steady_clock::now());
     }
     if (result.state == fog::PairedCheckoutState::Ready && !stopAfterTask_ && !result.stopRequested) {
         if (!pairedServices_->bindRental(result.rental)) { beginFinish("paired-stream-binding-failed"); return; }
@@ -155,6 +133,13 @@ void ApplicationController::handlePairedCheckout() {
         return;
     }
     if (stopAfterTask_ && !result.stopRequested) { beginFinish("paired-stop-queued"); return; }
+    if (stopAfterTask_ || result.stopRequested) {
+        if (stopRetry_.exhausted(std::chrono::steady_clock::now())) { pauseSessionRecovery(); return; }
+        screen_ = Screen::Checkout;
+        checkoutAutoPoll_ = true;
+        checkoutAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        return;
+    }
     if (result.state == fog::PairedCheckoutState::Preparing && !stopAfterTask_) {
         screen_ = Screen::Checkout; checkoutAutoPoll_ = true;
         checkoutAt_ = std::chrono::steady_clock::now()+std::chrono::seconds(2);
@@ -174,10 +159,14 @@ void ApplicationController::handleCheckout() {
         startStream(result.rentalId,!selectedPlayStation_,selectedComputerId_); return;
     }
     if (!sessionPending_) {
+        stopRetry_.reset(); recoveryPaused_ = false;
         disarmExitHandling(); stopAfterTask_ = false;
         screen_ = selectedPlayStation_ ? Screen::PlayStation : Screen::Games;
         status_ = result.state == fog::CheckoutState::Rejected ? uiText::Server::OrderRejected : uiText::Server::RentalFinished;
         return;
+    }
+    if ((result.stopRequested || stopAfterTask_) && stopRetry_.exhausted(std::chrono::steady_clock::now())) {
+        pauseSessionRecovery(); return;
     }
     screen_ = Screen::Checkout;
     if (result.stopRequested || stopAfterTask_) checkoutStatus_ = uiText::Server::WaitingStopData;
@@ -199,6 +188,10 @@ void ApplicationController::handleCheckout() {
 
 void ApplicationController::pollCheckout(bool manual) {
     if (pending_.valid()) return;
+    if (manual && (stopAfterTask_ || recoveryPaused_ || checkout_.result().stopRequested)) {
+        retrySessionRecovery(); return;
+    }
+    if (stopAfterTask_) { beginFinish("stop-poll"); return; }
     if (pairedPending_) {
         start(Task::PairedPoll,[this] { paired_->poll(); return std::monostate{}; });
         return;
@@ -212,6 +205,7 @@ void ApplicationController::createPairedSession(const fog::Computer& pc) {
     if (!pairedServices_->auth().authenticated()) {
         loginProvider_ = fog::ProviderId::FogHub; loginReturn_ = Screen::PlayStationDetails; screen_ = Screen::Consent; return;
     }
+    stopRetry_.reset(); recoveryPaused_ = false;
     checkStorage(); armExitHandling(); sessionPending_ = true; stopAfterTask_ = false;
     ratingFocusLost_ = false;
     selectedPlayStation_ = false;
@@ -234,7 +228,8 @@ void ApplicationController::createSession() {
     const bool playStation = screen_ == Screen::PlayStationDetails;
     if (screen_ != Screen::Details && !playStation) return;
     const auto& computers = playStation ? playStationComputers_ : computers_;
-    if (sessionPending_ || selection_ >= computers.size()) return;
+    if (sessionPending_) { screen_ = Screen::Recovery; status_ = uiText::Server::RecoveryPaused; return; }
+    if (selection_ >= computers.size()) return;
     const auto& pc = computers[selection_];
     if (pc.id.provider == fog::ProviderId::FogHub) { createPairedSession(pc); return; }
     if (playStation && (playStationLoadedAt_ == std::chrono::steady_clock::time_point{} ||
@@ -264,6 +259,7 @@ void ApplicationController::createSession() {
     order.ownAccount = playStation ? false : ownSteam_;
     recentLaunch_.prepare(playStation ? std::nullopt : selectedRecentGame_);
     // Lock focus/exit before the worker can send a billable create request.
+    stopRetry_.reset(); recoveryPaused_ = false;
     armExitHandling(); sessionPending_ = true; stopAfterTask_ = false;
     screen_ = Screen::Checkout;
     checkoutStatus_ = playStation ? uiText::PlayStation::CheckingTariff : uiText::Server::CreatingOrder;
@@ -295,11 +291,12 @@ void ApplicationController::loadSessions() {
 
 void ApplicationController::recoverSession() {
     if (pending_.valid()) return;
+    if (recoveryPaused_) { screen_ = Screen::Recovery; status_ = uiText::Server::RecoveryPaused; return; }
     if (pairedPending_) {
         loginProvider_ = fog::ProviderId::FogHub; screen_ = Screen::Recovery;
         if (!pairedServices_->auth().authenticated()) { status_ = "FogHub: нужен исходный аккаунт аренды. Y — профиль."; return; }
         armExitHandling(); stopAfterTask_ = true;
-        start(Task::PairedStop,[this] { paired_->bindAuthenticatedAccount(); paired_->stop(); return std::monostate{}; });
+        beginFinish("paired-recovery");
         return;
     }
     loginProvider_ = fog::ProviderId::Mts;
@@ -325,7 +322,10 @@ void ApplicationController::connectSession() {
 }
 
 void ApplicationController::beginFinish(const char* reason) {
-    if (pending_.valid() || !sessionPending_) return;
+    if (pending_.valid() || !sessionPending_ || exitAfterStop_ || shutdownDone_) return;
+    if (recoveryPaused_ || !stopRetry_.begin(std::chrono::steady_clock::now())) {
+        pauseSessionRecovery(); return;
+    }
     diagnostic("Rental stop begin; reason=" + std::string(reason) + " screen=" + std::to_string(static_cast<int>(screen_)));
     stopAfterTask_ = true;
     // The server stop must not wait for a synchronous RTC send already in flight.
@@ -333,12 +333,14 @@ void ApplicationController::beginFinish(const char* reason) {
     try {
         if (pairedPending_) {
             paired_->requestStop(); screen_ = Screen::Recovery;
-            start(Task::PairedStop,[this] { paired_->stop(); return std::monostate{}; });
+            start(Task::PairedStop,[this] { paired_->bindAuthenticatedAccount(); paired_->stop(); return std::monostate{}; });
             checkoutAutoPoll_ = false;
             status_ = "FogHub: отправляем завершение аренды…";
         } else if (checkout_.unresolved()) {
             screen_ = Screen::Checkout;
-            start(Task::CheckoutStop,[this] { checkout_.stop(); return std::monostate{}; });
+            const bool manualRetry = resetStopChecks_;
+            resetStopChecks_ = false;
+            start(Task::CheckoutStop,[this,manualRetry] { checkout_.stop(manualRetry); return std::monostate{}; });
             checkoutStatus_ = status_ = uiText::Server::RequestingStop;
         } else {
             screen_ = Screen::Stopping;

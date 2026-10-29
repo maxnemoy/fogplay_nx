@@ -3,7 +3,9 @@
 #include "features/streaming/domain/streaming_client.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <memory>
+#include <functional>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -30,6 +32,11 @@ public:
 // Optional workers consume the transport's synchronized compressed queues.
 class Media {
 public:
+    // Install before starting workers. Reporter executes on an observer thread;
+    // it must only enqueue diagnostics, never call UI/media or block on storage.
+    void setVideoStallReporter(std::function<void(const std::string&)> reporter);
+    // Observe the blocking SDL2 presentation call. Return is not proof of display scanout.
+    void present();
     struct WorkerError {
         std::exception_ptr error;
         ::stream::Packet packet;
@@ -58,7 +65,8 @@ public:
     bool workersRunning() const;
     bool takeWorkerError(WorkerError& error);
     std::uint64_t workerVideoGeneration() const;
-    void video(const std::byte* data, std::size_t size);
+    void video(const std::byte* data, std::size_t size,
+        std::uint64_t firstPacketMs = 0, std::uint64_t enqueueMs = 0);
     // Recreate video resources, retaining the last texture, counters and audio.
     // With workers this schedules a command without waiting for codec work.
     // Following packets are ignored until an IDR with matching VPS (HEVC), SPS and PPS arrives.
@@ -74,6 +82,9 @@ public:
     // take a due converted frame and upload only. Codec transfer failures arrive
     // through takeWorkerError(). Always application thread; false if none due.
     bool preparePresentation();
+    // Synchronous callers use the refresh slot captured before variable decode
+    // work. A successful upload advances that slot, never its completion time.
+    bool preparePresentation(std::chrono::steady_clock::time_point presentationSlot);
     // Draws only the last successfully uploaded texture.
     bool draw();
     // Call immediately after SDL_RenderPresent returns. Only a new uploaded
@@ -98,6 +109,9 @@ public:
     // Application thread only. Sparse CPU image statistics and SDL submission
     // stages; no screenshot, GPU readback or proof of physical screen contents.
     std::string imageDiagnostics() const;
+    // Application thread. Last 5s of completed new-frame presentations, excluding
+    // redraws; local receive-to-SDL-return age is not display scanout latency.
+    std::string latencyDiagnostics() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -1,3 +1,5 @@
+#include "core/diagnostics/latency_histogram.hpp"
+#include "core/diagnostics/thread_observation.hpp"
 #include "core/constants/storage_paths.hpp"
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
@@ -46,28 +48,23 @@ RestoredProviders ApplicationController::restoreProviders() {
     const bool pendingPaired = paired_ && paired_->unresolved();
     const bool pendingMts = checkout_.unresolved() || guard_.persistent() ||
         !guard_.pendingRental().empty() || !guard_.journalError().empty();
-    const auto restoreMts = [this,&result,pendingMts] {
+    const auto restoreMts = [this,&result] {
         try {
             result.mts = auth_.restore().restored;
-            if (result.mts && pendingMts) {
-                if (checkout_.unresolved()) checkout_.stop();
-                else if (guard_.ownsSession() || guard_.recoverMatchingSession()) guard_.finishAttempt();
-            }
         } catch (...) { result.mtsFailed = true; }
     };
-    const auto restorePaired = [this,&result,pendingPaired] {
+    const auto restorePaired = [this,&result] {
         if (!pairedServices_) return;
         try {
             result.foghub = pairedServices_->auth().restore().restored;
-            if (result.foghub && pendingPaired) {
-                paired_->bindAuthenticatedAccount();
-                paired_->stop();
-            }
         } catch (...) { result.foghubFailed = true; }
     };
-    if (pendingPaired) restorePaired();
+    // The main thread owns the stop-attempt budget. Restore only the provider
+    // needed for recovery now; unrelated login/profile traffic can wait.
+    if (pendingPaired) { restorePaired(); return result; }
+    if (pendingMts) { restoreMts(); return result; }
     restoreMts();
-    if (!pendingPaired) restorePaired();
+    restorePaired();
     if (result.mts) { try { result.mtsProfile = account_.profile(); } catch (...) {} }
     if (result.foghub) { try { result.foghubProfile = pairedServices_->account().profile(); } catch (...) {} }
     return result;
@@ -123,12 +120,12 @@ ApplicationController::ApplicationController(Runtime& runtime, std::unique_ptr<S
 ApplicationController::~ApplicationController() {
     stopRumble();
     cancelPlayStation();
-    if (playStationPending_.valid()) playStationPending_.wait();
     latency_.cancel();
     if (catalogApi_) catalogApi_->cancel();
-    // Last attempt precedes permanent cancellation and networking teardown.
+    // Cancel every worker before joining it or tearing down networking.
     shutdownSession();
     services_->cancel();
+    if (playStationPending_.valid()) playStationPending_.wait();
     if (pending_.valid()) pending_.wait();
     if (catalogPending_.valid()) catalogPending_.wait();
     latency_.stop();
@@ -138,6 +135,7 @@ ApplicationController::~ApplicationController() {
 }
 
 void ApplicationController::run() {
+    fog::diagnostics::observeThread("application");
     hidInitializeTouchScreen();
     PadState pad;
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -151,15 +149,16 @@ void ApplicationController::run() {
         fog::stream::LoopTiming::Scope eventsScope(loopTiming_, fog::stream::LoopTiming::Stage::Events);
         const bool systemRunning = appletMainLoop();
         if (!systemRunning) {
-            if (!sessionPending_) break;
-            if (!exitAfterStop_) diagnostic("Stop trigger: system exit request; OS grace period is limited.");
+            diagnostic("Stop trigger: system exit request; cancelling work without recovery retries.");
             exitAfterStop_ = true;
             stopAfterTask_ = true;
+            break;
         }
         const bool focused = appletGetFocusState() == AppletFocusState_InFocus;
         SDL_Event event;
         bool quit = false;
         while (SDL_PollEvent(&event)) if (event.type == SDL_QUIT) quit = true;
+        padSampledAtUs_ = fog::metrics::steadyNowUs();
         padUpdate(&pad);
         const auto rawDown = padGetButtonsDown(&pad);
         const auto rawHeld = padGetButtons(&pad);
@@ -167,9 +166,9 @@ void ApplicationController::run() {
         const auto down = focused ? rawDown : 0;
         auto uiDown = fog::controller::mapUiButtons(down,controllerSettings_,faceMasks);
         const auto held = focused ? rawHeld : 0;
-        if (quit || ((down & HidNpadButton_Plus) && !sessionPending_)) {
-            if (!sessionPending_) break;
+        if (quit || ((down & HidNpadButton_Plus) && (!sessionPending_ || recoveryPaused_))) {
             exitAfterStop_ = true; stopAfterTask_ = true;
+            break;
         }
         eventsScope.finish();
         if (!focused || screen_ != Screen::Streaming || stopAfterTask_) {
@@ -178,10 +177,6 @@ void ApplicationController::run() {
         }
         try {
             fog::stream::LoopTiming::Scope pollScope(loopTiming_, fog::stream::LoopTiming::Stage::Poll);
-            if (exitAfterStop_ && sessionPending_ && !pending_.valid() && !stopStartedOnExit_) {
-                stopStartedOnExit_ = true;
-                beginFinish("application-exit");
-            }
             // Accept stop intent before consuming a ready worker result. The worker may
             // still own checkout_/guard_, so queueing only changes main-thread state.
             if (screen_ == Screen::Checkout && (uiDown & HidNpadButton_B)) {
@@ -191,7 +186,7 @@ void ApplicationController::run() {
             // Queue focus loss before consuming a ready checkout, so a background
             // completion cannot briefly open RTC/media instead of stopping the rental.
             if (sessionPending_ && !focused) ratingFocusLost_ = true;
-            if (sessionPending_ && !stopAfterTask_ && !focused) {
+            if (sessionPending_ && !recoveryPaused_ && !stopAfterTask_ && !focused) {
                 diagnostic("Stop trigger: lost application focus; state=" + std::to_string(static_cast<int>(appletGetFocusState())));
                 stopAfterTask_ = true; if (paired_) paired_->requestStop(); if (!pending_.valid()) beginFinish("focus-lost");
             }
@@ -200,8 +195,8 @@ void ApplicationController::run() {
             poll();
             pollCatalog();
             pollPlayStation();
-            // The shutdown owner retries unresolved stops and provides an explicit escape.
-            if (exitAfterStop_ && !pending_.valid()) break;
+            if (sessionPending_ && stopAfterTask_ && !recoveryPaused_ && !pending_.valid() &&
+                stopRetry_.exhausted(std::chrono::steady_clock::now())) pauseSessionRecovery();
             if (screen_ == Screen::Checkout && !pending_.valid() && (pairedPending_ ? pairedServices_->auth().authenticated() : auth_.authenticated()) &&
                 checkoutAutoPoll_ && std::chrono::steady_clock::now() >= checkoutAt_) {
                 if (stopAfterTask_) beginFinish(); else pollCheckout(false);
@@ -215,7 +210,7 @@ void ApplicationController::run() {
             if (!pending_.valid() && focused) input(uiDown);
             updateRumble(pad, focused);
             if (screen_ == Screen::Games && focused && (!sidebar_ || catalog_.items().empty())) requestCatalog();
-            if (screen_ == Screen::Stopping && !pending_.valid() && !pairedPending_ && auth_.authenticated() &&
+            if (screen_ == Screen::Stopping && !recoveryPaused_ && !pending_.valid() && !pairedPending_ && auth_.authenticated() &&
                 std::chrono::steady_clock::now() >= retryAt_) beginFinish();
         }
         catch (const std::exception& error) {
@@ -245,7 +240,10 @@ void ApplicationController::start(Task kind, std::function<TaskResult()> work) {
     if (pending_.valid()) return;
     task_ = kind;
     status_ = uiText::Profile::ConnectingService;
-    pending_ = std::async(std::launch::async, std::move(work));
+    pending_ = std::async(std::launch::async, [work = std::move(work)]() mutable {
+        fog::diagnostics::observeThread("application-task");
+        return work();
+    });
 }
 
 void ApplicationController::poll() {
@@ -254,6 +252,11 @@ void ApplicationController::poll() {
     TaskResult data;
     try { data = pending_.get(); }
     catch (...) {
+        if (kind == Task::Recovery) {
+            syncPending();
+            pauseSessionRecovery();
+            throw;
+        }
         if (kind == Task::SessionRatingLoad || kind == Task::SessionRatingSubmit) {
             if (kind == Task::SessionRatingLoad) rating_.loadFailed(fog::rating::text::LoadFailed);
             else rating_.submitFailed(fog::rating::text::SubmitFailed);
@@ -271,6 +274,7 @@ void ApplicationController::poll() {
             syncPending(); screen_ = pairedPending_ ? Screen::Recovery : Screen::PlayStation;
             checkoutAutoPoll_ = false;
             if (!sessionPending_) { disarmExitHandling(); stopAfterTask_ = false; }
+            else if (kind == Task::PairedStop) pauseSessionRecovery();
             if (pairedPending_ && stopAfterTask_ && kind != Task::PairedStop) beginFinish("paired-worker-failed");
             throw;
         }
@@ -290,7 +294,7 @@ void ApplicationController::poll() {
             if (!sessionPending_) disarmExitHandling();
             else if (stopAfterTask_ && kind != Task::CheckoutStop) beginFinish();
         }
-        if (stopAfterTask_ && sessionPending_ && !pending_.valid() &&
+        if (stopAfterTask_ && sessionPending_ && !recoveryPaused_ && !pending_.valid() &&
             kind != Task::Finish && kind != Task::CheckoutStop) beginFinish();
         throw;
     }
@@ -303,11 +307,12 @@ void ApplicationController::poll() {
             loginProvider_ = fog::ProviderId::FogHub;
             screen_ = Screen::Recovery;
             status_ = "FogHub: войдите в исходный аккаунт аренды. A — проверить, Y — профиль.";
-            if (restored.foghub) handlePairedCheckout();
+            if (restored.foghub) recoverSession();
+            else { pauseSessionRecovery(); status_ = "FogHub: нужен исходный аккаунт аренды. B — меню; Y — профиль. Проверьте аренду на сайте."; }
         } else if (sessionPending_) {
             loginProvider_ = fog::ProviderId::Mts;
             if (restored.mts) recoverSession();
-            else { screen_ = Screen::Recovery; status_ = ui_.controllerHints(uiText::Profile::PreviousRentalSignInHint); }
+            else { pauseSessionRecovery(); status_ = ui_.controllerHints(uiText::Profile::PreviousRentalSignInHint) + " B — меню."; }
         } else if (!restored.mts && (restored.mtsFailed || !auth_.storageError().empty())) {
             loginProvider_ = fog::ProviderId::Mts; loginReturn_ = Screen::Games; screen_ = Screen::Consent;
             status_ = ui_.controllerHints(restored.mtsFailed ? uiText::Profile::RestoreFailedHint : uiText::Profile::ValidationFailedHint);
@@ -401,7 +406,7 @@ void ApplicationController::poll() {
         if (kind == Task::ManualResolution && !sessionPending_) status_ = uiText::Server::LocalBlockCleared;
         return;
     }
-    if (stopAfterTask_ && sessionPending_ && kind != Task::Finish && kind != Task::Recovery && kind != Task::Profile && kind != Task::Phone && kind != Task::Captcha && kind != Task::Otp) {
+    if (stopAfterTask_ && sessionPending_ && !recoveryPaused_ && kind != Task::Finish && kind != Task::Recovery && kind != Task::Profile && kind != Task::Phone && kind != Task::Captcha && kind != Task::Otp) {
         beginFinish(); return;
     }
     if (kind == Task::History) { history_ = std::move(std::get<std::vector<fog::HistoryEntry>>(data)); status_.clear(); return; }
@@ -412,11 +417,13 @@ void ApplicationController::poll() {
     }
     if (kind == Task::Finish) {
         if (std::get<fog::FinishResult>(data).terminated && std::get<fog::FinishResult>(data).journalCleared) {
+            stopRetry_.reset(); recoveryPaused_ = false;
             sessionPending_ = false; stopAfterTask_ = false; screen_ = Screen::Sessions; sessions_.clear(); selection_ = 0;
             status_ = uiText::Server::TerminationConfirmed;
             diagnostic("Session finish confirmed; active-session absence checked; journal cleared.");
             disarmExitHandling();
         } else {
+            if (stopRetry_.exhausted(std::chrono::steady_clock::now())) { pauseSessionRecovery(); return; }
             screen_ = Screen::Stopping;
             status_ = ui_.controllerHints(uiText::Server::TerminationRetrySignInHint);
             retryAt_ = std::chrono::steady_clock::now()+std::chrono::seconds(exitAfterStop_ ? 1 : 10);
@@ -426,7 +433,7 @@ void ApplicationController::poll() {
     }
     if (kind == Task::Recovery) {
         if (std::get<RecoveryResult>(data).matched) { armExitHandling(); beginFinish(); }
-        else { screen_ = Screen::Recovery; status_ = uiText::Server::PreviousRentalNotMatched; }
+        else { pauseSessionRecovery(); status_ = uiText::Server::PreviousRentalNotMatched + std::string(" B — меню; Y — профиль."); }
         return;
     }
     if (kind == Task::Sessions) {
@@ -446,9 +453,9 @@ void ApplicationController::poll() {
         status_ = loginAuth().storageError().empty() ? uiText::Profile::AuthSaved :
             uiText::Profile::AuthSaveFailed;
         diagnostic("Authenticated profile OK; personal fields not logged.");
-        if (pairedPending_) {
-            start(Task::PairedStop,[this] { paired_->bindAuthenticatedAccount(); paired_->stop(); return std::monostate{}; });
-        } else if (sessionPending_) recoverSession();
+        if (sessionPending_) {
+            if (recoveryPaused_) pauseSessionRecovery(); else recoverSession();
+        }
         else if (screen_ == Screen::History) loadHistory();
         else if (screen_ == Screen::PlayStation) loadPlayStation();
         else if (screen_ == Screen::Games && catalog_.items().empty()) loadGames();

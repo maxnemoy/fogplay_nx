@@ -15,6 +15,7 @@ def method(name):
     return source[start:end]
 
 harness = r'''
+#include "core/diagnostics/thread_observation.hpp"
 #include "features/playstation/application/catalog_progress.hpp"
 #include "features/playstation/domain/computer.hpp"
 #include <cassert>

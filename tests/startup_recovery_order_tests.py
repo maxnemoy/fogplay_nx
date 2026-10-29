@@ -87,52 +87,52 @@ int main() {
     {
         ApplicationController app;app.paired_->pending=true;
         app.restoreProviders();
-        expect({"FH.restore","FH.bind","FH.stop","MTS.restore","MTS.profile","FH.profile"});
+        expect({"FH.restore"});
     }
     {
         ApplicationController app;app.guard_.pending=true;
         app.restoreProviders();
-        expect({"MTS.restore","MTS.recover","MTS.stop","FH.restore","MTS.profile","FH.profile"});
+        expect({"MTS.restore"});
     }
     {
         ApplicationController app;app.checkout_.pending=true;
         app.restoreProviders();
-        expect({"MTS.restore","MTS.checkoutStop","FH.restore","MTS.profile","FH.profile"});
+        expect({"MTS.restore"});
     }
     {
         ApplicationController app;app.paired_->pending=true;app.checkout_.pending=true;
         app.restoreProviders();
-        expect({"FH.restore","FH.bind","FH.stop","MTS.restore","MTS.checkoutStop","MTS.profile","FH.profile"});
+        expect({"FH.restore"});
     }
     {
         ApplicationController app;app.paired_->pending=true;app.pairedServices_->auth_.restored=false;
         const auto result=app.restoreProviders();
-        expect({"FH.restore","MTS.restore","MTS.profile"});
+        expect({"FH.restore"});
         assert(!result.foghub && !result.foghubProfile);
     }
     {
         ApplicationController app;app.paired_->pending=true;app.pairedServices_->auth_.fail=true;
         const auto result=app.restoreProviders();
-        expect({"FH.restore","MTS.restore","MTS.profile"});
-        assert(result.foghubFailed && result.mts);
+        expect({"FH.restore"});
+        assert(result.foghubFailed && !result.mts);
     }
     {
         ApplicationController app;app.guard_.pending=true;app.auth_.restored=false;
         const auto result=app.restoreProviders();
-        expect({"MTS.restore","FH.restore","FH.profile"});
+        expect({"MTS.restore"});
         assert(!result.mts && !result.mtsProfile);
     }
     {
         ApplicationController app;app.paired_->pending=true;app.paired_->failStop=true;
         const auto result=app.restoreProviders();
-        expect({"FH.restore","FH.bind","FH.stop","MTS.restore","MTS.profile","FH.profile"});
-        assert(result.foghubFailed && app.paired_->unresolved());
+        expect({"FH.restore"});
+        assert(!result.foghubFailed && app.paired_->unresolved());
     }
     {
         ApplicationController app;app.paired_.reset();app.pairedServices_.reset();
         app.restoreProviders();expect({"MTS.restore","MTS.profile"});
     }
-    std::cout<<"Startup actual worker: pending FH/MTS rental recovery precedes unrelated auth and balances; missing auth, failures, both journals and MTS-only composition PASS\n";
+    std::cout<<"Startup actual worker: recovery-provider auth only, no unbudgeted stops or unrelated profiles; failures/both journals/MTS-only PASS\n";
 }
 """
 with tempfile.TemporaryDirectory(prefix='fog-startup-order-') as directory:

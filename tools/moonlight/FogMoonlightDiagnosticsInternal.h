@@ -62,6 +62,17 @@ void FogDiagFecOosMode(uint64_t enabled);
 void FogDiagSetWaitingForIdr(uint64_t waiting, uint64_t reason, uint64_t nowUs);
 void FogDiagIdrRequested(uint64_t nowUs);
 void FogDiagIdrDispatched(uint64_t nowUs);
+void FogDiagIdrDispatchResult(uint64_t success, uint64_t nowUs);
+void FogDiagIntactFrame(uint64_t frame, uint64_t blocks, uint64_t nowUs);
+void FogDiagIdrHeader(uint64_t frame, uint64_t blocks, uint64_t nowUs);
+void FogDiagIdrRecognized(uint64_t frame, uint64_t nowUs);
+void FogDiagIdrAssembled(uint64_t frame, uint64_t nowUs);
+void FogDiagFecFailure(uint64_t frame, uint64_t blocks, uint64_t nowUs);
+void FogDiagFecFrameAbandonedWithId(uint64_t frame, uint64_t nowUs, unsigned int pending,
+                                   unsigned int completed, unsigned int currentBlock, unsigned int lastBlock);
+int FogDiagPayloadStartsIdr(const unsigned char* payload, int length, unsigned int header, int hevc);
+void FogDiagThreadStarted(const char* role, int core, int ideal, uint64_t mask,
+                          int priority, uint64_t queryErrors, uint64_t nowUs);
 // Register once during depacketizer initialization before any core threads.
 void FogDiagRegisterDecodeQueue(const void* queue);
 // Called only under the queue's existing mutex, except after all users join

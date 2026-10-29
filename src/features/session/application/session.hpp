@@ -29,6 +29,9 @@ public:
     bool recoverMatchingSession();
     FinishResult finishAttempt();
 private:
+    friend class CheckoutGuard;
+    bool restoreCheckoutOwnership(const AccountId& account, const RentalId& rental);
+    void acknowledgeCheckoutResolution(const AccountId& account, const RentalId& rental);
     void loadJournal();
     void writeJournal();
     void clearJournal();

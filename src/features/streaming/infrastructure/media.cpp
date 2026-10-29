@@ -8,6 +8,8 @@
 #include "features/streaming/infrastructure/media_decoder_diagnostics.hpp"
 #include "features/streaming/infrastructure/media_frame_queue.hpp"
 #include "features/streaming/infrastructure/video_image_diagnostics.hpp"
+#include "features/streaming/infrastructure/video_watchdog.hpp"
+#include "core/diagnostics/thread_observation.hpp"
 #include <SDL.h>
 #include <opus/opus.h>
 extern "C" {
@@ -67,6 +69,16 @@ struct StageTiming {
 }
 struct Media::Impl {
     SDL_Renderer* renderer;
+    detail::VideoWatchdog watchdog;
+    using Flight = detail::VideoFlight;
+    Flight::Metadata decoderMetadata() const {
+        return {width.load(), height.load(), static_cast<int>(videoCodec.load()), lastFrameFormat,
+            pendingFrame ? pendingFrame->linesize[0] : 0, packetSize, packetNalTypes, frames.load()};
+    }
+    Flight::Metadata presentationMetadata() const {
+        return {textureWidth.load(), textureHeight.load(), static_cast<int>(videoCodec.load()),
+            AV_PIX_FMT_YUV420P, textureWidth.load(), 0, 0, uploadedFrames.load()};
+    }
     SDL_Texture* texture = nullptr;
     SDL_AudioDeviceID audioDevice = 0;
     AVCodecContext* decoder = nullptr;
@@ -86,6 +98,11 @@ struct Media::Impl {
     std::atomic<std::uint64_t> uploadedFrames{0}, supersededFrames{0};
     std::atomic<std::uint64_t> presentedFrames{0};
     std::uint64_t drawnGeneration = 0, presentedGeneration = 0;
+    detail::VideoFrameOrigins frameOrigins;
+    detail::VideoFrameOrigin pendingOrigin, uploadedOrigin;
+    detail::VideoLatencyMetrics latency;
+    std::int64_t nextFrameToken = 0;
+    std::atomic<std::uint64_t> originMisses{0};
     detail::VideoImageDiagnostics image;
     StageTiming imageTiming;
     DecoderClock::time_point imageUploadedAt{}, imageDrawnAt{}, imagePresentedAt{};
@@ -131,6 +148,9 @@ struct Media::Impl {
     std::deque<Media::WorkerError> errors;
     std::string videoSnapshot, audioSnapshot;
     int workerFps = 30;
+    // Switch's display is 60 Hz. Enable only for its active GLES VSYNC path;
+    // software/unpaced renderers and 30 FPS retain the timed queue policy.
+    bool displayPaced = false, refreshPrepared = false;
     static void recordQueueWait(const ::stream::Packet& incoming, StageTiming& timing) {
         const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             DecoderClock::now().time_since_epoch()).count());
@@ -156,7 +176,7 @@ struct Media::Impl {
     void discardReady() {
         std::lock_guard<std::mutex> lock(readyMutex);
         supersededFrames += readyFrames.size();
-        readyFrames.reset(workerFps);
+        readyFrames.reset(workerFps, displayPaced);
     }
     void requestReset() {
         ++epoch;
@@ -185,7 +205,8 @@ struct Media::Impl {
             return stopping.load() || (commands && resetRequested.load());
         });
     }
-    void decodeVideo(const std::byte* data, std::size_t size);
+    void decodeVideo(const std::byte* data, std::size_t size,
+        std::uint64_t firstPacketMs = 0, std::uint64_t enqueueMs = 0);
     void decodeAudio(const std::byte* data, std::size_t size, std::uint64_t enqueueMs = 0);
     bool recoverAudio(DecoderClock::time_point now);
     void resetVideo();
@@ -196,9 +217,12 @@ struct Media::Impl {
         bool deferred = false)
         : renderer(value), deferredPresentation(deferred), videoCodec(codec), parameters(codec) {}
     void releaseVideo() {
+        Flight::Scope flight(watchdog.decoder, Flight::Stage::DecoderRelease, decoderMetadata());
         // Pending hardware surfaces must outlive neither decoder nor device.
         av_frame_free(&pendingFrame);
         pending = false;
+        frameOrigins.clear();
+        pendingOrigin = {};
         sws_freeContext(scaler);
         scaler = nullptr;
         av_packet_free(&packet);
@@ -210,7 +234,10 @@ struct Media::Impl {
     }
     ~Impl() {
         if (audioDevice) SDL_CloseAudioDevice(audioDevice);
-        if (texture) SDL_DestroyTexture(texture);
+        if (texture) {
+            Flight::Scope scope(watchdog.presentation, Flight::Stage::TextureRelease, presentationMetadata());
+            SDL_DestroyTexture(texture);
+        }
         if (opus) opus_decoder_destroy(opus);
         releaseVideo();
         if (ownsCallback) releaseDecoderLogging();
@@ -318,11 +345,13 @@ struct Media::Impl {
     }
     int sendPacket() {
         const auto start = DecoderClock::now();
+        Flight::Scope flight(watchdog.decoder, Flight::Stage::DecodeSend, decoderMetadata());
         const int rc = avcodec_send_packet(decoder, packet);
         sendTiming.record(start);
         return rc;
     }
     void initVideo(bool requireHardware = false) {
+        Flight::Scope flight(watchdog.decoder, Flight::Stage::DecoderInit, decoderMetadata());
         // The temporary owner also cleans up partially initialized resources.
 #ifndef __SWITCH__
         (void)requireHardware;
@@ -379,7 +408,9 @@ struct Media::Impl {
     void receive() {
         while (true) {
             const auto receiveStart = DecoderClock::now();
+            Flight::Scope receiveFlight(watchdog.decoder, Flight::Stage::DecodeReceive, decoderMetadata());
             const int rc = avcodec_receive_frame(decoder, frame);
+            receiveFlight.finish();
             receiveTiming.record(receiveStart);
             if (rc == AVERROR(EAGAIN)) return;
             // This client never sends the drain marker; EOF is unexpected.
@@ -392,10 +423,15 @@ struct Media::Impl {
             hw = frame->hw_frames_ctx != nullptr;
             width = frame->width; height = frame->height;
             if (pending) ++supersededFrames;
+            Flight::Scope releaseFlight(watchdog.decoder, Flight::Stage::FrameRelease, decoderMetadata());
             av_frame_unref(pendingFrame);
             av_frame_move_ref(pendingFrame, frame);
+            releaseFlight.finish();
             pending = true;
             pendingSince = DecoderClock::now();
+            bool found = false;
+            pendingOrigin = frameOrigins.find(pendingFrame->pts, found);
+            if (!found) ++originMisses;
             ++frames;
             waiting = false;
         }
@@ -407,12 +443,17 @@ struct Media::Impl {
     detail::MediaFrameQueue::Frame convertPending() {
         requireVideo();
         detail::MediaFrameQueue::Frame output;
+        output.origin = pendingOrigin;
         output.pixels.swap(pixels);
         AVFrame* decoded = pendingFrame;
         if (pendingFrame->hw_frames_ctx) {
+            Flight::Scope releaseFlight(watchdog.decoder, Flight::Stage::FrameRelease, decoderMetadata());
             av_frame_unref(cpuFrame);
+            releaseFlight.finish();
             const auto transferStart = DecoderClock::now();
+            Flight::Scope transferFlight(watchdog.decoder, Flight::Stage::Transfer, decoderMetadata());
             const int transfer = av_hwframe_transfer_data(cpuFrame, pendingFrame, 0);
+            transferFlight.finish();
             transferTiming.record(transferStart);
             if (transfer < 0) codecFailure("hardware frame transfer", transfer);
             decoded = cpuFrame;
@@ -429,19 +470,25 @@ struct Media::Impl {
             output.pixels.data() + w*h + ((w+1)/2)*((h+1)/2), nullptr};
         int strides[4]{w, (w+1)/2, (w+1)/2, 0};
         const auto scaleStart = DecoderClock::now();
+        Flight::Scope scaleFlight(watchdog.decoder, Flight::Stage::Convert, decoderMetadata());
         const int scaled = sws_scale(scaler, decoded->data, decoded->linesize, 0, h, planes, strides);
+        scaleFlight.finish();
         scaleTiming.record(scaleStart);
         if (scaled != h) throw std::runtime_error(fog::constants::error::Stream::VideoConversionFailed);
         output.width = w; output.height = h;
         return output;
     }
     void clearPending() {
+        Flight::Scope flight(watchdog.decoder, Flight::Stage::FrameRelease, decoderMetadata());
         pending = false;
         av_frame_unref(pendingFrame);
         av_frame_unref(cpuFrame);
     }
     bool upload(const detail::MediaFrameQueue::Frame& output) {
         requireApplicationThread();
+        auto metadata = presentationMetadata();
+        metadata.width = output.width; metadata.height = output.height; metadata.stride = output.width;
+        Flight::Scope flight(watchdog.presentation, Flight::Stage::TextureUpload, metadata);
         const auto w = output.width, h = output.height;
         const auto* y = output.pixels.data();
         const auto* u = y + w*h;
@@ -472,20 +519,21 @@ struct Media::Impl {
         // A draw of the preceding texture cannot acknowledge this upload.
         drawnGeneration = 0;
         ++uploadedFrames;
+        uploadedOrigin = output.origin;
         imageUploadedAt = DecoderClock::now();
         const auto sampleStart = imageUploadedAt;
         image.uploaded(detail::VideoImageSample::inspect(output.pixels.data(), output.pixels.size(), w, h), w, h);
         imageTiming.record(sampleStart);
         return true;
     }
-    bool preparePresentation() {
+    bool preparePresentation(DecoderClock::time_point presentationSlot = DecoderClock::now()) {
         requireApplicationThread();
         requireVideo();
         if (!pending) return false;
-        if (!presentationCadence.due(DecoderClock::now())) return false;
+        if (!presentationCadence.due(presentationSlot)) return false;
         auto output = convertPending();
         const bool result = upload(output);
-        presentationCadence.uploaded(DecoderClock::now());
+        if (result) presentationCadence.uploaded(presentationSlot);
         pixels = std::move(output.pixels);
         clearPending();
         return result;
@@ -501,7 +549,14 @@ Media::Media(SDL_Renderer* renderer, ::stream::VideoCodec codec, bool deferredPr
     impl_->init();
 }
 Media::~Media() { stopWorkers(); }
-void Media::Impl::decodeVideo(const std::byte* data, std::size_t size) {
+void Media::setVideoStallReporter(std::function<void(const std::string&)> reporter) {
+    impl_->requireApplicationThread();
+    if (impl_->workers) throw std::logic_error("Configure video observer before starting workers");
+    impl_->watchdog.start(std::move(reporter));
+}
+void Media::Impl::decodeVideo(const std::byte* data, std::size_t size,
+    std::uint64_t firstPacketMs, std::uint64_t enqueueMs) {
+    const auto admittedUs = metrics::steadyNowUs();
     if (!data || !size || size > 4*1024*1024) throw std::runtime_error(fog::constants::error::Stream::InvalidVideoAccessUnit);
     auto& m = *this;
     m.requireVideo();
@@ -520,6 +575,12 @@ void Media::Impl::decodeVideo(const std::byte* data, std::size_t size) {
     if (allocated < 0) m.codecFailure("packet allocation", allocated, false);
     if (!prefix.empty()) std::memcpy(m.packet->data, prefix.data(), prefix.size());
     std::memcpy(m.packet->data + prefix.size(), data, size);
+    // PTS is used only as an opaque identity here; display cadence continues to
+    // use the original RTP timestamp. A missing decoder PTS yields no age sample.
+    m.packet->pts = ++m.nextFrameToken;
+    const bool hasQueueWait = enqueueMs && enqueueMs <= admittedUs / 1000;
+    m.frameOrigins.remember(m.packet->pts, {firstPacketMs,
+        hasQueueWait ? admittedUs - enqueueMs * 1000 : 0, hasQueueWait});
     int rc = m.sendPacket();
     if (rc == AVERROR(EAGAIN)) { m.receive(); rc = m.sendPacket(); }
     av_packet_unref(m.packet);
@@ -528,12 +589,14 @@ void Media::Impl::decodeVideo(const std::byte* data, std::size_t size) {
     m.receive();
     if (!m.deferredPresentation && !m.workers) m.preparePresentation();
 }
-void Media::video(const std::byte* data, std::size_t size) {
+void Media::video(const std::byte* data, std::size_t size,
+    std::uint64_t firstPacketMs, std::uint64_t enqueueMs) {
     impl_->requireApplicationThread();
     if (impl_->workers) throw std::logic_error("Media video is owned by worker");
-    impl_->decodeVideo(data, size);
+    impl_->decodeVideo(data, size, firstPacketMs, enqueueMs);
 }
 void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
+    diagnostics::observeThread("media-video");
     bool paused = false, haveGeneration = false;
     std::uint64_t lastGeneration = 0;
     while (!stopping) {
@@ -566,7 +629,7 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
             lastGeneration = incoming.videoGeneration;
             haveGeneration = true;
             transportGeneration = lastGeneration;
-            decodeVideo(incoming.data.data(), incoming.data.size());
+            decodeVideo(incoming.data.data(), incoming.data.size(), incoming.firstPacketMs, incoming.enqueueMs);
             if (pending) {
                 auto output = convertPending();
                 clearPending();
@@ -586,6 +649,7 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
     }
 }
 void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
+    diagnostics::observeThread("media-audio");
     bool paused = false;
     auto nextSnapshot = DecoderClock::now();
     while (!stopping) {
@@ -623,6 +687,15 @@ void Media::startWorkers(::stream::StreamingClient& client, int fps) {
     if (m.workers) throw std::logic_error("Media workers already running");
     if (fps < 1 || fps > 120) throw std::invalid_argument("Invalid media worker frame rate");
     m.workerFps = fps;
+    m.displayPaced = false;
+#ifdef __SWITCH__
+    SDL_RendererInfo rendererInfo{};
+    if (fps == 60 && SDL_GetRendererInfo(m.renderer, &rendererInfo) == 0 &&
+        rendererInfo.name && std::strcmp(rendererInfo.name, "opengles2") == 0 &&
+        (rendererInfo.flags & SDL_RENDERER_PRESENTVSYNC) && SDL_GL_GetSwapInterval() == 1)
+        m.displayPaced = true;
+#endif
+    m.refreshPrepared = false;
     m.discardReady();
     m.publishVideo(); m.publishAudio();
     m.stopping = false;
@@ -840,20 +913,29 @@ void Media::checkAudioRecovery() const {
         throw AudioPlaybackError("Audio recovery deadline exhausted; stopping rental");
 }
 bool Media::preparePresentation() {
+    return preparePresentation(DecoderClock::now());
+}
+bool Media::preparePresentation(DecoderClock::time_point presentationSlot) {
     auto& m = *impl_;
     m.requireApplicationThread();
-    if (!m.workers) return m.preparePresentation();
+    if (!m.workers) return m.preparePresentation(presentationSlot);
+    // At most one replacement texture per completed display cycle, even when
+    // a caller probes twice. SDL_RenderPresent supplies the active 60 Hz pace.
+    if (m.displayPaced && m.refreshPrepared) return false;
     detail::MediaFrameQueue::Frame output;
     std::uint64_t dropped = 0;
     {
         std::lock_guard<std::mutex> lock(m.readyMutex);
-        if (!m.readyFrames.take(output, DecoderClock::now(), dropped)) return false;
+        if (!m.readyFrames.take(output, m.displayPaced ? DecoderClock::now() : presentationSlot, dropped)) return false;
     }
     m.supersededFrames += dropped;
-    return m.upload(output);
+    const bool uploaded = m.upload(output);
+    if (uploaded && m.displayPaced) m.refreshPrepared = true;
+    return uploaded;
 }
 bool Media::draw() {
     impl_->requireApplicationThread();
+    Impl::Flight::Scope flight(impl_->watchdog.presentation, Impl::Flight::Stage::Draw, impl_->presentationMetadata());
     impl_->drawnGeneration = 0;
     if (!impl_->texture) { ++impl_->imageEmptyDraws; return false; }
     const double scale = std::min(1280.0/impl_->textureWidth, 720.0/impl_->textureHeight);
@@ -875,14 +957,23 @@ bool Media::draw() {
     ++impl_->imageDraws;
     return true;
 }
+void Media::present() {
+    impl_->requireApplicationThread();
+    Impl::Flight::Scope scope(impl_->watchdog.presentation, Impl::Flight::Stage::Present, impl_->presentationMetadata());
+    SDL_RenderPresent(impl_->renderer);
+    presented();
+}
+
 void Media::presented() {
     impl_->requireApplicationThread();
+    impl_->refreshPrepared = false;
     const auto generation = impl_->drawnGeneration;
     impl_->drawnGeneration = 0;
     if (generation && generation != impl_->presentedGeneration) {
         impl_->presentedGeneration = generation;
         ++impl_->presentedFrames;
         impl_->imagePresentedAt = DecoderClock::now();
+        impl_->latency.presented(impl_->uploadedOrigin, metrics::steadyNowUs());
         impl_->imagePresentedBlack = impl_->image.last.nearBlack();
         if (impl_->imagePresentedBlack) ++impl_->imagePresentedBlackFrames;
     }
@@ -933,15 +1024,18 @@ std::string Media::diagnostics() const {
             std::to_string(entry.second));
     }
     std::size_t depth;
+    detail::MediaFrameQueue::Stats queueStats;
     {
         std::lock_guard<std::mutex> lock(impl_->readyMutex);
         depth = impl_->readyFrames.size();
+        queueStats = impl_->readyFrames.stats();
     }
     return snapshot + " async_workers=1 presentation_queue=" + std::to_string(depth) +
         " presentation_queue_limit=3 presentation_fps=" + std::to_string(impl_->workerFps) +
         " video_worker_queue_samples=" + std::to_string(impl_->videoQueueWait.calls.load()) +
         " video_worker_queue_wait_avg_us=" + std::to_string(impl_->videoQueueWait.average()) +
-        " video_worker_queue_wait_max_us=" + std::to_string(impl_->videoQueueWait.maximum.load()) + " " + imageDiagnostics();
+        " video_worker_queue_wait_max_us=" + std::to_string(impl_->videoQueueWait.maximum.load()) +
+        " " + queueStats.diagnostics() + " " + imageDiagnostics();
 }
 std::string Media::imageDiagnostics() const {
     impl_->requireApplicationThread();
@@ -976,5 +1070,10 @@ std::string Media::imageDiagnostics() const {
         m.imagePresentedBlack ? 1 : 0, static_cast<unsigned long long>(m.imagePresentedBlackFrames),
         static_cast<unsigned long long>(m.imageTiming.average()), static_cast<unsigned long long>(m.imageTiming.maximum.load()));
     return text.data();
+}
+std::string Media::latencyDiagnostics() const {
+    impl_->requireApplicationThread();
+    return impl_->latency.diagnostics(metrics::steadyNowUs(), impl_->workerFps) +
+        " originMapCapacity=64 originMissesLifetime=" + std::to_string(impl_->originMisses.load());
 }
 }

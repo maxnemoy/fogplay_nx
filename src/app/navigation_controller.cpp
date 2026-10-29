@@ -9,7 +9,7 @@ namespace fogplay {
 
 void ApplicationController::moveGrid(u64 keys, std::size_t count, std::size_t columns) {
     if (!count) { selection_ = 0; return; }
-    if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) { if (selection_ % columns) --selection_; else if (!sessionPending_) sidebar_ = true; }
+    if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) { if (selection_ % columns) --selection_; else if (!sessionPending_ || recoveryPaused_) sidebar_ = true; }
     if ((keys & (HidNpadButton_Right | HidNpadButton_StickLRight)) && selection_ + 1 < count) ++selection_;
     if ((keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) && selection_ >= columns) selection_ -= columns;
     if ((keys & (HidNpadButton_Down | HidNpadButton_StickLDown)) && selection_ + columns < count) selection_ += columns;
@@ -25,7 +25,7 @@ void ApplicationController::input(u64 keys) {
     }
     if (screen_ == Screen::ManualResolution) {
         if (keys & HidNpadButton_A) start(Task::ManualResolution,[this] { checkout_.acknowledgeManualResolution(); return std::monostate{}; });
-        else if (keys & HidNpadButton_B) screen_ = Screen::Checkout;
+        else if (keys & HidNpadButton_B) { screen_ = recoveryPaused_ ? Screen::Recovery : Screen::Checkout; }
         return;
     }
     if (screen_ == Screen::Profile) {
@@ -46,14 +46,17 @@ void ApplicationController::input(u64 keys) {
         if (keys & HidNpadButton_Y) openProfile();
         else if (keys & HidNpadButton_B) queueCheckoutStop();
         else if ((keys & HidNpadButton_A) && (pairedPending_ ? pairedServices_->auth().authenticated() : auth_.authenticated())) pollCheckout(true);
-        else if ((keys & HidNpadButton_X) && !pairedPending_ && !guard_.persistent() && guard_.pendingRental().empty()) screen_ = Screen::ManualResolution;
+        else if ((keys & HidNpadButton_X) && !pairedPending_ && checkout_.unresolved()) screen_ = Screen::ManualResolution;
         return;
     }
     if (screen_ == Screen::Stopping || screen_ == Screen::Recovery) {
         if (keys & HidNpadButton_Y) openProfile();
+        else if ((keys & HidNpadButton_X) && !pairedPending_ && checkout_.unresolved()) screen_ = Screen::ManualResolution;
+        else if ((keys & HidNpadButton_B) && recoveryPaused_) {
+            loadGames(); sidebar_ = true; status_ = uiText::Server::RecoveryStillPending;
+        }
         else if ((keys & HidNpadButton_A) && (pairedPending_ ? pairedServices_->auth().authenticated() : auth_.authenticated())) {
-            if (pairedPending_) pollCheckout(true);
-            else if (guard_.ownsSession()) beginFinish(); else recoverSession();
+            retrySessionRecovery();
         }
         return;
     }
@@ -124,7 +127,7 @@ void ApplicationController::input(u64 keys) {
             selection_ = std::min(selection_,count-1);
             if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) {
                 if (selection_ % columns) --selection_;
-                else if (!sessionPending_) sidebar_ = true;
+                else if (!sessionPending_ || recoveryPaused_) sidebar_ = true;
             }
             if ((keys & (HidNpadButton_Right | HidNpadButton_StickLRight)) && selection_ % columns < columns-1 && selection_+1 < count) ++selection_;
             if ((keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) && selection_ >= columns) selection_ -= columns;

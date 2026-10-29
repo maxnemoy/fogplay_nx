@@ -515,6 +515,79 @@ int main() {
             require(checkout.poll().state == CheckoutState::RecoveryRequired && !sessions.ownsSession(),
                 "unexpected cancellation type cannot connect rental");
         }
+        // A real process restart reconstructs BOTH guards, losing all RAM evidence.
+        for (const bool rejectedStop : {false, true}) {
+            Fixture f;
+            {
+                fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+                fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+                checkout.create(f.selection()); f.makeActive();
+                require(f.settle(checkout).state == CheckoutState::Ready, "pre-restart rental ready");
+            }
+            f.active = fog::Json::array(); f.rejectedFinish = rejectedStop;
+            f.status["status"] = 2; f.status["hash"] = "";
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+            const auto result = checkout.stop();
+            require(f.finishes == 1 && f.checks == 3, "same-account recorded hash authorizes exact stop without status readiness");
+            if (rejectedStop) {
+                require(result.state == CheckoutState::RecoveryRequired && sessions.persistent() && checkout.unresolved(),
+                    "restart absence plus rejected finish is never automatic termination evidence");
+                f.login("89991234568");
+                rejects([&] { checkout.acknowledgeManualResolution(); }, "other account cannot clear matching pair");
+                checkout.stop();
+                require(f.finishes == 1 && sessions.persistent(), "other account cannot target recorded rental");
+                f.login();
+                require(checkout.acknowledgeManualResolution().state == CheckoutState::Idle &&
+                    !sessions.persistent() && sessions.pendingRental().empty() && !checkout.unresolved(),
+                    "explicit website confirmation clears both matching records without server request");
+                require(f.finishes == 1, "local confirmation never invents stop acknowledgement");
+            } else require(result.state == CheckoutState::Idle && !sessions.persistent() && !checkout.unresolved(),
+                "acknowledged targeted stop plus fresh absence clears restored records");
+        }
+        {
+            Fixture f;
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+            checkout.create(f.selection());
+            f.status["hash"] = "";
+            for (int attempt = 0; attempt < 40; ++attempt) checkout.stop();
+            require(f.checks == 30 && checkout.result().pollCount == 30 &&
+                !fog::checkoutNeedsAutomaticCheck(checkout.result()) && f.creates == 1,
+                "automatic unknown-hash stops never reset bounded status polling");
+            checkout.stop(true);
+            require(f.checks == 31 && checkout.result().pollCount == 1, "explicit manual stop alone renews status budget");
+            f.api.cancelAll();
+            const int checks = f.checks;
+            checkout.stop(true);
+            require(f.checks == checks, "final cancellation also rejects cleanup status transport");
+        }
+        {
+            Fixture f;
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+            checkout.create(f.selection()); f.makeActive(); checkout.poll();
+            sessions.adopt(mts("different-session"));
+            rejects([&] { checkout.acknowledgeManualResolution(); }, "website confirmation cannot clear another session marker");
+            require(checkout.stop().state == CheckoutState::RecoveryRequired && f.finishes == 0,
+                "mismatched session marker never borrows checkout ownership");
+        }
+        {
+            Fixture f;
+            fog::SessionGuard sessions(f.rentals, fog::makeMtsSessionJournal(f.sessionPath));
+            fog::CheckoutGuard checkout(f.rentals, sessions, fog::makeMtsCheckoutJournal(f.checkoutPath));
+            checkout.create(f.selection()); f.makeActive();
+            require(f.settle(checkout).state == CheckoutState::Ready, "paired clear failure fixture ready");
+            require(std::remove(f.checkoutPath.c_str()) == 0 && mkdir(f.checkoutPath.c_str(), 0700) == 0,
+                "replace checkout marker with an uncleareable directory");
+            const auto child = f.checkoutPath + "/child";
+            std::ofstream(child) << "fixture";
+            rejects([&] { checkout.acknowledgeManualResolution(); }, "partial local clear reports storage failure");
+            require(checkout.unresolved() && !sessions.persistent() && f.finishes == 0,
+                "remaining checkout blocks another rental after partial local clear");
+            rejects([&] { checkout.create(f.selection()); }, "partial clear cannot create another order");
+            std::remove(child.c_str()); rmdir(f.checkoutPath.c_str());
+        }
         std::cout << "Checkout offline tests passed: " << assertions << " assertions. No live orders or payments.\n";
         return 0;
     } catch (const std::exception& error) {

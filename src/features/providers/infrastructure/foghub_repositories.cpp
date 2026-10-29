@@ -34,28 +34,63 @@ std::string encode(const std::string& value) {
     }
     return result;
 }
-Money money(const std::string& value) {
-    if (value.empty() || value.size() > 18) fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub amount");
+Money money(const std::string& value, bool availableBalance = false) {
+    if (value.empty() || value.size() > (availableBalance ? 128U : 18U))
+        fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub amount");
     std::size_t i = value.front() == '-' ? 1 : 0;
     const bool negative = i != 0;
     std::int64_t whole = 0, fraction = 0;
+    bool discardedNonzero = false;
+    bool grouped = false;
+    std::size_t groupDigits = 0;
     const auto start = i;
-    while (i < value.size() && value[i] >= '0' && value[i] <= '9') {
-        whole = whole * 10 + value[i++] - '0';
-        if (whole > 1000000000000LL) fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub amount");
+    while (i < value.size()) {
+        if (value[i] >= '0' && value[i] <= '9') {
+            whole = whole * 10 + value[i++] - '0';
+            ++groupDigits;
+            if (whole > 1000000000000LL) fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub amount");
+        } else if (availableBalance && value[i] == ',') {
+            // The balance endpoint formats thousands with ASCII commas. Verify
+            // every group before ignoring separators; other money stays exact.
+            if (!groupDigits || (grouped ? groupDigits != 3 : groupDigits > 3))
+                fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub amount");
+            grouped = true; groupDigits = 0; ++i;
+        } else break;
     }
-    if (i == start) fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub amount");
+    if (i == start || (grouped && groupDigits != 3))
+        fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub amount");
     if (i < value.size()) {
-        if (value[i++] != '.' || i == value.size() || value.size()-i > 2)
+        if (value[i++] != '.' || i == value.size() || (!availableBalance && value.size()-i > 2))
             fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub amount");
         const auto digits = value.size()-i;
+        const auto fractionStart = i;
         for (;i < value.size();++i) {
             if (value[i] < '0' || value[i] > '9') fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub amount");
-            fraction = fraction*10 + value[i]-'0';
+            if (i-fractionStart < 2) fraction = fraction*10 + value[i]-'0';
+            else if (value[i] != '0') discardedNonzero = true;
         }
         if (digits == 1) fraction *= 10;
     }
-    return {(whole*100+fraction)*(negative ? -1 : 1),"RUB"};
+    // Available funds are rounded toward negative infinity, never upward.
+    // Other monetary fields retain their exact, at-most-two-decimal contract.
+    const auto minor = whole*100+fraction;
+    return {negative ? -minor-(discardedNonzero ? 1 : 0) : minor,"RUB"};
+}
+std::string balanceShape(const nlohmann::json& data) {
+    if (!data.is_object()) return "type=response-invalid length=0 decimal_digits=0";
+    const auto found = data.find("balance");
+    if (found == data.end()) return "type=missing length=0 decimal_digits=0";
+    std::size_t length = 0, decimals = 0;
+    if (found->is_string()) {
+        const auto& value = found->get_ref<const std::string&>();
+        length = value.size();
+        const auto point = value.find('.');
+        if (point != std::string::npos)
+            for (auto i=point+1;i<value.size() && value[i]>='0' && value[i]<='9';++i) ++decimals;
+    }
+    // type_name is library-controlled. Never include a response value or body.
+    return std::string("type=")+found->type_name()+" length="+std::to_string(length)+
+        " decimal_digits="+std::to_string(decimals);
 }
 std::string relativeLocation(const std::string& location) {
     static const std::string origin = "https://foghub.ru";
@@ -133,7 +168,11 @@ template<class Row, class Loader> std::vector<Row> catalogPage(int page, int siz
 }
 }
 
-Session::Session(WebTransport& transport, CookieStore& storage) : transport_(transport),storage_(storage) {}
+Session::Session(WebTransport& transport, CookieStore& storage, Diagnostic diagnostic)
+    : transport_(transport),storage_(storage),diagnostic_(std::move(diagnostic)) {}
+void Session::balanceDiagnostic(const std::string& message) const noexcept {
+    try { if (diagnostic_) diagnostic_("FogHub balance: "+message); } catch (...) {}
+}
 void Session::validateLogin(const LoginRequest& request) const {
     if (!clean(request.identifier,128) || !clean(request.secret,1024))
         fail(RepositoryErrorKind::InvalidRequest,"Enter FogHub login and password");
@@ -176,13 +215,23 @@ UserProfile Session::verifiedProfile() {
     const auto page = verifiedAuthPage(response.body, parseAccount,
         "FogHub page could not be verified (stage=account)");
     UserProfile profile{{ProviderId::FogHub,page.accountId},page.displayName,{}};
-    const auto balance = get("/user/balance",false);
-    if (balance.contentType.rfind("application/json",0) != 0)
-        fail(RepositoryErrorKind::InvalidResponse,"Expected FogHub balance response");
-    const auto data = nlohmann::json::parse(balance.body,nullptr,false);
-    if (!data.is_object() || !data.contains("balance") || !data["balance"].is_string())
-        fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub balance response");
-    profile.balance = money(data["balance"].get<std::string>());
+    std::string shape = "type=unread length=0 decimal_digits=0";
+    try {
+        const auto balance = get("/user/balance",false);
+        if (balance.contentType.rfind("application/json",0) != 0)
+            fail(RepositoryErrorKind::InvalidResponse,"Expected FogHub balance response");
+        const auto data = nlohmann::json::parse(balance.body,nullptr,false);
+        shape = balanceShape(data);
+        if (!data.is_object() || !data.contains("balance") || !data["balance"].is_string())
+            fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub balance response");
+        profile.balance = money(data["balance"].get_ref<const std::string&>(),true);
+        balanceDiagnostic("status=available "+shape);
+    } catch (const RepositoryError& error) {
+        // A verified account is independent of this optional balance endpoint.
+        // Explicit session expiry must still invalidate authentication.
+        balanceDiagnostic(std::string("status=unavailable reason=")+repositoryErrorKindName(error.kind())+" "+shape);
+        if (error.kind() == RepositoryErrorKind::NotAuthenticated) throw;
+    }
     return profile;
 }
 AuthResult Session::login(const LoginRequest& request) {
@@ -245,10 +294,11 @@ UserProfile Session::profile() {
 }
 Session::OwnHistory Session::ownHistory() {
     // Also verifies the account attached to the cookie session before reading its history.
-    profile();
+    const auto profile = this->profile();
     try {
         OwnHistory result;
         result.owner = auth_;
+        result.balance = profile.balance;
         std::set<std::string> ids, paths;
         std::string next = "/session/list";
         std::optional<std::size_t> expected;

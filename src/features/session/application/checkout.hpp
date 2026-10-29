@@ -25,7 +25,7 @@ struct CheckoutResult {
 inline bool checkoutNeedsAutomaticCheck(const CheckoutResult& result) {
     return ((result.state == CheckoutState::Pending || result.state == CheckoutState::PaymentRequired) &&
         result.pollCount < 30) ||
-        (result.stopRequested && (!result.creationId.empty() || !result.rentalId.empty()));
+        (result.stopRequested && result.pollCount < 30 && (!result.creationId.empty() || !result.rentalId.empty()));
 }
 // Serial API worker only. No destructor requests and no automatic create retry.
 class CheckoutGuard {
@@ -37,7 +37,7 @@ public:
     // One bounded GET. UI schedules at least 2 seconds apart; max 30 automatic polls.
     CheckoutResult poll(bool manualRetry = false);
     // Persist stop intent. If hash is unknown, keep polling; this is NOT cancellation.
-    CheckoutResult stop();
+    CheckoutResult stop(bool manualRetry = false);
     // Only after the user verifies on the official account that no rental/charge remains.
     // Does not send cancellation, and never reports server termination.
     CheckoutResult acknowledgeManualResolution();

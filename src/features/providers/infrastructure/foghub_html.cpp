@@ -646,16 +646,35 @@ HistoryPage parseHistory(const std::string& html) {
 
 GamesPage parseGames(const std::string& html) {
     auto doc = document(html);
-    auto* main = mainNode(doc.get(), "Все игры", false);
+    auto* main = mainNode(doc.get(), {}, false);
+    const auto headings = select(main, ".//h1");
+    require(headings.size() <= 1);
+    if (!headings.empty()) require(text(headings.front()) == "Все игры");
+    else {
+        // The current catalog comments out its h1. Verify both the document
+        // identity and catalog container before accepting that template.
+        require(text(one(xmlDocGetRootElement(doc.get()), "/html/head/title")) == "Все игры");
+        one(main, ".//div[contains(concat(' ',normalize-space(@class),' '),' game-index ')]");
+    }
     require(attr(one(main, ".//form[@id='search-form']"), "action") == "/game/list");
     auto* list = listView(main);
     GamesPage page;
     std::set<std::string> ids;
     for (auto* card : cards(list)) {
         const auto gameLinks = links(card, "/game/preview");
-        require(gameLinks.size() == 1);
+        require(!gameLinks.empty() && gameLinks.size() <= 2);
         GameRow row;
-        row.id = linkId(gameLinks.front(), "/game/preview");
+        std::set<std::string> modes;
+        for (auto* link : gameLinks) {
+            const auto params = query(attr(link, "href"), "/game/preview");
+            require(params.count("id") == 1 && (params.size() == 1 ||
+                (params.size() == 2 && params.count("mode") == 1 && params.at("mode") == "5")));
+            const auto& id = params.at("id");
+            identifier(id);
+            require(row.id.empty() || row.id == id);
+            row.id = id;
+            require(modes.insert(params.count("mode") ? params.at("mode") : "").second);
+        }
         require(ids.insert(row.id).second);
         const auto images = select(card, "./div/div[1]/img");
         require(images.size() <= 1);
@@ -724,7 +743,9 @@ ComputersPage parseComputers(const std::string& html, const std::string& gameId)
     identifier(gameId);
     auto doc = document(html);
     auto* main = mainNode(doc.get(), {}, false);
-    require(text(one(main, ".//h2")) == "Все компьютеры с игрой");
+    const auto subtitles = select(main, ".//h2");
+    require(subtitles.size() <= 1);
+    if (!subtitles.empty()) require(text(subtitles.front()) == "Все компьютеры с игрой");
     auto* search = one(main, ".//form[@id='search-form']");
     require(attr(search, "action") == "/game/preview");
     require(attr(one(search, ".//input[@name='id']"), "value") == gameId);

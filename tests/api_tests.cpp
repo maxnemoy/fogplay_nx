@@ -130,6 +130,12 @@ int main() {
         require(fake.requests.back().token == "fixture-token", "profile token forwarding");
         rejects([&] { api.submitPhone("PRIVATE"); }, "invalid account switch phone");
         require(api.loggedIn(), "invalid phone preserves current authorization");
+        const auto beforeFinalCancel = fake.requests.size();
+        api.cancelAll();
+        rejects([&] { api.finishSession("fixture-rental"); }, "final cancellation prevents independent finish transport");
+        rejects([&] { api.activeSessions(true); }, "final cancellation prevents independent verification transport");
+        rejects([&] { api.userInfo(); }, "final cancellation prevents normal transport");
+        require(fake.requests.size() == beforeFinalCancel, "no request reaches transport after final exit cancellation");
         api.clearToken();
         rejects([&] { api.userInfo(); }, "logged-out profile cannot request");
         fog::HttpClient http;

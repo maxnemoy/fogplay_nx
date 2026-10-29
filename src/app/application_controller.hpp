@@ -18,6 +18,7 @@
 #include "features/settings/infrastructure/connection_settings_storage.hpp"
 #include "features/settings/infrastructure/rumble_settings_storage.hpp"
 #include "features/session/application/session.hpp"
+#include "features/session/application/stop_retry_budget.hpp"
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/video_recovery.hpp"
 #include "features/streaming/domain/transport_reconnect.hpp"
@@ -78,7 +79,9 @@ using diagnostics::diagnostic;
 using diagnostics::safeText;
 using diagnostics::runLog;
 using diagnostics::PlaybackTiming;
-using diagnostics::diagnosticTiming;
+using diagnostics::diagnosticTimingSnapshot;
+using diagnostics::takeDiagnosticTiming;
+using diagnostics::resetDiagnosticTiming;
 inline constexpr const char* dataDir = platform::dataDir;
 inline constexpr fog::controller::FaceButtonMasks faceMasks{HidNpadButton_A,HidNpadButton_B,HidNpadButton_X,HidNpadButton_Y};
 inline constexpr SDL_Color white{234, 238, 245, 255};
@@ -125,8 +128,10 @@ private:
     bool pairedPending() const { return pairedPending_; }
     void armExitHandling();
     void disarmExitHandling();
-    std::string playbackTimings() const;
+    std::string playbackTimings(bool takeLogTiming = false) const;
     void logOutputTimings(bool final);
+    std::uint64_t padSampledAtUs_ = 0;
+    std::string lastThreadObservations_;
     void logIncomingControl(bool final = false) noexcept;
     void closeStream() noexcept;
     void stopRumble() noexcept;
@@ -150,6 +155,8 @@ private:
     bool completePairedTransportReconnect();
     void retryTransport(const char* reason);
     void shutdownSession() noexcept;
+    void pauseSessionRecovery();
+    void retrySessionRecovery();
     void syncPending();
     void logCheckoutResult(Task phase);
     void queueCheckoutStop();
@@ -337,7 +344,9 @@ private:
     unsigned sessionSequence_ = 0;
     std::vector<fog::Rental> sessions_;
     bool sessionPending_ = false, exitLocked_ = false, exitAfterStop_ = false, shutdownDone_ = false;
-    bool stopStartedOnExit_ = false;
+    fog::StopRetryBudget stopRetry_;
+    bool recoveryPaused_ = false;
+    bool resetStopChecks_ = false;
     std::chrono::steady_clock::time_point streamStarted_{}, lastVideo_{}, retryAt_{}, lastMediaLog_{};
     std::future<TaskResult> pending_;
     Task task_ = Task::RestoreAuth;

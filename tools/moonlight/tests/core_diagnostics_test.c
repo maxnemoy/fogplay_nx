@@ -3,6 +3,8 @@
 #include <assert.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <string.h>
+#include <sched.h>
 
 // Exercise the real prepared LinkedBlockingQueue with native pthread primitives.
 int PltCreateMutex(PLT_MUTEX* mutex) { return pthread_mutex_init(mutex, NULL); }
@@ -20,11 +22,203 @@ void PltWaitForConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex) {
 }
 
 static atomic_int running;
+#ifdef FOG_DIAG_TEST_HOOK
+static atomic_int eventPause;
+void FogDiagTestEventSelected(uint64_t kind, uint64_t wait) {
+    (void)wait;
+    int expected = 1;
+    if (kind == FOG_EVENT_IDR_REQUEST && atomic_compare_exchange_strong(&eventPause, &expected, 2)) {
+        while (atomic_load(&eventPause) != 3) sched_yield();
+    }
+}
+static void* pausedRequest(void* unused) {
+    (void)unused;
+    FogDiagIdrRequested(1200);
+    return NULL;
+}
+static void transitionAssociationTests(void) {
+    uint64_t cursor = 0, missed = 0;
+    FogMoonlightEvent event;
+    while (FogMoonlightReadEvent(&cursor, &event, &missed)) {}
+    missed = 0;
+    FogDiagReset();
+    FogDiagSetWaitingForIdr(1, 1, 1000);
+    atomic_store(&eventPause, 1);
+    pthread_t request;
+    assert(pthread_create(&request, NULL, pausedRequest, NULL) == 0);
+    while (atomic_load(&eventPause) != 2) sched_yield();
+    // Deterministically preempt after identity selection. Both transitions
+    // publish their unique token while the journal gate is held by wait 1.
+    FogDiagSetWaitingForIdr(0, 0, 1300);
+    FogDiagSetWaitingForIdr(1, 8, 1400);
+    FogDiagFecFailure(99, 4, 1500); // admission loss is explicitly counted
+    atomic_store(&eventPause, 3);
+    assert(pthread_join(request, NULL) == 0);
+    FogDiagIdrRequested(1600);
+    FogDiagFecFailure(100, 2, 1700);
+    FogDiagIdrDispatched(1800); // bound to wait 2 for the whole transaction
+    FogDiagSetWaitingForIdr(0, 0, 1900);
+    FogDiagSetWaitingForIdr(1, 5, 2000);
+    FogDiagIdrDispatchResult(1, 2100);
+    FogDiagIdrRequested(2200);
+    unsigned requests = 0, results = 0;
+    while (FogMoonlightReadEvent(&cursor, &event, &missed)) {
+        if (event.kind == FOG_EVENT_IDR_REQUEST) {
+            ++requests;
+            assert(event.waitId == requests && event.totalsValid);
+            assert(event.requests == 1 && event.intactFrames == 0);
+            assert(event.fecFailures == 0);
+        }
+        if (event.kind == FOG_EVENT_IDR_DISPATCH_RESULT) {
+            ++results; assert(event.waitId == 2 && event.requests == 1 && event.fecFailures == 2);
+        }
+        if (event.kind == FOG_EVENT_WAIT_EXIT) {
+            assert(event.waitId == 2 && event.requests == 1 && event.fecFailures == 2);
+        }
+    }
+    assert(requests == 3 && results == 1 && missed == 3);
+    atomic_store(&eventPause, 0);
+}
+#endif
+
+static void idleAndTypedEventTests(void) {
+    uint64_t cursor = 0, missed = 0;
+    FogMoonlightEvent event;
+    while (FogMoonlightReadEvent(&cursor, &event, &missed)) {}
+    missed = 0;
+    FogDiagReset();
+    for (unsigned i = 1; i <= 1000; ++i) {
+        FogDiagFecFailure(i, 3, i * 10);
+        FogDiagIdrHeader(i, 2, i * 10 + 1);
+        FogDiagIdrRecognized(i, i * 10 + 2);
+        FogDiagIdrAssembled(i, i * 10 + 3);
+    }
+    // Completed idle IDRs and idle loss do not enter the detailed journal.
+    assert(!FogMoonlightReadEvent(&cursor, &event, &missed) && missed == 0);
+    FogDiagIdrHeader(2000, 3, 20000);
+    FogDiagIdrHeader(2001, 4, 20010); // bounded retention replaces prior hint
+    assert(!FogMoonlightReadEvent(&cursor, &event, &missed));
+    FogDiagSetWaitingForIdr(1, 8, 20020);
+    assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+    assert(event.kind == FOG_EVENT_IDR_HEADER && event.waitId == 0);
+    assert(event.frameNumber == 2001 && event.value == 4 && event.timeUs == 20010);
+    assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+    assert(event.kind == FOG_EVENT_WAIT_ENTER && event.waitId == 1);
+    assert(!FogMoonlightReadEvent(&cursor, &event, &missed) && !missed);
+
+    FogDiagThreadStarted("VideoRecv", 2, -2, 5, 0x3b, 0, 30000);
+    assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+    assert(event.kind == FOG_EVENT_THREAD_START && event.timeUs == 30000);
+    assert(event.threadCore == 2 && event.threadIdealCore == -2 && event.threadPriority == 0x3b);
+    assert(event.threadAffinityMask == 5 && !event.threadQueryErrors);
+    assert(!strcmp(event.role, "VideoRecv"));
+    assert(!event.frameNumber && !event.value && !event.waitId && !event.requests && !event.intactFrames && !event.fecFailures);
+    FogDiagThreadStarted("FailedQuery", -1, -1, 0, -1, 3, 30001);
+    assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+    assert(event.threadCore == -1 && event.threadIdealCore == -1 && event.threadPriority == -1);
+    assert(event.threadAffinityMask == 0 && event.threadQueryErrors == 3);
+}
+
+static void idleHintCompletionTests(void) {
+    uint64_t cursor = 0, missed = 0;
+    FogMoonlightEvent event;
+    const struct {
+        uint64_t hintFrame, assembledFrame;
+        int retainHint;
+    } cases[] = {
+        {100, 100, 0}, // same-frame completion without recognition hook
+        {100, 101, 0}, // later completed IDR supersedes the saved prefix
+        {101, 100, 1}, // older completion cannot erase a newer prefix
+        {100, 0, 1},   // no completion: retain the original observation
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        while (FogMoonlightReadEvent(&cursor, &event, &missed)) {}
+        missed = 0;
+        FogDiagReset();
+        const uint64_t hintUs = 1000;
+        const uint64_t waitUs = hintUs + 90000000; // later recovery, 90 seconds away
+        FogDiagIdrHeader(cases[i].hintFrame, 3, hintUs);
+        // Do not call recognition: assembly must independently retire stale
+        // hints, including paths where cached codec config hides recognition.
+        if (cases[i].assembledFrame) FogDiagIdrAssembled(cases[i].assembledFrame, hintUs + 1000);
+        assert(!FogMoonlightReadEvent(&cursor, &event, &missed) && !missed);
+        FogDiagSetWaitingForIdr(1, 8, waitUs);
+        if (cases[i].retainHint) {
+            assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+            assert(event.kind == FOG_EVENT_IDR_HEADER && event.waitId == 0);
+            assert(event.frameNumber == cases[i].hintFrame && event.timeUs == hintUs && event.value == 3);
+        }
+        assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+        assert(event.kind == FOG_EVENT_WAIT_ENTER && event.waitId == 1 && event.timeUs == waitUs);
+        assert(!FogMoonlightReadEvent(&cursor, &event, &missed) && !missed);
+    }
+}
+
+static void journalTests(void) {
+    uint64_t cursor = 0, missed = 0;
+    FogMoonlightEvent event;
+    while (FogMoonlightReadEvent(&cursor, &event, &missed)) {}
+    missed = 0;
+    FogDiagReset();
+    FogDiagSetWaitingForIdr(1, 8, 1000);
+    FogDiagIdrRequested(1100);
+    FogDiagSetWaitingForIdr(1, 2, 1200); // repeated drop does not restart a wait
+    FogDiagIdrDispatched(1300);
+    FogDiagIdrDispatchResult(1, 1400);
+    FogDiagIntactFrame(76, 2, 1500);
+    FogDiagFecFrameAbandonedWithId(77, 1600, 2, 1, 1, 3);
+    FogDiagFecFailure(77, 1, 1601); // partial current block, counted separately
+    FogDiagIdrRequested(1700);
+    FogDiagIdrHeader(78, 4, 1800);
+    FogDiagIntactFrame(78, 4, 1900);
+    FogDiagIdrRecognized(78, 1950);
+    FogDiagSetWaitingForIdr(0, 0, 2000);
+    FogDiagIdrAssembled(78, 2100); // core releases before complete assembly
+    const uint64_t expected[] = {FOG_EVENT_WAIT_ENTER, FOG_EVENT_IDR_REQUEST, FOG_EVENT_IDR_DISPATCH,
+        FOG_EVENT_IDR_DISPATCH_RESULT, FOG_EVENT_INTACT_FRAME, FOG_EVENT_FEC_FAILURE, FOG_EVENT_FEC_FAILURE,
+        FOG_EVENT_IDR_REQUEST, FOG_EVENT_IDR_HEADER, FOG_EVENT_INTACT_FRAME,
+        FOG_EVENT_IDR_RECOGNIZED, FOG_EVENT_WAIT_EXIT, FOG_EVENT_IDR_ASSEMBLED};
+    uint64_t connection = 0;
+    for (unsigned i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
+        assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+        assert(event.kind == expected[i] && event.waitId == 1);
+        if (!connection) connection = event.connectionId;
+        assert(event.connectionId == connection);
+        if (event.kind == FOG_EVENT_IDR_HEADER) assert(event.frameNumber == 78 && event.value == 4);
+        if (event.kind == FOG_EVENT_WAIT_EXIT) {
+            assert(event.requests == 2 && event.intactFrames == 2 && event.fecFailures == 3);
+            assert(event.timeUs == 2000 && event.frameNumber == 78);
+        }
+        if (event.kind == FOG_EVENT_IDR_ASSEMBLED) assert(event.timeUs == 2100 && event.frameNumber == 78);
+    }
+    assert(!FogMoonlightReadEvent(&cursor, &event, &missed) && missed == 0);
+    FogDiagSetWaitingForIdr(1, 5, 2200);
+    assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+    assert(event.waitId == 2 && !event.requests && !event.intactFrames && !event.fecFailures);
+    FogDiagReset();
+    FogDiagSetWaitingForIdr(1, 1, 10); // new connection; clock can have a new epoch
+    assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+    assert(event.connectionId == connection + 1 && event.waitId == 1 && event.timeUs == 10);
+    for (unsigned i = 0; i < 257; ++i) FogDiagIdrRequested(100 + i);
+    unsigned count = 0;
+    while (FogMoonlightReadEvent(&cursor, &event, &missed)) ++count;
+    assert(count == 256 && missed == 1);
+
+    const unsigned char h264[] = {0,0,0,0, 0,0,0,1,0x67,1};
+    const unsigned char hevc[] = {0,0,1,0x46,1, 0,0,1,0x40,1}; // AUD then VPS
+    const unsigned char pframe[] = {0,0,1,0x41,0,0,1,0x67,1}; // never scan picture data
+    assert(FogDiagPayloadStartsIdr(h264, sizeof(h264), 4, 0));
+    assert(FogDiagPayloadStartsIdr(hevc, sizeof(hevc), 0, 1));
+    assert(!FogDiagPayloadStartsIdr(pframe, sizeof(pframe), 0, 0));
+    assert(!FogDiagPayloadStartsIdr(NULL, 1, 0, 0));
+    for (unsigned i = 0; i < sizeof(h264); ++i)
+        (void)FogDiagPayloadStartsIdr(h264, i, 4, 0);
+}
 
 static void* writer(void* ignored) {
     (void)ignored;
     for (int i = 0; i < 100000; i++) {
-        FogDiagAdd(FOG_DIAG_idrRequests, 1);
+        FogDiagIdrRequested((uint64_t)i);
         if (i % 1000 == 0) {
             FogDiagAdd(FOG_DIAG_videoPacketsRejectedSequence, 1);
             FogDiagFecBlockAbandoned(2, 4, 1, 1, 1);
@@ -35,6 +229,12 @@ static void* writer(void* ignored) {
 }
 
 int main(void) {
+#ifdef FOG_DIAG_TEST_HOOK
+    transitionAssociationTests();
+#endif
+    idleAndTypedEventTests();
+    idleHintCompletionTests();
+    journalTests();
     FogMoonlightDiagnostics snapshot;
     FogDiagReset();
     FogMoonlightGetDiagnostics(NULL);
@@ -136,6 +336,10 @@ int main(void) {
     assert(snapshot.fecOosMode == 1);
     FogDiagReset();
     pthread_t threads[4];
+    uint64_t cursor = 0, missed = 0, consumed = 0;
+    FogMoonlightEvent event;
+    while (FogMoonlightReadEvent(&cursor, &event, &missed)) {}
+    missed = 0;
     atomic_store(&running, 4);
     for (int i = 0; i < 4; i++) assert(pthread_create(&threads[i], NULL, writer, NULL) == 0);
     uint64_t previous = 0;
@@ -143,8 +347,11 @@ int main(void) {
         FogMoonlightGetDiagnostics(&snapshot);
         assert(snapshot.idrRequests >= previous && snapshot.idrRequests <= 400000);
         previous = snapshot.idrRequests;
+        if (FogMoonlightReadEvent(&cursor, &event, &missed)) ++consumed;
     }
     for (int i = 0; i < 4; i++) assert(pthread_join(threads[i], NULL) == 0);
+    while (FogMoonlightReadEvent(&cursor, &event, &missed)) ++consumed;
+    assert(consumed + missed == 400000);
     FogMoonlightGetDiagnostics(&snapshot);
     assert(snapshot.idrRequests == 400000);
     assert(snapshot.videoPacketsRejectedSequence == 400 && snapshot.fecAbandonedCurrentBlocks == 400);

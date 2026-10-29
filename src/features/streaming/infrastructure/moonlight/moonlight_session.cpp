@@ -1,9 +1,11 @@
+#include "core/diagnostics/latency_histogram.hpp"
 #include "moonlight_session.hpp"
 #include "app_selection.hpp"
 #include "frame_diagnostics.hpp"
 #include "resume_retry.hpp"
 #include "transport_retry.hpp"
 #include "controller_input.hpp"
+#include "core/diagnostics/thread_observation.hpp"
 #include "features/streaming/application/remote_input.hpp"
 #include "features/streaming/infrastructure/rumble_mailbox.hpp"
 #include <Settings.hpp>
@@ -169,6 +171,37 @@ bool copyFrame(const DECODE_UNIT& unit, std::vector<std::byte>& target) {
     }
     return target.size() == static_cast<std::size_t>(unit.fullLength);
 }
+void drainCoreEvents() noexcept {
+    try {
+        if (!moonlight_diagnostics::sink.load()) return;
+        // The exclusive Moonlight lease serializes all session workers. Retain
+        // the cursor across reconnects: journal IDs do not reset with counters.
+        static std::uint64_t cursor = 0;
+        std::uint64_t missed = 0;
+        FogMoonlightEvent event;
+        for (unsigned budget = 0; budget < 256 && FogMoonlightReadEvent(&cursor, &event, &missed); ++budget) {
+            if (event.kind == FOG_EVENT_THREAD_START) {
+                moonlight_diagnostics::emit("Moonlight thread role=" + std::string(event.role) +
+                    " connection=" + std::to_string(event.connectionId) + " core=" + std::to_string(event.threadCore) +
+                    " priority=" + std::to_string(event.threadPriority) + " mask=" + std::to_string(event.threadAffinityMask) +
+                    " ideal=" + std::to_string(event.threadIdealCore) + " queryErrors=" + std::to_string(event.threadQueryErrors) +
+                    " available=" + std::to_string(event.threadQueryErrors == 0) + " seq=" + std::to_string(event.sequence) +
+                    " core_us=" + std::to_string(event.timeUs));
+                continue;
+            }
+            static const char* names[] = {"unknown", "wait-enter", "request", "dispatch", "dispatch-result", "fec-failure",
+                "intact-frame", "idr-receive-hint", "idr-recognized", "wait-exit", "idr-assembled"};
+            const char* name = event.kind < sizeof(names) / sizeof(names[0]) ? names[event.kind] : "unknown";
+            moonlight_diagnostics::emit("Moonlight IDR event=" + std::string(name) +
+                " seq=" + std::to_string(event.sequence) + " connection=" + std::to_string(event.connectionId) +
+                " wait=" + std::to_string(event.waitId) + " core_us=" + std::to_string(event.timeUs) +
+                " frame=" + std::to_string(event.frameNumber) + " value=" + std::to_string(event.value) +
+                " totalsValid=" + std::to_string(event.totalsValid) + " requests=" + std::to_string(event.requests) + " intact=" + std::to_string(event.intactFrames) +
+                " fecFailedBlocks=" + std::to_string(event.fecFailures));
+        }
+        if (missed) moonlight_diagnostics::emit("Moonlight IDR journal missed=" + std::to_string(missed) + " through_seq=" + std::to_string(cursor));
+    } catch (...) { /* Optional diagnostics cannot terminate the session worker. */ }
+}
 void drainVideo(State& state) {
     VIDEO_FRAME_HANDLE handle; PDECODE_UNIT unit;
     unsigned budget = 0;
@@ -194,6 +227,13 @@ void drainVideo(State& state) {
                 state.trace.copy.add(detail::steadyUs() - copyStarted);
                 if (copied) {
                     packet.timestamp = unit->rtpTimestamp; packet.enqueueMs = nowMs();
+                    // Core timestamps can use a different epoch. Preserve
+                    // elapsed receipt age, never copy the absolute epoch.
+                    const auto coreNowUs = LiGetMicroseconds();
+                    if (unit->receiveTimeUs && coreNowUs >= unit->receiveTimeUs) {
+                        const auto ageMs = (coreNowUs - unit->receiveTimeUs) / 1000;
+                        if (packet.enqueueMs >= ageMs) packet.firstPacketMs = packet.enqueueMs - ageMs;
+                    }
                     const auto lockStarted = detail::steadyUs();
                     std::lock_guard<std::mutex> lock(state.mutex);
                     state.trace.queueLock.add(detail::steadyUs() - lockStarted);
@@ -579,12 +619,20 @@ public:
         LiRequestIdrFrame(); return true;
     }
     void setDecoderWaitingForKeyframe(bool waiting) override { state_->decoderWaiting = waiting; }
+    std::string inputLatencyDiagnostics() const override {
+        return "provider=FH scope=rolling-5s boundary=pad-to-send-return accepted-only=1 " +
+            inputLatency_.text(fog::metrics::steadyNowUs());
+    }
     bool sendGamepad(const stream::Gamepad& gamepad) override {
         std::lock_guard<std::mutex> lock(state_->apiMutex);
         if (!state_->running || state_->stop) return rejected();
         const int flags = detail::controllerButtonFlags(gamepad.buttons, profile_);
-        return accepted(LiSendMultiControllerEvent(0, 1, flags, trigger(gamepad.leftTrigger), trigger(gamepad.rightTrigger),
-            axis(gamepad.axes[0]), axis(-gamepad.axes[1]), axis(gamepad.axes[2]), axis(-gamepad.axes[3])));
+        const int result = LiSendMultiControllerEvent(0, 1, flags, trigger(gamepad.leftTrigger), trigger(gamepad.rightTrigger),
+            axis(gamepad.axes[0]), axis(-gamepad.axes[1]), axis(gamepad.axes[2]), axis(-gamepad.axes[3]));
+        const auto completedUs = fog::metrics::steadyNowUs();
+        if (result == 0 && gamepad.sampledAtUs && completedUs >= gamepad.sampledAtUs)
+            inputLatency_.record(completedUs - gamepad.sampledAtUs, completedUs);
+        return accepted(result);
     }
     bool sendInput(const fog::remote::Input& input) override {
         std::lock_guard<std::mutex> lock(state_->apiMutex);
@@ -610,6 +658,7 @@ private:
     fog::video::Settings settings_;
     stream::ControllerProfile profile_ = stream::ControllerProfile::Xbox;
     std::array<std::uint64_t, 2> lastMotionMs_{};
+    fog::metrics::LatencyHistogram inputLatency_; // Application thread only.
     bool resumeOnly_ = false;
     std::thread worker_;
     bool retryIdentityValid() const {
@@ -698,6 +747,7 @@ private:
         packet = std::move(queue.front()); queue.pop_front(); return true;
     }
     void run() noexcept {
+        fog::diagnostics::observeThread("moonlight-session");
         bool started = false;
         try {
             if (!state_->stop && launch(*state_, resumeOnly_) && !state_->stop) {
@@ -735,6 +785,7 @@ private:
                         const auto began = detail::steadyUs();
                         state_->trace.worker(began);
                         drainVideo(*state_);
+                        drainCoreEvents();
                         state_->trace.drain.add(detail::steadyUs() - began);
                         std::this_thread::sleep_for(std::chrono::milliseconds(3));
                     }
@@ -757,6 +808,7 @@ private:
             active = nullptr;
             state_->rumble.clear();
         }
+        drainCoreEvents();
         state_->streamInUse = false;
         state_->changed.notify_all();
     }
@@ -793,6 +845,7 @@ bool MoonlightSession::begin(const fog::PairedEndpoint& endpoint, const std::str
     Settings::instance().reset_cancel(); Settings::instance().set_timeout_ms(60000);
     try {
         impl_->pairing = std::thread([state, pin = std::string(pin)]() mutable {
+            fog::diagnostics::observeThread("moonlight-pairing");
             bool success = false;
             try {
                 std::error_code error; std::filesystem::create_directories(state->identity, error);

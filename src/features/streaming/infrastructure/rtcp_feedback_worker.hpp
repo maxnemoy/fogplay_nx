@@ -1,4 +1,5 @@
 #pragma once
+#include "core/diagnostics/thread_observation.hpp"
 #include <rtc/rtcpreceivingsession.hpp>
 #include <algorithm>
 #include <array>
@@ -161,6 +162,7 @@ private:
         Clock::time_point flightStarted{};
     };
     static void run(const std::shared_ptr<State>& state) noexcept {
+        fog::diagnostics::observeThread("rtcp-feedback");
         std::unique_lock lock(state->mutex);
         while (!state->stop) {
             const auto sessions = state->sessions;

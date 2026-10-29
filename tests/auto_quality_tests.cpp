@@ -14,6 +14,7 @@ struct Harness {
     Profile profile = Profile::Low;
     bool refresh = true, overload = false, staticSource = false, send = true;
     unsigned presentedPerTick = 3, decodedPerTick = 3, supersededPerTick = 0;
+    unsigned presentedExtraPerSecond = 0, decodedExtraPerSecond = 0, supersededExtraPerSecond = 0;
     unsigned workPerFrameUs = 3000;
     double sourceFps = 30;
     unsigned audioDroppedPerTick = 0, audioUnderrunsPerTick = 0;
@@ -42,9 +43,11 @@ struct Harness {
         for (unsigned i = 0; i < count; ++i) {
             now += 100;
             if (!staticSource) {
-                sample.frames += presentedPerTick; sample.decodedFrames += decodedPerTick;
-                sample.supersededFrames += supersededPerTick;
-                sample.workUs += overload ? 100000 : decodedPerTick * workPerFrameUs;
+                const auto decoded = decodedPerTick + (now % 1000 == 0 ? decodedExtraPerSecond : 0);
+                sample.frames += presentedPerTick + (now % 1000 == 0 ? presentedExtraPerSecond : 0);
+                sample.decodedFrames += decoded;
+                sample.supersededFrames += supersededPerTick + (now % 1000 == 0 ? supersededExtraPerSecond : 0);
+                sample.workUs += overload ? 100000 : decoded * workPerFrameUs;
             }
             sample.audioDropped += audioDroppedPerTick; sample.audioUnderruns += audioUnderrunsPerTick;
             if (refresh && now % 2000 == 0) readTelemetry(server,Json{{"preset", wireProfile(profile)}, {"fps", sourceFps}}, now);
@@ -68,6 +71,51 @@ int main() {
         h.advance(32);
         assert(h.actions == std::vector<Action>{Action::Enhance});
         assert(h.controller.diagnostics().find("autoTargetFps=60") != std::string::npos);
+    }
+    {
+        // A 67 FPS source can fill every configured 60 FPS display slot while
+        // intentionally coalescing the seven excess frames. That is headroom.
+        Harness h(60); h.decodedExtraPerSecond = h.supersededExtraPerSecond = 7;
+        h.workPerFrameUs = 6700;
+        h.advance(32);
+        assert(h.actions == std::vector<Action>{Action::Enhance});
+        assert(h.controller.diagnostics().find("autoCapCoalesced=14") != std::string::npos);
+    }
+    {
+        // An explicit 30 FPS display cap also permits a faster input source.
+        Harness h; h.decodedPerTick = 6; h.supersededPerTick = 3;
+        h.advance(32); assert(h.actions == std::vector<Action>{Action::Enhance});
+    }
+    {
+        // 53 delivered FPS meets the old 85% minimum, but missing configured
+        // display slots cannot be excused as intentional 67-to-60 coalescing.
+        Harness h(60); h.presentedPerTick = 5; h.presentedExtraPerSecond = 3;
+        h.decodedExtraPerSecond = 7; h.supersededPerTick = 1; h.supersededExtraPerSecond = 4;
+        h.advance(40); assert(h.actions.empty());
+        assert(std::string(h.controller.reason()) == "insufficient-headroom");
+        assert(h.controller.diagnostics().find("autoCapCoalesced=0") != std::string::npos);
+    }
+    {
+        Harness h(60); h.profile = Profile::High; h.presentedPerTick = 4;
+        h.presentedExtraPerSecond = 7; h.decodedExtraPerSecond = 7;
+        h.supersededPerTick = 2;
+        h.advance(6); assert(h.actions == std::vector<Action>{Action::Degrade});
+        assert(std::string(h.controller.reason()) == "video-delivery-loss");
+    }
+    {
+        // Filling display slots never masks other evidence against an upgrade.
+        for (const auto counter : {&Sample::errors, &Sample::missing, &Sample::faults,
+                                   &Sample::audioDropped, &Sample::audioUnderruns}) {
+            Harness h(60); h.decodedExtraPerSecond = h.supersededExtraPerSecond = 7;
+            for (unsigned window = 0; window < 20; ++window) { ++(h.sample.*counter); h.advance(2); }
+            assert(h.actions.empty());
+        }
+        Harness aged(60); aged.decodedExtraPerSecond = aged.supersededExtraPerSecond = 7;
+        aged.sample.queuedVideo = 1; aged.sample.oldestVideoMs = 150;
+        aged.advance(40); assert(aged.actions.empty());
+        Harness busy(60); busy.decodedExtraPerSecond = busy.supersededExtraPerSecond = 7;
+        busy.workPerFrameUs = 11000;
+        busy.advance(40); assert(busy.actions.empty());
     }
     {
         // At a 60 FPS request, presenting 30 of 60 decoded FPS is sustained
@@ -143,14 +191,56 @@ int main() {
     }
     {
         Harness h; h.advance(32); h.profile = Profile::Ultra; h.advance(2);
-        // A larger observed profile confirms direction; Auto never enhances HIGH/ULTRA.
-        assert(h.event("qualityEvent=confirmed")); h.advance(90); assert(h.actions.size() == 1);
-        h.overload = true; h.advance(6); assert(h.actions.back() == Action::Degrade);
+        // A larger observed profile confirms an enhancement, but an encoder
+        // jumping past HIGH still has to return to Auto's actual ceiling.
+        assert(h.event("qualityEvent=confirmed")); h.advance(4); assert(h.actions.size() == 1);
+        h.advance(2); assert(h.actions == std::vector<Action>({Action::Enhance, Action::Degrade}));
+        assert(std::string(h.controller.reason()) == "above-auto-ceiling");
+        h.profile = Profile::High; h.advance(2); assert(!h.controller.pending());
+        h.advance(90); assert(h.actions.size() == 2 && std::string(h.controller.reason()) == "ceiling-high");
     }
     {
         Harness h; h.profile = Profile::High; h.advance(32); assert(h.actions.empty());
-        h.profile = Profile::Ultra; h.advance(32); assert(h.actions.empty());
         h.staticSource = true; h.advance(40); assert(h.actions.empty()); // Low FPS alone is not a fault.
+    }
+    {
+        // Entering Auto from a healthy manual ULTRA must downshift without
+        // inventing capacity trouble or bypassing the normal startup cooldown.
+        Harness h(60); h.profile = Profile::Ultra;
+        readTelemetry(h.server,Json{{"preset","ULTRA"},{"fps",60}},h.now);
+        h.controller.enable(false,h.now); h.controller.enable(true,h.now);
+        h.controller.observe(h.now,h.sample,h.server);
+        h.advance(4); assert(h.actions.empty() && std::string(h.controller.reason()) == "down-cooldown");
+        h.advance(2); assert(h.actions == std::vector<Action>{Action::Degrade} && h.controller.pending());
+        assert(std::string(h.controller.reason()) == "above-auto-ceiling");
+        // Duplicate ULTRA revisions cannot acknowledge the downshift. A stale
+        // HIGH or a fresh pre-command HIGH cannot acknowledge it either.
+        h.now += 100; readTelemetry(h.server,Json{{"preset","ULTRA"}},h.now);
+        h.controller.observe(h.now,h.sample,h.server); assert(h.controller.pending());
+        h.server.profile.set(Profile::High,5999);
+        h.now += 100; h.controller.observe(h.now,h.sample,h.server); assert(h.controller.pending());
+        h.server.profile.set(Profile::High,0);
+        h.now += 100; h.controller.observe(h.now,h.sample,h.server); assert(h.controller.pending());
+        h.now += 100; readTelemetry(h.server,Json{{"preset","HIGH"}},h.now);
+        h.controller.observe(h.now,h.sample,h.server); assert(!h.controller.pending());
+        h.profile = Profile::High; h.advance(40);
+        assert(h.actions == std::vector<Action>{Action::Degrade} && std::string(h.controller.reason()) == "ceiling-high");
+    }
+    {
+        // Missing/stale ULTRA evidence cannot force a command. Fresh ULTRA
+        // then uses the existing pending timeout, backoff and two-attempt cap.
+        Harness h(60); h.profile = Profile::Ultra; h.refresh = false;
+        h.server.profile.set(Profile::Ultra,0); h.server.fps.set(60,0);
+        h.now = 7000; h.controller.observe(h.now,h.sample,h.server);
+        h.advance(4); assert(h.actions.empty());
+        h.refresh = true; h.advance(3);
+        assert(h.actions == std::vector<Action>{Action::Degrade} && h.controller.pending());
+        h.advance(8); assert(h.actions.size() == 1 && h.controller.pending());
+        h.advance(2); assert(h.actions.size() == 1 && !h.controller.pending());
+        h.advance(28); assert(h.actions.size() == 1);
+        h.advance(4); assert(h.actions == std::vector<Action>({Action::Degrade, Action::Degrade}));
+        h.advance(120); assert(h.actions.size() == 2 && !h.controller.pending());
+        assert(std::string(h.controller.reason()) == "down-unconfirmed");
     }
     {
         Harness h; h.advance(20); h.refresh = false; h.advance(30); assert(h.actions.empty());
@@ -374,6 +464,87 @@ int main() {
         Harness h; h.profile = Profile::Middle;
         for (unsigned i = 0; i < 40; ++i) { ++h.sample.supersededFrames; h.advance(2); }
         assert(h.actions.empty());
+    }
+    {
+        // An isolated mild interval pauses accumulated good time. It never
+        // contributes its own two seconds to the required thirty good seconds.
+        for (const auto counter : {&Sample::supersededFrames, &Sample::audioUnderruns, &Sample::audioDropped}) {
+            Harness h(60); h.advance(28);
+            ++(h.sample.*counter); h.advance(2);
+            assert(h.actions.empty() && std::string(h.controller.reason()) == "headroom-paused");
+            assert(h.controller.diagnostics().find("autoGoodMs=26000") != std::string::npos);
+            h.advance(2); assert(h.actions.empty());
+            h.advance(2); assert(h.actions == std::vector<Action>{Action::Enhance});
+            assert(h.event("goodMs=30000"));
+        }
+    }
+    {
+        // Intentional 67-to-60 cap coalescing does not turn one audio underrun
+        // into a hard failure. Only the unexplained superseding consumes grace.
+        Harness h(60); h.decodedExtraPerSecond = h.supersededExtraPerSecond = 7;
+        h.advance(28); ++h.sample.audioUnderruns; h.advance(2);
+        assert(std::string(h.controller.reason()) == "headroom-paused");
+        h.advance(4); assert(h.actions == std::vector<Action>{Action::Enhance});
+    }
+    {
+        Harness h(60); h.advance(28);
+        ++h.sample.supersededFrames; h.advance(2);
+        ++h.sample.supersededFrames; h.advance(2);
+        assert(h.actions.empty() && std::string(h.controller.reason()) == "insufficient-headroom");
+        assert(h.controller.diagnostics().find("autoGoodMs=0") != std::string::npos);
+        h.advance(30); assert(h.actions.empty()); h.advance(2);
+        assert(h.actions == std::vector<Action>{Action::Enhance});
+    }
+    {
+        // Nonconsecutive bad windows still cannot accumulate thirty good
+        // seconds over an unbounded wall-clock span. Both patterns stay below
+        // thirty good seconds inside the rolling forty-second evidence limit.
+        for (const unsigned period : {2u, 3u}) {
+            Harness h(60); h.advance(2);
+            for (unsigned window = 0; window < 90; ++window) {
+                if (window % period == 0) ++h.sample.supersededFrames;
+                h.advance(2);
+            }
+            assert(h.actions.empty());
+            assert(h.controller.diagnostics().find("autoEvidenceMs=40000") != std::string::npos);
+        }
+    }
+    {
+        // A single recovery counter delta is hard evidence even if its active
+        // state was too brief to be sampled. Other hard faults also reset grace.
+        for (const auto counter : {&Sample::recoveries, &Sample::errors, &Sample::missing,
+                                   &Sample::faults, &Sample::pressure, &Sample::audioResets}) {
+            Harness h(60); h.advance(28); ++(h.sample.*counter); h.advance(2);
+            assert(h.actions.empty() && std::string(h.controller.reason()) != "headroom-paused");
+            assert(h.controller.diagnostics().find("autoGoodMs=0") != std::string::npos);
+            h.advance(30); assert(h.actions.empty()); h.advance(2);
+            assert(h.actions == std::vector<Action>{Action::Enhance});
+        }
+        Harness work(60); work.advance(28); work.workPerFrameUs = 11000; work.advance(2);
+        assert(work.actions.empty() && work.controller.diagnostics().find("autoGoodMs=0") != std::string::npos);
+        work.workPerFrameUs = 3000; work.advance(30); assert(work.actions.empty()); work.advance(2);
+        assert(work.actions == std::vector<Action>{Action::Enhance});
+        Harness aged(60); aged.advance(28); aged.sample.queuedVideo = 1; aged.sample.oldestVideoMs = 101; aged.advance(2);
+        assert(aged.actions.empty() && aged.controller.diagnostics().find("autoGoodMs=0") != std::string::npos);
+    }
+    {
+        // Trace-derived 628..664s LOW segment from 0.6.15: clean delivery was
+        // interrupted by one supersede near 634s and four near 654s. Rounded
+        // two-second counts reproduce the classification, not exact telemetry.
+        Harness h(60); h.workPerFrameUs = 8500; h.advance(2);
+        for (unsigned window = 1; window <= 17; ++window) {
+            h.ticks(19);
+            if (window == 3) {
+                h.sample.frames -= 3; h.sample.decodedFrames -= 2;
+                h.sample.workUs -= 2 * h.workPerFrameUs; ++h.sample.supersededFrames;
+            } else if (window == 13) {
+                h.sample.frames -= 4; h.sample.supersededFrames += 4;
+            }
+            h.ticks(1);
+            if (window < 17) assert(h.actions.empty());
+        }
+        assert(h.actions == std::vector<Action>{Action::Enhance});
+        assert(h.event("goodMs=30000 evidenceMs=34000"));
     }
     {
         // Sustained local audio loss matters even with full video throughput.

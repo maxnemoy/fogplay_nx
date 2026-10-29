@@ -4,11 +4,14 @@
 #include "features/streaming/infrastructure/dtls_diagnostics.hpp"
 #include "features/streaming/infrastructure/stream_protocol.hpp"
 #include "features/streaming/domain/h264_rtp.hpp"
+#include "features/streaming/infrastructure/video_rtp_handler.hpp"
 #include "features/streaming/infrastructure/stream_queue.hpp"
 #include "features/streaming/infrastructure/async_control_sender.hpp"
 #include "features/streaming/infrastructure/async_ice_snapshot.hpp"
 #include "features/streaming/infrastructure/rtcp_feedback_worker.hpp"
 #include "features/streaming/infrastructure/incoming_control.hpp"
+#include "features/streaming/infrastructure/server_performance.hpp"
+#include "features/streaming/infrastructure/control_delivery.hpp"
 #include "features/streaming/infrastructure/rumble_mailbox.hpp"
 #include "features/streaming/infrastructure/transport_history.hpp"
 #include "features/streaming/infrastructure/timed_mutex.hpp"
@@ -73,44 +76,6 @@ struct TransportError final : std::runtime_error {
     explicit TransportError(const char* message, bool mayRetry = false)
         : std::runtime_error(message), retryable(mayRetry) {}
 };
-// Consume RTP only after the chained RTCP receiver has seen the original packet.
-// Ownership and timeout handling live in Shared; this callback never sends PLI.
-class VideoRtpHandler final : public rtc::MediaHandler {
-public:
-    explicit VideoRtpHandler(std::function<void(const std::byte*, std::size_t, const rtc::message_callback&)> receive)
-        : receive_(std::move(receive)) {}
-    void incoming(rtc::message_vector& messages, const rtc::message_callback& send) override {
-        for (const auto& message : messages)
-            if (message->type == rtc::Message::Binary) receive_(message->data(), message->size(), send);
-        messages.clear();
-    }
-private:
-    std::function<void(const std::byte*, std::size_t, const rtc::message_callback&)> receive_;
-};
-// incomingChain is reverse ordered: this tail runs before the RTCP receiver.
-class RtxRtpHandler final : public rtc::MediaHandler {
-public:
-    explicit RtxRtpHandler(std::function<bool(rtc::binary&, bool)> normalize) : normalize_(std::move(normalize)) {}
-    void incoming(rtc::message_vector& messages, const rtc::message_callback&) override {
-        rtc::message_vector accepted;
-        for (auto& message : messages) {
-            if (message->type == rtc::Message::Control) {
-                if (normalize_(*message, true)) accepted.push_back(std::move(message));
-                continue;
-            }
-            if (message->type != rtc::Message::Binary) continue;
-            if (normalize_(*message, false)) {
-                message->stream = (std::to_integer<unsigned>(message->at(8)) << 24) |
-                    (std::to_integer<unsigned>(message->at(9)) << 16) |
-                    (std::to_integer<unsigned>(message->at(10)) << 8) | std::to_integer<unsigned>(message->at(11));
-                accepted.push_back(std::move(message));
-            }
-        }
-        messages.swap(accepted);
-    }
-private:
-    std::function<bool(rtc::binary&, bool)> normalize_;
-};
 static std::uint64_t videoNow() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
 }
@@ -118,6 +83,8 @@ struct Client::Impl {
     struct IceData {
         std::string diagnostics;
         rtc::DtlsDiagnostics dtls;
+        std::optional<std::chrono::milliseconds> rtt;
+        Clock::time_point rttCapturedAt{};
         rtc::Candidate local, remote;
         bool pair = false, pairFailed = false;
         TransportStageTiming diagnosticTiming, pairTiming;
@@ -154,6 +121,7 @@ struct Client::Impl {
         MediaQueue media;
         TransportHistory transportHistory;
         IncomingControl incoming;
+        ServerPerformance serverPerformance;
         std::optional<ResolutionScale::Table> resolutions;
         bool resolutionsPending = false;
         std::uint64_t invalidResolutionTables = 0;
@@ -204,7 +172,7 @@ struct Client::Impl {
             H264RtpAssembler::Frame frame;
             while (video.poll(frame)) {
                 Packet packet{Kind::Video, std::move(frame.data), frame.timestamp,
-                              frame.firstSequence, frame.lastSequence, now, videoGeneration};
+                              frame.firstSequence, frame.lastSequence, now, videoGeneration, frame.firstPacketMs};
                 if (!media.push(std::move(packet), now)) { resyncQueue(true, now); return; }
                 lastVideo = Clock::now();
             }
@@ -233,7 +201,7 @@ struct Client::Impl {
             if (!packet.empty()) try { send(rtc::make_message(std::move(packet), rtc::Message::Control)); }
             catch (...) { TimedMutex::Guard lock(mutex, scope); ++nackSendErrors; }
         }
-        void videoRtp(const std::byte* bytes, std::size_t size, const rtc::message_callback& send) {
+        void videoRtp(const std::byte* bytes, std::size_t size, std::uint64_t receivedMs, const rtc::message_callback& send) {
             std::vector<std::byte> feedback;
             {
                 TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
@@ -241,7 +209,7 @@ struct Client::Impl {
                 videoFeedback = send;
                 lastRtpMs = videoNow(); receivedVideoBytes += size;
                 expireMedia(lastRtpMs);
-                video.receive(bytes, size, lastRtpMs, videoFrameBudget()); drainVideo();
+                video.receive(bytes, size, lastRtpMs, videoFrameBudget(), receivedMs); drainVideo();
                 feedback = repair.nack(video.takeNacks(lastRtpMs));
             }
             transmitNack(std::move(feedback), send, TimedMutex::Scope::Callback);
@@ -330,6 +298,10 @@ struct Client::Impl {
                 if (stopped) return;
                 lastControlMs = videoNow();
                 incoming.receive(message, lastControlMs + qualityTimeOffset);
+                if (message.kind == IncomingControl::Kind::Stats) {
+                    try { serverPerformance.receive(message.data, lastControlMs); }
+                    catch (...) {} // Optional telemetry cannot terminate playback.
+                }
                 if (message.kind == IncomingControl::Kind::Stats && message.data.contains("resolutions")) {
                     if (auto table = resolutionTable(message.data)) {
                         if (!resolutions || *resolutions != *table) {
@@ -495,6 +467,10 @@ struct Client::Impl {
     unsigned routeSelections = 0, routeEventDrops = 0;
     std::deque<std::string> routeEvents;
     std::string finalIceDiagnostics;
+    std::optional<std::chrono::milliseconds> sctpRtt;
+    Clock::time_point rttCapturedAt{};
+    std::shared_ptr<ControlDelivery> controlDelivery = std::make_shared<ControlDelivery>();
+    std::string channelReliability = " reliabilityKnown=0";
     rtc::DtlsDiagnostics finalDtlsDiagnostics;
     bool iceSnapshotAvailable = false;
     std::string routeDiagnostics() const {
@@ -538,6 +514,8 @@ struct Client::Impl {
         iceSnapshotAvailable = !value.diagnostics.empty();
         if (iceSnapshotAvailable) finalIceDiagnostics = std::move(value.diagnostics);
         finalDtlsDiagnostics = value.dtls;
+        sctpRtt = value.rtt;
+        rttCapturedAt = value.rttCapturedAt;
         routeCapturedAt = completed->capturedAt; routeRevision = completed->revision;
         routeCurrent = !value.pairFailed && value.pair;
         {
@@ -593,6 +571,9 @@ struct Client::Impl {
                 try { value.diagnostics = transport->iceDiagnostics(); } catch (...) {}
             }
             try { value.dtls = transport->getDtlsDiagnostics(); } catch (...) {}
+            // SCTP round-trip estimate, not an application input acknowledgement.
+            try { value.rtt = transport->rtt(); } catch (...) {}
+            value.rttCapturedAt = Clock::now();
 #ifdef FOG_STREAM_TESTING
             fixture->wait(1);
 #endif
@@ -1024,6 +1005,8 @@ struct Client::Impl {
                     Event e(EventType::Failure); e.text = "Control channel failed"; st.event(std::move(e));
                 }); });
                 dc->onMessage([weak](rtc::message_variant msg) {
+        thread_local const bool observed = [] { fog::diagnostics::observeThread("rtc-control"); return true; }();
+        (void)observed;
                     callback(weak, [&msg](Shared& st) {
                         if (const auto text = std::get_if<std::string>(&msg))
                             st.controlMessage(*text);
@@ -1037,7 +1020,14 @@ struct Client::Impl {
                         }
                     });
                 });
-                Event e(EventType::Channel); e.channel = dc; s.event(std::move(e));
+                Event e(EventType::Channel); e.channel = dc;
+                try {
+                    const auto reliability = dc->reliability();
+                    e.text = " reliabilityKnown=1 unordered=" + std::to_string(reliability.unordered) +
+                        " maxRetransmits=" + (reliability.maxRetransmits ? std::to_string(*reliability.maxRetransmits) : "unset") +
+                        " maxLifetimeMs=" + (reliability.maxPacketLifeTime ? std::to_string(reliability.maxPacketLifeTime->count()) : "unset");
+                } catch (...) {}
+                s.event(std::move(e));
             });
         });
         peer->onTrack([weak](std::shared_ptr<rtc::Track> track) {
@@ -1046,6 +1036,8 @@ struct Client::Impl {
                 if (desc.isRemoved()) return;
                 desc.setDirection(rtc::Description::Direction::RecvOnly);
                 track->setDescription(desc);
+                auto receiver = std::make_shared<rtc::RtcpReceivingSession>();
+                receiver->setDeferredReports(true);
                 Kind kind;
                 std::shared_ptr<rtc::MediaHandler> depacketizer;
                 if (desc.type() == "video") {
@@ -1058,16 +1050,19 @@ struct Client::Impl {
                         s.repair = RtpRepair(protocol::videoRepairConfig(static_cast<std::string>(desc)));
                         s.video.enableNack(s.repair.config().nack());
                     }
-                    depacketizer = std::make_shared<VideoRtpHandler>([weak](const std::byte* data, std::size_t size, const rtc::message_callback& send) {
-                        callback(weak, [data, size, &send](Shared& st) { st.videoRtp(data, size, send); });
-
-                    });
+                    depacketizer = std::make_shared<VideoRtpHandler>(receiver,
+                        [weak](rtc::binary& packet, bool control) {
+                            bool accepted = false;
+                            callback(weak, [&packet, &accepted, control](Shared& st) { accepted = st.normalizeVideo(packet, control); });
+                            return accepted;
+                        },
+                        [weak](const std::byte* data, std::size_t size, std::uint64_t receivedMs, const rtc::message_callback& send) {
+                            callback(weak, [data, size, receivedMs, &send](Shared& st) { st.videoRtp(data, size, receivedMs, send); });
+                        });
                 } else if (desc.type() == "audio") {
                     kind = Kind::Audio; depacketizer = std::make_shared<rtc::OpusRtpDepacketizer>();
                 } else return;
-                // incomingChain runs next first: RTCP sees original RTP before depacketization.
-                auto receiver = std::make_shared<rtc::RtcpReceivingSession>();
-                receiver->setDeferredReports(true);
+                // Video handler owns normalization/RTCP ordering and ingress time.
                 std::shared_ptr<RtcpFeedbackWorker> feedback;
                 {
                     TimedMutex::Guard lock(s.mutex, TimedMutex::Scope::Callback);
@@ -1076,12 +1071,7 @@ struct Client::Impl {
                 }
                 if (!feedback || !feedback->addSession(receiver))
                     throw TransportError(fog::constants::error::Stream::RTCPReceiverRegistrationFailed);
-                depacketizer->addToChain(receiver);
-                if (kind == Kind::Video) depacketizer->addToChain(std::make_shared<RtxRtpHandler>([weak](rtc::binary& packet, bool control) {
-                    bool accepted = false;
-                    callback(weak, [&packet, &accepted, control](Shared& st) { accepted = st.normalizeVideo(packet, control); });
-                    return accepted;
-                }));
+                if (kind == Kind::Audio) depacketizer->addToChain(receiver);
                 track->setMediaHandler(depacketizer);
                 if (kind == Kind::Audio) track->onFrame([weak](rtc::binary bytes, rtc::FrameInfo info) {
                     callback(weak, [&bytes, info](Shared& st) { st.packet(Kind::Audio, std::move(bytes), info.timestamp); });
@@ -1275,9 +1265,11 @@ struct Client::Impl {
             channel = event.channel;
             {
                 const auto dc = channel;
+                if (!event.text.empty()) channelReliability = event.text;
+                const auto delivery = controlDelivery;
                 const std::weak_ptr<Shared> weak(shared);
                 controlSender = std::make_shared<AsyncControlSender>(
-                    [dc, weak] {
+                    [dc, weak, delivery] {
                         {
                             const auto s = weak.lock();
                             if (!s) return false;
@@ -1293,7 +1285,10 @@ struct Client::Impl {
                                     std::chrono::milliseconds(RouteSnapshotSchedule::IntervalMs * 2)) return false;
                             }
                         }
-                        return dc->isOpen() && dc->bufferedAmount() <= 64 * 1024;
+                        if (!dc->isOpen()) return false;
+                        const auto buffered = dc->bufferedAmount();
+                        delivery->sample(buffered, videoNow());
+                        return buffered <= 64 * 1024;
                     },
                     [dc
 #ifdef FOG_STREAM_TESTING
@@ -1499,6 +1494,8 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
             Impl::Event e(Impl::EventType::Failure); e.text = "Signaling transport failed"; s.event(std::move(e));
         }); });
         i.ws->onMessage([weak](rtc::message_variant data) {
+        thread_local const bool observed = [] { fog::diagnostics::observeThread("rtc-signaling"); return true; }();
+        (void)observed;
             Impl::callback(weak, [&data](Impl::Shared& s) {
                 Impl::Event e(Impl::EventType::WsData);
                 if (auto text = std::get_if<std::string>(&data)) e.text = std::move(*text);
@@ -1906,6 +1903,25 @@ bool Client::requestVideoKeyframe() {
     } catch (...) { return false; }
     return requested;
 }
+std::string Client::serverPerformanceDiagnostics() const {
+    if (!impl_->shared) return {};
+    ServerPerformance snapshot;
+    {
+        TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
+        snapshot = impl_->shared->serverPerformance;
+    }
+    return snapshot.diagnostics(videoNow());
+}
+std::string Client::controlDeliveryDiagnostics() const {
+    const auto& i = *impl_;
+    const auto age = i.rttCapturedAt == Clock::time_point{} ? -1LL :
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - i.rttCapturedAt).count());
+    return i.controlDelivery->diagnostics(videoNow()) + i.channelReliability +
+        " sctpRttMs=" + (i.sctpRtt ? std::to_string(i.sctpRtt->count()) : "unknown") +
+        " rttSnapshotAgeMs=" + std::to_string(age) +
+        " rttSnapshotCurrent=" + std::to_string(i.iceWorker && i.routeRevision == i.iceWorker->state().revision && age >= 0 && static_cast<std::uint64_t>(age) < RouteSnapshotSchedule::IntervalMs * 2) +
+        " inputAck=unsupported";
+}
 std::string Client::inputDiagnostics() const {
     const auto out = impl_->controlSender ? impl_->controlSender->snapshot() : impl_->finalControl;
     auto text = "PS input scope=transport-generation isPS=" + std::to_string(impl_->playStation) +
@@ -1932,6 +1948,9 @@ std::string Client::inputDiagnostics() const {
     }
     return text + " sendSuccess=local-rtc-acceptance ack=unsupported";
 }
+std::string Client::inputLatencyDiagnostics() const {
+    return impl_->controlSender ? impl_->controlSender->inputLatencyDiagnostics() : "provider=MTS unavailable=closed";
+}
 bool Client::sendGamepad(const Gamepad& state) {
     if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed() || !impl_->controlSender) {
         if (impl_->playStation) ++impl_->psUnavailableFrames;
@@ -1945,7 +1964,7 @@ bool Client::sendGamepad(const Gamepad& state) {
             if (state.buttons[i]) buttons |= std::uint32_t{1} << i;
         if (std::isfinite(state.leftTrigger) && state.leftTrigger > 0) buttons |= std::uint32_t{1} << 18;
         if (std::isfinite(state.rightTrigger) && state.rightTrigger > 0) buttons |= std::uint32_t{1} << 19;
-        return impl_->controlSender->enqueueGamepad(payload, buttons, impl_->playStation);
+        return impl_->controlSender->enqueueGamepad(payload, buttons, impl_->playStation, state.sampledAtUs);
     }
     catch (const TransportError& error) {
         // Public send may run before pump. Examine queued terminal signaling first.

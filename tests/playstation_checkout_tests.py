@@ -18,6 +18,7 @@ def method(source, name):
 
 harness = r'''
 #include "core/constants/ui_text.hpp"
+#include "features/session/application/stop_retry_budget.hpp"
 namespace uiText = fog::constants::ui;
 #include "features/session/domain/service_models.hpp"
 #include "features/playstation/domain/computer.hpp"
@@ -60,9 +61,11 @@ std::vector<Computer> fetchPlayStationComputers() {
 constexpr int AppletFocusState_InFocus=1;
 int focusState=AppletFocusState_InFocus;
 int appletGetFocusState() { return focusState; }
-enum class Screen { Details, PlayStationDetails, PlayStation, Consent, Checkout };
+enum class Screen { Details, PlayStationDetails, PlayStation, Consent, Checkout, Recovery };
 enum class Task { Create, PairedCreate };
 struct ApplicationController {
+    fog::StopRetryBudget stopRetry_;
+    bool recoveryPaused_ = false;
     Screen screen_ = Screen::PlayStationDetails, loginReturn_ = Screen::Details;
     bool sessionPending_=false, selectedPlayStation_=false, stopAfterTask_=false, ownSteam_=true, exitAfterStop_=false;
     struct Auth { bool signedIn=true; bool authenticated() const { return signedIn; } } auth_;

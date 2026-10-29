@@ -1,3 +1,4 @@
+#include "core/diagnostics/thread_observation.hpp"
 #include "core/constants/resources.hpp"
 #include "core/constants/app_info.hpp"
 #include "core/constants/error_text.hpp"
@@ -450,6 +451,7 @@ struct ArtworkCache::Impl {
         } catch (...) { /* Preserve the placeholder if memory is exhausted. */ }
     }
     void run() noexcept {
+        fog::diagnostics::observeThread("artwork");
         disk.initialize();
         while (!cancelled.load(std::memory_order_relaxed)) {
             std::string url;

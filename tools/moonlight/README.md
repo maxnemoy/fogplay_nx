@@ -1,5 +1,64 @@
 # Isolated Nintendo Switch Moonlight dependencies
 
+IDR recovery diagnostics use a 256-entry best-effort journal, drained by the
+session worker into individual `Moonlight IDR` lines. `connection`, `wait`,
+`seq`, `core_us` and `frame` join requests, reliable-control dispatch/results,
+received IDR hints, intact FEC frames, depacketizer recognition, wait exit and
+complete IDR assembly. Wait-exit `requests`, `intact` and `fecFailedBlocks` are
+per-wait counters, including intact frames discarded while waiting. Failed
+blocks mean abandonment under the existing FEC policy, not network packet loss;
+detailed FEC events are emitted only while a wait is active. The initiating
+loss remains visible in the independent cumulative FEC counters.
+
+`idr-receive-hint` observes the first data packet before FEC completion, using
+the host's explicit frame type or an H.264 SPS / HEVC VPS/IDR NAL prefix. Its
+`value` is the advertised FEC block count. A lost first packet or unsupported
+prefix prevents identification; absence of a hint cannot establish that no IDR
+was sent. While idle, only the latest raw IDR hint is retained silently;
+recognition of that frame, or assembly of the same or a newer IDR, clears it.
+A later wait entry publishes the retained hint with its original time and
+`wait=0`; retention does not prove that the hinted frame remained incomplete.
+Completed idle IDRs do not
+produce detailed receive/recognition/assembly lines. Join hints/failures by
+connection and frame as well as wait, since a
+frame gap can open a wait after the raw first packet arrived. Duplicate first
+packets can produce duplicate hints. A control success establishes local
+transport acceptance, not host receipt or a causal response to that request.
+
+The pinned core releases its wait at IDR recognition before complete assembly;
+`wait-exit` is therefore not decoding or presentation success. Core timestamps
+share `LiGetMicroseconds()` and may jump with its clock; use sequence/IDs and
+reject backward duration samples. A single atomic transition token publishes
+both active state and unique wait identity. Totals belong to that identity in
+64 bounded keyed records under the journal's nonblocking gate: a delayed event
+cannot reset or increment a later wait's totals. Dispatch results retain the
+dispatch's original wait even if it finishes after another wait has started.
+`totalsValid=0` means no wait, or the keyed record was already replaced by 64
+newer waits. Entry/exit records can appear after observations from another
+thread; their stable wait IDs retain the association.
+
+Totals count admitted journal observations. Receive/control threads never wait,
+allocate or write logs. `journal missed=N` reports overwritten entries or
+producer contention. Rejected admission can undercount a summary; overwriting
+an admitted event removes chain detail while its keyed count remains intact.
+The associated cumulative recovery counters remain independent and unchanged.
+Incomplete event chains with missed records cannot prove
+an IDR was damaged. Thread starts are observed after existing scheduling hints
+and logged separately as `Moonlight thread`, including query failure bits.
+Thread events have dedicated signed core/ideal/priority fields, an affinity
+mask and query error bits; they never reuse IDR frame/counter fields.
+
+The raw hint's copied header-size policy is guarded by an exact SHA-256 contract
+against the canonical pinned depacketizer block. Preparation fails before edits
+if its boundaries or content change; review both implementations before
+updating the contract. The test mutates a canonical size branch and verifies
+that instrumentation rejects it without modifying the source.
+
+`DECODE_UNIT.receiveTimeUs` becomes the adapter packet's first-receipt timestamp
+by subtracting validated core receipt age from the local steady clock. This
+preserves age across clock epochs; zero/future/underflow timestamps remain
+unavailable. It is a local receive-to-present measurement, not host latency.
+
 Run `tools/moonlight/build.sh` from WSL with devkitPro installed. This fetches
 only the required upstream submodules, prepares the GameStream HTTP client,
 builds four static libraries, and links a complete Switch smoke executable.

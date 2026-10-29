@@ -56,6 +56,7 @@ struct FakeWeb final : WebTransport {
     bool loseCreate = false, loseClose = false, failCreatedHistory = false;
     bool previousClient = false, freshSubmitted = false;
     std::string failPath;
+    WebResponse balance{200,"{\"balance\":\"250.00\"}",{},"application/json"};
     bool unexpectedFailure = false;
     Query fields;
     std::function<void()> historyReadAction;
@@ -66,7 +67,7 @@ struct FakeWeb final : WebTransport {
             throw TransportError(TransportFailure::Network);
         }
         if (path == "/user/info") return html(profile);
-        if (path == "/user/balance") return {200,"{\"balance\":\"250.00\"}",{},"application/json"};
+        if (path == "/user/balance") return balance;
         if (path == "/session/list") {
             ++historyReads;
             if (historyReadAction) historyReadAction();
@@ -169,6 +170,30 @@ void preparationDiagnostics() {
       stagedFailure(PairedPreparationStage::FreshPairingPage,RepositoryErrorKind::NetworkFailure,[&] { s.prepare(); }); }
     { Setup s; s.web.connect=replace(s.web.connect,"name=\"Pc[pin]\"","name=\"unknown\"");
       stagedFailure(PairedPreparationStage::ConnectionForm,RepositoryErrorKind::InvalidResponse,[&] { s.prepare(); }); }
+}
+void unavailableBalanceBlocksPaidCheckout() {
+    for (const auto& response : std::vector<WebResponse>{
+            {503,{},{},{}},{200,"{\"balance\":\"unknown\"}",{},"application/json"},
+            {200,"{\"balance\":\"0.009\"}",{},"application/json"},
+            {200,"{\"balance\":\"-0.001\"}",{},"application/json"}}) {
+        Setup preparing; preparing.web.balance=response;
+        stagedFailure(PairedPreparationStage::AccountHistory,RepositoryErrorKind::Unavailable,[&] { preparing.prepare(); });
+        assert(preparing.session.authenticated() && preparing.web.posts==0 && preparing.web.closes==0);
+        // Balance failures also block a previously prepared, otherwise valid form.
+        Setup submitting; const auto handle=submitting.prepare(); submitting.web.balance=response;
+        rejects(RepositoryErrorKind::Unavailable,[&] { submitting.rentals.createPairedRental(handle.id,"0123"); });
+        assert(submitting.session.authenticated() && submitting.web.posts==0 && submitting.web.closes==0);
+        rejects(RepositoryErrorKind::InvalidRequest,[&] { submitting.rentals.createPairedRental(handle.id,"0123"); });
+        submitting.web.balance={200,"{\"balance\":\"1,250.00999\"}",{},"application/json"};
+        assert(!submitting.create().rental.empty() && submitting.web.posts==1);
+        // Closing an existing billable rental must remain possible without balance.
+        submitting.web.balance=response;
+        assert(submitting.rentals.finishSession({ProviderId::FogHub,"9000042"}) && submitting.web.closes==1);
+    }
+    Setup network; network.web.failPath="/user/balance";
+    assert(!network.session.profile().balance && network.session.authenticated());
+    stagedFailure(PairedPreparationStage::AccountHistory,RepositoryErrorKind::Unavailable,[&] { network.prepare(); });
+    assert(network.web.posts==0 && network.web.closes==0 && network.session.authenticated());
 }
 void happyAndExactIds() {
     Setup s;
@@ -431,6 +456,6 @@ void automaticCheckoutEndToEnd() {
 }
 }
 int main() {
-    happyAndExactIds(); preparationDiagnostics(); preparationGuards(); unknownCreateNeverRetries(); partialReceiptAndOwnership(); closeFreshnessAndNoReplay(); automaticCheckoutEndToEnd();
+    happyAndExactIds(); preparationDiagnostics(); unavailableBalanceBlocksPaidCheckout(); preparationGuards(); unknownCreateNeverRetries(); partialReceiptAndOwnership(); closeFreshnessAndNoReplay(); automaticCheckoutEndToEnd();
     std::cout << "FogHub paired rental adapter offline tests passed\n";
 }

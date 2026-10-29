@@ -13,6 +13,7 @@ const char* menuModeName(fog::stream::OverlayMode mode) {
         case Mode::Mouse: return "mouse";
         case Mode::Keyboard: return "keyboard";
         case Mode::ImageSettings: return "image-settings";
+        case Mode::QualitySelect: return "quality-select";
         case Mode::RumbleSettings: return "rumble-settings";
         case Mode::StopConfirm: return "stop-confirm";
     }

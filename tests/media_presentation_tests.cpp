@@ -2,6 +2,7 @@
 #include "features/streaming/domain/media_annexb.hpp"
 #include "features/streaming/domain/audio_queue_metrics.hpp"
 #include "features/streaming/infrastructure/video_image_diagnostics.hpp"
+#include "core/diagnostics/latency_histogram.hpp"
 #include <SDL.h>
 #include <opus/opus.h>
 extern "C" {
@@ -64,8 +65,12 @@ extern "C" int __real_SDL_QueueAudio(SDL_AudioDeviceID, const void*, Uint32);
 extern "C" void __real_SDL_ClearQueuedAudio(SDL_AudioDeviceID);
 static bool failCreation = false, failUpload = false, emulateHardwareFrame = false;
 static bool failTransfer = false, failDraw = false, mockAudio = false, failQueue = false;
+static bool omitFrameTimestamp = false;
+static bool captureFrameTimestamps = false;
+static std::vector<std::int64_t> frameTimestamps;
 static Uint32 audioBytes = 0;
 static unsigned audioClears = 0;
+static std::chrono::microseconds uploadDelay{0};
 extern "C" int __wrap_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture,
     const SDL_Rect* source, const SDL_Rect* destination) {
     if (failDraw) { failDraw = false; return -1; }
@@ -86,6 +91,11 @@ extern "C" void __wrap_SDL_ClearQueuedAudio(SDL_AudioDeviceID device) {
 }
 extern "C" int __wrap_avcodec_receive_frame(AVCodecContext* context, AVFrame* frame) {
     const int result = __real_avcodec_receive_frame(context, frame);
+    if (result == 0 && captureFrameTimestamps) frameTimestamps.push_back(frame->pts);
+    if (result == 0 && omitFrameTimestamp) {
+        omitFrameTimestamp = false;
+        frame->pts = AV_NOPTS_VALUE;
+    }
     if (result == 0 && emulateHardwareFrame) {
         emulateHardwareFrame = false;
         // A reference-counted marker exercises dispatch/ownership only, not a GPU.
@@ -105,6 +115,7 @@ extern "C" SDL_Texture* __wrap_SDL_CreateTexture(SDL_Renderer* renderer, Uint32 
 extern "C" int __wrap_SDL_UpdateYUVTexture(SDL_Texture* texture, const SDL_Rect* rect,
     const Uint8* y, int ys, const Uint8* u, int us, const Uint8* v, int vs) {
     if (failUpload) { failUpload = false; return -1; }
+    if (uploadDelay.count()) std::this_thread::sleep_for(uploadDelay);
     return __real_SDL_UpdateYUVTexture(texture, rect, y, ys, u, us, v, vs);
 }
 static void feed(fog::Media& media, const Bytes& bytes) {
@@ -124,10 +135,9 @@ static Bytes snapshot(fog::Media& media, SDL_Renderer* renderer) {
         "renderer readback failed");
     return pixels;
 }
-static void present(fog::Media& media, SDL_Renderer* renderer) {
+static void present(fog::Media& media, SDL_Renderer*) {
     check(media.draw(), "presentation draw unavailable");
-    SDL_RenderPresent(renderer);
-    media.presented();
+    media.present();
 }
 static void imageSamples() {
     using Sample = fog::detail::VideoImageSample;
@@ -197,8 +207,8 @@ static void presentationCounts(SDL_Renderer* renderer, const Units& units) {
     media.presented();
     check(media.presentedFrames() == 0, "upload without draw counted as present");
     check(media.draw() && media.presentedFrames() == 0, "draw counted before RenderPresent");
-    SDL_RenderPresent(renderer);
-    media.presented(); media.presented();
+    media.present();
+    media.presented();
     present(media, renderer);
     check(media.presentedFrames() == 1, "repeated present counted same generation twice");
     feed(media, units[1]);
@@ -230,6 +240,74 @@ static void presentationCounts(SDL_Renderer* renderer, const Units& units) {
     present(media, renderer);
     check(media.presentedFrames() == 4, "intervening generation fresh draw not counted");
     std::cout << "PASS new-generation presentation: draw/present separation, repeats, draw failure, decoder recovery\n";
+}
+static std::uint64_t latencyValue(const fog::Media& media, const std::string& key) {
+    const auto text = media.latencyDiagnostics();
+    const auto position = text.find(key);
+    check(position != std::string::npos, "missing video latency field");
+    return std::stoull(text.substr(position + key.size()));
+}
+static void presentationLatency(SDL_Renderer* renderer, const Units& units) {
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    const auto nowMs = fog::metrics::steadyNowUs() / 1000;
+    media.video(reinterpret_cast<const std::byte*>(units[0].data()), units[0].size(), nowMs - 1000, nowMs - 500);
+    media.video(reinterpret_cast<const std::byte*>(units[1].data()), units[1].size(), nowMs - 200, nowMs - 30);
+    check(media.preparePresentation(), "latency batch upload missing");
+    check(latencyValue(media, "frameAge{samples=") == 0, "upload prematurely recorded present age");
+    present(media, renderer); present(media, renderer);
+    check(latencyValue(media, "frameAge{samples=") == 1 &&
+        latencyValue(media, "frameAge{samples=1 p50Us=") >= 200000 &&
+        latencyValue(media, "frameAge{samples=1 p50Us=") < 500000 &&
+        latencyValue(media, "assembledQueueWait{samples=1 p50Us=") >= 30000 &&
+        latencyValue(media, "assembledQueueWait{samples=1 p50Us=") < 100000,
+        "coalescing lost actual newest AU origin or redraw counted twice");
+    media.video(reinterpret_cast<const std::byte*>(units[2].data()), units[2].size(), nowMs - 100, nowMs - 10);
+    check(media.preparePresentation(), "next latency upload missing");
+    failDraw = true;
+    try { media.draw(); } catch (const std::runtime_error&) {}
+    media.presented();
+    check(latencyValue(media, "frameAge{samples=") == 1, "failed draw recorded latency");
+    present(media, renderer);
+    check(latencyValue(media, "frameAge{samples=") == 2 && latencyValue(media, "presentGap{samples=") == 1,
+        "new-generation presentation did not record age/gap once");
+    omitFrameTimestamp = true;
+    media.video(reinterpret_cast<const std::byte*>(units[3].data()), units[3].size(), nowMs - 50, nowMs - 5);
+    check(media.preparePresentation(), "missing-PTS frame did not render");
+    present(media, renderer);
+    check(latencyValue(media, "frameAge{samples=") == 2 &&
+        latencyValue(media, "frameAgeUnavailableLifetime=") == 1 &&
+        latencyValue(media, "originMissesLifetime=") == 1,
+        "missing decoder PTS guessed a timestamp or suppressed valid presentation");
+    media.resetVideoDecoder(); present(media, renderer);
+    check(latencyValue(media, "frameAge{samples=") == 2, "retained reset texture recorded new age");
+    std::cout << "PASS presentation latency: actual coalesced AU, upload/draw/completed-present boundary, redraw/failure/reset exclusions, missing decoder PTS\n";
+}
+static void reorderedPresentationLatency(SDL_Renderer* renderer, const Units& units) {
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    const auto nowMs = fog::metrics::steadyNowUs() / 1000;
+    frameTimestamps.clear(); captureFrameTimestamps = true;
+    for (std::size_t i = 0; i < units.size(); ++i)
+        media.video(reinterpret_cast<const std::byte*>(units[i].data()), units[i].size(),
+            nowMs - (i + 1) * 100, nowMs - (i + 1) * 10);
+    captureFrameTimestamps = false;
+    check(frameTimestamps.size() >= 3 && frameTimestamps.size() < units.size(),
+        "B-frame fixture did not exercise decoder delay");
+    bool reordered = false;
+    for (std::size_t i = 1; i < frameTimestamps.size(); ++i)
+        if (frameTimestamps[i] < frameTimestamps[i - 1]) reordered = true;
+    check(reordered && frameTimestamps.back() > 0 &&
+        frameTimestamps.back() != static_cast<std::int64_t>(units.size()),
+        "B-frame fixture did not exercise output PTS association");
+    const auto originToken = static_cast<std::uint64_t>(frameTimestamps.back());
+    check(media.preparePresentation(), "B-frame output upload missing");
+    present(media, renderer);
+    const auto age = latencyValue(media, "frameAge{samples=1 p50Us=");
+    const auto wait = latencyValue(media, "assembledQueueWait{samples=1 p50Us=");
+    check(age >= originToken * 100000 && age < originToken * 100000 + 90000 &&
+        wait >= originToken * 10000 && wait < originToken * 10000 + 90000 &&
+        latencyValue(media, "originMissesLifetime=") == 0,
+        "reordered output received the currently submitted packet's origin");
+    std::cout << "PASS reordered H264 latency: real B-frame delay/reordering retains packet PTS origin\n";
 }
 static void audioObservations() {
     using Metrics = fog::detail::AudioQueueMetrics;
@@ -455,8 +533,54 @@ static void pacedPresentation(SDL_Renderer* renderer, const Units& units) {
     }
     std::cout << "PASS paced synchronous presentation: 30/60 FPS, bounded latest frame, reset/codec phase\n";
 }
+static void refreshSlotPresentation(SDL_Renderer* renderer, const Units& units) {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    const std::array<std::array<unsigned, 9>, 4> batches{{
+        {{1,1,1,1,1,1,1,1,1}}, {{1,1,2,1,1,1,1,1,1}},
+        {{2,1,1,1,1,1,1,1,1}}, {{2,0,2,1,1,1,1,1,1}}
+    }};
+    const std::array<std::int64_t, 4> jitter{{0, 200000, -200000, 0}};
+    uploadDelay = 5220us;
+    for (const int fps : {30, 60}) {
+        for (std::size_t pattern = 0; pattern < batches.size(); ++pattern) {
+            fog::Media media(renderer, stream::VideoCodec::H264, true);
+            media.setPresentationFrameRate(fps);
+            const auto origin = Clock::now();
+            check(!media.preparePresentation(origin), "empty refresh reserved a cadence slot");
+            std::size_t decoded = 0;
+            unsigned uploaded = 0;
+            for (unsigned refresh = 0; refresh < 36; ++refresh) {
+                const auto slot = origin + std::chrono::nanoseconds(
+                    static_cast<std::int64_t>(refresh) * 1000000000 / 60 + jitter[refresh % jitter.size()]);
+                const auto batch = batches[pattern][refresh % batches[pattern].size()];
+                for (unsigned n = 0; n < batch; ++n) feed(media, units[decoded++ % units.size()]);
+                // The actual decode/upload cost varies, but both cadence calls
+                // must use the refresh slot captured before that work.
+                if (media.preparePresentation(slot)) ++uploaded;
+                check(!media.preparePresentation(slot), "one refresh uploaded twice");
+            }
+            const auto expected = fps == 30 ? 18u : pattern == 3 ? 32u : 36u;
+            check(uploaded == expected && media.uploadedFrames() == expected,
+                "decode batch phase or nonzero upload cost rejected an available refresh slot");
+            check(counter(media, "upload_avg_us") >= 5220, "upload-cost regression used an instantaneous mock");
+        }
+    }
+    uploadDelay = 0us;
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    media.setPresentationFrameRate(60);
+    const auto slot = Clock::now();
+    feed(media, units.front()); failUpload = true;
+    bool failed = false;
+    try { media.preparePresentation(slot); } catch (const std::runtime_error&) { failed = true; }
+    check(failed && media.preparePresentation(slot), "failed upload advanced the refresh phase");
+    feed(media, units[1]);
+    check(!media.preparePresentation(slot) && media.preparePresentation(slot + 17ms),
+        "successful retry did not advance exactly one refresh slot");
+    std::cout << "PASS refresh-slot presentation: 30/60 FPS, 0/1/2 decode batches and rotations, 5220us upload, jitter, empty/failure\n";
+}
 int main(int argc, char** argv) {
-    if (argc != 4) return 2;
+    if (argc != 5) return 2;
     SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
     SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) return 3;
@@ -470,7 +594,10 @@ int main(int argc, char** argv) {
         blackImageMeasurements(renderer, load(argv[3]), units);
         test(renderer, units, load(argv[2]));
         presentationCounts(renderer, units);
+        presentationLatency(renderer, units);
+        reorderedPresentationLatency(renderer, load(argv[4]));
         pacedPresentation(renderer, units);
+        refreshSlotPresentation(renderer, units);
         audioObservations();
         audioCounts(renderer);
     }

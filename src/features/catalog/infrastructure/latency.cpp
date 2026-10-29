@@ -1,3 +1,4 @@
+#include "core/diagnostics/thread_observation.hpp"
 #include "core/constants/resources.hpp"
 #include "features/catalog/infrastructure/latency.hpp"
 #include <nlohmann/json.hpp>
@@ -173,6 +174,7 @@ std::optional<int> LatencyService::estimate(const Computer& computer) const {
     return best;
 }
 void LatencyService::run() {
+        fog::diagnostics::observeThread("latency");
     while (!stopped_.load()) {
         std::uint64_t generation;
         {
@@ -193,6 +195,7 @@ void LatencyService::run() {
             endpoints.erase(std::unique(endpoints.begin(),endpoints.end()),endpoints.end());
             std::atomic_size_t next{0};
             const auto check=[&] {
+                fog::diagnostics::observeThread("latency-probe");
                 try { while (!cancelled()) {
                     const auto index=next.fetch_add(1);
                     if (index>=endpoints.size()) return;

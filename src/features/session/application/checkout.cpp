@@ -223,7 +223,7 @@ CheckoutResult CheckoutGuard::finishKnown() {
             }
         } else if (sessions_.pendingRental() != result_.rentalId) {
             return recovery(fog::constants::error::Session::AnotherRentalIsPendingRecoveryResolveItFirst);
-        } else if (!sessions_.ownsSession() && !sessions_.recoverMatchingSession()) {
+        } else if (!sessions_.ownsSession() && !sessions_.restoreCheckoutOwnership(account_, result_.rentalId)) {
             return recovery(fog::constants::error::Session::CannotEstablishOwnershipOfRecordedRental);
         }
         return finishReady();
@@ -231,30 +231,34 @@ CheckoutResult CheckoutGuard::finishKnown() {
         return recovery(std::string(fog::constants::error::Session::CannotStopRecordedRentalRecoveryMarkerRetainedPrefix) + error.what());
     } catch (...) { return recovery(fog::constants::error::Session::CannotStopRecordedRentalRecoveryMarkerRetained); }
 }
-CheckoutResult CheckoutGuard::stop() {
+CheckoutResult CheckoutGuard::stop(bool manualRetry) {
     if (!pending_) return result_;
+    if (manualRetry) { polls_ = 0; result_.pollCount = 0; }
     if (invalid_) return recovery(fog::constants::error::Session::InvalidCheckoutMarkerVerifyOfficialAccountManually);
     result_.stopRequested = true;
     try { persist(); }
     catch (const JournalError& error) {
         if (sameAccount() && !result_.rentalId.empty()) return finishKnown();
-        if (sameAccount() && !result_.creationId.empty()) return poll(true);
+        if (sameAccount() && !result_.creationId.empty()) return poll(false);
         return recovery(std::string(fog::constants::error::Session::CannotSaveStopIntentOrderRemainsUnresolvedPrefix) + error.what());
     }
     catch (...) {
         // Already-owned rentals remain stoppable when the SD becomes unwritable.
         if (sameAccount() && !result_.rentalId.empty()) return finishKnown();
-        if (sameAccount() && !result_.creationId.empty()) return poll(true);
+        if (sameAccount() && !result_.creationId.empty()) return poll(false);
         return recovery(fog::constants::error::Session::CannotSaveStopIntentOrderRemainsUnresolved);
     }
     if (sameAccount() && !result_.rentalId.empty()) return finishKnown();
-    return poll(true);
+    return poll(false);
 }
 CheckoutResult CheckoutGuard::acknowledgeManualResolution() {
-    if (!sessions_.pendingRental().empty() || !sessions_.journalError().empty())
-        throw std::logic_error(fog::constants::error::Session::ResolveSessionRecoveryBeforeAcknowledgingCheckout);
     if (!pending_) return result_;
     if (!invalid_ && !sameAccount()) throw std::logic_error(fog::constants::error::Auth::SignInToTheOriginalAccountFirst);
+    if (!sessions_.pendingRental().empty() || sessions_.persistent() || !sessions_.journalError().empty()) {
+        if (invalid_ || !sameAccount() || result_.rentalId.empty() || sessions_.pendingRental() != result_.rentalId)
+            throw std::logic_error(fog::constants::error::Session::ResolveSessionRecoveryBeforeAcknowledgingCheckout);
+        sessions_.acknowledgeCheckoutResolution(account_, result_.rentalId);
+    }
     clear();
     result_.message = "Local marker cleared after your account check; no server cancellation was sent";
     return result_;

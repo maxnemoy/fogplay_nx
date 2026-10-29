@@ -57,9 +57,17 @@ assert finish.index('stopAfterTask_ = true;') < finish.index('start(Task::Finish
 assert finish.index('start(Task::CheckoutStop') < finish.index('closeStream();')
 assert finish.index('start(Task::Finish') < finish.index('closeStream();')
 shutdown = method(rental, 'shutdownSession')
-assert shutdown.index('beginFinish(') < shutdown.index('closeStream();')
-assert 'if (sessionPending_ && !stopAfterTask_ && !focused)' in app
-assert 'beginFinish("focus-lost")' in app and 'beginFinish("application-exit")' in app
+assert shutdown.index('services_->cancel();') < shutdown.index('closeStream();')
+assert shutdown.index('disarmExitHandling();') < shutdown.index('closeStream();')
+assert 'beginFinish(' not in shutdown and 'armExitHandling();' not in shutdown.replace('disarmExitHandling();', '')
+assert 'while (' not in shutdown
+assert 'if (sessionPending_ && !recoveryPaused_ && !stopAfterTask_ && !focused)' in app
+assert 'beginFinish("focus-lost")' in app and 'beginFinish("application-exit")' not in app
+ui_text = (root / 'src/core/constants/ui_text.hpp').read_text()
+for notice in ('PaidRentalNotice', 'AdoptRentalNotice'):
+    line = next(line for line in ui_text.splitlines() if f'char {notice}[]' in line)
+    assert 'Закрытие из HOME может оставить аренду активной' in line
+    assert 'проверьте сайт сервиса' in line
 print('Same-rental reconnect application safety boundaries passed (static only)')
 
 # Both providers execute the same state, retry, backoff, start and cancellation code.

@@ -9,6 +9,12 @@ namespace {
 bool sameAuth(const AuthData& a,const AuthData& b) {
     return a.account == b.account && a.generation == b.generation && a.state == b.state;
 }
+void requireAvailableBalance(const std::optional<Money>& balance) {
+    if (!balance || balance->currency != "RUB")
+        fail(RepositoryErrorKind::Unavailable,"FogHub balance is unavailable; refresh profile before starting a paid session");
+    if (balance->minorUnits <= 0)
+        fail(RepositoryErrorKind::Unavailable,"FogHub balance must be positive to start a paid session");
+}
 bool numeric(const std::string& value) {
     return !value.empty() && value.size() <= 20 && value.front() != '0' &&
         std::all_of(value.begin(),value.end(),[](unsigned char c){ return c >= '0' && c <= '9'; });
@@ -96,6 +102,7 @@ PairedPreparation Rentals::preparePairedRental(const StartRentalRequest& request
             fail(RepositoryErrorKind::Unavailable,"FogHub computer is not currently available for paired launch");
         stage = PairedPreparationStage::AccountHistory;
         const auto history = session_.ownHistory();
+        requireAvailableBalance(history.balance);
         stage = PairedPreparationStage::IdleBaseline;
         auto baseline = idleBaseline(history);
         stage = PairedPreparationStage::ConnectionPage;
@@ -142,6 +149,7 @@ PairedLaunchReceipt Rentals::createPairedRental(const EntityId& handle,const std
         fail(RepositoryErrorKind::InvalidRequest,"FogHub preparation has expired");
     if (unresolvedCreate_) fail(RepositoryErrorKind::OutcomeUnknown,"FogHub creation outcome requires reconciliation");
     const auto before = session_.ownHistory();
+    requireAvailableBalance(before.balance);
     if (!sameAuth(before.owner,pending.owner) || idleBaseline(before) != pending.baseline)
         fail(RepositoryErrorKind::OutcomeUnknown,"FogHub history changed before creation");
     if (std::chrono::steady_clock::now() >= pending.expires)

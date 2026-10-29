@@ -7,12 +7,14 @@
 #include <atomic>
 #include <memory>
 #include <map>
+#include <functional>
 
 namespace fog::foghub {
 // One serialized worker owns the session, its repositories and cookie store.
 class Session {
 public:
-    Session(WebTransport& transport, CookieStore& storage);
+    using Diagnostic = std::function<void(const std::string&)>;
+    Session(WebTransport& transport, CookieStore& storage, Diagnostic diagnostic = {});
     AuthData auth() const { return auth_; }
     bool authenticated() const noexcept { return authenticated_.load(); }
     void validateLogin(const LoginRequest&) const;
@@ -30,6 +32,7 @@ private:
     // the same complete/account-verified history reader as the read adapter.
     struct OwnHistory {
         AuthData owner;
+        std::optional<Money> balance;
         std::vector<HistoryRow> rows;
         std::vector<std::string> pages;
         std::map<std::string,std::size_t> rowPages;
@@ -44,11 +47,13 @@ private:
     void invalidate(bool removeSaved);
     void persist();
     void accept(const UserProfile& profile);
+    void balanceDiagnostic(const std::string&) const noexcept;
     WebTransport& transport_;
     CookieStore& storage_;
     AuthData auth_{{ProviderId::FogHub,{}}, AuthState::SignedOut, 0};
     std::atomic_bool authenticated_{false};
     std::string storageError_;
+    Diagnostic diagnostic_;
 };
 
 class Auth final : public AuthRepository {

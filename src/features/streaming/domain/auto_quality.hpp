@@ -81,6 +81,7 @@ public:
         observed_ = Profile::Unknown;
         attemptsUp_ = attemptsDown_ = downgradeStreak_ = 0; nextUp_ = nextDown_ = now; lastCommand_ = now;
         lagging_ = false; lagSince_ = 0; queueWindows_ = deliveryWindows_ = audioWindows_ = 0; maxOldestVideoMs_ = 0;
+        capCoalesced_ = 0;
         reason_ = enabled ? "startup" : "manual";
         event(enabled ? "enabled" : "disabled", now);
     }
@@ -153,27 +154,50 @@ public:
         const bool overloaded = decoded && (busy_ >= 0.85 || (workMs_ >= 30 * frameBudgetScale && fps_ < expected * 0.8));
         const bool damaged = errors >= 2 || (errors && fps_ < expected * 0.8) ||
             missing >= 8 || recoveries >= 2 || pressure || queueWindows_ >= 2;
-        if (overloaded || damaged || deliveryTrouble || audioTrouble) {
+        // Source delivery can exceed the configured display cap. Replacing
+        // those excess frames is intentional only when the cap's display slots
+        // were actually filled. One boundary presentation and one pending frame
+        // may straddle the cumulative-counter window; no wider FPS allowance.
+        const auto capFrames = static_cast<std::uint64_t>(elapsed * framesPerSecond_ / 1000.0);
+        const bool capDelivered = frames >= capFrames || (capFrames && frames == capFrames - 1);
+        capCoalesced_ = capDelivered && decoded > capFrames && superseded <= decoded - capFrames + 2
+            ? superseded : 0;
+        // A manually selected ULTRA can remain active when Auto is enabled.
+        // HIGH is the policy ceiling even when that ULTRA happens to decode
+        // quickly; use the same confirmed, bounded downshift as overload.
+        const bool aboveCeiling = server.profile.value == Profile::Ultra;
+        if (aboveCeiling || overloaded || damaged || deliveryTrouble || audioTrouble) {
             stable_ = false;
             if (server.profile.value == Profile::Low) { decide("floor-low", now); return Action::None; }
             if (now - lastCommand_ < 5000 || now < nextDown_) { decide("down-cooldown", now); return Action::None; }
             if (attemptsDown_ >= 2) { decide("down-unconfirmed", now); return Action::None; }
-            decide(overloaded ? "video-work-overload" : damaged ? "transport-decode-trouble" :
+            decide(aboveCeiling ? "above-auto-ceiling" : overloaded ? "video-work-overload" : damaged ? "transport-decode-trouble" :
                 deliveryTrouble ? "video-delivery-loss" : "audio-playback-loss", now);
             return Action::Degrade;
         }
-        const bool healthy = contiguous && !sample.recovering && !errors && !missing && !faults && !pressure &&
-            !superseded && !audioDropped && !audioUnderruns && !audioResets &&
+        const bool headroom = contiguous && !sample.recovering && !errors && !missing && !faults && !recoveries && !pressure && !audioResets &&
             // Brief young batches are normal, but every healthy window
             // must demonstrate that old queued video was actually drained.
             oldest <= 100 && !sustainedQueue && frames && fps_ >= expected * 0.85 && workMs_ <= 20 * frameBudgetScale && busy_ < 0.65 &&
             server.fps.fresh(now);
-        if (!healthy) { stable_ = false; decide(contiguous ? "insufficient-headroom" : "recovery-window", now); return Action::None; }
-        if (server.profile.value == Profile::High || server.profile.value == Profile::Ultra) {
+        const bool healthy = headroom && superseded == capCoalesced_ && !audioDropped && !audioUnderruns;
+        if (!healthy) {
+            // One small isolated loss pauses an existing experiment. It adds
+            // no good time and cannot excuse work/age/fault/recovery evidence.
+            const bool mild = headroom && superseded - capCoalesced_ <= std::max<std::uint64_t>(4, decoded / 20) &&
+                audioDropped <= 1 && audioUnderruns <= 1;
+            if (mild && stable_ && !headroomPaused_ && elapsed <= 3000) {
+                recordHeadroom(now, static_cast<std::uint64_t>(elapsed), false);
+                headroomPaused_ = true; decide("headroom-paused", now); return Action::None;
+            }
+            stable_ = false; decide(contiguous ? "insufficient-headroom" : "recovery-window", now); return Action::None;
+        }
+        if (server.profile.value == Profile::High) {
             stable_ = false; decide("ceiling-high", now); return Action::None;
         }
-        if (!stable_) { stable_ = true; stableAt_ = now; }
-        if (now - stableAt_ < 30000) { decide("stable-window", now); return Action::None; }
+        recordHeadroom(now, static_cast<std::uint64_t>(elapsed), true);
+        headroomPaused_ = false;
+        if (headroomGoodMs_ < 30000) { decide("stable-window", now); return Action::None; }
         if (now - lastCommand_ < 30000 || now < nextUp_) { decide("up-cooldown", now); return Action::None; }
         if (attemptsUp_ >= 2) { decide("up-unconfirmed", now); return Action::None; }
         decide("stable-headroom", now); return Action::Enhance;
@@ -192,9 +216,10 @@ public:
     double fps() const { return fps_; }
     std::string diagnostics() const {
         char out[640];
-        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d autoTargetFps=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u",
+        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d autoTargetFps=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u autoCapCoalesced=%llu autoGoodMs=%llu autoEvidenceMs=%llu autoPaused=%d",
             enabled_, reason_, pending(), framesPerSecond_, fps_, decodedFps_, workMs_, busy_, attemptsUp_, attemptsDown_, downgradeStreak_,
-            static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_);
+            static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_, static_cast<unsigned long long>(capCoalesced_),
+            static_cast<unsigned long long>(stable_ ? headroomGoodMs_ : 0), static_cast<unsigned long long>(headroomSpan()), stable_ && headroomPaused_);
         return out;
     }
     bool pollEvent(std::string& out) {
@@ -202,6 +227,26 @@ public:
         out = std::move(events_.front()); events_.pop_front(); return true;
     }
 private:
+    struct HeadroomWindow { std::uint64_t begin = 0, end = 0; bool healthy = false; };
+    void recordHeadroom(std::uint64_t now, std::uint64_t duration, bool healthy) {
+        if (!stable_) {
+            headroom_.clear(); headroomGoodMs_ = 0;
+            stable_ = true;
+            duration = 0; // The first clean window establishes the baseline.
+        }
+        if (duration) headroom_.push_back({now - duration, now, healthy});
+        const auto cutoff = now > 40000 ? now - 40000 : 0;
+        while (!headroom_.empty() && headroom_.front().end <= cutoff) headroom_.pop_front();
+        if (!headroom_.empty() && headroom_.front().begin < cutoff) headroom_.front().begin = cutoff;
+        // Evaluations are >=2s apart: the 40s horizon retains at most 21
+        // complete/partial windows, even through a long upgrade cooldown.
+        headroomGoodMs_ = 0;
+        for (const auto& window : headroom_)
+            if (window.healthy) headroomGoodMs_ += window.end - window.begin;
+    }
+    std::uint64_t headroomSpan() const {
+        return stable_ && !headroom_.empty() ? headroom_.back().end - headroom_.front().begin : 0;
+    }
     void confirm(std::uint64_t now, const Telemetry& server) {
         if (server.profile.fresh(now) && server.profile.value != observed_) {
             const auto previous = observed_;
@@ -240,19 +285,24 @@ private:
     }
     void event(const char* state, std::uint64_t now) {
         if (events_.size() >= 32) events_.pop_front();
-        char values[360];
-        std::snprintf(values, sizeof(values), " sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f downgrades=%u nextUpMs=%llu queueWindows=%u deliveryWindows=%u audioWindows=%u", fps_, decodedFps_, workMs_, busy_, downgradeStreak_, static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_);
+        char values[448];
+        std::snprintf(values, sizeof(values), " sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f downgrades=%u nextUpMs=%llu queueWindows=%u deliveryWindows=%u audioWindows=%u goodMs=%llu evidenceMs=%llu paused=%d", fps_, decodedFps_, workMs_, busy_, downgradeStreak_, static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_,
+            static_cast<unsigned long long>(stable_ ? headroomGoodMs_ : 0), static_cast<unsigned long long>(headroomSpan()), stable_ && headroomPaused_);
         events_.push_back(std::string("qualityEvent=") + state + " ms=" + std::to_string(now) +
             " reason=" + reason_ + " profile=" + name(observed_) + values);
     }
     bool enabled_ = false, sampled_ = false, stable_ = false, interrupted_ = false;
-    std::uint64_t baseAt_ = 0, lastObserve_ = 0, stableAt_ = 0, lastCommand_ = 0;
+    std::uint64_t baseAt_ = 0, lastObserve_ = 0, lastCommand_ = 0;
     std::uint64_t nextUp_ = 0, nextDown_ = 0, pendingAt_ = 0, pendingRevision_ = 0;
     unsigned attemptsUp_ = 0, attemptsDown_ = 0, queueWindows_ = 0, deliveryWindows_ = 0, audioWindows_ = 0, downgradeStreak_ = 0;
     Profile observed_ = Profile::Unknown, from_ = Profile::Unknown;
     Action pending_ = Action::None;
     bool lagging_ = false;
     std::uint64_t lagSince_ = 0, maxOldestVideoMs_ = 0;
+    std::uint64_t capCoalesced_ = 0;
+    std::deque<HeadroomWindow> headroom_;
+    std::uint64_t headroomGoodMs_ = 0;
+    bool headroomPaused_ = false;
     Sample base_;
     int framesPerSecond_ = 30;
     double fps_ = 0, decodedFps_ = 0, workMs_ = 0, busy_ = 0;

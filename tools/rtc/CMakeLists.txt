@@ -54,6 +54,8 @@ endif()
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
   add_executable(rtc-host-loopback host-loopback.cpp)
   target_link_libraries(rtc-host-loopback PRIVATE datachannel-static)
+  add_executable(rtc-thread-observation-test thread-observation-test.cpp)
+  target_link_libraries(rtc-thread-observation-test PRIVATE datachannel-static)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")

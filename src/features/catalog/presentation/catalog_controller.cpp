@@ -1,3 +1,4 @@
+#include "core/diagnostics/thread_observation.hpp"
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 
@@ -36,7 +37,7 @@ void ApplicationController::loadGames() {
 }
 
 void ApplicationController::requestCatalog(bool manual) {
-    if (catalogPending_.valid() || exitAfterStop_ || sessionPending_) return;
+    if (catalogPending_.valid() || exitAfterStop_ || (sessionPending_ && !recoveryPaused_)) return;
     const auto request = catalog_.begin(manual);
     if (!request) return;
     try {
@@ -45,6 +46,7 @@ void ApplicationController::requestCatalog(bool manual) {
         catalogApi_ = services_->publicCatalog();
         catalogRequest_ = *request;
         catalogPending_ = std::async(std::launch::async, [api=catalogApi_, request=*request] {
+            fog::diagnostics::observeThread("catalog-task");
             return api->games({request.query, request.page, fog::Catalog::PageSize, request.genreId});
         });
     } catch (const std::exception& error) {
@@ -83,7 +85,7 @@ void ApplicationController::moveCatalog(u64 keys) {
     }
     using Direction = fog::Catalog::Direction;
     if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) {
-        if (homeCatalog_.move(catalog_,recentGames_.items().size(),Direction::Left) && !sessionPending_) sidebar_ = true;
+        if (homeCatalog_.move(catalog_,recentGames_.items().size(),Direction::Left) && (!sessionPending_ || recoveryPaused_)) sidebar_ = true;
     }
     if (keys & (HidNpadButton_Right | HidNpadButton_StickLRight)) homeCatalog_.move(catalog_,recentGames_.items().size(),Direction::Right);
     if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) homeCatalog_.move(catalog_,recentGames_.items().size(),Direction::Up);
@@ -168,7 +170,7 @@ void ApplicationController::pollRecentSave() noexcept {
             catch (...) { diagnostic("Recent game save failed; playback continues."); }
         }
         if (!recentSavePending_) return;
-        recentSave_ = std::async(std::launch::async, [snapshot = recentGames_]() mutable { return snapshot.save(); });
+        recentSave_ = std::async(std::launch::async, [snapshot = recentGames_]() mutable { fog::diagnostics::observeThread("recent-save"); return snapshot.save(); });
         recentSavePending_ = false;
     } catch (...) {
         recentSavePending_ = false;

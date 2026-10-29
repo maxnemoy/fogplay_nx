@@ -6,6 +6,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 application = (root / 'src/app/application.cpp').read_text()
 authentication = (root / 'src/features/auth/presentation/authentication_controller.cpp').read_text()
+rental = (root / 'src/features/session/presentation/rental_controller.cpp').read_text()
 header = (root / 'src/app/application_controller.hpp').read_text()
 
 
@@ -27,7 +28,9 @@ def enum(name):
 harness = r'''
 #include "features/account/domain/account_repository.hpp"
 #include "features/session/application/session.hpp"
+#include "features/session/application/stop_retry_budget.hpp"
 #include "core/constants/ui_text.hpp"
+#include "core/diagnostics/thread_observation.hpp"
 #include "features/session/presentation/session_rating.hpp"
 #include "features/session/presentation/session_rating_text.hpp"
 #include <algorithm>
@@ -111,6 +114,8 @@ struct ApplicationController {
     std::string status_,checkoutStatus_;
     std::size_t selection_=1;
     bool sessionPending_=false,pairedPending_=false,stopAfterTask_=false,exitAfterStop_=false;
+    bool recoveryPaused_=false;
+    fog::StopRetryBudget stopRetry_;
     bool checkoutAutoPoll_=false,selectedPlayStation_=false,authSaveFailed_=false;
     std::chrono::steady_clock::time_point retryAt_{},checkoutAt_{},playStationLoadedAt_{};
     std::optional<fog::UserProfile> mtsProfile_,foghubProfile_;
@@ -124,10 +129,12 @@ struct ApplicationController {
     std::unique_ptr<FakePaired> paired_=std::make_unique<FakePaired>();
     void* captcha_=nullptr;
     int gameLoads=0;
+    int recoveryCalls=0;
     void loadGames() {++gameLoads;}
     void syncPending() {} void disarmExitHandling() {} void armExitHandling() {}
+    void pauseSessionRecovery();
     void beginFinish(const char* ="") {} void logCheckoutResult(Task) {} void handleCheckout() {}
-    void handlePairedCheckout() {} void recoverSession() {} void loadHistory() {} void loadPlayStation() {}
+    void handlePairedCheckout() {} void recoverSession() {++recoveryCalls;} void loadHistory() {} void loadPlayStation() {}
     void completeSessionRatingLoad(std::optional<fog::SessionRatingForm>) {}
     void completeSessionRatingSubmit(const fog::SessionRatingResult&) {}
     void setCaptcha(const fog::AuthResult&) {}
@@ -144,7 +151,7 @@ bool checkoutNeedsAutomaticCheck(int) {return false;}
 bool isPlayStationComputerId(int) {return false;}
 }
 namespace fogplay {
-''' + '\n'.join([method(application, 'refreshProfile'), method(application, 'start'),
+''' + '\n'.join([method(application, 'refreshProfile'), method(application, 'start'), method(rental, 'pauseSessionRecovery'),
                   method(application, 'poll'), method(authentication, 'beginLogin')]) + r'''
 }
 void reset(std::vector<std::optional<std::string>> values) {
@@ -158,6 +165,20 @@ void noSecretsInLogs() {
 }
 int main() {
     using fogplay::ApplicationController;using fogplay::Screen;
+    {
+        ApplicationController app; app.sessionPending_=true;
+        app.start(fogplay::Task::Recovery,[]() -> fogplay::TaskResult {throw std::runtime_error("synthetic active-list outage");});
+        app.drain();
+        assert(app.sessionPending_ && app.recoveryPaused_ && !app.checkoutAutoPoll_ && app.screen_==Screen::Recovery);
+        assert(!app.pending_.valid());
+    }
+    for (const bool paused : {false,true}) {
+        ApplicationController app; app.sessionPending_=true; app.pairedPending_=true; app.recoveryPaused_=paused;
+        app.start(fogplay::Task::Profile,[]() -> fogplay::TaskResult {return fog::UserProfile{};}); app.drain();
+        assert(app.recoveryCalls==(paused?0:1) && !app.pending_.valid());
+        assert(app.stopRetry_.attempts()==0); // profile never dispatches an unbudgeted PairedStop
+        if(paused) assert(app.recoveryPaused_ && app.screen_==Screen::Recovery);
+    }
     {
         reset({"identifier-private","password-private"});ApplicationController app;
         app.refreshProfile();

@@ -20,6 +20,9 @@ struct Packet {
     std::int64_t firstSequence = 0, lastSequence = 0; // Video extended RTP range.
     std::uint64_t enqueueMs = 0; // Local steady clock, never a remote timestamp.
     std::uint64_t videoGeneration = 0; // Reset decoder when the next video AU changes generation.
+    // Earliest received RTP packet of this video AU, in local steady milliseconds.
+    // Distinct from assembled queue admission. Zero means unavailable.
+    std::uint64_t firstPacketMs = 0;
 };
 struct PlaybackObservation {
     std::uint64_t presentedFrames = 0, decodedFrames = 0, supersededFrames = 0;
@@ -32,6 +35,7 @@ struct Gamepad {
     std::array<float, 4> axes{};
     float rightTrigger = 0;
     float leftTrigger = 0;
+    std::uint64_t sampledAtUs = 0; // Local pad poll timestamp; never serialized to the host.
 };
 struct StreamConnection {
     fog::EntityId rental;
@@ -84,6 +88,10 @@ public:
     virtual std::string rtcpDiagnostics() const = 0;
     // Local queue/RTC acceptance, scoped to this transport generation. No remote input ACK exists.
     virtual std::string inputDiagnostics() const = 0;
+    virtual std::string inputLatencyDiagnostics() const { return {}; }
+    // Optional bounded performance samples; never query transport SDKs on the frame thread.
+    virtual std::string serverPerformanceDiagnostics() const { return {}; }
+    virtual std::string controlDeliveryDiagnostics() const { return {}; }
     virtual bool pollVideoDiagnostic(std::string& event) = 0;
     // Sanitized, bounded incoming control samples. final flushes pending counts.
     virtual bool pollControlDiagnostic(std::string&, bool final = false) { (void)final; return false; }

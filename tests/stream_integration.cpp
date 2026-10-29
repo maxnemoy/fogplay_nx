@@ -445,7 +445,8 @@ struct Fixture {
                     qualityCommand = id;
                     configurationOrder.push_back(id);
                     dc->send(Json{{"id","stats"},{"target_bitrate",18000000},{"preset",qualityProfile},
-                                  {"fps",30},{"autoquality",true},{"server_codec",hevc ? "H265" : "H264"}}.dump());
+                                  {"fps",30},{"autoquality",true},{"server_codec",hevc ? "H265" : "H264"},
+                                  {"cpu_usage",75},{"encode","4.25"},{"serverfps",60},{"manufacturer","private-server-identity"}}.dump());
                 }
                 else if (id == "apply_scale") {
                     assert(j.size() == 3 && j.at("preset").is_number_unsigned() && j.at("enabled").is_boolean());
@@ -812,6 +813,15 @@ int main(int argc, char** argv) {
         assert(client.qualityStatus().find("18.0") != std::string::npos);
         assert(client.videoDiagnostics().find("serverPreset=LOW") != std::string::npos);
         assert(client.videoDiagnostics().find("statsCount=1") != std::string::npos);
+        const auto performance = client.serverPerformanceDiagnostics();
+        assert(performance.find("cpu_usageRaw=75") != std::string::npos);
+        assert(performance.find("encodeRaw=4.25") != std::string::npos);
+        assert(performance.find("serverfpsRaw=60") != std::string::npos);
+        assert(performance.find("private-server-identity") == std::string::npos && performance.size() <= 1600);
+        const auto delivery = client.controlDeliveryDiagnostics();
+        assert(delivery.find("controlBufferedKnown=1") != std::string::npos);
+        assert(delivery.find("reliabilityKnown=1 unordered=0 maxRetransmits=unset maxLifetimeMs=unset") != std::string::npos);
+        assert(delivery.find("sctpRttMs=") != std::string::npos && delivery.find("inputAck=unsupported") != std::string::npos);
         if (round == 1) {
             // The exact preset comes from the announced table, even when 720p
             // is not at the usual index. Late repeated stats must not spam it.

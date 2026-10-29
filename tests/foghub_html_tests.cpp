@@ -201,6 +201,66 @@ void catalog() {
     rejects([&] { parseComputers(fixture("login"), "70"); }, RepositoryErrorKind::NotAuthenticated);
     rejects([&] { parseGames(fixture("login")); }, RepositoryErrorKind::NotAuthenticated);
 }
+void currentCatalog() {
+    const auto games = fixture("games-2026-10-29");
+    const auto page = parseGames(games);
+    check(page.rows.size() == 24 && page.totalItems == 5950 && page.firstIndex == 0 &&
+        page.nextPath == "/game/list?page=2&per-page=24");
+    check(page.rows[0].id == "18726" && page.rows[1].id == "70" && page.rows[1].name == "Cyberpunk 2077");
+    bool foundNoImage = false;
+    for (const auto& game : page.rows) if (game.id == "122") foundNoImage = game.imageUrl.empty() && !game.name.empty();
+    check(foundNoImage);
+    const std::string fhLink = "href=\"/game/preview?id=18726&amp;mode=5\"";
+    const std::string allLink = "href=\"/game/preview?id=18726\"";
+    check(parseGames(replace(games, fhLink, "")).rows[0].id == "18726");
+    check(parseGames(replace(games, allLink, "")).rows[0].id == "18726");
+    check(parseGames(replace(games, fhLink, "href=\"/game/preview?mode=5&amp;id=18726\"")).rows[0].id == "18726");
+    for (const auto* mode : {"0", "6", "", "05"}) {
+        rejects([&] { parseGames(replace(games, fhLink, "href=\"/game/preview?id=18726&amp;mode=" + std::string(mode) + "\"")); });
+    }
+    rejects([&] { parseGames(replace(games, fhLink, "href=\"/game/preview?id=18726&amp;mode=5&amp;extra=1\"")); });
+    rejects([&] { parseGames(replace(games, allLink, "href=\"/game/preview?id=18726&amp;extra=1\"")); });
+    rejects([&] { parseGames(replace(games, fhLink, "href=\"/game/preview?id=70&amp;mode=5\"")); });
+    rejects([&] { parseGames(replace(games, fhLink, allLink)); });
+    rejects([&] { parseGames(replace(games, allLink, fhLink)); });
+    rejects([&] { parseGames(replace(games, fhLink, "href=\"/game/preview?id=18726&amp;id=18726&amp;mode=5\"")); });
+    rejects([&] { parseGames(replace(games, fhLink, "href=\"/game/preview?id=18726&amp;mode=5&amp;mode=5\"")); });
+    rejects([&] { parseGames(replace(games, fhLink, "href=\"/game/preview?id=0&amp;mode=5\"")); });
+    rejects([&] { parseGames(replace(replace(games, fhLink, ""), allLink, "")); });
+    auto extraGameLink = games;
+    const auto allLinkEnd = extraGameLink.find("</a>", extraGameLink.find(allLink));
+    check(allLinkEnd != std::string::npos);
+    extraGameLink.insert(allLinkEnd + 4, "<a href='/game/preview?id=18726'>Duplicate</a>");
+    rejects([&] { parseGames(extraGameLink); });
+    auto duplicateGame = replace(games, "/game/preview?id=70&amp;mode=5", "/game/preview?id=18726&amp;mode=5");
+    duplicateGame = replace(duplicateGame, "href=\"/game/preview?id=70\"", allLink);
+    rejects([&] { parseGames(duplicateGame); });
+    rejects([&] { parseGames(replace(games, "<title>Все игры</title>", "")); });
+    rejects([&] { parseGames(replace(games, "<title>Все игры</title>", "<title>Ошибка</title>")); });
+    rejects([&] { parseGames(replace(games, "</head>", "<title>Все игры</title></head>")); });
+    rejects([&] { parseGames(replace(games, "class=\"game-index\"", "class=\"other-index\"")); });
+    rejects([&] { parseGames(replace(games, "</main>", "<h1>Ошибка</h1></main>")); });
+    rejects([&] { parseGames(replace(games, "</main>", "<h1>Все игры</h1><h1>Все игры</h1></main>")); });
+    rejects([&] { parseGames(replace(games, "action=\"/game/list\"", "action=\"/other/list\"")); });
+    rejects([&] { parseGames(replace(games, "data-page=\"1\"", "data-page=\"0\"")); });
+    check(parseGames(replace(games, "</main>", "<h1>Все игры</h1></main>")).totalItems == page.totalItems);
+
+    const auto computers = fixture("computers-2026-10-29");
+    const auto pcs = parseComputers(computers, "70");
+    check(pcs.game.id == "70" && pcs.game.name == "Cyberpunk 2077" && pcs.rows.size() == 24 &&
+        pcs.totalItems == 271 && pcs.firstIndex == 0 && pcs.nextPath == "/game/preview?id=70&page=2&per-page=24");
+    check(pcs.rows[0].id == "1839" && pcs.rows[0].online && pcs.rows[0].fhAvailable && pcs.rows[0].pricePerHour == "35");
+    check(parseComputers(replace(computers, "</main>", "<h2>Все компьютеры с игрой</h2></main>"), "70").totalItems == pcs.totalItems);
+    rejects([&] { parseComputers(replace(computers, "</main>", "<h2>Ошибка</h2></main>"), "70"); });
+    rejects([&] { parseComputers(replace(computers, "</main>", "<h2>Все компьютеры с игрой</h2><h2>Все компьютеры с игрой</h2></main>"), "70"); });
+    rejects([&] { parseComputers(computers, "71"); });
+    rejects([&] { parseComputers(replace(computers, "action=\"/game/preview\"", "action=\"/game/list\""), "70"); });
+    rejects([&] { parseComputers(replace(computers, "name=\"id\"", "name=\"other-id\""), "70"); });
+    rejects([&] { parseComputers(replace(replace(computers, "<h1>", "<div>"), "</h1>", "</div>"), "70"); });
+    rejects([&] { parseComputers(replace(computers, "<h1>Cyberpunk 2077 ", "<h1> "), "70"); });
+    rejects([&] { parseComputers(replace(computers, "id=70&amp;page=2", "id=71&amp;page=2"), "70"); });
+    rejects([&] { parseComputers(replace(computers, "/pc/play?id=1839", "/pc/play?id=151"), "70"); });
+}
 void malformedAndLimits() {
     const auto login = fixture("login");
     rejects([] { parseLogin(""); });
@@ -228,6 +288,7 @@ int main() {
         loginAndAccount();
         history();
         catalog();
+        currentCatalog();
         malformedAndLimits();
         std::cout << "FogHub HTML parser tests passed (" << checks << " checks)\n";
         return 0;

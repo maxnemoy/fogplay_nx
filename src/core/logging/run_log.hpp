@@ -36,6 +36,8 @@ public:
     // Nonblocking bounded enqueue. true means accepted with both sinks healthy,
     // not durable. Surviving sinks continue after a sticky I/O failure.
     bool append(const std::string& preparedLine) noexcept;
+    // Ask the writer to sync pending lines promptly without waiting for SD I/O.
+    void requestFlush() noexcept;
     // Wait until all earlier accepted lines and drop notices have synced/committed.
     // Reports sticky I/O failures or lost lines. Never needed in the frame loop.
     bool flush() noexcept;

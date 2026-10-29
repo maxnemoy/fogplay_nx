@@ -7,8 +7,12 @@ fi
 mkdir -p work/logs
 bash tools/test/stream-input.sh
 bash tools/test/reconnect.sh
+bash tools/test/server-performance.sh
+bash tools/test/control-delivery.sh
 flags=(-std=c++17 -Wall -Wextra -Werror -pthread -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1 -Isrc -Ithird_party -Ithird_party/rtc/host/include)
 libs=(-Lthird_party/rtc/host/lib -Wl,--start-group -ldatachannel -ljuice -lusrsctp -lsrtp2 -lmbedtls -lmbedx509 -lmbedcrypto -leverest -lp256m -Wl,--end-group)
+g++ "${flags[@]}" tests/video_rtp_handler_tests.cpp "${libs[@]}" -o work/video_rtp_handler_tests
+./work/video_rtp_handler_tests | tee work/logs/video-rtp-handler-tests.log
 g++ "${flags[@]}" tests/incoming_control_tests.cpp -o work/incoming_control_tests
 ./work/incoming_control_tests | tee work/logs/incoming-control-tests.log
 g++ "${flags[@]}" tests/incoming_control_diagnostics_tests.cpp -o work/incoming_control_diagnostics_tests

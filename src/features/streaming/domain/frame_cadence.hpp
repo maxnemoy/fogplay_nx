@@ -4,6 +4,8 @@
 namespace fog {
 // A successful upload advances the phase; probing an empty queue or a failed
 // upload does not. The unconfigured state preserves legacy unpaced callers.
+// due() and uploaded() must receive the same refresh-slot timestamp, captured
+// before variable decode/conversion work rather than after the upload finishes.
 class FrameCadence {
 public:
     using Clock = std::chrono::steady_clock;

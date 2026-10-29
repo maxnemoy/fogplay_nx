@@ -72,6 +72,7 @@ uint64_t LiGetMicroseconds(void) {
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+int FogMoonlightReadEvent(uint64_t*, FogMoonlightEvent*, uint64_t*) { return 0; }
 void FogMoonlightGetDiagnostics(FogMoonlightDiagnostics* snapshot) {
     if (!snapshot) return;
     *snapshot = {};
@@ -197,7 +198,9 @@ bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* handle, PDECODE_UNIT* unit) {
     static char bytes[4]{0, 0, 1, 0x65};
     static LENTRY entry{}; entry.data = bytes; entry.length = 4;
     static DECODE_UNIT frame{}; frame.fullLength = 4; frame.bufferList = &entry; frame.frameType = FRAME_TYPE_IDR;
-    frame.rtpTimestamp = 90000; *unit = &frame; *handle = reinterpret_cast<VIDEO_FRAME_HANDLE>(1); return true;
+    frame.rtpTimestamp = 90000;
+    frame.receiveTimeUs = LiGetMicroseconds() - 42000;
+    *unit = &frame; *handle = reinterpret_cast<VIDEO_FRAME_HANDLE>(1); return true;
 }
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE, int result) { assert(result == DR_OK); }
 void LiRequestIdrFrame() {}
@@ -525,6 +528,7 @@ int main() {
             gaps.find("core_waiting_idr_drops=") != std::string::npos);
         assert(!session.begin(endpoint(), "1234")); // Cannot replace an active transport.
         stream::Packet packet; assert(client->poll(packet) && packet.timestamp == 90000 && packet.data.size() == 4);
+        assert(packet.firstPacketMs && packet.enqueueMs >= packet.firstPacketMs + 42);
         assert(client->pollAudio(packet) && packet.kind == stream::Kind::Audio && packet.data.size() == 2);
         stream::Gamepad pad; pad.buttons[0] = 1; pad.buttons[12] = 1; pad.axes[1] = 1; pad.leftTrigger = .5;
         assert(client->sendGamepad(pad)); assert(buttonFlags == (A_FLAG | UP_FLAG) && leftTrigger == 127 && leftY == -32767);

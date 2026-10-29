@@ -9,7 +9,7 @@ struct SDL_Renderer;
 namespace fog::ui { class Ui; }
 
 namespace fog::stream {
-enum class OverlayMode { Closed, Menu, Mouse, Keyboard, ImageSettings, StopConfirm, RumbleSettings };
+enum class OverlayMode { Closed, Menu, Mouse, Keyboard, ImageSettings, StopConfirm, RumbleSettings, QualitySelect };
 enum class OverlayActionType { None, SendText, Enter, Tab, Backspace, Escape, StopSession, SettingsChanged, RequestKeyframe, RumbleSettingsChanged };
 struct OverlayAction {
     OverlayActionType type = OverlayActionType::None;

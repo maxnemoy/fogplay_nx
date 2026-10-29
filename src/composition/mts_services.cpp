@@ -1,4 +1,5 @@
 #include "composition/mts_services.hpp"
+#include "app/app_diagnostics.hpp"
 #include "core/constants/resources.hpp"
 #include <switch.h>
 #include "core/constants/storage_paths.hpp"
@@ -22,7 +23,8 @@ class FogHubServices final : public Services {
 public:
     FogHubServices() : transport_(fog::foghub::makeWebTransport()),
         storage_(fog::foghub::makeCookieStore(fog::constants::storage::path(fog::constants::storage::FogHubAuth))),
-        session_(*transport_,*storage_), auth_(session_), account_(session_), catalog_(session_), rentals_(session_),
+        session_(*transport_,*storage_,[](const std::string& message) { diagnostics::diagnostic(message); }),
+        auth_(session_), account_(session_), catalog_(session_), rentals_(session_),
         moonlight_(fog::constants::storage::path(fog::constants::storage::MoonlightIdentities)) {}
     Services* provider(fog::ProviderId id) override { return id == fog::ProviderId::FogHub ? this : nullptr; }
     fog::AuthRepository& auth() override { return auth_; }
@@ -76,7 +78,7 @@ public:
         std::string suffix;
         for (auto value : random) suffix += "0123456789abcdefghijklmnopqrstuvwxyz"[value % 36];
         return std::make_unique<stream::Client>(fog::constants::resources::CertificateBundle,suffix); }
-    void cancel() noexcept override { api_.cancel(); foghub_.cancel(); }
+    void cancel() noexcept override { api_.cancelAll(); foghub_.cancel(); }
 private:
     FogHubServices foghub_;
     std::string id_;

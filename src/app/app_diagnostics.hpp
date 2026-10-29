@@ -21,7 +21,10 @@ struct PlaybackTiming {
 };
 
 extern fog::RunLog runLog;
-extern PlaybackTiming diagnosticTiming;
+// diagnostic() also runs on provider workers. Only copies leave the timing lock.
+PlaybackTiming diagnosticTimingSnapshot();
+PlaybackTiming takeDiagnosticTiming();
+void resetDiagnosticTiming();
 void diagnostic(const std::string& text, std::size_t maximum = 512);
 void firstUiFramePresented();
 class StartupStage {

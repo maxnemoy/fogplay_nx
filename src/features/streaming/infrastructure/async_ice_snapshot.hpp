@@ -1,4 +1,5 @@
 #pragma once
+#include "core/diagnostics/thread_observation.hpp"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -77,6 +78,7 @@ public:
     void stop() { requestStop(); if (worker_.joinable()) worker_.join(); }
 private:
     void run() noexcept {
+        fog::diagnostics::observeThread("ice-snapshot");
         try {
             std::unique_lock<std::mutex> lock(mutex_);
             for (;;) {

@@ -11,8 +11,14 @@ for option in "$@"; do
     esac
 done
 python3 tools/check-architecture.py
+python3 -m unittest discover -s tools/diagnostics -p "test_*.py"
+bash tools/test/thread-observation.sh
+bash tools/test/stage0-metrics.sh
+bash tools/test/video-latency.sh
+bash tools/test/app-diagnostics.sh
 bash tools/test/rumble.sh
 bash tools/test/rumble-settings.sh
+bash tools/test/video-watchdog.sh
 for suite in build-tools host repositories foghub-transport foghub-cookie-storage foghub-html foghub-rental-html foghub-repositories foghub-rentals foghub-review session-rating-ui paired_checkout paired-video-settings-controller paired-checkout-storage catalog-domain stream-input ps-sensors ps-native-input playstation-catalog artwork steam-artwork recent-games control-sender ice-snapshot stream timed-mutex loop-timing playback-drain media media-workers h264-rtp rtp-repair rtp-media hevc media-presentation decoder-diagnostics previews; do
     printf '\nRunning %s tests\n' "$suite"
     bash "tools/test/$suite.sh"

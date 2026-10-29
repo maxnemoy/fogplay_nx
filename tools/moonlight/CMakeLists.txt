@@ -45,7 +45,7 @@ set_target_properties(MbedTLS::mbedcrypto PROPERTIES
 add_subdirectory("${UPSTREAM}/extern/moonlight-common-c" moonlight-common-c)
 # Replace only explicitly prepared translation units; leave the pinned checkout untouched.
 get_target_property(MOONLIGHT_SOURCES moonlight-common-c SOURCES)
-set(PREPARED_CORE_SOURCES Connection VideoStream RtpVideoQueue VideoDepacketizer ControlStream LinkedBlockingQueue PlatformSockets)
+set(PREPARED_CORE_SOURCES Connection VideoStream RtpVideoQueue VideoDepacketizer ControlStream LinkedBlockingQueue PlatformSockets PlatformStuff)
 foreach(name IN LISTS PREPARED_CORE_SOURCES)
   list(LENGTH MOONLIGHT_SOURCES MOONLIGHT_SOURCE_COUNT)
   list(FILTER MOONLIGHT_SOURCES EXCLUDE REGEX "(^|/)${name}\\.c$")

@@ -1,3 +1,4 @@
+#include "core/diagnostics/thread_observation.hpp"
 #include "core/constants/resources.hpp"
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
@@ -17,12 +18,13 @@ void ApplicationController::logIncomingControl(bool final) noexcept {
     } catch (...) {} // Diagnostics cannot interrupt playback or teardown.
 }
 
-std::string ApplicationController::playbackTimings() const {
+std::string ApplicationController::playbackTimings(bool takeLogTiming) const {
+    const auto logTiming = takeLogTiming ? takeDiagnosticTiming() : diagnosticTimingSnapshot();
     const auto log = runLog.stats();
     return "Playback timing: " + drainTiming_.text("drain") + " " + presentTiming_.text("present") +
         " " + transportPumpTiming_.text("transportPump") + " " + videoFeedTiming_.text("videoFeed") +
         " " + decoderResetTiming_.text("decoderReset") + " " + audioFeedTiming_.text("audioFeed") + " " + prepareTiming_.text("prepare") +
-        " " + diagnosticTiming.text("logEnqueue") + " pumpGapMaxUs=" + std::to_string(pumpGapMaxUs_) +
+        " " + logTiming.text("logEnqueue") + " pumpGapMaxUs=" + std::to_string(pumpGapMaxUs_) +
         " outsideMeasuredPumpMaxUs=" + std::to_string(outsideMeasuredPumpMaxUs_) +
         " videoQueueWaitMaxMs=" + std::to_string(videoQueueWaitMaxMs_) +
         " audioQueueWaitMaxMs=" + std::to_string(audioQueueWaitMaxMs_) +
@@ -36,6 +38,13 @@ std::string ApplicationController::playbackTimings() const {
 }
 
 void ApplicationController::logOutputTimings(bool final) {
+    if (media_) diagnostic("Client latency: " + media_->latencyDiagnostics(),4096);
+    if (stream_) diagnostic("Input latency: " + stream_->inputLatencyDiagnostics(),1024);
+    const auto threads = fog::diagnostics::threadObservationText();
+    if (threads != lastThreadObservations_) {
+        for (const auto& line : fog::diagnostics::threadObservationLines()) diagnostic(line,512);
+        lastThreadObservations_ = threads;
+    }
     using Timing = fog::stream::LoopTiming;
     const auto now = std::chrono::steady_clock::now();
     const auto active = loopTiming_.activeText(now);
@@ -139,6 +148,8 @@ void ApplicationController::closeStream() noexcept {
 }
 
 bool ApplicationController::startTransport(bool resumeOnly) {
+    fog::diagnostics::beginThreadObservationEpoch();
+    fog::diagnostics::observeThread("application");
     // Transport replacement must not adopt, create, or reset rental ownership.
     mouseButtons_.reset();
     gamepadSchedule_.reset();
@@ -147,6 +158,10 @@ bool ApplicationController::startTransport(bool resumeOnly) {
     loopTiming_.resetPresentationCounter();
     videoWorkUs_ = videoDecodeErrors_ = lastVideoGeneration_ = 0;
     media_ = std::make_unique<fog::Media>(rt_.renderer,stream::VideoCodec::H264,true);
+    media_->setVideoStallReporter([](const std::string& value) {
+        runLog.append("[Video watchdog] " + value);
+        runLog.requestFlush();
+    });
     auto* provider = providerServices(streamRental_.provider);
     if (!provider) throw std::runtime_error("Stream provider unavailable; stopping rental");
     stream_ = provider->stream();
@@ -208,7 +223,7 @@ void ApplicationController::startStream(const fog::RentalId& rental, bool create
     sessionPending_ = true;
     transportReconnect_.reset();
     loopTiming_.reset(); loopTimingWindowAt_ = loopTimingLifetimeAt_ = std::chrono::steady_clock::now();
-    drainTiming_ = {}; presentTiming_ = {}; diagnosticTiming = {};
+    drainTiming_ = {}; presentTiming_ = {}; resetDiagnosticTiming();
     lastPumpAt_ = {}; lastProtocolLog_ = {}; pumpGapMaxUs_ = 0; outsideMeasuredPumpMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
     transportPumpTiming_ = {}; videoFeedTiming_ = {}; decoderResetTiming_ = {}; audioFeedTiming_ = {}; prepareTiming_ = {};
     drainVideoTotal_ = drainVideoMax_ = drainVideoBudgetHits_ = 0;
@@ -430,7 +445,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
                 continue;
             }
             const auto workStarted = std::chrono::steady_clock::now();
-            try { media_->video(packet.data.data(), packet.data.size()); }
+            try { media_->video(packet.data.data(), packet.data.size(), packet.firstPacketMs, packet.enqueueMs); }
             catch (const fog::VideoDecodeError& error) {
                 videoFeedTiming_.record(workStarted);
                 videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -452,7 +467,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     drainVideoMax_ = std::max(drainVideoMax_, static_cast<std::uint64_t>(drainBudget.video()));
     const auto presentationStarted = std::chrono::steady_clock::now();
     bool prepared = false;
-    try { prepared = media_->preparePresentation(); }
+    try { prepared = media_->preparePresentation(pumpAt); }
     catch (const fog::VideoDecodeError& error) {
         videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now()-presentationStarted).count());
@@ -535,9 +550,13 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         diagnostic("Media queue: " + stream_->queueDiagnostics(),2048);
         diagnostic("Video decoder: " + media_->diagnostics(),4096);
         diagnostic("Audio playback: " + media_->audioDiagnostics(),2048);
+        const auto serverPerformance = stream_->serverPerformanceDiagnostics();
+        if (!serverPerformance.empty()) diagnostic("Server performance: " + serverPerformance,2048);
+        const auto controlDelivery = stream_->controlDeliveryDiagnostics();
+        if (!controlDelivery.empty()) diagnostic("Control delivery: " + controlDelivery,2048);
         logOutputTimings(false);
-        const auto timings = playbackTimings();
-        drainTiming_ = {}; presentTiming_ = {}; diagnosticTiming = {};
+        const auto timings = playbackTimings(true);
+        drainTiming_ = {}; presentTiming_ = {};
         pumpGapMaxUs_ = 0; outsideMeasuredPumpMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
         transportPumpTiming_ = {}; videoFeedTiming_ = {}; decoderResetTiming_ = {}; audioFeedTiming_ = {}; prepareTiming_ = {};
         drainVideoTotal_ = drainVideoMax_ = drainVideoBudgetHits_ = 0;
@@ -578,6 +597,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     gamepad.leftTrigger = (held & HidNpadButton_ZL) ? 1.0f : 0.0f;
     gamepad.rightTrigger = (held & HidNpadButton_ZR) ? 1.0f : 0.0f;
     if (!gamepadSchedule_.due(gamepad, now)) return;
+    gamepad.sampledAtUs = padSampledAtUs_;
     const bool accepted = stream_->sendGamepad(gamepad);
     if (accepted) gamepadSchedule_.accepted(gamepad, now);
     if (streamPlayStation_) {

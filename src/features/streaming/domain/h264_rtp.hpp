@@ -19,6 +19,7 @@ public:
         std::vector<std::byte> data;
         std::uint32_t timestamp = 0;
         std::int64_t firstSequence = 0, lastSequence = 0;
+        std::uint64_t firstPacketMs = 0;
     };
     struct Stats {
         std::uint64_t received = 0, candidates = 0, reordered = 0, duplicate = 0, late = 0;
@@ -73,7 +74,7 @@ public:
     std::size_t pendingPackets() const { return pending_.size(); }
     std::size_t pendingBytes() const { return pendingBytes_; }
     std::size_t assemblyBytes() const { return au_.size(); }
-    void receive(const std::byte* data, std::size_t size, std::uint64_t now, std::size_t frameBudget = 2) {
+    void receive(const std::byte* data, std::size_t size, std::uint64_t now, std::size_t frameBudget = 2, std::uint64_t receivedMs = 0) {
         ++stats_.received;
         // Enforce the repair deadline even when the consumer pump was delayed.
         // A late retransmission cannot revive an already expired prediction chain.
@@ -114,6 +115,7 @@ public:
             ++stats_.reordered;
         }
         observeResponse(seq, p, now, false);
+        p.firstPacketMs = receivedMs ? receivedMs : now;
         p.arrived = now; p.arrivalOrder = stats_.received;
         p.repairMs = nackEnabled_ ? repairMs_ : ReorderMs;
         pendingBytes_ += p.payload.size();
@@ -243,6 +245,7 @@ private:
         bool marker = false;
         std::uint64_t arrived = 0, arrivalOrder = 0, repairMs = RepairMs;
         std::vector<std::byte> payload;
+        std::uint64_t firstPacketMs = 0;
     };
     static unsigned byte(std::byte b) { return std::to_integer<unsigned>(b); }
     static std::uint16_t be16(const std::byte* p) { return std::uint16_t((byte(p[0]) << 8) | byte(p[1])); }
@@ -486,8 +489,11 @@ private:
         }
         if (!active_) {
             active_ = true; timestamp_ = p.timestamp; firstSequence_ = seq; auSince_ = now; auRepair_ = false;
+            auFirstPacketMs_ = p.firstPacketMs;
             vcl_ = idr_ = nonIdr_ = false;
         }
+        // Arrival order can differ from sequence order, especially during repair.
+        auFirstPacketMs_ = std::min(auFirstPacketMs_, p.firstPacketMs);
         if (!payload(p) || (p.marker && fu_)) {
             ++stats_.malformed; damage(3, seq, p.timestamp, now);
             if (p.marker) { boundary_ = true; lastTimestamp_ = p.timestamp; haveTimestamp_ = true; }
@@ -522,7 +528,7 @@ private:
         }
         lastFirst_ = firstSequence_; lastLast_ = seq;
         frameBytes_ += au_.size();
-        frames_.push_back({std::move(au_), p.timestamp, firstSequence_, seq});
+        frames_.push_back({std::move(au_), p.timestamp, firstSequence_, seq, auFirstPacketMs_});
         au_.clear(); ++stats_.emitted;
     }
     struct Request {
@@ -692,7 +698,7 @@ private:
     unsigned fuHeader_ = 0;
     std::uint32_t ssrc_ = 0, timestamp_ = 0, lastTimestamp_ = 0;
     std::int64_t expected_ = 0, firstSequence_ = 0, lastFirst_ = 0, lastLast_ = 0, gapSequence_ = 0;
-    std::uint64_t gapSince_ = 0, gapDetectedMs_ = 0, auSince_ = 0;
+    std::uint64_t gapSince_ = 0, gapDetectedMs_ = 0, auSince_ = 0, auFirstPacketMs_ = 0;
     std::size_t pendingBytes_ = 0, frameBytes_ = 0, fuOffset_ = 0;
     std::map<std::int64_t, Rtp> pending_;
     std::deque<std::int64_t> recent_;

@@ -16,13 +16,14 @@ public:
         bool playStation = false, touchDown = false, touchEdge = false;
         std::uint64_t sequence = 0;
         unsigned nativeInput = 0; // 1=touch down, 2=move, 3=up, 4=accel, 5=gyro.
+        std::uint64_t sampledAtUs = 0;
     };
     struct Message { std::string payload, input; Mode mode; std::uint64_t enqueuedMs = 0; std::string release; InputTrace trace{}; };
     static constexpr std::size_t MaxMessages = 64, ReleaseReserve = 16;
     static constexpr std::size_t MaxBytes = 256 * 1024, ReleaseBytes = 16 * 1024;
     static constexpr std::size_t GamepadBytes = 64 * 1024;
     static constexpr std::uint64_t StallMs = 15000;
-    bool push(std::string payload, Mode mode, std::string input, std::uint64_t now, std::string releasePayload = {}, InputTrace trace = {false, false, false, 0, 0}) {
+    bool push(std::string payload, Mode mode, std::string input, std::uint64_t now, std::string releasePayload = {}, InputTrace trace = {false, false, false, 0, 0, 0}) {
         if (mode == Mode::Release && !input.empty()) {
             // Multiple best-effort releases for an already released key/button
             // need one entry, unless a newer press for that input intervened.

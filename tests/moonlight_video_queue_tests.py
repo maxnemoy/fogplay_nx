@@ -75,7 +75,7 @@ struct Frame {
 using VIDEO_FRAME_HANDLE = Frame*;
 struct State {
     CAPACITY_DECLARATION
-    std::atomic<bool> stop{false}, failed{false}, terminated{false}, assemblyWaiting{true};
+    std::atomic<bool> stop{false}, failed{false}, terminated{false}, assemblyWaiting{true}, fatalFailure{false};
     std::atomic<int> code{0};
     std::atomic<std::uint64_t> frames{0}, videoDrops{0};
     std::atomic<std::uint64_t> videoFullYields{0}, videoQueueHigh{0}, videoBatchMax{0}, videoQueueAgeMaxMs{0};
@@ -244,15 +244,32 @@ void diagnosticsObserveActualDrain() {
     assert(trace.units == 2 && trace.payloadBytes == 4 && trace.idrs == 1);
     assert(trace.invalidTimes == 0 && trace.skippedFrameNumbers == 0 && trace.repeatedOrReordered == 0);
     assert(trace.assembly.count == 2 && trace.assembly.totalUs == 100 && trace.assembly.maxUs == 50);
-    assert(trace.coreAge.count == 2 && trace.coreAge.totalUs == 199601 && trace.coreAge.maxUs == 99850);
+    // Each copied frame now takes a second core-clock sample to translate its
+    // receipt age into the packet's distinct local epoch. Trace sampling itself
+    // stays before copying; the second frame therefore advances by 2 us.
+    assert(trace.coreAge.count == 2 && trace.coreAge.totalUs == 199602 && trace.coreAge.maxUs == 99850);
     assert(trace.hostProcessing.count == 2 && trace.hostProcessing.totalUs == 1400);
-    assert(trace.arrivalGap.count == 1 && trace.arrivalGap.totalUs == 1);
-    assert(trace.lastUnitUs == 1000001 && fakeClockUs == 1000002);
+    assert(trace.arrivalGap.count == 1 && trace.arrivalGap.totalUs == 2);
+    assert(trace.lastUnitUs == 1000002 && fakeClockUs == 1000004);
     assert(trace.copy.count == 2 && trace.copy.totalUs == 14);
     assert(trace.completion.count == 2 && trace.completion.totalUs == 14);
     assert(trace.queueLock.count == 5 && trace.queueLock.totalUs == 35 && trace.emptyPolls == 1);
+    assert(state.video[0].firstPacketMs == nowMs() - 99 && state.video[1].firstPacketMs == nowMs() - 99);
     consume(state, 1, 2, 42);
     assertHealthy(state, 2);
+}
+void invalidReceiptTimestampUnavailable() {
+    for (unsigned scenario = 0; scenario < 3; ++scenario) {
+        resetCore(); State state;
+        core.add(1, true);
+        auto& unit = core.pending.front()->unit;
+        if (scenario == 0) unit.receiveTimeUs = 0;
+        if (scenario == 1) unit.receiveTimeUs = fakeClockUs + 10000;
+        if (scenario == 2) { fakeClockUs = 9000000000000; unit.receiveTimeUs = 1; }
+        drainVideo(state);
+        assert(state.video.size() == 1 && state.video.front().firstPacketMs == 0);
+        assertHealthy(state, 1);
+    }
 }
 int main() {
     assert(State::VideoCapacity == 4);
@@ -263,7 +280,8 @@ int main() {
     invalidFrameWaitsForIdr();
     startupRequiresIdr();
     diagnosticsObserveActualDrain();
-    std::cout << "Moonlight video queue: 7 scenarios PASS (real copyFrame/drainVideo/FrameDiagnostics, fake core, real Packet)\n";
+    invalidReceiptTimestampUnavailable();
+    std::cout << "Moonlight video queue: 8 scenarios PASS (real copyFrame/drainVideo/FrameDiagnostics, fake core, real Packet)\n";
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fog-moonlight-video-') as directory:

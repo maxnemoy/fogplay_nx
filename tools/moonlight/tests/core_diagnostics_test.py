@@ -10,9 +10,10 @@ ROOT = Path(__file__).resolve().parents[3]
 TOOLS = ROOT / "tools/moonlight"
 CORE = ROOT / "third_party/moonlight/moonlight-switch/extern/moonlight-common-c/src"
 NAMES = ("Connection.c", "VideoStream.c", "RtpVideoQueue.c", "VideoDepacketizer.c",
-         "ControlStream.c", "LinkedBlockingQueue.c", "PlatformSockets.c")
+         "ControlStream.c", "LinkedBlockingQueue.c", "PlatformSockets.c", "PlatformStuff.c")
 sys.path.insert(0, str(TOOLS))
 from diagnostics import apply
+from idr_diagnostics import apply as apply_idr_diagnostics, validate_frame_header_policy
 
 
 def digests(directory):
@@ -20,6 +21,24 @@ def digests(directory):
 
 
 original = digests(CORE)
+header_source = (CORE / "VideoDepacketizer.c").read_text()
+validate_frame_header_policy(header_source)
+with tempfile.TemporaryDirectory(prefix="moonlight-header-contract-") as directory:
+    destination = Path(directory)
+    (destination / "core").mkdir()
+    # Change a pinned branch's size without touching any replacement anchor:
+    # preparation must reject it before making even its first source edit.
+    modified = header_source.replace("frameHeaderSize = 44;", "frameHeaderSize = 45;", 1)
+    assert modified != header_source
+    target = destination / "core/VideoDepacketizer.c"
+    target.write_text(modified)
+    try:
+        apply_idr_diagnostics(destination)
+    except RuntimeError as error:
+        assert "Pinned frame-header policy changed" in str(error)
+        assert target.read_text() == modified
+    else:
+        raise AssertionError("Changed pinned header policy must reject IDR instrumentation")
 subprocess.run([sys.executable, str(TOOLS / "prepare.py")], check=True)
 prepared = ROOT / "third_party/moonlight/prepared/core"
 first = digests(prepared)
@@ -39,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix="moonlight-diagnostics-") as directory:
         raise AssertionError("Patch must reject already transformed/unexpected source")
     binary = destination / "core-diagnostics-test"
     subprocess.run([
-        "cc", "-std=c11", "-DLC_DEBUG", "-Wall", "-Wextra", "-Werror", "-pthread",
+        "cc", "-std=c11", "-DLC_DEBUG", "-DFOG_DIAG_TEST_HOOK", "-Wall", "-Wextra", "-Werror", "-pthread",
         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
         f"-I{TOOLS}", f"-I{CORE}", str(TOOLS / "FogMoonlightDiagnostics.c"),
         str(prepared / "LinkedBlockingQueue.c"), str(TOOLS / "tests/core_diagnostics_test.c"),
@@ -126,6 +145,7 @@ typedef struct Packet { unsigned int frameIndex; } Packet;
 static void reportFinalFrameFecStatus(Queue* queue) { (void)queue; }
 static void purgeListEntries(List* list) { list->count = 0; }
 static void notifyFrameLost(unsigned int frame, bool speculative) { (void)frame; (void)speculative; }
+static uint64_t PltGetMicroseconds(void) { return 1000; }
 static int transition(Queue* queue, unsigned int frame, uint8_t fecCurrentBlockNumber) {
     Packet packet = {frame};
     Packet* nvPacket = &packet;

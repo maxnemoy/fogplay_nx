@@ -176,6 +176,8 @@ Api::Api(std::string deviceId, Transport transport, OptionsTransport optionsTran
 Api::~Api() { clearToken(); }
 HttpResponse Api::request(const std::string& method, const std::string& path,
         const Query& query, const std::string& body, const std::string& token, bool shutdown, bool creation) {
+    if (cancelledAll_.load(std::memory_order_acquire))
+        throw RepositoryError(RepositoryErrorKind::NetworkFailure, fog::constants::error::Connection::RequestCancelled);
     const RequestOptions options = creation ? RequestOptions{30000, 15000} :
         shutdown ? RequestOptions{4000, 4000} : RequestOptions{};
     try {
@@ -430,4 +432,9 @@ void Api::clearToken() noexcept {
     nextStep_ = AuthStep::Restart;
 }
 void Api::cancel() noexcept { http_.cancel(); }
+void Api::cancelAll() noexcept {
+    cancelledAll_.store(true, std::memory_order_release);
+    http_.cancel();
+    shutdownHttp_.cancel();
+}
 }

@@ -18,7 +18,7 @@ int main(int argc, char** argv) {
     if (!surface || !renderer || !font || !title) return 2;
     {
         fog::ui::Ui ui(renderer,font,title);
-        for (int mode=0; mode<19; ++mode) {
+        for (int mode=0; mode<20; ++mode) {
             SDL_SetRenderDrawColor(renderer,30,53,57,255);
             SDL_RenderClear(renderer);
             ui.text("Синтетический фон трансляции",30,10,1000);
@@ -32,6 +32,12 @@ int main(int argc, char** argv) {
                 overlay.down(); overlay.down(); overlay.select();
                 overlay.setVideoStatus("H.264 · приём: 18.4 Мбит/с · цель сервера: 20 Мбит/с");
                 overlay.setSaveStatus("Сохранено на SD. Запрошено; подтверждение сервера не гарантируется.");
+            }
+            if (mode==19) {
+                fog::video::Settings settings; settings.quality = 3;
+                overlay.setVideoSettings(settings);
+                overlay.down(); overlay.down(); overlay.select(); overlay.select();
+                overlay.right(); overlay.right(); // HIGH -> ULTRA -> AUTO stays an unapplied local selection.
             }
             if (mode==7 || mode==8) {
                 overlay.setProvider(fog::ProviderId::FogHub);

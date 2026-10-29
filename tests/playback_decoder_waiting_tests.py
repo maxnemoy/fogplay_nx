@@ -7,6 +7,8 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 source = (root / 'src/features/streaming/presentation/playback_controller.cpp').read_text()
 pump = source[source.index('void ApplicationController::pumpStream('):]
+clock_begin = pump.index('    const auto pumpAt = ')
+pump_clock = pump[clock_begin:pump.index('\n', clock_begin) + 1]
 begin = pump.index('    const auto presentationStarted = ')
 end = pump.index('    drainTiming_.record(drainStarted);', begin)
 presentation = pump[begin:end]
@@ -26,7 +28,9 @@ namespace fog { struct VideoDecodeError : std::runtime_error { using std::runtim
 struct ApplicationController {
     struct Media {
         bool prepared = false, waiting = true, fail = false;
-        bool preparePresentation() {
+        std::chrono::steady_clock::time_point presentationSlot{};
+        bool preparePresentation(std::chrono::steady_clock::time_point slot) {
+            presentationSlot = slot;
             if (fail) throw fog::VideoDecodeError("prepare failed");
             return prepared;
         }
@@ -79,9 +83,10 @@ struct ApplicationController {
     }
     void present() {
 '''
-harness += presentation
+harness += pump_clock + presentation
 harness += r'''
         (void)prepareWorkUs;
+        assert(media_->presentationSlot == pumpAt);
     }
 };
 void decodedFrame(ApplicationController& app) {

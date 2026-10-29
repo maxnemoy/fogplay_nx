@@ -36,6 +36,29 @@ static void padding(A& a, unsigned seq, unsigned ts, bool marker, std::uint64_t 
 int main() {
     {
         A a; init(a);
+        const auto start = rtp(100,300,false,{0x7c,0x81,0x11});
+        const auto end = rtp(101,300,true,{0x7c,0x41,0x22});
+        a.receive(start.data(),start.size(),200,2,100);
+        a.tick(260); // Assembly deadline starts at processing=200, not receipt=100.
+        assert(!a.waiting());
+        a.receive(end.data(),end.size(),261,2,105);
+        A::Frame frame; assert(a.poll(frame) && frame.firstPacketMs == 100);
+        assert(a.stats().timeout == 0);
+    }
+
+    {
+        A a; init(a); a.enableNack(true);
+        // Later sequence arrives first; repair unblocks both packets at t=90.
+        // The frame must retain first network evidence at t=10, not t=90.
+        feed(a,101,300,true,{0x7c,0x41,0x22},10);
+        feed(a,100,300,false,{0x7c,0x81,0x11},90);
+        A::Frame f; assert(a.poll(f) && f.firstPacketMs == 10 && f.firstSequence == 100);
+        feed(a,102,400,false,{0x7c,0x81,0x11},100);
+        feed(a,103,400,true,{0x7c,0x41,0x22},130);
+        assert(a.poll(f) && f.firstPacketMs == 100); // New AU resets the origin.
+    }
+    {
+        A a; init(a);
         const auto faults = a.stats().faultSerial;
         padding(a,100,200,true); // Repeated old timestamp/marker must not reopen an AU.
         feed(a,101,300,true,{0x61,0x44},1);
@@ -278,5 +301,5 @@ int main() {
         assert(!a.waiting() && a.stats().gaps == 0 && a.stats().late == 0);
         feed(a,100,400,true,{0x61,0x11}); empty(a); assert(a.stats().duplicate == 1);
     }
-    std::cout << "H264 RTP assembler: 28 deterministic scenarios passed\n";
+    std::cout << "H264 RTP assembler: 29 deterministic scenarios passed\n";
 }
