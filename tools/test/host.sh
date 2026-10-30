@@ -54,6 +54,7 @@ g++ -std=c++17 -Wall -Wextra -Werror -Isrc -Ithird_party \
 bash tools/test/connection-settings.sh
 
 python3 tests/rental_stop_dispatch_tests.py | tee work/logs/rental-stop-dispatch-tests.log
+python3 tests/foghub_stop_recovery_glue_tests.py | tee work/logs/foghub-stop-recovery-glue-tests.log
 
 python3 tests/startup_recovery_order_tests.py | tee work/logs/startup-recovery-order-tests.log
 

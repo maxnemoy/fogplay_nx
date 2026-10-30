@@ -247,8 +247,11 @@ Paging pagination(xmlNode* container, std::size_t rows, const std::string& path,
     auto* current = one(pager, "./li[contains(concat(' ',normalize-space(@class),' '),' active ')]/a");
     const auto currentPage = number(attr(current, "data-page"));
     const auto currentParams = query(attr(current, "href"), path);
-    require(currentParams.count("per-page") == 1);
-    const auto pageSize = number(currentParams.at("per-page"));
+    // Own-history links omit per-page for the site's default of 20 (observed
+    // on both pages after the 21st rental). Keep this default route-specific;
+    // summary ranges and every pagination link must still agree below.
+    require(currentParams.count("per-page") == 1 || path == "/session/list");
+    const auto pageSize = currentParams.count("per-page") ? number(currentParams.at("per-page")) : 20;
     require(pageSize > 0 && pageSize <= 200 && currentPage <= 1000000);
     require(counts[0] == currentPage * pageSize + 1 && rows <= pageSize && (!hasMore || rows == pageSize));
     auto* next = one(pager, "./li[contains(concat(' ',normalize-space(@class),' '),' next ')]");

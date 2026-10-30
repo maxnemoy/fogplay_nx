@@ -17,7 +17,7 @@ import wave
 
 BASELINE_VERSION = "0.6.18"
 BASELINE_SHA256 = "85621608ea1a1d0997d1aee37f8df77e2bcc684fe17323261663465b7b1aca04"
-INSTRUMENTED_VERSIONS = ("0.6.19", "0.6.20", "0.6.21")
+INSTRUMENTED_VERSIONS = ("0.6.19", "0.6.20", "0.6.21", "0.6.22")
 COUNTERS = ("decoded_frames", "uploaded_frames", "presented_frames", "superseded_frames")
 KV = re.compile(r"([A-Za-z_][A-Za-z_0-9-]*)=([^\s{};]+)")
 HEADER = re.compile(r"FogPlay NX (\d+\.\d+\.\d+) startup\.")

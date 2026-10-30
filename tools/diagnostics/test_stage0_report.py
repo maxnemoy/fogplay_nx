@@ -134,7 +134,7 @@ class Stage0ReportTests(unittest.TestCase):
                          "baseline-version-only-unverified")
 
     def test_instrumented_versions_have_distinct_comparison_groups(self):
-        versions = ("0.6.19", "0.6.20", "0.6.21")
+        versions = ("0.6.19", "0.6.20", "0.6.21", "0.6.22")
         lines = []
         for number, version in enumerate(versions, 1):
             lines.extend((f"[0 ms] FogPlay NX {version} startup.",
@@ -143,9 +143,9 @@ class Stage0ReportTests(unittest.TestCase):
         runs = report.parse_log(self.log("\n".join(lines)))["runs"]
         self.assertEqual([run["identity"]["comparison_group"] for run in runs],
                          [f"version:{version}" for version in versions])
-        self.assertEqual(len({run["identity"]["comparison_group"] for run in runs}), 3)
+        self.assertEqual(len({run["identity"]["comparison_group"] for run in runs}), 4)
         self.assertTrue(all(run["identity"]["eligibility"] == "instrumented-separate-from-baseline" for run in runs))
-        self.assertEqual([run["streams"][0]["counter_samples"][0]["decoded_frames"] for run in runs], [1, 2, 3])
+        self.assertEqual([run["streams"][0]["counter_samples"][0]["decoded_frames"] for run in runs], [1, 2, 3, 4])
         self.assertIsNone(report.identity(None, None)["comparison_group"])
         self.assertIsNone(report.identity("0.6.21", {"artifact_version": "0.6.20"})["comparison_group"])
         self.assertEqual(report.identity("0.6.18", None)["comparison_group"], "version:0.6.18")

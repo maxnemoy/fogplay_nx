@@ -47,13 +47,16 @@ struct FakeWeb final : WebTransport {
     std::string profile = fixture("account"), currentHistory = baseline();
     std::string connect = fixture("connect-metadata-synthetic");
     std::string afterCreate = history(true), afterClose = history(false);
+    std::string defaultHistoryPage2;
     std::deque<std::string> queuedHistory;
     WebResponse submitted{302,{},"/pc/play-success?id=42&withResume=0",{}};
     WebResponse success = html(fixture("launch-success-metadata-synthetic"));
     WebResponse closed{302,{},"/session/list",{}};
     unsigned posts = 0, closes = 0, successReads = 0, historyReads = 0;
+    unsigned defaultPage2Reads = 0;
     unsigned failHistoryAt = 0;
     bool loseCreate = false, loseClose = false, failCreatedHistory = false;
+    bool failDefaultPage2 = false;
     bool previousClient = false, freshSubmitted = false;
     std::string failPath;
     WebResponse balance{200,"{\"balance\":\"250.00\"}",{},"application/json"};
@@ -75,6 +78,11 @@ struct FakeWeb final : WebTransport {
             if (failCreatedHistory && posts) throw TransportError(TransportFailure::Network);
             if (queuedHistory.empty()) return html(currentHistory);
             auto value=queuedHistory.front(); queuedHistory.pop_front(); return html(value);
+        }
+        if (path == "/session/list?page=2") {
+            ++defaultPage2Reads;
+            if (failDefaultPage2) throw TransportError(TransportFailure::Network);
+            return html(defaultHistoryPage2);
         }
         if (path == "/pc/preview?id=42") return html(all(fixture("computer-preview-card-excerpt"),"1838","42"));
         if (path == "/pc/play?id=42") {
@@ -381,6 +389,82 @@ struct CheckoutSetup {
     void reset() { guard=std::make_unique<PairedCheckoutGuard>(adapter.rentals,pair,pins,std::make_unique<CheckoutJournal>(disk)); }
     PairedCheckoutResult create() { return guard->create({{ProviderId::FogHub,"42"},{},{},false}); }
 };
+void defaultTwentyHistory(FakeWeb& web) {
+    web.currentHistory=fixture("history-default-baseline");
+    web.afterCreate=fixture("history-default-page1-active");
+    web.afterClose=fixture("history-default-page1-terminal");
+    web.defaultHistoryPage2=fixture("history-default-page2");
+}
+void defaultHistoryTwentyToTwentyOne() {
+    CheckoutSetup s;
+    defaultTwentyHistory(s.adapter.web);
+    assert(s.adapter.session.history().size()==20 && s.adapter.web.defaultPage2Reads==0);
+    const auto ready=s.create();
+    assert(ready.state==PairedCheckoutState::Ready && ready.rental==RentalId({ProviderId::FogHub,"9000042"}) && ready.endpoint);
+    assert(s.adapter.web.posts==1 && s.adapter.web.closes==0 && s.pair.completes==1 && s.disk.saved.pending);
+    const auto inspected=s.adapter.rentals.inspectRental(ready.rental);
+    assert(inspected.state==RentalInspectionState::Ready && inspected.rental==ready.rental &&
+        inspected.account==s.adapter.session.auth().account && inspected.computer==EntityId({ProviderId::FogHub,"42"}));
+    assert(s.adapter.session.history().size()==21 && s.adapter.web.defaultPage2Reads>=2 &&
+        s.adapter.rentals.activeSessions().size()==1);
+    const auto readsBeforeStop=s.adapter.web.defaultPage2Reads;
+    assert(s.guard->stop().state==PairedCheckoutState::Terminal && s.adapter.web.closes==1 &&
+        s.adapter.web.posts==1 && !s.disk.saved.pending && !s.guard->unresolved());
+    assert(s.adapter.web.defaultPage2Reads>readsBeforeStop && s.adapter.session.history().size()==21 &&
+        s.adapter.rentals.activeSessions().empty());
+    assert(s.adapter.rentals.finishSession(ready.rental) && s.adapter.web.closes==1);
+    // Both the persisted coordinator guard and adapter-local create guard clear.
+    assert(!s.adapter.prepare().id.empty() && s.adapter.web.posts==1);
+}
+void defaultHistoryExternalEndRecovery() {
+    CheckoutSetup s;
+    defaultTwentyHistory(s.adapter.web);
+    assert(s.create().state==PairedCheckoutState::Ready && s.disk.saved.record.rental.value=="9000042");
+    // Another client ended this exact rental while the app was not running.
+    s.adapter.web.currentHistory=s.adapter.web.afterClose;
+    s.reset();
+    assert(s.guard->unresolved() && s.disk.saved.pending);
+    const auto readsBeforeBind=s.adapter.web.defaultPage2Reads;
+    assert(s.guard->bindAuthenticatedAccount().state==PairedCheckoutState::Terminal &&
+        !s.guard->unresolved() && !s.disk.saved.pending && s.adapter.web.closes==0 && s.adapter.web.posts==1);
+    assert(s.adapter.web.defaultPage2Reads>=readsBeforeBind+2);
+    assert(s.adapter.rentals.finishSession({ProviderId::FogHub,"9000042"}) && s.adapter.web.closes==0);
+    assert(!s.adapter.prepare().id.empty());
+}
+void defaultHistoryIncompleteEvidenceKeepsGuard() {
+    for (const bool networkFailure : {true,false}) {
+        CheckoutSetup s;
+        defaultTwentyHistory(s.adapter.web);
+        // The 20-row preflight succeeds; the newly required second page fails
+        // only after the paid create returned an exact receipt.
+        s.adapter.web.failDefaultPage2=networkFailure;
+        if (!networkFailure) s.adapter.web.defaultHistoryPage2.clear();
+        assert(s.create().state==PairedCheckoutState::RecoveryRequired && s.adapter.web.posts==1 &&
+            s.adapter.web.closes==0 && s.disk.saved.pending && s.guard->unresolved() &&
+            s.disk.saved.record.rental.value=="9000042");
+        s.guard->stop(); s.guard->poll();
+        assert(s.adapter.web.posts==1 && s.adapter.web.closes==0 && s.disk.saved.pending && s.guard->unresolved());
+        s.adapter.web.failDefaultPage2=false;
+        s.adapter.web.defaultHistoryPage2=fixture("history-default-page2");
+        assert(s.guard->stop().state==PairedCheckoutState::Terminal && s.adapter.web.closes==1 &&
+            s.adapter.web.posts==1 && !s.disk.saved.pending && !s.guard->unresolved());
+    }
+    CheckoutSetup missing;
+    defaultTwentyHistory(missing.adapter.web);
+    missing.adapter.web.afterCreate=all(missing.adapter.web.afterCreate,"9000042","9000099");
+    assert(missing.create().state==PairedCheckoutState::RecoveryRequired &&
+        missing.disk.saved.record.rental.value=="9000042" && missing.guard->unresolved());
+    assert(missing.create().state==PairedCheckoutState::RecoveryRequired && missing.adapter.web.posts==1 &&
+        missing.adapter.web.closes==0 && missing.disk.saved.pending);
+    // A different terminal row is not permission to release the exact receipt.
+    missing.adapter.web.currentHistory=all(missing.adapter.web.afterClose,"9000042","9000099");
+    assert(missing.guard->bindAuthenticatedAccount().state==PairedCheckoutState::RecoveryRequired &&
+        missing.guard->unresolved() && missing.disk.saved.pending && missing.adapter.web.closes==0);
+    missing.adapter.web.currentHistory=missing.adapter.web.afterClose;
+    assert(missing.guard->bindAuthenticatedAccount().state==PairedCheckoutState::Terminal &&
+        !missing.guard->unresolved() && !missing.disk.saved.pending && missing.adapter.web.closes==0 &&
+        missing.adapter.web.posts==1);
+}
 void automaticCheckoutEndToEnd() {
     { CheckoutSetup s;
       s.adapter.web.currentHistory=withRatedPrevious(baseline());
@@ -457,5 +541,6 @@ void automaticCheckoutEndToEnd() {
 }
 int main() {
     happyAndExactIds(); preparationDiagnostics(); unavailableBalanceBlocksPaidCheckout(); preparationGuards(); unknownCreateNeverRetries(); partialReceiptAndOwnership(); closeFreshnessAndNoReplay(); automaticCheckoutEndToEnd();
+    defaultHistoryTwentyToTwentyOne(); defaultHistoryExternalEndRecovery(); defaultHistoryIncompleteEvidenceKeepsGuard();
     std::cout << "FogHub paired rental adapter offline tests passed\n";
 }

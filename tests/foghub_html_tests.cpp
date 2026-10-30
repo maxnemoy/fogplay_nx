@@ -98,6 +98,30 @@ void loginAndAccount() {
     rejects([&] { parseAccount(login); }, RepositoryErrorKind::NotAuthenticated);
     rejects([&] { parseHistory(login); }, RepositoryErrorKind::NotAuthenticated);
 }
+void defaultHistoryPagination() {
+    const auto active = fixture("history-default-page1-active");
+    const auto terminal = fixture("history-default-page1-terminal");
+    const auto last = fixture("history-default-page2");
+    const auto before = parseHistory(fixture("history-default-baseline"));
+    check(before.rows.size() == 20 && before.totalItems == 20 && before.nextPath.empty());
+    for (const auto& row : before.rows) check(row.state == HistoryState::Finished);
+    const auto first = parseHistory(active);
+    check(first.rows.size() == 20 && first.totalItems == 21 && first.nextPath == "/session/list?page=2");
+    check(first.rows.front().id == "9000042" && first.rows.front().computerId == "42" &&
+        first.rows.front().state == HistoryState::Active);
+    check(parseHistory(terminal).rows.front().state == HistoryState::Finished);
+    const auto second = parseHistory(last);
+    check(second.rows.size() == 1 && second.totalItems == 21 && second.nextPath.empty());
+    check(second.rows.front().id == "9001020" && second.rows.front().state == HistoryState::Finished);
+    rejects([&] { parseHistory(replace(active, "<b>1-20</b>", "<b>2-21</b>")); });
+    rejects([&] { parseHistory(replace(last, "<b>21-21</b>", "<b>22-22</b>")); });
+    rejects([&] { parseHistory(replace(active, "class=\"next\"", "class=\"next disabled\"")); });
+    rejects([&] { parseHistory(replace(last, "class=\"next disabled\"", "class=\"next\"")); });
+    rejects([&] { parseHistory(replace(active, "/session/list?page=2", "/session/list?page=2&amp;per-page=20")); });
+    rejects([&] { parseHistory(replace(active, "/session/list?page=2", "https://example.org/session/list?page=2")); });
+    rejects([&] { parseHistory(replace(active, "/session/list?page=2", "/session/close?page=2")); });
+    rejects([&] { parseHistory(replace(active, "/session/list?page=2", "/session/list?page=2&amp;SessionSearch[pc_id]=42")); });
+}
 void history() {
     const auto active = fixture("history-active");
     const auto terminal = fixture("history-terminal");
@@ -287,6 +311,7 @@ int main() {
     try {
         loginAndAccount();
         history();
+        defaultHistoryPagination();
         catalog();
         currentCatalog();
         malformedAndLimits();
