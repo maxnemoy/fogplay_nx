@@ -2,6 +2,10 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 mkdir -p work/logs
+g++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/stick_deadzone_tests.cpp -o work/stick_deadzone_tests
+./work/stick_deadzone_tests | tee work/logs/stick-deadzone-tests.log
+python3 tests/early_stream_input_tests.py | tee work/logs/early-stream-input-tests.log
+python3 tests/input_suspension_tests.py | tee work/logs/input-suspension-tests.log
 g++ -std=c++17 -Wall -Wextra -Werror -Isrc -Ithird_party \
     tests/stream_input_gate_tests.cpp -o work/stream_input_gate_tests
 ./work/stream_input_gate_tests | tee work/logs/stream-input-gate-tests.log

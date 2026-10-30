@@ -29,6 +29,7 @@ complete = method(recovery, 'completeTransportRecovery')
 pump = method(playback, 'pumpStream')
 close = method(playback, 'closeTransport')
 final = method(playback, 'closeStream')
+joined = method(playback, 'pollTransportTeardown')
 for glue in (transport, recovery, paired, pump, close):
     for forbidden in ('guard_.adopt', 'checkout_.create', 'startStream(', 'disarmExitHandling(',
                       'transportReconnect_.reset()', 'sessionPending_ = false', 'recentLaunch_.close()'):
@@ -37,10 +38,34 @@ assert 'stream_->start({streamRental_, resumeOnly})' in transport
 assert close.index('media_->stopWorkers()') < close.index('stream_->close()')
 assert 'streamRental_ = rental;' in method(playback, 'startStream')
 assert 'if (final) stream_->close();' in close
-assert 'else if (!stream_->disconnectForRetry()) {\n                retryAllowed = false;' in close
+assert 'else if (!stream_->disconnectForRetry()) { retryAllowed = false;' in ' '.join(close.split())
 assert 'catch (...) { retryAllowed = false; }' in close
 assert 'return final || retryAllowed;' in close
 assert close.index('if (!final && !retryAllowed) return false;') < close.index('stream_.reset();')
+# FH callback joins run in the owned mailbox. Preserve the older synchronous
+# checks above for MTS; both paths retain rental-stop ordering below.
+fh_close = close[close.index('if (streamRental_.provider == fog::ProviderId::FogHub)'):]
+fh_close = fh_close[:fh_close.index('if (stream_)')]
+assert 'transportTeardown_.begin(stream_, !final)' in fh_close
+assert 'stream_->close()' not in fh_close and 'stream_->disconnectForRetry()' not in fh_close
+assert close.index('media_->stopWorkers()') < close.index('transportTeardown_.begin(')
+assert transport.index('transportTeardown_.pending()') < transport.index('std::make_unique<fog::Media>')
+assert advance.index('transportTeardown_.pending()') < advance.index('transportReconnect_.poll(now)')
+assert joined.index('transportTeardown_.take()') < joined.index('if (!result.allowed)')
+refused = joined[joined.index('if (!result.allowed)'):joined.index('result.client.reset();')]
+assert refused.index('stream_ = std::move(result.client);') < refused.index('stopTransportRecovery(')
+assert 'transportTeardown_.begin(result.client, false)' in refused
+# Mailbox polling precedes input sampling in application glue. It may consume a
+# join, but only the post-overlay recovery phase may dispatch a quality resume.
+assert 'startTransport(' not in joined and 'resumePairedVideoAfterClose(' not in joined
+assert 'pairedVideoResumeAfterClose_ = false;' not in joined[joined.index('result.client.reset();'):]
+assert advance.index('transportTeardown_.pending()') < advance.index('resumePairedVideoAfterClose();')
+assert advance.index('pairedVideoResumeAfterClose_ = false;') < advance.index('resumePairedVideoAfterClose();')
+assert advance.index('resumePairedVideoAfterClose();') < advance.index('transportReconnect_.poll(now)')
+assert 'transportTeardown_.pending() || pairedVideoResumeAfterClose_) && focused && !stopAfterTask_' in app
+assert final.index('pairedVideoResumeAfterClose_ = false;') < final.index('closeTransport(true);')
+assert 'retryStream_ = std::move(stream_);' in close
+assert 'stream_ = retryStream_ ? std::move(retryStream_) : provider->stream();' in transport
 assert 'if (!closeTransport(false)) {' in retry
 assert 'stopTransportRecovery("transport-retry-terminal"); return;' in retry
 assert 'streamRental_ = {};' in final and 'transportReconnect_.cancel();' in final
@@ -51,11 +76,12 @@ assert pump.index('stream_->pump();') < pump.index('handleTransportState(') < pu
 assert 'stream_->ready() && !stream_->disconnected()' in pump
 assert 'switch (stream_->recoveryState())' in state
 assert 'transportReconnect_.recovering() || videoRecovery_.active()' in pump
-assert 'return !transportReconnect_.recovering() && stream_' in inputs
+assert '!transportReconnect_.recovering() && !videoRecovery_.active()' in inputs
 finish = method(rental, 'beginFinish')
 assert finish.index('stopAfterTask_ = true;') < finish.index('start(Task::Finish')
 assert finish.index('start(Task::CheckoutStop') < finish.index('closeStream();')
 assert finish.index('start(Task::Finish') < finish.index('closeStream();')
+assert finish.index('start(Task::PairedStop') < finish.index('closeStream();')
 shutdown = method(rental, 'shutdownSession')
 assert shutdown.index('services_->cancel();') < shutdown.index('closeStream();')
 assert shutdown.index('disarmExitHandling();') < shutdown.index('closeStream();')

@@ -30,7 +30,8 @@ public:
     ~RunLog();
     RunLog(const RunLog&) = delete;
     RunLog& operator=(const RunLog&) = delete;
-    // Commit executes during start, clean close, and on the writer thread after each batch.
+    // Commit executes during start, clean close, and on the writer thread at most every five seconds (or an explicit flush barrier).
+    // The Stage 1 baseline profile instead syncs each ordinary 250-ms batch.
     // The callback must be thread-safe and must not re-enter this RunLog.
     bool start(const std::string& dataDir, std::time_t timestamp = std::time(nullptr), bool (*commit)() = nullptr) noexcept;
     // Nonblocking bounded enqueue. true means accepted with both sinks healthy,
@@ -52,7 +53,7 @@ public:
 private:
     void fail(const char* operation, int code) noexcept;
     void closeSink(int& fd, const char* operation) noexcept;
-    bool writeSink(int& fd, const std::string& batch, const char* operation) noexcept;
+    bool writeSink(int& fd, const std::string& batch, const char* operation, bool sync) noexcept;
     void writer() noexcept;
     int archiveFd_ = -1, mirrorFd_ = -1;
     std::atomic<bool> archiveHealthy_{false}, mirrorHealthy_{false};

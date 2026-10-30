@@ -12,7 +12,7 @@ for directory in ("libgamestream", "crypto"):
     shutil.copytree(SOURCE / directory, DEST / directory, dirs_exist_ok=True)
 (DEST / "core").mkdir(parents=True, exist_ok=True)
 for name in ("Connection.c", "VideoStream.c", "RtpVideoQueue.c",
-             "VideoDepacketizer.c", "ControlStream.c", "LinkedBlockingQueue.c", "PlatformSockets.c", "PlatformStuff.c"):
+             "VideoDepacketizer.c", "ControlStream.c", "LinkedBlockingQueue.c", "PlatformSockets.c", "PlatformStuff.c", "RtspConnection.c"):
     shutil.copy2(BASE / "moonlight-switch/extern/moonlight-common-c/src" / name,
                  DEST / "core" / name)
 
@@ -267,3 +267,6 @@ apply_recovery(DEST)
 
 from idr_diagnostics import apply as apply_idr_diagnostics
 apply_idr_diagnostics(DEST)
+
+from transport import apply as apply_transport
+apply_transport(DEST)

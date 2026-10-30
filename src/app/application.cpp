@@ -125,10 +125,12 @@ ApplicationController::~ApplicationController() {
     // Cancel every worker before joining it or tearing down networking.
     shutdownSession();
     services_->cancel();
+    transportTeardown_.finish();
     if (playStationPending_.valid()) playStationPending_.wait();
     if (pending_.valid()) pending_.wait();
     if (catalogPending_.valid()) catalogPending_.wait();
     latency_.stop();
+    flushSettingsSaves();
     if (recentSave_.valid()) recentSave_.wait();
     if (recentSavePending_) recentGames_.save();
     if (captcha_) SDL_DestroyTexture(captcha_);
@@ -192,6 +194,8 @@ void ApplicationController::run() {
             }
             if (stopAfterTask_ && paired_) paired_->requestStop();
             pollRecentSave();
+            pollSettingsSaves();
+            pollTransportTeardown();
             poll();
             pollCatalog();
             pollPlayStation();
@@ -202,12 +206,13 @@ void ApplicationController::run() {
                 if (stopAfterTask_) beginFinish(); else pollCheckout(false);
             }
             pollScope.finish();
-            if ((stream_ || transportReconnect_.recovering()) && focused && !stopAfterTask_) {
+            if ((stream_ || transportReconnect_.recovering() || transportTeardown_.pending() || pairedVideoResumeAfterClose_) && focused && !stopAfterTask_) {
                 fog::stream::LoopTiming::Scope pumpScope(loopTiming_, fog::stream::LoopTiming::Stage::Pump);
                 pumpStream(pad, held, down);
             }
             fog::stream::LoopTiming::Scope inputScope(loopTiming_, fog::stream::LoopTiming::Stage::Input);
-            if (!pending_.valid() && focused) input(uiDown);
+            if (!pending_.valid() && focused &&
+                (!transportTeardown_.pending() || screen_ == Screen::Streaming || screen_ == Screen::StopConfirm)) input(uiDown);
             updateRumble(pad, focused);
             if (screen_ == Screen::Games && focused && (!sidebar_ || catalog_.items().empty())) requestCatalog();
             if (screen_ == Screen::Stopping && !recoveryPaused_ && !pending_.valid() && !pairedPending_ && auth_.authenticated() &&
@@ -219,7 +224,7 @@ void ApplicationController::run() {
             if (screen_ == Screen::Checkout && !pending_.valid()) checkoutStatus_ = status_;
             if (sessionPending_ && (stream_ || !streamRental_.empty() || transportReconnect_.recovering())) beginFinish("stream-exception");
         }
-        if (exitAfterStop_ && !sessionPending_ && !pending_.valid()) break;
+        if (exitAfterStop_ && !sessionPending_ && !pending_.valid() && !transportTeardown_.pending()) break;
         try {
             fog::stream::LoopTiming::Scope drawScope(loopTiming_, fog::stream::LoopTiming::Stage::Draw);
             if (focused) draw(); else svcSleepThread(16000000);

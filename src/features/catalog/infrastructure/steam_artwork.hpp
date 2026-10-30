@@ -49,6 +49,9 @@ public:
     SteamArtworkStats stats() const;
     // Cancels network work, drops queued requests, and joins the worker.
     void stop() noexcept;
+    // Nonblocking: interrupt in-flight downloads, retain queued work for resume.
+    // An already executing disk operation may finish; no new downloads start.
+    void setPaused(bool paused) noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

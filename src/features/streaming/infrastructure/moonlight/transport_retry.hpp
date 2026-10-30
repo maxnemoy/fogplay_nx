@@ -3,13 +3,14 @@
 #include <cerrno>
 
 namespace moonlight::detail {
-// The core reports socket errno values directly; negative Moonlight errors have
-// their own meanings. Unknown errors and host-requested termination fail closed.
+// Use only for core transport events or LiStartConnection stage failures.
+// Host messages can contain these exact positive errno values too.
 inline bool retryableTransportError(int code) {
     return code == -1 || code == ML_ERROR_NO_VIDEO_TRAFFIC || code == ML_ERROR_NO_VIDEO_FRAME ||
         code == ECONNRESET || code == ECONNABORTED || code == ECONNREFUSED ||
         code == ETIMEDOUT || code == ENETDOWN || code == ENETUNREACH ||
-        code == EHOSTUNREACH || code == EPIPE;
+        code == EHOSTUNREACH || code == EPIPE || code == ENOTCONN ||
+        code == EHOSTDOWN || code == ENOBUFS || code == EBADF;
 }
 
 // Host metadata reads have no launch/resume side effects. Only classified

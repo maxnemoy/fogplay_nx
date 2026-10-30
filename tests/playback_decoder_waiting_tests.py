@@ -15,6 +15,7 @@ presentation = pump[begin:end]
 
 harness = r'''
 #include "core/constants/ui_text.hpp"
+#include "core/constants/stage1_options.hpp"
 #include "features/streaming/domain/stream_input_gate.hpp"
 #include "features/streaming/domain/video_recovery.hpp"
 #include <cassert>
@@ -48,6 +49,7 @@ struct ApplicationController {
             if (!waiting) ++clears;
         }
         bool waitingForVideoKeyframe() const { return assemblyWaiting || decoderWaiting; }
+        bool inputSuspended() const { return false; }
         bool ready() const { return connected; }
         bool disconnected() const { return !connected; }
     } streamStorage;

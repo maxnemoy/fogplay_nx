@@ -186,10 +186,40 @@ void computerPreview() {
     check(!parseComputerPreview(replace(html,"Онлайн","Офлайн"),"1838").fhAvailable);
     check(!parseComputerPreview(replace(html,"href=\"/pc/play?id=1838\"","href=\"/pc/click-play?id=1838\""),"1838").fhAvailable);
 }
+void computerPreviewBonusPrice() {
+    const auto html = fixture("computer-preview-card-excerpt");
+    const std::string badge = "<span class='badge bg-success me-1 text-decoration-none' title='Сыгранное время в FH возвращается бонусами — на них можно бесплатно играть у того же мерчанта'>+10|25%</span>";
+    const std::string label = "<small>Играть FH</small> 60₽ " + badge;
+    const auto bonus = replace(html, "Играть FH 25₽", label);
+    const auto pc = parseComputerPreview(bonus, "1838");
+    check(pc.id == "1838" && pc.fhAvailable && pc.pricePerHour == "60");
+    check(parseComputerPreview(replace(bonus, "+10|25%", "+5%"), "1838").pricePerHour == "60");
+    check(parseComputerPreview(replace(bonus, "60₽", "60.50₽"), "1838").pricePerHour == "60.50");
+    check(parseComputerPreview(replace(html, "Играть FH 25₽", "<small>Играть FH</small> 25₽"), "1838").pricePerHour == "25");
+    check(parseComputerPreview(replace(bonus, label, "Играть FH 60₽ " + badge), "1838").pricePerHour == "60");
+    for (const auto* malformed : {"+0%", "+101%", "+05%", "+10|0%", "+10|101%", "+10|25|30%", "10|25%", "+5% бонусов", "+5% 99₽", "+x%", "", "Онлайн"})
+        rejects([&] { parseComputerPreview(replace(bonus, "+10|25%", malformed), "1838"); });
+    for (const auto& malformed : {
+        replace(badge, "bg-success", "bg-secondary"), replace(badge, "badge bg-success", "other badge bg-success"),
+        replace(badge, "title=", "data-title="), replace(badge, "+10|25%", "<b>+10|25%</b>"),
+        replace(badge, "<span", "<span onclick='unsafe()'"), badge + badge, std::string("<span>+5%</span>"), std::string("<script>+5%</script>")})
+        rejects([&] { parseComputerPreview(replace(bonus, badge, malformed), "1838"); });
+    for (const auto* malformed : {"0", "0.00", "-1", "60.5", "60.000", "60 unknown", "60₽ 99"})
+        rejects([&] { parseComputerPreview(replace(bonus, "60₽", std::string(malformed) + "₽"), "1838"); });
+    rejects([&] { parseComputerPreview(replace(bonus, label, badge + " Играть FH 60₽"), "1838"); });
+    rejects([&] { parseComputerPreview(replace(bonus, label, label + " unknown"), "1838"); });
+    rejects([&] { parseComputerPreview(replace(bonus, "<small>Играть FH</small>", "<b>Играть FH</b>"), "1838"); });
+    rejects([&] { parseComputerPreview(replace(bonus, "<small>Играть FH</small>", "<small><b>Играть FH</b></small>"), "1838"); });
+    rejects([&] { parseComputerPreview(replace(bonus, "Играть FH", "Играть МТС"), "1838"); });
+    rejects([&] { parseComputerPreview(replace(bonus, "/pc/play?id=1838", "/pc/play?id=1836"), "1838"); });
+    rejects([&] { parseComputerPreview(replace(bonus, "/pc/play?id=1838", "/pc/play?id=1838&amp;gameId=70"), "1838"); });
+    for (const auto* action : {"onclick='unsafe()'", "data-method='post'", "target='_blank'", "download"})
+        rejects([&] { parseComputerPreview(replace(bonus, "href=\"/pc/play?id=1838\"", std::string(action) + " href=\"/pc/play?id=1838\""), "1838"); });
+}
 }
 int main() {
     try {
-        endpoints(); forms(); success(); reviewRequired(); bonusChoice(); closeActions(); computerPreview();
+        endpoints(); forms(); success(); reviewRequired(); bonusChoice(); closeActions(); computerPreview(); computerPreviewBonusPrice();
         std::cout << "FogHub rental HTML parser tests passed (" << checks << " checks)\n";
         return 0;
     } catch (const std::exception& error) {

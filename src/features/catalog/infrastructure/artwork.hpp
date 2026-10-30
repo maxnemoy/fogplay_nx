@@ -58,6 +58,9 @@ public:
     SDL_Texture* get(const std::vector<std::string>& urls);
     // Cancels and joins the worker and frees textures. Call before SDL teardown.
     void stop() noexcept;
+    // Nonblocking: interrupt in-flight downloads, retain queued work for resume.
+    // An already executing disk operation may finish; no new downloads start.
+    void setPaused(bool paused) noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -493,6 +493,41 @@ void uploadFailureFallback(SDL_Renderer* renderer) {
     for (int i = 0; i < 100; ++i) assert(cache.request(urls));
     assert(calls == 2);
 }
+void pauseAndResume(SDL_Renderer* renderer) {
+    std::atomic_int calls{0};
+    std::atomic_bool interrupted{false};
+    fog::ArtworkCache cache([&](const auto&, const std::atomic_bool& cancelled) {
+        if (++calls == 1) {
+            while (!cancelled.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            interrupted = true;
+            throw std::runtime_error("cancelled by pause");
+        }
+        return raster(true);
+    });
+    cache.setPaused(true);
+    const auto url = prefix + "pause.png";
+    assert(cache.request(url));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    assert(calls == 0);
+    cache.setPaused(false);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (calls == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    assert(calls == 1);
+    cache.setPaused(true);
+    while (!interrupted && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    assert(interrupted);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    cache.update(renderer);
+    assert(calls == 1 && !cache.get(url) && !cache.exhausted({url}));
+    cache.setPaused(false);
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!cache.get(url) && std::chrono::steady_clock::now() < deadline) {
+        cache.update(renderer); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(calls == 2 && cache.get(url));
+    cache.setPaused(true);
+    cache.stop();
+}
 void malformedDownload(SDL_Renderer* renderer) {
     std::atomic_int calls{0};
     fog::ArtworkCache cache([&](const std::string&, const std::atomic_bool&) {
@@ -540,6 +575,7 @@ int main(int argc, char**) {
     auto* surface = SDL_CreateRGBSurfaceWithFormat(0, 640, 480, 32, SDL_PIXELFORMAT_RGBA32);
     auto* renderer = SDL_CreateSoftwareRenderer(surface);
     if (!surface || !renderer) throw std::runtime_error(SDL_GetError());
+    pauseAndResume(renderer);
     cacheAndEviction(renderer);
     malformedDownload(renderer);
     candidateFallback(renderer);

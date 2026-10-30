@@ -28,6 +28,29 @@ ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 INCLUDE := -I$(CURDIR)/src -I$(CURDIR)/third_party -isystem $(RTC_PREFIX)/include -isystem $(DEVKITPRO)/libnx/include -DRTC_STATIC -DRTC_ENABLE_MEDIA=1 -DRTC_ENABLE_WEBSOCKET=1
 INCLUDE += -idirafter $(MOONLIGHT_PREFIX)/include -I$(MOONLIGHT_PREFIX)/include/gamestream -I$(MOONLIGHT_PREFIX)/include/crypto
 CFLAGS := -g -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections $(ARCH) -D__SWITCH__ $(INCLUDE) $(shell $(PC_ENV) pkg-config --cflags $(PACKAGES) 2>/dev/null)
+# A common safe diagnostic baseline, then exactly one experimental change.
+STAGE1_PROFILE ?= full
+STAGE1_MASK_full := 255
+STAGE1_MASK_control := 0
+STAGE1_MASK_c1 := 1
+STAGE1_MASK_c2 := 2
+STAGE1_MASK_s5 := 4
+STAGE1_MASK_p9 := 8
+STAGE1_MASK_p10 := 16
+STAGE1_MASK_s14 := 32
+STAGE1_MASK_s10 := 64
+STAGE1_MASK_p4 := 128
+STAGE1_MASK_p4_legacy := 128
+STAGE1_MASK_s16 := 256
+ifeq ($(filter $(STAGE1_PROFILE),full control c1 c2 s5 p9 p10 s14 s10 p4 p4_legacy s16),)
+$(error Invalid STAGE1_PROFILE: $(STAGE1_PROFILE))
+endif
+CFLAGS += -DFOGPLAY_STAGE1_FEATURE_MASK=$(STAGE1_MASK_$(STAGE1_PROFILE))
+CFLAGS += -DFOGPLAY_MTS_CATCHUP_AGE_GUARD=$(if $(filter p4_legacy,$(STAGE1_PROFILE)),0,1)
+# Stage 1 audio experiment; enable only for an external A/V comparison.
+ifeq ($(BOUNDED_SYNC_AUDIO),1)
+CFLAGS += -DFOGPLAY_BOUNDED_SYNC_AUDIO
+endif
 CXXFLAGS := $(CFLAGS) -std=c++17 -fexceptions -frtti -MD -MP
 LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,--gc-sections,-Map,$(CURDIR)/build/$(TARGET).map
 LIBPATHS := -L$(FFMPEG_DIAG)/lib -L$(RTC_PREFIX)/lib -L$(PORTLIBS)/lib -L$(DEVKITPRO)/libnx/lib

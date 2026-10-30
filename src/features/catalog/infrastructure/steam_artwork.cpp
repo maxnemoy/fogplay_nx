@@ -247,6 +247,7 @@ struct SteamArtworkResolver::Impl {
     std::map<Key, Record> records;
     std::deque<Key> queue;
     std::atomic_bool cancelled{false};
+    bool paused = false;
     std::thread worker;
     std::uint64_t sequence = 0;
     std::size_t pending = 0;
@@ -361,8 +362,9 @@ struct SteamArtworkResolver::Impl {
             Key key;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                wake.wait(lock, [this] { return stopped || !queue.empty(); });
+                wake.wait(lock, [this] { return stopped || (!paused && !queue.empty()); });
                 if (stopped) return;
+                cancelled = false;
                 key = std::move(queue.front());
                 queue.pop_front();
                 auto& record = records.at(key);
@@ -386,6 +388,7 @@ struct SteamArtworkResolver::Impl {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (stopped) return;
+                if (cancelled.load()) { queue.push_front(std::move(key)); continue; }
                 auto& record = records.at(key);
                 record.pending = false;
                 --pending;
@@ -443,6 +446,14 @@ std::string SteamArtworkResolver::get(int mtsId, const std::string& title) const
 SteamArtworkStats SteamArtworkResolver::stats() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return {impl_->records.size(), impl_->pending, impl_->ready};
+}
+void SteamArtworkResolver::setPaused(bool paused) noexcept {
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->paused = paused;
+        if (paused) impl_->cancelled = true;
+    }
+    impl_->wake.notify_all();
 }
 void SteamArtworkResolver::stop() noexcept {
     if (!impl_) return;

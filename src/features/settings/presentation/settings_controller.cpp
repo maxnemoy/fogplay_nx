@@ -20,16 +20,19 @@ void ApplicationController::inputControllerSettings(u64 keys) {
     if (selection_ == 0) next.profile = next.profile == ::stream::ControllerProfile::Xbox ?
         ::stream::ControllerProfile::DualSense : ::stream::ControllerProfile::Xbox;
     else next.xbox = !next.xbox;
+    controllerSettings_ = next;
+    ui_.setXboxLayout(next.xbox);
+    controllerSaveStatus_ = uiText::Settings::Saving;
     try {
-        fog::controller::saveSettings(storagePaths::path(storagePaths::ControllerSettings), next);
-        controllerSettings_ = next;
-        ui_.setXboxLayout(next.xbox);
-        controllerSaveStatus_ = fog::controller::text::Saved;
-        diagnostic(std::string("Controller settings saved: profile=") + fog::controller::text::profileLabel(next.profile) +
-            " layout=" + (next.xbox ? "xbox" : "nintendo") + "; applies to next connection");
+        settingsSaves_.submit(fog::settings::Key::Controller, [next] {
+            fog::controller::saveSettings(storagePaths::path(storagePaths::ControllerSettings), next);
+        }, [this](bool saved) {
+            controllerSaveStatus_ = saved ? fog::controller::text::Saved : fog::controller::text::SaveFailed;
+            if (!saved) diagnostic("Controller settings save failed; active preferences remain in memory.");
+        });
     } catch (...) {
         controllerSaveStatus_ = fog::controller::text::SaveFailed;
-        diagnostic("Controller settings save failed; previous settings retained.");
+        diagnostic("Controller settings save dispatch failed; active preferences remain in memory.");
     }
 }
 
@@ -86,13 +89,18 @@ void ApplicationController::inputConnectionSettings(u64 keys) {
     else if (keys & (HidNpadButton_Right | HidNpadButton_StickLRight | HidNpadButton_A)) direction = 1;
     auto next = connectionSettings_;
     if (!fog::connection::adjust(next, direction)) return;
+    connectionSettings_ = next;
+    connectionSaveStatus_ = uiText::Settings::Saving;
     try {
-        fog::connection::saveSettings(storagePaths::path(storagePaths::ConnectionSettings), next);
-        connectionSettings_ = next;
-        connectionSaveStatus_ = uiText::Settings::ConnectionSaved;
+        settingsSaves_.submit(fog::settings::Key::Connection, [next] {
+            fog::connection::saveSettings(storagePaths::path(storagePaths::ConnectionSettings), next);
+        }, [this](bool saved) {
+            connectionSaveStatus_ = saved ? uiText::Settings::ConnectionSaved : uiText::Settings::ConnectionSaveFailed;
+            if (!saved) diagnostic("Connection settings save failed; active preferences remain in memory.");
+        });
     } catch (...) {
         connectionSaveStatus_ = uiText::Settings::ConnectionSaveFailed;
-        diagnostic("Connection settings save failed; no settings payload logged.");
+        diagnostic("Connection settings save dispatch failed; active preferences remain in memory.");
     }
 }
 
@@ -110,17 +118,22 @@ void ApplicationController::drawConnectionSettings() {
 
 void ApplicationController::changeRumbleSettings(const fog::rumble::Settings& value) {
     if (!fog::rumble::valid(value)) return;
+    rumbleSettings_ = value;
+    const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    rumble_.setMode(value.mode, nowMs);
+    rumbleSaveStatus_ = uiText::Settings::Saving;
     try {
-        fog::rumble::saveSettings(storagePaths::path(storagePaths::RumbleSettings), value);
-        rumbleSettings_ = value;
-        const auto nowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-        rumble_.setMode(value.mode, nowMs);
-        rumbleSaveStatus_ = fog::rumble::text::Saved;
-        diagnostic(std::string("Rumble settings changed: mode=") + fog::rumble::modeId(value.mode));
+        settingsSaves_.submit(fog::settings::Key::Rumble, [value] {
+            fog::rumble::saveSettings(storagePaths::path(storagePaths::RumbleSettings), value);
+        }, [this](bool saved) {
+            rumbleSaveStatus_ = saved ? fog::rumble::text::Saved : fog::rumble::text::SaveFailed;
+            overlay_.setRumbleStatus(rumbleSaveStatus_);
+            if (!saved) diagnostic("Rumble settings save failed; active preferences remain in memory.");
+        });
     } catch (...) {
         rumbleSaveStatus_ = fog::rumble::text::SaveFailed;
-        diagnostic("Rumble settings save failed; previous mode retained.");
+        diagnostic("Rumble settings save dispatch failed; active preferences remain in memory.");
     }
     overlay_.setRumbleSettings(rumbleSettings_);
     overlay_.setRumbleStatus(rumbleSaveStatus_);

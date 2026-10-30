@@ -2,6 +2,7 @@
 #include "core/constants/ui_text.hpp"
 #include "features/session/application/paired_checkout.hpp"
 #include "features/settings/domain/video_settings.hpp"
+#include "features/settings/infrastructure/deferred_settings.hpp"
 #include "features/streaming/domain/transport_reconnect.hpp"
 #include "features/streaming/domain/streaming_client.hpp"
 #include <future>
@@ -50,11 +51,17 @@ struct TestOverlay {
     void setSaveStatus(const std::string& status) { saved = status; }
 };
 struct TestInputGate { int suspensions = 0; void suspendVideo() { ++suspensions; } };
+// Deterministic mailbox for settings-controller tests. Native reaper tests
+// separately exercise the real background worker and callback joins.
+struct TestTransportTeardown { bool occupied = false; bool pending() const { return occupied; } };
 class ApplicationController {
 public:
+    explicit ApplicationController(std::chrono::milliseconds saveDelay = std::chrono::milliseconds(0))
+        : settingsSaves_(saveDelay) {}
     void changeVideoSettings(const fog::video::Settings&,bool);
     bool requestPairedVideoReconnect();
     bool completePairedVideoReconnect();
+    void resumePairedVideoAfterClose();
     void requestPairedTransportReconnect();
     bool completePairedTransportReconnect();
     bool transportRecoveryAllowed() const;
@@ -74,7 +81,24 @@ public:
     bool closeTransport(bool final) {
         ++disconnects; finalDisconnect = final;
         if (!disconnectAllowed) return false;
+        if (deferClose) {
+            closingStream_ = std::move(stream_);
+            transportTeardown_.occupied = true;
+            return true;
+        }
         stream_.reset(); return true;
+    }
+    void completeDeferredClose() {
+        if (!transportTeardown_.pending()) return;
+        transportTeardown_.occupied = false;
+        closingStream_.reset();
+    }
+    // Production dispatch happens in advanceTransportRecovery after overlay
+    // input. Keep it separate from mailbox completion to test same-frame stop.
+    void dispatchDeferredResume() {
+        if (transportTeardown_.pending() || !pairedVideoResumeAfterClose_) return;
+        pairedVideoResumeAfterClose_ = false;
+        resumePairedVideoAfterClose();
     }
     bool startTransport(bool resumeOnly = false) {
         ++starts; resumedOnly = resumeOnly; startedRental = streamRental_; startedSettings = videoSettings_;
@@ -87,12 +111,14 @@ public:
     }
     void closeStream() {
         ++streamCloses; pairedVideoReconnectPending_ = pairedTransportReconnectPending_ = false;
+        pairedVideoResumeAfterClose_ = false;
         transportReconnect_.cancel(); stream_.reset();
     }
     void beginFinish(const char*) {
         if (pending_.valid() || !sessionPending_) return;
         ++finishes; stopAfterTask_ = true;
         pairedVideoReconnectPending_ = pairedTransportReconnectPending_ = false;
+        pairedVideoResumeAfterClose_ = false;
         transportReconnect_.cancel();
     }
     void neutralizeStreamInput() { ++neutralizations; }
@@ -101,6 +127,8 @@ public:
     Task task_ = Task::Other;
     bool sessionPending_ = true, pairedPending_ = true, pairedVideoReconnectPending_ = false;
     bool pairedTransportReconnectPending_ = false;
+    bool pairedVideoResumeAfterClose_ = false, deferClose = false;
+    std::chrono::steady_clock::time_point transportCloseStarted_{};
     bool stopAfterTask_ = false, exitAfterStop_ = false, shutdownDone_ = false;
     bool dispatchThrows = false, disconnectAllowed = true, startAllowed = true, startThrows = false;
     bool startRetryable = false;
@@ -110,6 +138,8 @@ public:
     std::unique_ptr<TestPaired> paired_ = std::make_unique<TestPaired>();
     TestPaired* pairedServices_ = paired_.get();
     std::unique_ptr<TestStream> stream_ = std::make_unique<TestStream>();
+    std::unique_ptr<TestStream> closingStream_;
+    TestTransportTeardown transportTeardown_;
     std::future<TaskResult> pending_;
     fog::RentalId streamRental_{fog::ProviderId::FogHub,"owned"}, startedRental;
     fog::video::Settings videoSettings_, startedSettings;
@@ -118,5 +148,8 @@ public:
     TestInputGate streamInputGate_;
     fog::stream::TransportReconnect transportReconnect_;
     std::string videoSaveStatus_, status_;
+    // Zero debounce keeps controller tests fast while exercising the same
+    // serialized asynchronous writer and owner-thread completion path.
+    fog::settings::DeferredSettings settingsSaves_;
 };
 }

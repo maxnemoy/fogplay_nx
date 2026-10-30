@@ -76,12 +76,13 @@ int main() {
         assert(sender.snapshot().pending == 63);
         assert(sender.enqueueGamepad("neutral", std::uint32_t{0}));
         assert(sender.snapshot().pending == 64 && !sender.snapshot().stalled);
-        // An analog-only sample may be retried once room exists. Losing an edge
-        // instead publishes a stall, so the application cannot silently miss it.
+        // Analog-only samples can be retried. An overflowing edge collapses
+        // history to current state and publishes retryable backpressure.
         assert(!sender.enqueueGamepad("periodic-neutral", std::uint32_t{0}));
         assert(!sender.snapshot().stalled);
-        assert(!sender.enqueueGamepad("overflow-down", std::uint32_t{1}));
-        assert(sender.snapshot().stalled && sender.snapshot().buttonRejectedEdges == 1 && sender.snapshot().pending == 64);
+        assert(sender.enqueueGamepad("overflow-down", std::uint32_t{1}));
+        const auto overflow = sender.snapshot();
+        assert(overflow.backpressure && !overflow.operationStalled && overflow.queueResets == 1 && overflow.pending == 1);
         sender.stop(); assert(fake.sent.empty());
     }
     {
@@ -222,12 +223,12 @@ int main() {
         for (unsigned n = 0; n < 46; ++n) assert(sender.enqueue("command"));
         assert(!sender.enqueue("full"));
         assert(sender.enqueueGamepad("touch-up", false));
-        assert(!sender.enqueueGamepad("rejected-down", true));
+        assert(sender.enqueueGamepad("rejected-down", true));
         const auto queued = sender.snapshot();
-        assert(queued.touchQueuedDown == 1 && queued.touchQueuedUp == 1 && queued.touchRejectedDown == 1);
-        assert(queued.psAccepted == 2 && queued.psRejected == 1 && queued.pending == 48);
+        assert(queued.touchQueuedDown == 2 && queued.touchQueuedUp == 1 && queued.touchRejectedDown == 0);
+        assert(queued.psAccepted == 3 && queued.psRejected == 0 && queued.pending == 1 && queued.backpressure);
         sender.stop();
-        assert(sender.snapshot().touchDropped == 2 && fake.sent.empty());
+        assert(sender.snapshot().touchDropped == 3 && fake.sent.empty());
     }
     {
         Fake fake;
@@ -363,5 +364,84 @@ int main() {
         assert(sender.snapshot().failure == Sender::Failure::Transport);
         assert(!sender.enqueue("retry must be a new generation")); sender.stop();
     }
-    std::cout << "Async control sender: blocked-send publication, ordered/coalesced inputs, pong priority, saturation/stall, held releases, generation shutdown and sanitized failure passed\n";
+    {
+        // Full SCTP buffer is idle backpressure, not a stuck transport call.
+        std::atomic<unsigned> probes{0};
+        Sender sender([&] { ++probes; return false; }, [](const auto&) { assert(false); }, {}, "neutral");
+        sender.allow(true);
+        for (unsigned n = 0; n < 47; ++n) assert(sender.enqueue("old-command"));
+        assert(sender.enqueueGamepad("latest", std::uint32_t{4}));
+        const auto status = sender.inspect();
+        assert(status.backpressure && !status.operationStalled && status.pending == 2 && status.queueResets == 1);
+        sender.requestStop({}, false); sender.stop();
+        assert(!sender.snapshot().transportActive);
+    }
+    for (bool probeBlocked : {false, true}) {
+        Fake blocked; blocked.block = true;
+        Sender sender([&] { if (probeBlocked) blocked.send("probe"); return true; },
+                      [&](const auto& payload) { blocked.send(payload); }, {}, "neutral");
+        sender.allow(true); assert(sender.enqueueGamepad("in-flight", std::uint32_t{1})); blocked.awaitEntry();
+        for (unsigned n = 0; n < (probeBlocked ? 46u : 47u); ++n) assert(sender.enqueue("old-command"));
+        assert(sender.enqueueGamepad("overflow", std::uint32_t{3}));
+        assert(sender.snapshot().backpressure && sender.snapshot().transportActive);
+        sender.advance(15001, false);
+        const auto diagnostic = sender.snapshot();
+        assert(!diagnostic.operationStalled && diagnostic.operationMs >= 15000);
+        assert(!sender.snapshot().operationStalled); // const read has no publication side effect.
+        assert(sender.inspect().operationStalled);
+        sender.requestStop({}, false); blocked.unblock(); sender.stop();
+    }
+    for (const bool probe : {false, true}) for (const bool reject : {false, true}) {
+        // Deadline ownership survives late success/transport failure even when
+        // the owner never inspected the blocked operation before completion.
+        Fake blocked; blocked.block = true;
+        Sender sender([&] {
+            if (probe) { blocked.send("probe"); if (reject) throw std::runtime_error("late probe failure"); }
+            return true;
+        }, [&](const auto& payload) {
+            blocked.send(payload); if (reject) throw std::runtime_error("late send failure");
+        });
+        sender.allow(true); assert(sender.enqueue("call")); blocked.awaitEntry();
+        sender.advance(15001, false);
+        assert(!sender.snapshot().operationStalled);
+        blocked.unblock();
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (sender.snapshot().transportActive && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        const auto completed = sender.snapshot();
+        assert(!completed.transportActive && completed.operationStalled);
+        assert(completed.failure == (reject ? Sender::Failure::Transport : Sender::Failure::None));
+        sender.requestStop({}, false); sender.stop();
+    }
+    for (const std::string input : {"key:A", "mouse:0", "touch:0"}) {
+        // Saturated release reserve cannot strand a previously delivered press.
+        // The replacement receives only release obligations then neutral, ahead
+        // of a new physical sample; no old queued press is replayed.
+        Fake old, next;
+        Sender sender([] { return true; }, [&](const auto& payload) { old.send(payload); }, {}, "neutral");
+        sender.allow(true); assert(sender.enqueue("down", Mode::Ordered, input, "up")); old.awaitSize(1);
+        sender.block(true);
+        for (unsigned n = 0; n < 47; ++n) assert(sender.enqueue("old-press"));
+        for (unsigned n = 0; n < 16; ++n) assert(sender.enqueue("release", Mode::Release, std::to_string(n)));
+        assert(sender.enqueue("up", Mode::Release, input));
+        assert(sender.inspect().backpressure && !sender.snapshot().operationStalled);
+        sender.requestStop({}, false);
+        const auto releases = sender.releasesForRetry();
+        assert(releases.size() == 1 && releases.front().payload == "up");
+        sender.stop();
+        Sender replacement([] { return true; }, [&](const auto& payload) { next.send(payload); }, {}, "neutral", releases, true);
+        replacement.allow(true);
+        assert(replacement.enqueueGamepad("fresh-state", std::uint32_t{1}));
+        std::this_thread::sleep_for(10ms);
+        { std::lock_guard<std::mutex> lock(next.mutex); assert(next.sent.empty()); }
+        // The adapter publishes initialization before accepting fresh input.
+        // A caller that queued fresh state early cannot bypass this boundary.
+        replacement.requestStop({}, false); replacement.stop();
+        Sender initialized([] { return true; }, [&](const auto& payload) { next.send(payload); }, {}, "neutral", releases, true);
+        assert(initialized.enqueue("connection-ready", Mode::Initialize));
+        assert(initialized.enqueueGamepad("fresh-state", std::uint32_t{1})); initialized.allow(true);
+        next.awaitSize(4); initialized.requestStop({}, false); initialized.stop();
+        assert((old.sent == std::vector<std::string>{"down"}));
+        assert((next.sent == std::vector<std::string>{"connection-ready", "up", "neutral", "fresh-state"}));
+    }
+    std::cout << "Async control sender: blocked-send publication, ordered/coalesced inputs, pong priority, retryable overload/stuck-operation separation, pure snapshots, held releases, generation shutdown and sanitized failure passed\n";
 }

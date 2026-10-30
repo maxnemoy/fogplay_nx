@@ -416,7 +416,8 @@ struct ArtworkCache::Impl {
     // before any download starts; it has process lifetime and cannot race worker teardown.
     HttpClient runtimeGuard;
     Downloader download;
-    std::atomic_bool cancelled{false};
+    std::atomic_bool cancelled{false}, workCancelled{false};
+    bool paused = false;
     std::mutex mutex;
     std::condition_variable wake;
     std::deque<std::string> queue;
@@ -458,8 +459,9 @@ struct ArtworkCache::Impl {
             {
                 std::unique_lock<std::mutex> lock(mutex);
                 wake.wait(lock, [this] { return cancelled.load(std::memory_order_relaxed) ||
-                    (!queue.empty() && ready.size() < maxReady); });
+                    (!paused && !queue.empty() && ready.size() < maxReady); });
                 if (cancelled.load(std::memory_order_relaxed)) return;
+                workCancelled = false;
                 url = std::move(queue.front());
                 queue.pop_front();
             }
@@ -472,16 +474,24 @@ struct ArtworkCache::Impl {
                     catch (...) { disk.discard(url); }
                 }
                 if (cancelled.load(std::memory_order_relaxed)) return;
+                if (workCancelled.load()) throw std::runtime_error("artwork paused");
                 if (hit) disk.touch(url);
                 else {
-                    bytes = download(url, cancelled);
+                    bytes = download(url, workCancelled);
                     if (cancelled.load(std::memory_order_relaxed)) return;
+                    if (workCancelled.load()) throw std::runtime_error("artwork paused");
                     pixels = decodeArtwork(bytes);
+                    if (workCancelled.load()) throw std::runtime_error("artwork paused");
                     disk.write(url, bytes);
                 }
                 std::lock_guard<std::mutex> lock(mutex);
                 if (!cancelled.load(std::memory_order_relaxed)) ready.push_back({url, std::move(pixels)});
             } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (cancelled.load()) return;
+                    if (workCancelled.load()) { queue.push_front(std::move(url)); continue; }
+                }
                 failedRequest(url);
             }
         }
@@ -541,7 +551,7 @@ void ArtworkCache::update(SDL_Renderer* renderer) {
     Impl::Ready item;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->ready.empty()) return;
+        if (impl_->paused || impl_->ready.empty()) return;
         item = std::move(impl_->ready.front());
         impl_->ready.pop_front();
         impl_->pending.erase(item.url);
@@ -568,12 +578,21 @@ SDL_Texture* ArtworkCache::get(const std::string& url) {
     found->second.used = ++impl_->clock;
     return found->second.value;
 }
+void ArtworkCache::setPaused(bool paused) noexcept {
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->paused = paused;
+        if (paused) impl_->workCancelled = true;
+    }
+    impl_->wake.notify_all();
+}
 void ArtworkCache::stop() noexcept {
     // Match the condition-variable predicate's mutex so cancellation cannot be
     // notified between its last predicate check and entering the wait.
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->cancelled.store(true, std::memory_order_relaxed);
+        impl_->workCancelled = true;
     }
     impl_->wake.notify_all();
     if (impl_->worker.joinable()) impl_->worker.join();

@@ -334,6 +334,57 @@ void noRoutingOverride(xmlNode* node) {
     for (const auto* name : {"onclick", "onsubmit", "formaction", "formmethod", "formenctype", "formtarget", "data-method", "data-params"})
         require(!hasAttr(node, name));
 }
+bool bonusPercent(const std::string& value) {
+    return digits(value) && value.front() != '0' && number(value) <= 100;
+}
+void verifyPlayBonus(xmlNode* badge) {
+    require(tag(badge, "span") && select(badge, "./*").empty());
+    const auto classes = normalized(attr(badge, "class"));
+    require(hasClass(badge, "badge") && hasClass(badge, "bg-success") &&
+        hasClass(badge, "me-1") && hasClass(badge, "text-decoration-none") &&
+        std::count(classes.begin(), classes.end(), ' ') == 3);
+    for (auto* property = badge->properties; property; property = property->next)
+        require(xmlStrEqual(property->name, BAD_CAST "class") || xmlStrEqual(property->name, BAD_CAST "title"));
+    require(attr(badge, "title") == "Сыгранное время в FH возвращается бонусами — на них можно бесплатно играть у того же мерчанта");
+    const auto label = text(badge);
+    require(label.size() >= 3 && label.front() == '+' && label.back() == '%');
+    const auto percent = label.substr(1, label.size() - 2);
+    const auto separator = percent.find('|');
+    if (separator == std::string::npos) require(bonusPercent(percent));
+    else require(bonusPercent(percent.substr(0, separator)) && bonusPercent(percent.substr(separator + 1)));
+}
+std::string playPrice(xmlNode* link) {
+    noRoutingOverride(link);
+    require(!hasAttr(link, "target") && !hasAttr(link, "download"));
+    std::string label;
+    bool small = false, bonus = false;
+    // Current cards put a bonus badge after the price. Exclude only that
+    // verified leaf; arbitrary descendants must not hide price/action text.
+    for (auto* child = link->children; child; child = child->next) {
+        if (child->type == XML_TEXT_NODE && child->content) {
+            const std::string part(reinterpret_cast<const char*>(child->content));
+            require(!bonus || normalized(part).empty());
+            label += part;
+        } else if (tag(child, "small")) {
+            require(!small && !bonus && normalized(label).empty() && !child->properties &&
+                select(child, "./*").empty() && text(child) == "Играть FH");
+            small = true;
+            label += "Играть FH ";
+        } else {
+            require(!bonus);
+            verifyPlayBonus(child);
+            bonus = true;
+        }
+    }
+    label = normalized(label);
+    const std::string prefix = "Играть FH ", suffix = "₽";
+    require(label.rfind(prefix, 0) == 0 && label.size() > prefix.size() + suffix.size() &&
+        label.compare(label.size() - suffix.size(), suffix.size(), suffix) == 0);
+    const auto price = label.substr(prefix.size(), label.size() - prefix.size() - suffix.size());
+    require(digits(price) || money(price));
+    require(std::any_of(price.begin(), price.end(), [](unsigned char c) { return c >= '1' && c <= '9'; }));
+    return price;
+}
 bool verifyBonusChoice(xmlNode* form) {
     const auto choices = select(form,".//select[@name='Pc[use_bonus]']");
     require(choices.size() <= 1);
@@ -728,14 +779,7 @@ ComputerRow parseComputerPreview(const std::string& html, const std::string& com
     require(play.size() <= 1);
     if (!play.empty()) {
         require(linkId(play.front(), "/pc/play") == computerId);
-        const auto label = text(play.front());
-        const std::string prefix = "Играть FH ", suffix = "₽";
-        require(label.rfind(prefix, 0) == 0 && label.size() > prefix.size()+suffix.size() &&
-            label.compare(label.size()-suffix.size(),suffix.size(),suffix) == 0);
-        row.pricePerHour = label.substr(prefix.size(),label.size()-prefix.size()-suffix.size());
-        require(digits(row.pricePerHour) || money(row.pricePerHour));
-        require(std::any_of(row.pricePerHour.begin(),row.pricePerHour.end(),
-            [](unsigned char c) { return c >= '1' && c <= '9'; }));
+        row.pricePerHour = playPrice(play.front());
         // A contradictory page must not make this PC launchable.
         row.fhAvailable = row.online && !row.busy;
     }
@@ -783,12 +827,7 @@ ComputersPage parseComputers(const std::string& html, const std::string& gameId)
         if (!play.empty()) {
             const auto params = query(attr(play.front(), "href"), "/pc/play");
             require(params.size() == 2 && params.count("id") && params.count("gameId") && params.at("id") == row.id && params.at("gameId") == gameId);
-            const auto label = text(play.front());
-            const std::string prefix = "Играть FH ";
-            const std::string suffix = "₽";
-            require(label.compare(0, prefix.size(), prefix) == 0 && label.size() > prefix.size() + suffix.size() && label.compare(label.size() - suffix.size(), suffix.size(), suffix) == 0);
-            row.pricePerHour = label.substr(prefix.size(), label.size() - prefix.size() - suffix.size());
-            require(digits(row.pricePerHour) || money(row.pricePerHour));
+            row.pricePerHour = playPrice(play.front());
             require(row.online && !row.busy);
             row.fhAvailable = true;
         }

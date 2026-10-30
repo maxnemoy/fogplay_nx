@@ -1,6 +1,8 @@
 #include "core/constants/error_text.hpp"
+#include "core/constants/stage1_options.hpp"
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/media_annexb.hpp"
+#include "features/streaming/domain/video_limits.hpp"
 #include "features/streaming/domain/audio_queue_metrics.hpp"
 #include "features/streaming/domain/audio_latency_policy.hpp"
 #include "features/streaming/domain/audio_recovery.hpp"
@@ -115,6 +117,12 @@ struct Media::Impl {
     std::uint64_t audioDiscardedPackets = 0, audioDiscardedFrames = 0;
     std::uint64_t audioStalePackets = 0, audioOverflowPackets = 0, audioCatchups = 0;
     bool audioCatchingUp = false;
+    // Experimental opt-in only until external A/V comparison is recorded.
+#ifdef FOGPLAY_BOUNDED_SYNC_AUDIO
+    bool boundedSyncAudio = true;
+#else
+    bool boundedSyncAudio = false;
+#endif
     AudioRecovery audioRecovery;
     bool audioResetNeeded = false, audioOutputResetNeeded = false;
     std::uint64_t audioBadPackets = 0, audioDecoderErrors = 0, audioOutputErrors = 0;
@@ -161,12 +169,19 @@ struct Media::Impl {
         if (std::this_thread::get_id() != applicationThread)
             throw std::logic_error("Media presentation/lifecycle requires application thread");
     }
-    void publishVideo() {
+    DecoderClock::time_point nextVideoSnapshot{}, nextAudioSnapshot{};
+    void publishVideo(bool force = false) {
+        const auto now = DecoderClock::now();
+        if (fog::stage1::sparseDiagnostics && !force && now < nextVideoSnapshot) return;
+        nextVideoSnapshot = now + std::chrono::seconds(1);
         auto text = diagnostics();
         std::lock_guard<std::mutex> lock(snapshotMutex);
         videoSnapshot = std::move(text);
     }
-    void publishAudio() {
+    void publishAudio(bool force = false) {
+        const auto now = DecoderClock::now();
+        if (fog::stage1::sparseDiagnostics && !force && now < nextAudioSnapshot) return;
+        nextAudioSnapshot = now + std::chrono::seconds(1);
         auto text = audioDiagnostics();
         underruns = audioMetrics.prolongedEmptyObservations;
         audioResets = audioMetrics.resets;
@@ -319,7 +334,7 @@ struct Media::Impl {
             "audio_pcm_discarded_packets=%llu audio_pcm_discarded_ms=%llu audio_stale_packets=%llu "
             "audio_overflow_packets=%llu audio_catchups=%llu audio_worker_refill_ms=40 audio_worker_max_ms=80 audio_worker_stale_ms=60 "
             "audio_bad_packets=%llu audio_decoder_errors=%llu audio_output_errors=%llu audio_recovery_attempts=%llu "
-            "audio_recovery_failures=%llu audio_recovery_discarded_packets=%llu audio_recovery_pending=%d audio_recovery_limit=3/60s audio_recovery_deadline_ms=10000",
+            "audio_recovery_failures=%llu audio_recovery_discarded_packets=%llu audio_recovery_pending=%d audio_recovery_limit=3/60s audio_recovery_deadline_ms=10000 audio_sync_bounded=%d",
             static_cast<unsigned long long>(packets),
             static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(bytes)),
             static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.maximumBytes)),
@@ -340,7 +355,8 @@ struct Media::Impl {
             static_cast<unsigned long long>(audioOutputErrors),
             static_cast<unsigned long long>(audioRecoveryAttempts),
             static_cast<unsigned long long>(audioRecoveryFailures),
-            static_cast<unsigned long long>(audioRecoveryDiscardedPackets), audioResetNeeded ? 1 : 0);
+            static_cast<unsigned long long>(audioRecoveryDiscardedPackets), audioResetNeeded ? 1 : 0,
+            boundedSyncAudio ? 1 : 0);
         return text.data();
     }
     int sendPacket() {
@@ -557,7 +573,7 @@ void Media::setVideoStallReporter(std::function<void(const std::string&)> report
 void Media::Impl::decodeVideo(const std::byte* data, std::size_t size,
     std::uint64_t firstPacketMs, std::uint64_t enqueueMs) {
     const auto admittedUs = metrics::steadyNowUs();
-    if (!data || !size || size > 4*1024*1024) throw std::runtime_error(fog::constants::error::Stream::InvalidVideoAccessUnit);
+    if (!data || !size || size > ::stream::MaxVideoAccessUnitBytes) throw std::runtime_error(fog::constants::error::Stream::InvalidVideoAccessUnit);
     auto& m = *this;
     m.requireVideo();
     const auto* bytes = reinterpret_cast<const unsigned char*>(data);
@@ -611,11 +627,17 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
                 else resetVideo();
                 discardReady();
                 paused = false;
-                publishVideo();
+                publishVideo(true);
                 resetInProgress = false;
             }
             if (paused) { idle(true); continue; }
-            if (!client.poll(incoming)) { idle(true); continue; }
+            if (!client.poll(incoming)) {
+                // Sparse snapshots need an idle refresh after the last frame.
+                // The control profile retains the original frame/reset/error
+                // publication sites instead of formatting on every empty poll.
+                if (fog::stage1::sparseDiagnostics) publishVideo();
+                idle(true); continue;
+            }
             hasPacket = true;
             recordQueueWait(incoming, videoQueueWait);
             const auto decodeEpoch = epoch.load();
@@ -644,14 +666,14 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
             paused = true;
             waiting = true;
             reportError(hasPacket ? &incoming : nullptr);
-            try { publishVideo(); } catch (...) {}
+            try { publishVideo(true); } catch (...) {}
         }
     }
 }
 void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
     diagnostics::observeThread("media-audio");
     bool paused = false;
-    auto nextSnapshot = DecoderClock::now();
+    auto nextQueueObservation = DecoderClock::now();
     while (!stopping) {
         ::stream::Packet incoming;
         bool hasPacket = false;
@@ -659,12 +681,14 @@ void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
             if (paused) { idle(); continue; }
             if (audioRecovery.expired(DecoderClock::now()))
                 throw AudioPlaybackError("Audio recovery deadline exhausted; stopping rental");
-            observeAudioQueue();
+            if (!fog::stage1::sparseDiagnostics) observeAudioQueue();
             const auto now = DecoderClock::now();
-            if (now >= nextSnapshot) {
-                publishAudio();
-                nextSnapshot = now + std::chrono::milliseconds(20);
+            if (now >= nextQueueObservation) {
+                if (fog::stage1::sparseDiagnostics) observeAudioQueue();
+                else publishAudio();
+                nextQueueObservation = now + std::chrono::milliseconds(20);
             }
+            if (fog::stage1::sparseDiagnostics) publishAudio();
             // Never backpressure the compressed FIFO from SDL: doing so keeps
             // a permanent backlog after a stall. Decode every packet and admit
             // only useful PCM, retaining Opus state while catching up.
@@ -673,11 +697,11 @@ void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
             recordQueueWait(incoming, audioQueueWait);
             decodeAudio(incoming.data.data(), incoming.data.size(), incoming.enqueueMs);
             publishAudio();
-            nextSnapshot = DecoderClock::now() + std::chrono::milliseconds(20);
+            nextQueueObservation = DecoderClock::now() + std::chrono::milliseconds(20);
         } catch (...) {
             paused = true;
             reportError(hasPacket ? &incoming : nullptr);
-            try { publishAudio(); } catch (...) {}
+            try { publishAudio(true); } catch (...) {}
         }
     }
 }
@@ -697,7 +721,7 @@ void Media::startWorkers(::stream::StreamingClient& client, int fps) {
 #endif
     m.refreshPrepared = false;
     m.discardReady();
-    m.publishVideo(); m.publishAudio();
+    m.publishVideo(true); m.publishAudio(true);
     m.stopping = false;
     m.resetRequested = false; m.codecRequested = false; m.resetInProgress = false;
     m.transportGeneration = 0;
@@ -870,12 +894,12 @@ void Media::Impl::decodeAudio(const std::byte* data, std::size_t size, std::uint
     }
     // Drop stale queued audio after a scheduling stall instead of increasing latency.
     const auto queued = observeAudioQueue();
-    if (!workers && queued > detail::AudioQueueMetrics::bytesPerSecond / 5) {
+    if (!workers && !boundedSyncAudio && queued > detail::AudioQueueMetrics::bytesPerSecond / 5) {
         SDL_ClearQueuedAudio(audioDevice);
         audioMetrics.cleared(queued);
     }
     auto selected = detail::AudioLatencyPolicy::Selection{0, static_cast<std::uint32_t>(count), false, false};
-    if (workers) {
+    if (workers || boundedSyncAudio) {
         const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             DecoderClock::now().time_since_epoch()).count());
         const auto residence = enqueueMs && enqueueMs <= now ? now - enqueueMs : 0;

@@ -2,6 +2,9 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 mkdir -p work/logs
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -Itools/moonlight -c tools/moonlight/FogMoonlightTermination.c -o work/moonlight-termination.o
+python3 tools/moonlight/tests/transport_test.py | tee work/logs/moonlight-transport-test.log
 python3 tools/moonlight/tests/core_diagnostics_test.py | tee work/logs/moonlight-core-diagnostics-test.log
 g++ -std=c++17 -Wall -Wextra -Werror -Isrc tools/moonlight/tests/app_selection_test.cpp \
     -o work/moonlight-app-selection-test
@@ -29,6 +32,24 @@ g++ -std=c++17 -Wall -Wextra -Werror -pthread -fsanitize=address,undefined -fno-
     -Itools/moonlight/tests/stubs -Itools/moonlight/compat -Itools/moonlight -Isrc -Ithird_party/moonlight/switch/include \
     -Ithird_party/moonlight/switch/include/crypto \
     src/features/streaming/infrastructure/moonlight/moonlight_session.cpp \
-    src/features/streaming/application/remote_input.cpp tools/moonlight/tests/session_test.cpp \
+    src/features/streaming/application/remote_input.cpp tools/moonlight/tests/session_test.cpp work/moonlight-termination.o \
     -o work/moonlight-production-session-test
 ./work/moonlight-production-session-test | tee work/logs/moonlight-production-session-test.log
+g++ -std=c++17 -Wall -Wextra -Werror -pthread -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -DFOGPLAY_STAGE1_FEATURE_MASK=0 \
+    -Itools/moonlight/tests/stubs -Itools/moonlight/compat -Itools/moonlight -Isrc -Ithird_party/moonlight/switch/include \
+    -Ithird_party/moonlight/switch/include/crypto \
+    src/features/streaming/infrastructure/moonlight/moonlight_session.cpp \
+    src/features/streaming/application/remote_input.cpp tools/moonlight/tests/session_test.cpp work/moonlight-termination.o \
+    -o work/moonlight-control-session-test
+./work/moonlight-control-session-test | tee work/logs/moonlight-control-session-test.log
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -Itools/moonlight -c tools/moonlight/FogMoonlightDiagnostics.c -o work/moonlight-log-diagnostics.o
+g++ -std=c++17 -Wall -Wextra -Werror -pthread -fsanitize=address,undefined -fno-omit-frame-pointer \
+    -Itests/stubs/app_diagnostics -Itools/moonlight/tests/stubs -Itools/moonlight/compat \
+    -Itools/moonlight -Isrc -Ithird_party/moonlight/switch/include -Ithird_party/moonlight/switch/include/crypto \
+    src/features/streaming/infrastructure/moonlight/moonlight_session.cpp \
+    src/features/streaming/application/remote_input.cpp src/app/app_diagnostics.cpp src/core/logging/run_log.cpp \
+    tools/moonlight/tests/log_integration_test.cpp work/moonlight-log-diagnostics.o work/moonlight-termination.o \
+    -o work/moonlight-production-log-test
+./work/moonlight-production-log-test | tee work/logs/moonlight-production-log-test.log

@@ -194,8 +194,54 @@ static void staleSamples(void) {
     monotonicUs = 0; assert(!FogIdrRecoveryTryRetry());
     separateClock = false;
 }
+static void localDecoderRecoveryScenarios(void) {
+    clockUs += 1000000; init(false); frame(1, true, true);
+    assert(presented == 1 && !waitingForIdrFrame);
+    FogIdrRecoveryRequestDecoderRefresh();
+    FogIdrRecoveryRequestDecoderRefresh();
+    assert(FogIdrRecoveryTakeDecoderRefresh());
+    assert(!FogIdrRecoveryTakeDecoderRefresh()); // command bursts coalesce
+    FogIdrRecoveryRequestDecoderRefresh();
+    FogIdrRecoveryPollDecoder(); // receive loop, with no new RTP at all
+    assert(waitingForIdrFrame && events == 1);
+    clockUs += 499999; FogIdrRecoveryPollDecoder(); assert(events == 1 && presented == 1);
+    clockUs++; FogIdrRecoveryPollDecoder(); assert(events == 2 && presented == 1);
+    frame(2, false, true); assert(events == 2); // frame-driven gate coalesces
+    clockUs += 500000; FogIdrRecoveryPollDecoder(); assert(events == 3);
+    clockUs++; frame(4, true, true); assert(!waitingForIdrFrame && presented == 2);
+    assert(!localDecoderRecovery);
+    clockUs += 500000; FogIdrRecoveryPollDecoder(); frame(5, false, true);
+    assert(events == 3 && presented == 3);
+    FogIdrRecoveryRequestDecoderRefresh(); FogIdrRecoveryReset();
+    assert(!FogIdrRecoveryTakeDecoderRefresh()); // no inherited decoder command
+    done();
+}
+static void ordinaryWaitDoesNotGainTimeoutRetry(void) {
+    clockUs += 1000000; init(false);
+    // Startup wait: socket timeout polls must not create IDR requests.
+    FogIdrRecoveryPollDecoder(); clockUs += 1000000; FogIdrRecoveryPollDecoder();
+    assert(events == 0 && !localDecoderRecovery);
+    frame(1, true, true);
+    notifyFrameLost(2, true);
+    assert(waitingForIdrFrame && !localDecoderRecovery);
+    clockUs += 1000000; FogIdrRecoveryPollDecoder(); assert(events == 0);
+    frame(3, false, true); assert(events == 1); // prior frame-driven policy
+    clockUs += 1000000; FogIdrRecoveryPollDecoder(); assert(events == 1);
+    // A local scope closes when the IDR is recognized, including a partial
+    // IDR later lost to network damage before the next timeout poll.
+    FogIdrRecoveryRequestDecoderRefresh(); FogIdrRecoveryPollDecoder();
+    assert(localDecoderRecovery && events == 2);
+    frame(4, true, false); assert(!waitingForIdrFrame && !localDecoderRecovery);
+    decodingFrame = false; notifyFrameLost(4, false);
+    clockUs += 1000000; FogIdrRecoveryPollDecoder(); assert(events == 2);
+    FogIdrRecoveryRequestDecoderRefresh(); FogIdrRecoveryPollDecoder();
+    assert(localDecoderRecovery); // reset a still-active local scope
+    done();
+    clockUs += 1000000; init(false); assert(!localDecoderRecovery);
+    FogIdrRecoveryPollDecoder(); assert(events == 0); done();
+}
 int main(void) {
-    timedRetriesAndRelease(); lossGatingAndReferenceSafety(); controlOutcomesAndReset(); staleSamples();
+    timedRetriesAndRelease(); lossGatingAndReferenceSafety(); controlOutcomesAndReset(); staleSamples(); localDecoderRecoveryScenarios(); ordinaryWaitDoesNotGainTimeoutRetry();
     puts("Prepared IDR wait/retry, reference safety, dispatch and reset tests passed");
     return 0;
 }

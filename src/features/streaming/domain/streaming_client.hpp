@@ -4,6 +4,7 @@
 #include "features/streaming/domain/controller_profile.hpp"
 #include "features/streaming/domain/remote_input.hpp"
 #include "features/streaming/domain/rumble.hpp"
+#include "features/streaming/domain/input_suspension.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -96,6 +97,12 @@ public:
     // Sanitized, bounded incoming control samples. final flushes pending counts.
     virtual bool pollControlDiagnostic(std::string&, bool final = false) { (void)final; return false; }
     virtual bool waitingForVideoKeyframe() const = 0;
+    virtual InputSuspension inputSuspension() const { return {}; }
+    bool inputSuspended() const { return inputSuspension().suspended(); }
+    // Synchronized source generation, including faults already repaired into a
+    // queued IDR. Assembly readiness alone does not prove decoder readiness.
+    // Zero is the initial generation and the default for worker-only adapters.
+    virtual std::uint64_t currentVideoGeneration() const { return 0; }
     virtual bool requestVideoKeyframe() = 0; // Best effort PLI on open video tracks; no transport reset.
     // Decoder recovery is independent of transport assembly and quality mode.
     // Keep requesting IDR until the owner successfully prepares decoded output.

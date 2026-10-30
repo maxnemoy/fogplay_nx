@@ -12,11 +12,13 @@
 #include "features/catalog/presentation/home_catalog.hpp"
 #include "features/catalog/infrastructure/recent_games.hpp"
 #include "features/streaming/application/remote_input.hpp"
+#include "features/streaming/application/transport_teardown.hpp"
 #include "features/streaming/presentation/stream_overlay.hpp"
 #include "features/settings/domain/video_settings.hpp"
 #include "features/settings/infrastructure/video_settings_storage.hpp"
 #include "features/settings/infrastructure/connection_settings_storage.hpp"
 #include "features/settings/infrastructure/rumble_settings_storage.hpp"
+#include "features/settings/infrastructure/deferred_settings.hpp"
 #include "features/session/application/session.hpp"
 #include "features/session/application/stop_retry_budget.hpp"
 #include "features/streaming/infrastructure/media.hpp"
@@ -24,6 +26,7 @@
 #include "features/streaming/domain/transport_reconnect.hpp"
 #include "features/streaming/domain/stream_input_gate.hpp"
 #include "features/streaming/domain/mouse_buttons.hpp"
+#include "features/streaming/domain/key_releases.hpp"
 #include "features/streaming/domain/gamepad_schedule.hpp"
 #include "features/streaming/domain/loop_timing.hpp"
 #include "core/logging/run_log.hpp"
@@ -141,6 +144,8 @@ private:
     void dispatchPlayStationInput(bool allowed);
     void releasePlayStationInput();
     bool closeTransport(bool final) noexcept;
+    void pollTransportTeardown();
+    void resumePairedVideoAfterClose();
     bool startTransport(bool resumeOnly = false);
     bool requestPairedVideoReconnect();
     bool completePairedVideoReconnect();
@@ -175,12 +180,14 @@ private:
     void beginFinish(const char* reason = "rental-guard");
     void recoverVideoError(const fog::VideoDecodeError& error, const stream::Packet* packet);
     void pumpStream(PadState& pad, u64 held, u64 down);
+    void sendStreamInput(PadState& pad, u64 held, bool overlayHandled);
     void feedStreamAudio(const stream::Packet& packet);
     void drainStreamAudio();
     SDL_Rect videoRect() const;
     bool sendRemote(const fog::remote::Input& command);
     void releaseMouse() noexcept;
     void retryMouseReleases() noexcept;
+    void retryKeyReleases() noexcept;
     void retryGamepadRelease() noexcept;
     void neutralizeStreamInput();
     void suspendVideoInput();
@@ -189,6 +196,8 @@ private:
     void observeStreamMenuInput(bool focused, u64 held, u64 down);
     void streamMenuPresented(bool videoDrawn);
     void changeVideoSettings(const fog::video::Settings& value, bool live);
+    void pollSettingsSaves() { settingsSaves_.poll(); }
+    void flushSettingsSaves() { settingsSaves_.finish(); }
     void inputImageSettings(u64 keys);
     void drawImageSettings();
     void inputConnectionSettings(u64 keys);
@@ -202,7 +211,6 @@ private:
     bool handleStreamOverlay(PadState& pad, u64 held, u64 down);
     void updateMouse(PadState& pad,u64 held,u64 down,const HidTouchScreenState& touch);
     void drawStreamOverlay();
-    static float axis(int value);
     void text(const std::string& value, int x, int y, SDL_Color color = white, int width = 1190, bool title = false);
     void box(int x, int y, int w, int h, SDL_Color color);
     void start(Task kind, std::function<TaskResult()> work);
@@ -295,6 +303,10 @@ private:
     Screen loginReturn_ = Screen::Games;
     std::chrono::steady_clock::time_point checkoutAt_{};
     std::unique_ptr<stream::StreamingClient> stream_;
+    std::unique_ptr<stream::StreamingClient> retryStream_;
+    fog::stream::TransportTeardown<stream::StreamingClient> transportTeardown_;
+    bool pairedVideoResumeAfterClose_ = false;
+    std::chrono::steady_clock::time_point transportCloseStarted_{};
     fog::stream::Overlay overlay_;
     fog::video::Settings videoSettings_;
     int activeFramesPerSecond_ = fog::video::DefaultFramesPerSecond;
@@ -307,7 +319,10 @@ private:
     bool firstFramePresented_ = false;
     std::string videoSaveStatus_ = uiText::Settings::AutoSaveNotice;
     std::string connectionSaveStatus_ = uiText::Settings::ConnectionAutoSaveNotice;
+    fog::settings::DeferredSettings settingsSaves_;
     fog::stream::StreamInputGate streamInputGate_;
+    fog::stream::InputSuspensionStats inputSuspensionStats_;
+    bool inputFreezeWaiting_ = false;
     // Main-thread diagnostics. Only the menu chord is observed; remote input/text is excluded.
     std::uint64_t menuPolls_ = 0, menuHandlers_ = 0, menuTransitions_ = 0;
     std::uint64_t menuPaints_ = 0, menuPresents_ = 0, menuPaintedTransition_ = 0, menuPresentedTransition_ = 0;
@@ -317,6 +332,7 @@ private:
     std::chrono::steady_clock::time_point menuHeartbeatAt_{}, menuTransitionAt_{};
     bool touchWasDown_ = false, touchDrag_ = false;
     fog::stream::MouseButtons mouseButtons_;
+    fog::stream::KeyReleases keyReleases_;
     fog::stream::GamepadSchedule gamepadSchedule_;
     float pointerX_ = 640.0f, pointerY_ = 360.0f;
     std::chrono::steady_clock::time_point mouseAt_{}, lastPointerSent_{}, overlayNoticeAt_{}, overlayHintAt_{};
@@ -338,7 +354,7 @@ private:
     std::uint64_t lastPumpWorkUs_ = 0, slowPlaybackCycles_ = 0;
     std::chrono::steady_clock::time_point lastSlowPlaybackLog_{};
     std::uint64_t pumpGapMaxUs_ = 0, outsideMeasuredPumpMaxUs_ = 0, drainBudgetHits_ = 0, catchupWindows_ = 0;
-    std::chrono::steady_clock::time_point lastPumpAt_{}, lastProtocolLog_{};
+    std::chrono::steady_clock::time_point lastPumpAt_{}, lastProtocolLog_{}, lastMetricsLog_{};
     bool videoLossWaiting_ = false;
     std::chrono::steady_clock::time_point lastVideoEventLog_{};
     unsigned sessionSequence_ = 0;

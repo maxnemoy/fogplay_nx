@@ -47,10 +47,16 @@ void ApplicationController::loadPlayStation() {
                 [publish](const std::vector<fog::Computer>& snapshot) { publish(false,snapshot); },
                 [updates] { return updates->cancelled(); });
             publish(false,result); primaryOk = true;
-        } catch (...) { failure = std::current_exception(); }
+        } catch (...) {
+            failure = std::current_exception();
+            if (!updates->cancelled()) diagnostic("PlayStation provider failed: worker=playstation-catalog");
+        }
         if (featuredWork.valid()) {
             try { publish(true,featuredWork.get()); featuredOk = true; }
-            catch (...) { if (!failure) failure = std::current_exception(); }
+            catch (...) {
+                if (!failure) failure = std::current_exception();
+                if (!updates->cancelled()) diagnostic("PlayStation provider failed: worker=playstation-featured");
+            }
         }
         if (!primaryOk && !featuredOk && failure) std::rethrow_exception(failure);
         std::lock_guard<std::mutex> lock(snapshots->mutex);

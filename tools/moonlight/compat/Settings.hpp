@@ -25,6 +25,7 @@ public:
     void pairing_dispatched() noexcept { dispatched_.store(true); }
     bool pairing_was_dispatched() const noexcept { return dispatched_.load(); }
     void request_cancel() noexcept { cancelled_.store(true); }
+    bool cancel_requested() const noexcept { return cancelled_.load(); }
     void reset_cancel() noexcept {
         deadlineMs_.store(0);
         cancelled_.store(false);

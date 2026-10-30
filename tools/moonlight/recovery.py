@@ -7,10 +7,35 @@ def apply(dest):
             raise RuntimeError(f"Pinned recovery source mismatch: {file}: {old[:70]!r}")
         path.write_text(source.replace(old, new))
 
-    for file in ("Connection.c", "ControlStream.c", "VideoDepacketizer.c"):
+    for file in ("Connection.c", "ControlStream.c", "VideoDepacketizer.c", "VideoStream.c"):
         replace(file, '#include "Limelight-internal.h"',
                 '#include "Limelight-internal.h"\n#include "FogMoonlightRecovery.h"')
     replace("Connection.c", "    FogDiagReset();", "    FogDiagReset();\n    FogIdrRecoveryReset();")
+    replace("VideoDepacketizer.c", "static bool waitingForIdrFrame;",
+            "static bool waitingForIdrFrame;\nstatic bool localDecoderRecovery;")
+    replace("VideoDepacketizer.c", "    nextFrameNumber = 1;",
+            "    nextFrameNumber = 1;\n    localDecoderRecovery = false;")
+    replace("VideoDepacketizer.c", "waitingForIdrFrame = false; FogDiagSetWaitingForIdr(0, 0, PltGetMicroseconds());",
+            "localDecoderRecovery = false;\n            waitingForIdrFrame = false; FogDiagSetWaitingForIdr(0, 0, PltGetMicroseconds());", 2)
+    # Enter the existing core decoder-refresh lifecycle on its receive owner.
+    # LiRequestIdrFrame alone does not enable waitingForIdrFrame or its retry.
+    replace("VideoDepacketizer.c", "// Return 1 if packet is the first one in the frame",
+            "void FogIdrRecoveryPollDecoder(void) {\n"
+            "    if (FogIdrRecoveryTakeDecoderRefresh()) {\n"
+            "        localDecoderRecovery = true;\n"
+            "        requestDecoderRefresh();\n"
+            "    }\n"
+            "    if (!waitingForIdrFrame) localDecoderRecovery = false;\n"
+            "    if (localDecoderRecovery && waitingForIdrFrame && FogIdrRecoveryTryRetry()) {\n"
+            "        FogDiagAdd(FOG_DIAG_idrWaitRetryRequests, 1);\n"
+            "        LiRequestIdrFrame();\n"
+            "    }\n"
+            "}\n\n// Return 1 if packet is the first one in the frame")
+    # Timeout servicing is limited to the wait explicitly opened by a local
+    # decoder command. Network/startup waits retain their frame-driven policy.
+    replace("VideoStream.c", "    while (!PltIsThreadInterrupted(&receiveThread)) {",
+            "    while (!PltIsThreadInterrupted(&receiveThread)) {\n"
+            "        FogIdrRecoveryPollDecoder();")
     # Thread the diagnostic cause through existing drop calls only; this does
     # not alter state decisions. Keep all seven pinned call sites fail closed.
     replace("VideoDepacketizer.c", "static void dropFrameState(void) {",
@@ -30,9 +55,9 @@ def apply(dest):
     replace("VideoDepacketizer.c",
             "    if (strictIdrFrameWait || !idrFrameProcessed || waitingForIdrFrame) {",
             "    if (strictIdrFrameWait || !idrFrameProcessed || waitingForIdrFrame || (nalChainHead && frameType == FRAME_TYPE_IDR)) {")
-    # Keep the original first-successful-frame request. Subsequent retries only
-    # occur on complete discarded frames, so they cannot extend a frame, flush
-    # the decoder, or pretend dependent P frames are safe reference frames.
+    # Keep the original first-successful-frame request. Frame-driven retries
+    # share the reservation with receive-loop timeout servicing above; these
+    # retries do not flush the decoder or admit dependent P frames.
     replace("VideoDepacketizer.c", """                if (waitingForNextSuccessfulFrame) {
                     LiRequestIdrFrame();
                 }""", """                if (waitingForNextSuccessfulFrame) {

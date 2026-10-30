@@ -398,10 +398,11 @@ struct Client::Impl {
     struct ControlSendFixture {
         std::mutex mutex;
         std::condition_variable condition;
-        bool blocked = false;
+        bool blocked = false, reject = false;
         void wait() {
             std::unique_lock<std::mutex> lock(mutex);
             condition.wait(lock, [this] { return !blocked; });
+            if (reject) throw std::runtime_error("Fixture control send rejected");
         }
     };
     std::shared_ptr<ControlSendFixture> controlSendFixture = std::make_shared<ControlSendFixture>();
@@ -427,6 +428,8 @@ struct Client::Impl {
     bool isReady = false, decoderWaiting = false, retryableFailure = false, closingForRetry = false;
     bool relay = false, routeSelected = false, routeCurrent = false, wasReady = false;
     bool playStation = false;
+    bool retryInputReset = false;
+    std::vector<ControlQueue::Message> retryInputReleases;
     Clock::time_point unprovenRouteAt{};
     SelectedRoute route;
     CandidateProofs remoteCandidateProofs;
@@ -766,6 +769,8 @@ struct Client::Impl {
         return " controlPending=" + std::to_string(out.pending) + " controlBytes=" + std::to_string(out.bytes) +
             " controlRejected=" + std::to_string(out.rejected) + " controlSent=" + std::to_string(out.sent) + " controlPongCoalesced=" + std::to_string(out.pongCoalesced) +
             " controlAgeMs=" + std::to_string(out.ageMs) + " controlAgeMaxMs=" + std::to_string(out.ageMaxMs) +
+            " controlBackpressure=" + std::to_string(out.backpressure) + " controlOperationStalled=" + std::to_string(out.operationStalled) +
+            " controlOperationMs=" + std::to_string(out.operationMs) + " controlQueueResets=" + std::to_string(out.queueResets) +
             " controlTransportActive=" + std::to_string(out.transportActive) + " controlInFlight=" + std::to_string(out.inFlight) + " controlInFlightMs=" + std::to_string(out.inFlightMs) +
             " controlSendCalls=" + std::to_string(out.sendCalls) + " controlSendAvgUs=" +
             std::to_string(out.sendCalls ? out.sendTotalUs / out.sendCalls : 0) + " controlSendMaxUs=" + std::to_string(out.sendMaxUs) +
@@ -783,12 +788,16 @@ struct Client::Impl {
             TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
             controlSender->allow(routeAllowed());
         }
-        const auto out = controlSender->snapshot();
+        const auto out = controlSender->inspect();
+        // A latched operation deadline is terminal even when the callback
+        // subsequently returns a retryable transport exception before this pump.
+        if (out.operationStalled) throw TransportError(fog::constants::error::Stream::ControlChannelStalled);
         if (out.failure == AsyncControlSender::Failure::Transport) throw TransportError(fog::constants::error::Stream::ControlSendFailed, true);
         if (out.failure == AsyncControlSender::Failure::Unexpected) throw TransportError(fog::constants::error::Stream::ControlSenderFailed);
-        // A stalled synchronous sender must reach rental termination before any
-        // cleanup join; retry cleanup could otherwise wait on the stalled call.
-        if (out.stalled) throw TransportError(fog::constants::error::Stream::ControlChannelStalled);
+        // Backpressure seals new work in the sender. Let an already-started
+        // probe/send return before retry; a call exceeding its own deadline is
+        // fatal above, preserving HTTP rental-stop before any unavoidable join.
+        if (out.backpressure && !out.transportActive) throw TransportError("Control channel backpressure", true);
     }
     bool control(const std::string& payload, ControlQueue::Mode mode = ControlQueue::Mode::Ordered,
                  const std::string& input = {}, const std::string& release = {}) {
@@ -802,7 +811,7 @@ struct Client::Impl {
             state = "Waiting for TURN route";
             return;
         }
-        control(Json{{"id", "connection_ready"}}.dump());
+        control(Json{{"id", "connection_ready"}}.dump(), ControlQueue::Mode::Initialize);
         channelOpen = true;
         if (!isReady) state = "Waiting for video";
     }
@@ -918,8 +927,11 @@ struct Client::Impl {
         if (controlSender) {
             // A completed failure may retry, but never join a still-running RTC
             // call before the owner can dispatch its rental-stop request.
-            if (mayRetry && controlSender->snapshot().transportActive) {
-                reason = fog::constants::error::Stream::ControlOperationBlockedDuringTransportFailure; mayRetry = false;
+            const auto sender = controlSender->inspect();
+            if (mayRetry && (sender.operationStalled || sender.transportActive)) {
+                reason = sender.operationStalled ? fog::constants::error::Stream::ControlChannelStalled :
+                    fog::constants::error::Stream::ControlOperationBlockedDuringTransportFailure;
+                mayRetry = false;
             }
         }
         if (failure.empty()) { failure = reason; retryableFailure = mayRetry; }
@@ -1305,7 +1317,8 @@ struct Client::Impl {
                             TimedMutex::Guard lock(s.mutex, TimedMutex::Scope::Callback);
                             if (!s.stopped) { if (sent) s.incoming.pongSent(); else s.incoming.pongFailed(); }
                         });
-                    });
+                    }, protocol::gamepad(Gamepad{}, playStation).dump(), retryInputReleases, retryInputReset);
+                retryInputReleases.clear(); retryInputReset = false;
                 TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
                 if (!shared->pendingPong.empty()) {
                     controlSender->enqueue(std::move(shared->pendingPong), ControlQueue::Mode::Pong);
@@ -1433,10 +1446,10 @@ void Client::blockIceForTesting(bool blocked, unsigned stage) {
     if (blocked) impl_->invalidateRoute();
 }
 void Client::blockControlForTesting(bool blocked) { if (impl_->controlSender) impl_->controlSender->block(blocked); }
-void Client::blockControlSendForTesting(bool blocked) {
+void Client::blockControlSendForTesting(bool blocked, bool reject) {
     const auto fixture = impl_->controlSendFixture;
     std::lock_guard<std::mutex> lock(fixture->mutex);
-    fixture->blocked = blocked; fixture->condition.notify_all();
+    fixture->blocked = blocked; fixture->reject = reject; fixture->condition.notify_all();
 }
 void Client::advanceControlForTesting(unsigned milliseconds) { if (impl_->controlSender) impl_->controlSender->advance(milliseconds); }
 void Client::elapseForTesting(unsigned seconds) {
@@ -1465,6 +1478,12 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
     impl_->videoSettings = preferences;
     impl_->relay = relay;
     impl_->playStation = playStation;
+    if (retryInputReset_ && retryInputHash_ == hash) {
+        impl_->retryInputReset = true;
+        impl_->retryInputReleases = retryInputReleases_;
+    } else {
+        retryInputReset_ = false; retryInputReleases_.clear(); retryInputHash_.clear();
+    }
     auto& i = *impl_;
     // Do not permit STOMP header/destination injection.
     const auto safe = [](const std::string& s) {
@@ -1777,6 +1796,19 @@ bool Client::disconnectForRetry() {
     auto& i = *impl_;
     if (!i.running || !i.shared) {
         if (!i.failure.empty() && !i.retryableFailure) return false;
+        if (i.controlSender) {
+            const auto sender = i.controlSender->inspect();
+            if (sender.operationStalled || sender.transportActive || sender.failure == AsyncControlSender::Failure::Unexpected) {
+                const auto reason = sender.operationStalled ? fog::constants::error::Stream::ControlChannelStalled :
+                    sender.transportActive ? fog::constants::error::Stream::ControlOperationBlockedDuringTransportFailure :
+                    fog::constants::error::Stream::ControlSenderFailed;
+                i.failure.clear(); i.fail(reason);
+                return false;
+            }
+        }
+        if (i.controlSender) retryInputReleases_ = i.controlSender->releasesForRetry();
+        retryInputReset_ = true;
+        if (!i.hash.empty()) retryInputHash_ = i.hash;
         if (i.shared) i.stop(false);
         return true;
     }
@@ -1793,7 +1825,11 @@ bool Client::disconnectForRetry() {
     i.closingForRetry = true;
     pump(); // Frozen terminal evidence still wins over transport-only recovery.
     if (!i.running) {
-        if (i.retryableFailure) i.stop(false);
+        if (i.retryableFailure) {
+            if (i.controlSender) retryInputReleases_ = i.controlSender->releasesForRetry();
+            retryInputReset_ = true; retryInputHash_ = i.hash;
+            i.stop(false);
+        }
         return i.retryableFailure;
     }
     if (i.rtcpWorker && !i.rtcpWorker->quiescent()) {
@@ -1806,14 +1842,16 @@ bool Client::disconnectForRetry() {
     }
     if (i.controlSender) {
         const auto sender = i.controlSender->snapshot();
-        if (sender.stalled || sender.transportActive) {
-            i.fail(sender.stalled ? fog::constants::error::Stream::ControlChannelStalled : fog::constants::error::Stream::ControlOperationBlockedDuringTransportFailure);
+        if (sender.operationStalled || sender.transportActive) {
+            i.fail(sender.operationStalled ? fog::constants::error::Stream::ControlChannelStalled : fog::constants::error::Stream::ControlOperationBlockedDuringTransportFailure);
             return false; // Owner dispatches rental stop BEFORE close/destructor.
         }
         if (sender.failure == AsyncControlSender::Failure::Unexpected) {
             i.fail(fog::constants::error::Stream::ControlSenderFailed); return false;
         }
     }
+    if (i.controlSender) retryInputReleases_ = i.controlSender->releasesForRetry();
+    retryInputReset_ = true; retryInputHash_ = i.hash;
     i.stop(false);
     return true;
 }
@@ -1882,6 +1920,11 @@ bool Client::waitingForVideoKeyframe() const {
     if (!impl_->shared) return false;
     TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
     return impl_->shared->videoTrack && impl_->shared->video.waiting();
+}
+std::uint64_t Client::currentVideoGeneration() const {
+    if (!impl_->shared) return 0;
+    TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
+    return impl_->shared->videoGeneration;
 }
 void Client::setDecoderWaitingForKeyframe(bool waiting) { impl_->decoderWaiting = waiting; }
 bool Client::requestVideoKeyframe() {

@@ -1,5 +1,6 @@
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/domain/media_annexb.hpp"
+#include "features/streaming/domain/video_limits.hpp"
 #include <SDL.h>
 #include <opus/opus.h>
 extern "C" {
@@ -173,8 +174,17 @@ static void test(fog::Media& media, SDL_Renderer* renderer, const Units& origina
     }
     media.audio(reinterpret_cast<const std::byte*>(audio.data()), audio.size());
     check(media.audioPackets() == 2, "audio did not survive video resets");
+    // A legal large IDR plus filler is accepted by both ingress and decoder.
+    auto large = changed[0];
+    large.insert(large.end(), {0, 0, 0, 1, 0x0c});
+    large.resize(stream::MaxVideoAccessUnitBytes - 1, 0xff);
+    large.push_back(0x80);
+    before = media.videoFrames();
+    feed(media, large);
+    check(media.videoFrames() > before, "shared 8MiB AU rejected by decoder");
+    large.push_back(0xff);
     bool rejected = false;
-    try { media.video(nullptr, 4 * 1024 * 1024 + 1); } catch (const std::runtime_error&) { rejected = true; }
+    try { feed(media, large); } catch (const std::runtime_error&) { rejected = true; }
     check(rejected, "oversize access unit accepted");
     rejected = false;
     try { media.video(nullptr, 5); } catch (const std::runtime_error&) { rejected = true; }

@@ -262,9 +262,10 @@ int main() {
     {
         A a; init(a);
         auto p = rtp(100,300,false,{0x61}); p.resize(65000,std::byte{0x22});
-        for (unsigned seq=100; seq<180; ++seq) {
+        const unsigned last = 100 + A::MaxFrameBytes / 60000 + 1;
+        for (unsigned seq=100; seq<=last; ++seq) {
             p[2]=std::byte(seq>>8); p[3]=std::byte(seq);
-            p[1]=std::byte(seq==179 ? 0xe0 : 0x60);
+            p[1]=std::byte(seq==last ? 0xe0 : 0x60);
             a.receive(p.data(),p.size(),1);
         }
         empty(a); assert(a.waiting() && a.stats().pressure>0 && a.assemblyBytes()<=A::MaxFrameBytes);

@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "core/logging/run_log.hpp"
+#include "core/constants/stage1_options.hpp"
 #include "core/diagnostics/thread_observation.hpp"
 #include <cerrno>
 #include <algorithm>
@@ -157,7 +158,7 @@ bool preserveLegacy(const std::string& source, const std::string& directory,
 bool syncDirectory(const std::string& directory) {
 #ifdef __SWITCH__
     // libnx does not provide POSIX directory fsync; the platform callback
-    // commits startup migration and each ordinary diagnostic batch.
+    // commits startup migration, periodic diagnostic syncs and explicit barriers.
     (void)directory;
     return true;
 #else
@@ -300,9 +301,9 @@ bool RunLog::start(const std::string& dataDir, std::time_t timestamp, bool (*com
         std::chrono::steady_clock::now() - startupBegan).count());
     return !errorOperation_;
 }
-bool RunLog::writeSink(int& fd, const std::string& batch, const char* operation) noexcept {
+bool RunLog::writeSink(int& fd, const std::string& batch, const char* operation, bool sync) noexcept {
     if (fd < 0) return false;
-    if ((!batch.empty() && !writeBytes(fd, batch.data(), batch.size())) || fsync(fd) != 0) {
+    if ((!batch.empty() && !writeBytes(fd, batch.data(), batch.size())) || (sync && fsync(fd) != 0)) {
         fail(operation, errno);
         closeSink(fd, "close-failed-sink");
         return false;
@@ -349,32 +350,41 @@ void RunLog::writer() noexcept {
         fog::diagnostics::observeThread("runlog");
     using Clock = std::chrono::steady_clock;
     std::size_t inFlightLines = 0;
+    bool dirty = false;
+    auto nextSync = Clock::now() + std::chrono::seconds(5);
     try {
         for (;;) {
             std::deque<std::string> lines;
             std::uint64_t barrier = 0, dropped = 0;
+            bool sync = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                ready_.wait(lock, [&] { return stopping_ || !queue_.empty() || pendingDrops_ || requestedBarrier_ > completedBarrier_; });
-                if (!stopping_ && requestedBarrier_ == completedBarrier_) {
+                const auto hasWork = [&] { return stopping_ || !queue_.empty() || pendingDrops_ || requestedBarrier_ > completedBarrier_; };
+                if (dirty) ready_.wait_until(lock, nextSync, hasWork);
+                else ready_.wait(lock, hasWork);
+                if (!stopping_ && requestedBarrier_ == completedBarrier_ && !queue_.empty() && Clock::now() < nextSync) {
                     ready_.wait_for(lock, std::chrono::milliseconds(250), [&] {
                         return stopping_ || requestedBarrier_ > completedBarrier_ || stats_.queuedBytes >= 32 * 1024;
                     });
                 }
-                if (stopping_ && queue_.empty() && !pendingDrops_ && requestedBarrier_ == completedBarrier_) break;
+                if (stopping_ && !dirty && queue_.empty() && !pendingDrops_ && requestedBarrier_ == completedBarrier_) break;
                 lines.swap(queue_);
                 inFlightLines = lines.size();
                 stats_.queuedLines = stats_.queuedBytes = 0;
                 dropped = pendingDrops_; pendingDrops_ = 0;
                 barrier = requestedBarrier_;
+                sync = !fog::stage1::sparseDiagnostics || stopping_ ||
+                    barrier > completedBarrier_ || Clock::now() >= nextSync;
             }
             const auto began = Clock::now();
             std::string batch;
             for (const auto& line : lines) { batch += line; batch += '\n'; }
             if (dropped) batch += "[RunLog] dropped " + std::to_string(dropped) + " diagnostic lines (queue capacity)\n";
-            const bool archive = writeSink(archiveFd_, batch, "write-archive");
-            const bool mirror = writeSink(mirrorFd_, batch, "write-mirror");
-            if (commit_) {
+            const bool archive = writeSink(archiveFd_, batch, "write-archive", sync);
+            const bool mirror = writeSink(mirrorFd_, batch, "write-mirror", sync);
+            dirty = !sync;
+            if (sync) nextSync = Clock::now() + std::chrono::seconds(5);
+            if (sync && commit_) {
                 try { if (!commit_()) fail("commit-device", EIO); }
                 catch (...) { fail("commit-device", EIO); }
             }

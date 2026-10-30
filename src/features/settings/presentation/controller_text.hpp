@@ -13,7 +13,7 @@ inline constexpr char ApplyNotice[] = "При следующем подключ�
 inline constexpr char HostNotice[] = "Сервис может определить DualSense как контроллер PS4.";
 inline constexpr char LayoutNotice[] = "Раскладка меняет кнопки меню; в игре DualSense кнопки соответствуют их положению.";
 inline constexpr char Saved[] = "Настройки контроллера сохранены на SD.";
-inline constexpr char SaveFailed[] = "Не удалось сохранить. Предыдущие настройки сохранены.";
+inline constexpr char SaveFailed[] = "Не удалось сохранить. После перезапуска изменения потеряются.";
 inline constexpr char LoadFailed[] = "Настройки не прочитаны. Используются профиль и раскладка Xbox.";
 inline const char* profileLabel(::stream::ControllerProfile profile) {
     return profile == ::stream::ControllerProfile::DualSense ? "DualSense" : "Xbox";

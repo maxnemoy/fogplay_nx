@@ -1,4 +1,5 @@
 #include "core/constants/app_info.hpp"
+#include "core/constants/stage1_options.hpp"
 #include "core/constants/storage_paths.hpp"
 #include "app/app_diagnostics.hpp"
 #include "platform/switch/switch_runtime.hpp"
@@ -89,6 +90,7 @@ void firstUiFramePresented() {
 LogSession::LogSession() {
     startupAt = std::chrono::steady_clock::now();
     diagnostic(std::string(fog::constants::common::Title) + " startup. Live session candidate; tested LAN AV stack. No credentials logged.");
+    diagnostic(fog::stage1::diagnostics());
     diagnostic("Startup main_entered; time before main (loader/SD executable read) is not measured");
 }
 void LogSession::start() {

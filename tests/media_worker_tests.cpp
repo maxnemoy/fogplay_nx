@@ -1,3 +1,4 @@
+#include "core/constants/stage1_options.hpp"
 #include "features/streaming/infrastructure/media.hpp"
 #include "features/streaming/infrastructure/media_frame_queue.hpp"
 #include "features/streaming/domain/audio_latency_policy.hpp"
@@ -13,6 +14,8 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -123,6 +126,40 @@ public:
     void close() override {}
 };
 static std::atomic<bool> captureAudio{false};
+static std::atomic<unsigned> videoPublications{0}, audioPublications{0}, audioQueueObservations{0};
+static std::mutex publicationMutex;
+static std::vector<std::chrono::steady_clock::time_point> audioPublicationTimes;
+static void recordPublication(const char* format) {
+    if (std::strncmp(format, "decoder codec=", 14) == 0) ++videoPublications;
+    if (std::strncmp(format, "audio_packets=", 14) == 0) {
+        std::lock_guard<std::mutex> lock(publicationMutex);
+        audioPublicationTimes.push_back(std::chrono::steady_clock::now());
+        ++audioPublications;
+    }
+}
+extern "C" int __wrap_snprintf(char* destination, std::size_t size, const char* format, ...) {
+    recordPublication(format);
+    va_list arguments;
+    va_start(arguments, format);
+    const int result = std::vsnprintf(destination, size, format, arguments);
+    va_end(arguments);
+    return result;
+}
+// Ubuntu's optimized compiler uses the fortified symbol for bounded arrays.
+extern "C" int __wrap___snprintf_chk(char* destination, std::size_t size, int, std::size_t,
+    const char* format, ...) {
+    recordPublication(format);
+    va_list arguments;
+    va_start(arguments, format);
+    const int result = std::vsnprintf(destination, size, format, arguments);
+    va_end(arguments);
+    return result;
+}
+extern "C" Uint32 __real_SDL_GetQueuedAudioSize(SDL_AudioDeviceID);
+extern "C" Uint32 __wrap_SDL_GetQueuedAudioSize(SDL_AudioDeviceID device) {
+    ++audioQueueObservations;
+    return __real_SDL_GetQueuedAudioSize(device);
+}
 static std::atomic<int> failAudioQueue{0}, failAudioOpen{0}, failAudioDecode{0};
 extern "C" int __real_SDL_QueueAudio(SDL_AudioDeviceID, const void*, Uint32);
 extern "C" int __wrap_SDL_QueueAudio(SDL_AudioDeviceID device, const void* data, Uint32 size) {
@@ -446,6 +483,22 @@ static std::vector<Bytes> audioSequence(unsigned count) {
     opus_encoder_destroy(encoder);
     return result;
 }
+static void synchronousAudioPolicy(SDL_Renderer* renderer) {
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    const auto sequence = audioSequence(24);
+    for (const auto& packet : sequence) media.audio(packet.data(), packet.size());
+    const auto diagnostics = media.audioDiagnostics();
+    check(media.audioPackets() == sequence.size(), "sync policy skipped compressed decode");
+#ifdef FOGPLAY_BOUNDED_SYNC_AUDIO
+    check(diagnostics.find("audio_sync_bounded=1") != std::string::npos, "sync experiment not enabled");
+    check(media.audioQueueResets() == 0, "bounded sync policy cleared queued audio");
+    const auto key = diagnostics.find("audio_max_queued_ms=");
+    check(key != std::string::npos && std::stoul(diagnostics.substr(key + 20)) <= 80,
+        "bounded sync policy exceeded 80ms");
+#else
+    check(diagnostics.find("audio_sync_bounded=0") != std::string::npos, "unmeasured audio policy enabled by default");
+#endif
+}
 static void audioCatchup(SDL_Renderer* renderer) {
     constexpr unsigned burst = 12, episodes = 3, stride = burst + 1;
     const auto sequence = audioSequence(episodes * stride + burst);
@@ -494,6 +547,68 @@ static void audioCatchup(SDL_Renderer* renderer) {
     std::cout << "Audio catchup: " << text << "; all " << expected.size()
         << " decoded PCM hashes match continuous reference Opus\n";
 }
+static void idlePublications(SDL_Renderer* renderer) {
+    Client client;
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    videoPublications = 0; audioPublications = 0; audioQueueObservations = 0;
+    media.startWorkers(client, 30);
+    // Keep transports empty long enough for several legacy 20-ms snapshots.
+    // The counters instrument actual formatting/SDL calls, not source layout.
+    const auto started = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(130ms);
+    media.stopWorkers();
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    const auto video = videoPublications.load();
+    const auto audio = audioPublications.load();
+    const auto observations = audioQueueObservations.load();
+    std::cout << "Idle publications sparse=" << fog::stage1::sparseDiagnostics << " duration_ms=" << elapsedMs
+        << " polls=" << client.polls << " video=" << video << " audio=" << audio
+        << " queue_observations=" << observations << '\n';
+    check(client.polls >= 20, "idle publication test did not exercise worker polling");
+    if (fog::stage1::sparseDiagnostics) {
+        check(video <= 2 + elapsedMs / 1000 && audio <= 2 + elapsedMs / 1000,
+            "sparse idle diagnostic formatting exceeded one-second cadence");
+        check(observations <= 3 + elapsedMs / 20,
+            "sparse idle audio queue observations exceeded 20-ms cadence");
+    } else {
+        check(video == 1, "control profile formatted video on an empty transport poll");
+        check(audio >= 3 && audio <= 3 + elapsedMs / 20,
+            "control profile idle audio formatting lost original 20-ms cadence");
+        check(observations >= audio,
+            "control profile lost original audio queue observations");
+    }
+}
+static void packetPublicationCadence(SDL_Renderer* renderer) {
+    if (fog::stage1::sparseDiagnostics) return;
+    Client client;
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    const auto packet = sound();
+    {
+        std::lock_guard<std::mutex> lock(publicationMutex);
+        audioPublicationTimes.clear(); audioPublications = 0;
+    }
+    media.startWorkers(client, 30);
+    until([] { return audioPublications >= 3; });
+    std::chrono::steady_clock::time_point lastIdle;
+    {
+        std::lock_guard<std::mutex> lock(publicationMutex);
+        lastIdle = audioPublicationTimes.back();
+    }
+    // A packet between idle ticks must restart the legacy idle deadline.
+    std::this_thread::sleep_until(lastIdle + 8ms);
+    const auto before = audioPublications.load();
+    client.push(packet, true);
+    until([&] { return media.audioPackets() == 1 && audioPublications > before; });
+    const auto packetPublication = audioPublications.load() - 1;
+    until([&] { return audioPublications > packetPublication + 1; });
+    media.stopWorkers();
+    std::lock_guard<std::mutex> lock(publicationMutex);
+    const auto gap = std::chrono::duration_cast<std::chrono::microseconds>(
+        audioPublicationTimes.at(packetPublication + 1) - audioPublicationTimes.at(packetPublication)).count();
+    check(gap >= 19000, "control audio idle deadline was not restarted after packet publication");
+    std::cout << "Control packet-to-next-idle-publication gap_us=" << gap << '\n';
+}
 static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units, int fps) {
     Client client;
     // Negotiation selects H264 although construction preferred H265.
@@ -541,9 +656,10 @@ static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units, int
     check(hevcOpens == previousHevcOpens, "latest codec command was ignored during blocked decode");
     check(media.diagnostics().find("presentation_fps=" + std::to_string(fps)) != std::string::npos,
         "configured worker frame rate missing from diagnostics");
-    check(media.diagnostics().find("video_worker_queue_samples=0") == std::string::npos &&
-        media.audioDiagnostics().find("audio_worker_queue_samples=0") == std::string::npos,
-        "worker dequeue wait was not measured");
+    // Owner-published diagnostic strings refresh at most once per second;
+    // decoding counters remain immediate and must not force per-frame formatting.
+    until([&] { return media.diagnostics().find("video_worker_queue_samples=0") == std::string::npos &&
+        media.audioDiagnostics().find("audio_worker_queue_samples=0") == std::string::npos; });
     const auto beforeGeneration = media.videoFrames();
     client.push(units[1], false, 2, 3000);
     until([&] { return media.workerVideoGeneration() == 2 && media.waitingForVideoKeyframe(); });
@@ -719,7 +835,7 @@ int main(int argc, char** argv) {
     auto* renderer = surface ? SDL_CreateSoftwareRenderer(surface) : nullptr;
     if (!renderer) return 4;
     int result = 0;
-    try { pacing(); audioPolicy(); audioRecoveryPolicy(); audioRecoverySync(renderer); audioCatchup(renderer);
+    try { idlePublications(renderer); packetPublicationCadence(renderer); pacing(); audioPolicy(); synchronousAudioPolicy(renderer); audioRecoveryPolicy(); audioRecoverySync(renderer); audioCatchup(renderer);
         const auto units = load(argv[1]); workers(renderer, units, 30); workers(renderer, units, 60);
         audioRecoveryWorkerBacklog(renderer); audioRecoveryWorker(renderer, units); }
     catch (const std::exception& error) { blockSend = false; gate.notify_all(); std::cerr << error.what() << '\n'; result = 1; }

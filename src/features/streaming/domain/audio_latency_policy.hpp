@@ -3,7 +3,7 @@
 #include <cstdint>
 
 namespace fog::detail {
-// Worker-only PCM admission: consume/decode every Opus packet to preserve its
+// Shared PCM admission (synchronous path requires measured opt-in): consume/decode every Opus packet to preserve its
 // predictive state, then catch up without clearing sound already in SDL.
 // 40 ms refill protects against jitter; 80 ms bounds software output buffering.
 // The age budget is deliberately less aggressive than Moonlight-Switch's

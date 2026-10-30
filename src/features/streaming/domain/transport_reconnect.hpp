@@ -23,6 +23,7 @@ public:
         return phase_ == Phase::Grace || phase_ == Phase::Backoff || phase_ == Phase::Connecting;
     }
     bool connecting() const { return phase_ == Phase::Connecting; }
+    bool deadlineExpired(Time now) const { return recovering() && expired(now); }
     bool disconnected(Time now) {
         if (phase_ != Phase::Idle) return recovering();
         expireAttempts(now);

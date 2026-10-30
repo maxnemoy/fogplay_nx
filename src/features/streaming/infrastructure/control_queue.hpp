@@ -11,7 +11,7 @@ namespace stream {
 // capacity for releases even when ordinary commands saturate the queue.
 class ControlQueue {
 public:
-    enum class Mode { Ordered, Gamepad, MouseMove, Pong, Release, GamepadEdge, GamepadRelease, TouchMove, Motion, GamepadNeutral };
+    enum class Mode { Ordered, Gamepad, MouseMove, Pong, Release, GamepadEdge, GamepadRelease, TouchMove, Motion, GamepadNeutral, Initialize };
     struct InputTrace {
         bool playStation = false, touchDown = false, touchEdge = false;
         std::uint64_t sequence = 0;

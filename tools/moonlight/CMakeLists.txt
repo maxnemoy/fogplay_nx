@@ -45,7 +45,7 @@ set_target_properties(MbedTLS::mbedcrypto PROPERTIES
 add_subdirectory("${UPSTREAM}/extern/moonlight-common-c" moonlight-common-c)
 # Replace only explicitly prepared translation units; leave the pinned checkout untouched.
 get_target_property(MOONLIGHT_SOURCES moonlight-common-c SOURCES)
-set(PREPARED_CORE_SOURCES Connection VideoStream RtpVideoQueue VideoDepacketizer ControlStream LinkedBlockingQueue PlatformSockets PlatformStuff)
+set(PREPARED_CORE_SOURCES Connection VideoStream RtpVideoQueue VideoDepacketizer ControlStream LinkedBlockingQueue PlatformSockets PlatformStuff RtspConnection)
 foreach(name IN LISTS PREPARED_CORE_SOURCES)
   list(LENGTH MOONLIGHT_SOURCES MOONLIGHT_SOURCE_COUNT)
   list(FILTER MOONLIGHT_SOURCES EXCLUDE REGEX "(^|/)${name}\\.c$")
@@ -60,7 +60,8 @@ foreach(name IN LISTS PREPARED_CORE_SOURCES)
   target_sources(moonlight-common-c PRIVATE "${PREPARED}/core/${name}.c")
 endforeach()
 target_sources(moonlight-common-c PRIVATE "${CMAKE_CURRENT_LIST_DIR}/FogMoonlightDiagnostics.c"
-  "${CMAKE_CURRENT_LIST_DIR}/FogMoonlightRecovery.c")
+  "${CMAKE_CURRENT_LIST_DIR}/FogMoonlightRecovery.c"
+  "${CMAKE_CURRENT_LIST_DIR}/FogMoonlightTermination.c")
 target_include_directories(moonlight-common-c PRIVATE
   "${UPSTREAM}/extern/moonlight-common-c/src" "${CMAKE_CURRENT_LIST_DIR}")
 target_sources(moonlight-common-c PRIVATE "${CMAKE_CURRENT_LIST_DIR}/signal-switch.c")

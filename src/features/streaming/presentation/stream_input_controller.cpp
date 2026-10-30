@@ -1,5 +1,7 @@
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
+#include "features/streaming/domain/stick_deadzone.hpp"
+#include "core/constants/stage1_options.hpp"
 
 namespace uiText = ::fog::constants::ui;
 
@@ -79,7 +81,47 @@ SDL_Rect ApplicationController::videoRect() const {
 }
 
 bool ApplicationController::sendRemote(const fog::remote::Input& command) {
-    return !transportReconnect_.recovering() && stream_ && stream_->ready() && stream_->sendInput(command);
+    const auto* key = std::get_if<fog::remote::Key>(&command);
+    if (key && !key->down) {
+        // A video fault between key-down and key-up must never strand the key.
+        // Keep a rejected release on this transport until it accepts the retry.
+        return keyReleases_.release(key->code,[this](const std::string& code) {
+            return stream_ && stream_->ready() && !stream_->disconnected() &&
+                stream_->recoveryState() == ::stream::RecoveryState::Connected &&
+                stream_->sendInput(fog::remote::key(false,code));
+        });
+    }
+    if (key && keyReleases_.pending(key->code)) {
+        retryKeyReleases();
+        if (keyReleases_.pending(key->code)) return false;
+    }
+    // Overlay keyboard/mouse actions share the same fresh safety checks as the
+    // early gamepad phase. Releases bypass this gate in their retry helpers.
+    const bool allowed = screen_ == Screen::Streaming && !stopAfterTask_ && !exitAfterStop_ &&
+        !transportReconnect_.recovering() && !videoRecovery_.active() &&
+        !streamInputGate_.videoSuspended() &&
+        !videoRecovery_.expired(std::chrono::steady_clock::now()) && !videoLossWaiting_ &&
+        stream_ && media_ && firstFramePresented_ && stream_->ready() && !stream_->disconnected() &&
+        (!fog::stage1::inputFreezeGate || !stream_->inputSuspended()) &&
+        std::chrono::steady_clock::now()-lastVideo_ < std::chrono::seconds(10) &&
+        stream_->recoveryState() == ::stream::RecoveryState::Connected &&
+        !stream_->waitingForVideoKeyframe() && !media_->waitingForVideoKeyframe() &&
+        (media_->workersRunning() ? media_->workerVideoGeneration() == lastVideoGeneration_
+            : stream_->currentVideoGeneration() == lastVideoGeneration_);
+    if (!allowed) return false;
+    const bool accepted = stream_->sendInput(command);
+    if (accepted && key) keyReleases_.pressed(key->code);
+    return accepted;
+}
+
+void ApplicationController::retryKeyReleases() noexcept {
+    keyReleases_.retry([this](const std::string& code) {
+        try {
+            return stream_ && stream_->ready() && !stream_->disconnected() &&
+                stream_->recoveryState() == ::stream::RecoveryState::Connected &&
+                stream_->sendInput(fog::remote::key(false,code));
+        } catch (...) { return false; }
+    });
 }
 
 void ApplicationController::releaseMouse() noexcept {
@@ -101,6 +143,7 @@ void ApplicationController::retryMouseReleases() noexcept {
 
 void ApplicationController::neutralizeStreamInput() {
     stopRumble();
+    retryKeyReleases();
     releasePlayStationInput();
     psTouchLastSubmitted_ = false;
     releaseMouse();
@@ -134,6 +177,7 @@ void ApplicationController::updateRumble(PadState& pad, bool focused) {
     const bool enabled = focused && screen_ == Screen::Streaming && !stopAfterTask_ &&
         stream_ && stream_->ready() && !stream_->disconnected() &&
         !transportReconnect_.recovering() && !videoRecovery_.active() && !videoLossWaiting_ &&
+        (!fog::stage1::inputFreezeGate || !stream_->inputSuspended()) &&
         streamInputGate_.gamepadAllowed(overlay_.mode() != fog::stream::OverlayMode::Closed);
     rumble_.update(pad, received ? &feedback : nullptr, enabled, nowMs);
     if (stream_ && nowMs - rumbleLogAtMs_ >= 5000) {
@@ -247,11 +291,13 @@ void ApplicationController::updateMouse(PadState& pad,u64 held,u64 down,const Hi
     const auto now = std::chrono::steady_clock::now();
     const float elapsed = std::clamp(std::chrono::duration<float>(now-mouseAt_).count(),0.0f,0.05f);
     mouseAt_ = now;
-    if (streamInputGate_.videoSuspended() || videoRecovery_.active() || videoLossWaiting_ || !stream_ || !stream_->ready() || !media_ || !media_->videoFrames()) return;
+    if (streamInputGate_.videoSuspended() || videoRecovery_.active() || videoLossWaiting_ || !stream_ || !stream_->ready() ||
+        (fog::stage1::inputFreezeGate && stream_->inputSuspended()) || !media_ || !media_->videoFrames()) return;
     const auto rect = videoRect();
     const auto stick = padGetStickPos(&pad,0);
-    pointerX_ += axis(stick.x)*900.0f*elapsed;
-    pointerY_ -= axis(stick.y)*900.0f*elapsed;
+    const auto axes = fog::stream::cursorStick(stick.x,stick.y);
+    pointerX_ += axes.x*900.0f*elapsed;
+    pointerY_ -= axes.y*900.0f*elapsed;
     if (touch.count > 0) {
         const int x = static_cast<int>(touch.touches[0].x), y = static_cast<int>(touch.touches[0].y);
         const bool inside = x >= rect.x && y >= rect.y && x < rect.x+rect.w && y < rect.y+rect.h;
@@ -273,11 +319,6 @@ void ApplicationController::updateMouse(PadState& pad,u64 held,u64 down,const Hi
     });
     if (down & HidNpadButton_L) sendRemote(fog::remote::wheel(-32));
     if (down & HidNpadButton_R) sendRemote(fog::remote::wheel(32));
-}
-
-float ApplicationController::axis(int value) {
-    const float normalized = std::clamp(value / 32767.0f,-1.0f,1.0f);
-    return std::abs(normalized) < 0.12f ? 0.0f : normalized;
 }
 
 }

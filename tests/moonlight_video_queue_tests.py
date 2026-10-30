@@ -31,6 +31,7 @@ for signature in ('std::string videoDiagnostics()', 'std::string gapDiagnostics(
     assert 'LiGetMicroseconds' not in re.sub(gated_clock, '', diagnostic), signature + ' has an ungated core clock read'
 harness = r'''
 #include "features/streaming/domain/streaming_client.hpp"
+#include "features/streaming/domain/video_limits.hpp"
 #include "features/streaming/infrastructure/moonlight/frame_diagnostics.hpp"
 #include <algorithm>
 #include <atomic>
@@ -77,7 +78,7 @@ struct State {
     CAPACITY_DECLARATION
     std::atomic<bool> stop{false}, failed{false}, terminated{false}, assemblyWaiting{true}, fatalFailure{false};
     std::atomic<int> code{0};
-    std::atomic<std::uint64_t> frames{0}, videoDrops{0};
+    std::atomic<std::uint64_t> frames{0}, videoDrops{0}, lastVideoMs{0};
     std::atomic<std::uint64_t> videoFullYields{0}, videoQueueHigh{0}, videoBatchMax{0}, videoQueueAgeMaxMs{0};
     std::atomic<std::uint64_t> videoInvalid{0}, videoWaitDrops{0}, videoResyncs{0};
     std::mutex mutex;

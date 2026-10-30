@@ -1102,10 +1102,24 @@ int main(int argc, char** argv) {
             }
             assert(burstFrames >= 64 && client.videoDiagnostics().find("queueResync=0 ") != std::string::npos);
             // A genuinely stale consumer still needs an IDR-safe age flush.
+            const auto displayedGeneration = client.currentVideoGeneration();
             fixture.sendMedia();
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
             client.pump();
             assert(client.error().empty() && client.videoDiagnostics().find("queueAge=0") == std::string::npos);
+            // Fault and repaired IDR may both arrive between UI cycles. The
+            // assembler can be ready before poll exposes the decoder's new
+            // generation, so early input must compare this synchronized value.
+            fixture.sendMedia();
+            const auto beforeNextUiCycle = Clock::now();
+            while (client.waitingForVideoKeyframe() && Clock::now()-beforeNextUiCycle < std::chrono::seconds(2)) {
+                // The first post-resync AU establishes a clean RTP boundary;
+                // the following IDR can recover without any UI pump/pop.
+                fixture.pump(); fixture.sendMedia();
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            assert(!client.waitingForVideoKeyframe() && client.queuedVideoPackets() > 0);
+            assert(client.currentVideoGeneration() > displayedGeneration);
             bool generation = false;
             const auto staleRecoveryStart = Clock::now();
             while (Clock::now() - staleRecoveryStart < std::chrono::seconds(2) && !generation) {
@@ -1275,7 +1289,7 @@ int main(int argc, char** argv) {
             assert(client.sendInput(fog::remote::key(false,"Enter")));
             client.advanceControlForTesting(15001);
             client.pump();
-            assert(client.error() == "Control channel stalled" && !client.ready() && !client.retryableError());
+            assert(client.error() == "Control channel backpressure" && !client.ready() && client.retryableError());
         }
         client.close();
         assert(client.diagnostics().find(turn ? "requested=relay actual=turn" : "requested=all actual=direct") != std::string::npos);
@@ -1302,7 +1316,7 @@ int main(int argc, char** argv) {
         while (Clock::now() - closeStart < std::chrono::seconds(2) && (!fixture.closed || !fixture.neutral)) {
             fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        assert(fixture.closed && fixture.neutral);
+        assert((round == 2 ? !fixture.closed : fixture.closed) && fixture.neutral);
         std::cout << "Local transport integration passed: STOMP, actual ICE/DTLS/SRTP/SCTP, "
                      "filtered answer, H264/H265 AnnexB, Opus, PLI, REMB, quality controls/stats/confirmed Auto enhance+degrade/manual isolation, gamepad/mouse/keyboard/close\n";
     }
@@ -1531,14 +1545,23 @@ int main(int argc, char** argv) {
                     auto bad = motion; bad["data"]["sensor"] = 3; assert(!client.sendControl(bad.dump()));
                     assert(client.sendControl(motion.dump()));
                 }
+                const std::size_t resetSensors = attempt == 0 ? 0 : 2;
                 const auto nativeAt = Clock::now();
-                while (fixture.remoteControls.size() < 5 && Clock::now() - nativeAt < std::chrono::seconds(1)) {
+                while (fixture.remoteControls.size() < 5 + resetSensors && Clock::now() - nativeAt < std::chrono::seconds(1)) {
                     fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
-                assert(fixture.remoteControls.size() == 5 && fixture.remoteControls[1]["data"]["x"] == 0.9);
+                assert(fixture.remoteControls.size() == 5 + resetSensors && fixture.remoteControls[resetSensors + 1]["data"]["x"] == 0.9);
+                if (resetSensors) {
+                    const auto& resetAccel = fixture.remoteControls[0];
+                    assert(resetAccel["id"] == "gamepad_sensor" && resetAccel["data"]["sensor"] == 1 &&
+                        resetAccel["data"]["x"] == 0 && resetAccel["data"]["z"] == 0 &&
+                        std::abs(resetAccel["data"]["y"].get<double>() - fog::playstation::NativeInput::Gravity) < 0.00001);
+                    assert(fixture.remoteControls[1] == stream::protocol::remoteInput(fog::playstation::NativeInput::sensor(2, {0, 0, 0})));
+                }
                 const auto native = client.inputDiagnostics();
                 assert(native.find("nativeDownSent=1 ") != std::string::npos && native.find("nativeMoveSent=1 ") != std::string::npos);
-                assert(native.find("nativeUpSent=1 ") != std::string::npos && native.find("gyroSent=1 ") != std::string::npos);
+                assert(native.find("nativeUpSent=1 ") != std::string::npos &&
+                    native.find("gyroSent=" + std::to_string(attempt == 0 ? 1 : 2) + " ") != std::string::npos);
                 assert(native.find("invalidNative=6 ") != std::string::npos);
             } else assert(!client.sendControl(touch.dump()));
             assert(client.diagnostics().find("incomingIgnored=0 ") != std::string::npos);
@@ -1595,7 +1618,7 @@ int main(int argc, char** argv) {
                 assert(input.find("touchSentDown=1 ") != std::string::npos);
                 assert(input.find("touchSentUp=1 ") != std::string::npos);
                 assert(input.find("touchFailedDown=0 ") != std::string::npos);
-                const std::string sensorSent = attempt == 0 ? "1 " : "2 ";
+                const std::string sensorSent = attempt == 0 ? "1 " : "3 ";
                 assert(input.find("accelSent=" + sensorSent) != std::string::npos && input.find("gyroSent=" + sensorSent) != std::string::npos);
             }
         }
@@ -1618,7 +1641,13 @@ int main(int argc, char** argv) {
                 if (client.ready() && fixture.controlReady && fixture.pong) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
-            assert(client.ready() && fixture.controlReady && fixture.pong && fixture.remoteControls.empty());
+            assert(client.ready() && fixture.controlReady && fixture.pong);
+            Json releasePrefix = attempt == 0 ? Json::array() : Json::array({
+                stream::protocol::remoteInput(fog::playstation::NativeInput::sensor(1, {0, fog::playstation::NativeInput::Gravity, 0})),
+                stream::protocol::remoteInput(fog::playstation::NativeInput::sensor(2, {0, 0, 0})),
+                stream::protocol::remoteInput(fog::playstation::NativeInput::touch(0x658, 0, 1, 1))});
+            if (attempt != 0) releasePrefix[0]["data"]["y"] = 9.80665;
+            assert(fixture.remoteControls == releasePrefix);
             // Application transport startup creates a new NativeInput, even
             // when the same Client reconnects while a finger remains held.
             fog::playstation::NativeInput native;
@@ -1635,12 +1664,13 @@ int main(int argc, char** argv) {
             // any preceding DOWN, before held touch and motion are forwarded.
             client.blockControlSendForTesting(true);
             native.update(sample, 100, true, emit);
-            const Json expected = Json::array({
+            Json expected = releasePrefix;
+            for (const auto& command : Json::array({
                 stream::protocol::remoteInput(fog::playstation::NativeInput::touch(0x658, 0, 0, 0)),
                 stream::protocol::remoteInput(fog::playstation::NativeInput::touch(0x658, 1, 0, 0)),
                 stream::protocol::remoteInput(fog::playstation::NativeInput::touch(0x656, 0, 1, 1)),
                 stream::protocol::remoteInput(fog::playstation::NativeInput::sensor(1, {0, fog::playstation::NativeInput::Gravity, 0})),
-                stream::protocol::remoteInput(fog::playstation::NativeInput::sensor(2, {1, 2, 3}))});
+                stream::protocol::remoteInput(fog::playstation::NativeInput::sensor(2, {1, 2, 3}))})) expected.push_back(command);
             assert(native.contactsInitialized() && native.counters().resetUpQueued == 2 &&
                 native.counters().up == 0 && native.counters().down == 1 && native.counters().rejected == 0);
             native.update(sample, 140, true, emit);
@@ -1656,15 +1686,66 @@ int main(int argc, char** argv) {
             }
             assert(fixture.remoteControls == expected);
             const auto input = client.inputDiagnostics();
-            assert(input.find("nativeUpSent=2 ") != std::string::npos &&
+            assert(input.find("nativeUpSent=" + std::to_string(attempt == 0 ? 2 : 3) + " ") != std::string::npos &&
                 input.find("nativeDownSent=1 ") != std::string::npos &&
-                input.find("accelSent=1 ") != std::string::npos && input.find("gyroSent=1 ") != std::string::npos);
+                input.find("accelSent=" + std::to_string(attempt == 0 ? 1 : 2) + " ") != std::string::npos &&
+                input.find("gyroSent=" + std::to_string(attempt == 0 ? 1 : 2) + " ") != std::string::npos);
             if (attempt == 0) assert(client.disconnectForRetry());
             else client.close();
         }
     }
     stream::Client::cleanupRuntime();
     std::cout << "PS native transport reset: two initial UPs before held DOWN/sensors, once per generation, same Client reconnect passed\n";
+    {
+        stream::Client client;
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            const std::string suffix = attempt == 0 ? "abcde" : "abcdf";
+            Fixture fixture("4000,4000", true, false, suffix);
+            assert(client.startForTesting("fixture", suffix,
+                "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+            const auto begin = Clock::now();
+            while (Clock::now() - begin < std::chrono::seconds(4)) {
+                fixture.pump(); client.pump(); fixture.sendMedia();
+                stream::Packet packet; while (client.poll(packet)) {}
+                assert(client.error().empty());
+                if (client.ready() && fixture.controlReady && fixture.pong) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(client.ready());
+            if (attempt == 0) {
+                assert(client.sendInput(fog::remote::key(true, "Enter")));
+                const auto downAt = Clock::now();
+                while (fixture.remoteControls.empty() && Clock::now() - downAt < std::chrono::seconds(1)) {
+                    fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                assert(fixture.remoteControls.size() == 1 && fixture.remoteControls[0]["id"] == "keydown");
+                client.blockControlForTesting(true);
+                for (unsigned n = 0; n < 47; ++n) assert(client.sendInput(fog::remote::key(true, "Enter")));
+                for (unsigned n = 0; n < 16; ++n)
+                    assert(client.sendControl(Json{{"id", "keyup"}, {"data", {{"code", "unused-" + std::to_string(n)}}}}.dump()));
+                assert(client.sendInput(fog::remote::key(false, "Enter")));
+                assert(client.diagnostics().find("controlBackpressure=1 ") != std::string::npos);
+                client.pump();
+                assert(client.error() == "Control channel backpressure" && client.retryableError());
+                const auto retryAt = Clock::now();
+                assert(client.disconnectForRetry());
+                assert(Clock::now() - retryAt < std::chrono::milliseconds(200));
+                assert(!fixture.closed && fixture.remoteControls.size() == 1);
+            } else {
+                assert(fixture.remoteControls.size() == 1 && fixture.remoteControls[0]["id"] == "keyup");
+                assert(!fixture.gamepadButton0.empty() && fixture.gamepadButton0.front() == 0);
+                assert(client.sendInput(fog::remote::key(true, "Enter")));
+                const auto freshAt = Clock::now();
+                while (fixture.remoteControls.size() < 2 && Clock::now() - freshAt < std::chrono::seconds(1)) {
+                    fixture.pump(); client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                assert(fixture.remoteControls.size() == 2 && fixture.remoteControls[1]["id"] == "keydown");
+                client.close();
+            }
+        }
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "Idle control overflow: retry without close, rejected release carried, neutral before fresh input, old presses discarded passed\n";
     // Failure before any control channel exists must retain the ICE owner too.
     {
         Fixture fixture("4000,4000", false);
@@ -1782,6 +1863,36 @@ int main(int argc, char** argv) {
     }
     stream::Client::cleanupRuntime();
     std::cout << "Blocked sender failure/retry publishes terminal error without join; frozen callbacks and old queued inputs discarded\n";
+    for (const bool competingTransportFailure : {false, true}) {
+        Fixture fixture;
+        stream::Client client;
+        assert(client.startForTesting("fixture", "abcde", "ws://127.0.0.1:" + std::to_string(fixture.server->port()) + "/ws/"));
+        const auto begin = Clock::now();
+        while (!client.ready() && Clock::now() - begin < std::chrono::seconds(4)) {
+            fixture.pump(); client.pump(); fixture.sendMedia();
+            stream::Packet packet; while (client.poll(packet)) {}
+            assert(client.error().empty()); std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        assert(client.ready());
+        client.blockControlSendForTesting(true);
+        assert(client.sendInput(fog::remote::key(true, "Enter")));
+        const auto blockedAt = Clock::now();
+        while (client.diagnostics().find("controlInFlight=1 ") == std::string::npos && Clock::now() - blockedAt < std::chrono::seconds(2))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        assert(client.diagnostics().find("controlInFlight=1 ") != std::string::npos);
+        client.advanceControlForTesting(15001);
+        client.blockControlSendForTesting(false, true);
+        const auto returnedAt = Clock::now();
+        while (client.diagnostics().find("controlTransportActive=1 ") != std::string::npos && Clock::now() - returnedAt < std::chrono::seconds(2))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        assert(client.diagnostics().find("controlTransportActive=0 ") != std::string::npos);
+        if (competingTransportFailure) client.failThenReceiveForTesting("{}", false);
+        client.pump();
+        assert(client.error() == "Control channel stalled" && !client.retryableError());
+        assert(!client.disconnectForRetry()); client.close();
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "Expired control operation remains terminal after late transport exception and competing failure passed\n";
     {
         // The remote DTLS close can make PeerConnection release ICE before the
         // application processes its queued callbacks. Preserve the RTC snapshot.

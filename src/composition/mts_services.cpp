@@ -1,4 +1,5 @@
 #include "composition/mts_services.hpp"
+#include "composition/moonlight_diagnostics.hpp"
 #include "app/app_diagnostics.hpp"
 #include "core/constants/resources.hpp"
 #include <switch.h>
@@ -32,7 +33,7 @@ public:
     fog::CatalogRepository& catalog() override { return catalog_; }
     fog::RentalRepository& rentals() override { return rentals_; }
     std::shared_ptr<fog::CatalogRepository> publicCatalog() override {
-        return fog::foghub::makePublicCatalog();
+        return fog::foghub::makePublicCatalog([](const std::string& message) { diagnostics::diagnostic(message); });
     }
     std::unique_ptr<fog::SessionJournal> sessionJournal(const std::string&) override { return {}; }
     std::unique_ptr<fog::CheckoutJournal> checkoutJournal(const std::string&) override { return {}; }
@@ -45,6 +46,7 @@ public:
     std::unique_ptr<stream::StreamingClient> stream() override { return moonlight_.create(); }
     void cancel() noexcept override { session_.cancel(); }
 private:
+    MoonlightDiagnosticsBridge moonlightDiagnostics_;
     std::unique_ptr<fog::foghub::WebTransport> transport_;
     std::unique_ptr<fog::foghub::CookieStore> storage_;
     fog::foghub::Session session_;

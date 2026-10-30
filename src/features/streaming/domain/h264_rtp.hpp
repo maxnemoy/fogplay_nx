@@ -2,6 +2,7 @@
 // H.264 packetization-mode 1 / HEVC RFC 7798 receiver (base layer, no DONL). No RTC, platform or decoder dependencies.
 // All methods must be serialized by the owner. Time is monotonic milliseconds.
 #include "features/streaming/domain/media_annexb.hpp"
+#include "features/streaming/domain/video_limits.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -67,7 +68,7 @@ public:
     }
     std::uint32_t sourceSsrc() const { return initialized_ ? ssrc_ : 0; }
     static constexpr std::size_t MaxPending = 256, MaxPendingBytes = 2 * 1024 * 1024;
-    static constexpr std::size_t MaxFrameBytes = 4 * 1024 * 1024, MaxFrames = 8;
+    static constexpr std::size_t MaxFrameBytes = MaxVideoAccessUnitBytes, MaxFrames = 8;
     const Stats& stats() const { return stats_; }
     bool waiting() const { return waiting_; }
     bool needsPli() const { return waiting_; }

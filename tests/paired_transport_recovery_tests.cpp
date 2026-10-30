@@ -1,6 +1,15 @@
 #include "app/application_controller.hpp"
 #include <iostream>
 
+namespace fogplay {
+// This executable tests transport recovery without linking settings/UI code.
+// Quality resume is exercised with the real implementation in the paired
+// video-settings suite; reaching that path here indicates a fixture regression.
+void ApplicationController::resumePairedVideoAfterClose() {
+    throw std::logic_error("unexpected quality resume in transport recovery fixture");
+}
+}
+
 namespace {
 using fogplay::ApplicationController;
 using Reconnect = fog::stream::TransportReconnect;

@@ -173,6 +173,9 @@ Session::Session(WebTransport& transport, CookieStore& storage, Diagnostic diagn
 void Session::balanceDiagnostic(const std::string& message) const noexcept {
     try { if (diagnostic_) diagnostic_("FogHub balance: "+message); } catch (...) {}
 }
+void Session::catalogDiagnostic(const std::string& message) const noexcept {
+    try { if (diagnostic_) diagnostic_("FogHub featured catalog: "+message); } catch (...) {}
+}
 void Session::validateLogin(const LoginRequest& request) const {
     if (!clean(request.identifier,128) || !clean(request.secret,1024))
         fail(RepositoryErrorKind::InvalidRequest,"Enter FogHub login and password");
@@ -427,21 +430,31 @@ std::vector<Computer> Catalog::playStationComputers(const CatalogProgress& progr
     std::vector<Computer> result;
     for (const auto* id : {"1838", "1836", "1233", "1232", "1231", "1235", "1237", "1230"}) {
         if (cancelled && cancelled()) fail(RepositoryErrorKind::Unavailable,"FogHub catalog cancelled");
-        const auto row = parseComputerPreview(session_.readPublic(std::string("/pc/preview?id=")+id),id);
+        const auto page = session_.readPublic(std::string("/pc/preview?id=")+id);
         if (cancelled && cancelled()) fail(RepositoryErrorKind::Unavailable,"FogHub catalog cancelled");
         Computer computer;
-        computer.id = {ProviderId::FogHub,row.id}; computer.name = row.name;
-        computer.listed = true;
-        computer.availability = row.busy ? Availability::Busy : row.online ? Availability::Online : Availability::Offline;
-        if (!row.pricePerHour.empty()) {
-            computer.hourlyPrice = money(row.pricePerHour);
-            if (computer.hourlyPrice->minorUnits <= 0) fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub hourly price");
-            computer.price = row.pricePerHour;
+        try {
+            const auto row = parseComputerPreview(page,id);
+            computer.id = {ProviderId::FogHub,row.id}; computer.name = row.name;
+            computer.listed = true;
+            computer.availability = row.busy ? Availability::Busy : row.online ? Availability::Online : Availability::Offline;
+            if (!row.pricePerHour.empty()) {
+                computer.hourlyPrice = money(row.pricePerHour);
+                if (computer.hourlyPrice->minorUnits <= 0) fail(RepositoryErrorKind::InvalidResponse,"Invalid FogHub hourly price");
+                computer.price = row.pricePerHour;
+            }
+            computer.launchable = row.fhAvailable && computer.hourlyPrice.has_value();
+        } catch (const RepositoryError& error) {
+            if (error.kind() != RepositoryErrorKind::InvalidResponse) throw;
+            // The selected ID is fixed locally. Never log HTML, credentials,
+            // response values or exception text from an unverified card.
+            session_.catalogDiagnostic(std::string("card-skipped id=")+id+" reason=invalid-response");
+            continue;
         }
-        computer.launchable = row.fhAvailable && computer.hourlyPrice.has_value();
         result.push_back(std::move(computer));
         if (progress) progress(result);
     }
+    if (result.empty()) fail(RepositoryErrorKind::InvalidResponse,"No verified FogHub featured computers");
     return result;
 }
 ReadRepositories::ReadRepositories(const std::string& cookiePath) : transport_(makeWebTransport()),storage_(makeCookieStore(cookiePath)),
@@ -456,12 +469,13 @@ public:
 struct PublicCatalog {
     std::unique_ptr<WebTransport> transport = makeWebTransport();
     EphemeralCookies storage;
-    Session session{*transport,storage};
+    Session session;
     Catalog catalog{session};
+    explicit PublicCatalog(Session::Diagnostic diagnostic) : session(*transport,storage,std::move(diagnostic)) {}
 };
 }
-std::shared_ptr<CatalogRepository> makePublicCatalog() {
-    auto owner = std::make_shared<PublicCatalog>();
+std::shared_ptr<CatalogRepository> makePublicCatalog(Session::Diagnostic diagnostic) {
+    auto owner = std::make_shared<PublicCatalog>(std::move(diagnostic));
     return {owner,&owner->catalog};
 }
 std::shared_ptr<CatalogRepository> ReadRepositories::publicCatalog() { return makePublicCatalog(); }

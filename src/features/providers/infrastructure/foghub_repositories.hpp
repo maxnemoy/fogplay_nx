@@ -27,6 +27,7 @@ public:
     std::string readPublic(const std::string& path);
     void cancel() noexcept { transport_.cancel(); }
 private:
+    friend class Catalog;
     friend class Rentals;
     // Raw page evidence stays private to infrastructure. Rental commands use
     // the same complete/account-verified history reader as the read adapter.
@@ -48,6 +49,7 @@ private:
     void persist();
     void accept(const UserProfile& profile);
     void balanceDiagnostic(const std::string&) const noexcept;
+    void catalogDiagnostic(const std::string&) const noexcept;
     WebTransport& transport_;
     CookieStore& storage_;
     AuthData auth_{{ProviderId::FogHub,{}}, AuthState::SignedOut, 0};
@@ -93,7 +95,7 @@ private:
 };
 
 // Isolated public catalog with in-memory cookies and no account storage.
-std::shared_ptr<CatalogRepository> makePublicCatalog();
+std::shared_ptr<CatalogRepository> makePublicCatalog(Session::Diagnostic diagnostic = {});
 
 // Owns the read adapters; composition attaches rental and streaming separately.
 class ReadRepositories {

@@ -35,6 +35,8 @@ cp "$ROOT/third_party/moonlight/prepared/libgamestream/"*.h "$PREFIX/include/gam
 cp "$ROOT/third_party/moonlight/prepared/crypto/"*.hpp "$PREFIX/include/crypto/"
 cp "$ROOT/third_party/moonlight/moonlight-switch/extern/moonlight-common-c/src/Limelight.h" "$PREFIX/include/"
 cp "$ROOT/tools/moonlight/FogMoonlightDiagnostics.h" "$PREFIX/include/"
+cp "$ROOT/tools/moonlight/FogMoonlightRecovery.h" "$PREFIX/include/"
+cp "$ROOT/tools/moonlight/FogMoonlightTermination.h" "$PREFIX/include/"
 cp "$ROOT/tools/moonlight/compat/Settings.hpp" "$PREFIX/include/"
 cp "$ROOT/tools/moonlight/compat/Diagnostics.hpp" "$PREFIX/include/"
 python3 "$ROOT/tools/moonlight/manifest.py" "$PREFIX"

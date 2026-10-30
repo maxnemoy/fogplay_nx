@@ -39,7 +39,7 @@ inline ThreadObservations& threadObservations() {
     return state;
 }
 inline bool persistentThreadRole(const char* role) {
-    for (const char* value : {"application", "runlog", "artwork", "steam-artwork", "latency",
+    for (const char* value : {"application", "runlog", "artwork", "steam-artwork", "latency", "settings-save",
             "RTC worker", "RTC poll", "RTC server", "juice poll", "juice mux", "juice agent",
             "SCTP timer", "SCTP iterator", "rtc-control", "rtc-signaling"})
         if (std::strcmp(role, value) == 0) return true;

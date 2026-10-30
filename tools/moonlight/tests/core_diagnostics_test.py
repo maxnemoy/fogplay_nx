@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[3]
 TOOLS = ROOT / "tools/moonlight"
 CORE = ROOT / "third_party/moonlight/moonlight-switch/extern/moonlight-common-c/src"
 NAMES = ("Connection.c", "VideoStream.c", "RtpVideoQueue.c", "VideoDepacketizer.c",
-         "ControlStream.c", "LinkedBlockingQueue.c", "PlatformSockets.c", "PlatformStuff.c")
+         "ControlStream.c", "LinkedBlockingQueue.c", "PlatformSockets.c", "PlatformStuff.c", "RtspConnection.c")
 sys.path.insert(0, str(TOOLS))
 from diagnostics import apply
 from idr_diagnostics import apply as apply_idr_diagnostics, validate_frame_header_policy

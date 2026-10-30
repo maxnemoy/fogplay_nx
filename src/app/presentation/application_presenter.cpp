@@ -281,7 +281,9 @@ void ApplicationController::draw() {
         ui_.dialog({uiText::Server::TerminationUnconfirmed,
             hint,uiText::Common::Check,"",true,true});
     } else if (screen_ == Screen::Streaming) {
-        if (transportReconnect_.recovering())
+        if (transportTeardown_.pending())
+            ui_.empty(uiText::Stream::StoppingTransport,uiText::Stream::StoppingTransportNotice);
+        else if (transportReconnect_.recovering())
             ui_.empty(uiText::Stream::Reconnecting,uiText::Stream::ReconnectNotice);
         else ui_.empty(uiText::Stream::ConnectingComputer,uiText::Stream::FirstFrameHint);
     } else if (screen_ == Screen::Consent) {
@@ -304,6 +306,8 @@ void ApplicationController::draw() {
         ui_.status(playStationError_,false,true);
     else if (screen_ != Screen::Genres && screen_ != Screen::SessionRating && (pending_.valid() || !routineStatus(status_)))
         ui_.status(pending_.valid() ? uiText::Common::Loading : status_, pending_.valid());
+    if (transportTeardown_.pending() && screen_ != Screen::Streaming)
+        ui_.status(uiText::Stream::StoppingTransport,true);
     if (screen_ == Screen::Streaming) drawStreamOverlay();
     if (screen_ == Screen::Streaming && media_) media_->present();
     else SDL_RenderPresent(rt_.renderer);

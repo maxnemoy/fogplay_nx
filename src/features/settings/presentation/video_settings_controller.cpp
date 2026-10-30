@@ -21,12 +21,24 @@ void ApplicationController::changeVideoSettings(const fog::video::Settings& valu
     } else {
         videoSettings_ = value;
     }
-    bool saved = false;
+    videoSaveStatus_ = uiText::Settings::Saving;
     try {
-        fog::video::saveSettings(storagePaths::path(storagePaths::VideoSettings), videoSettings_);
-        saved = true;
-    } catch (...) { diagnostic("Video settings save failed; no settings payload logged."); }
-    videoSaveStatus_ = saved ? uiText::Settings::Saved : uiText::Settings::NotSaved;
+        settingsSaves_.submit(fog::settings::Key::Video, [value = videoSettings_] {
+            fog::video::saveSettings(storagePaths::path(storagePaths::VideoSettings), value);
+        }, [this](bool saved) {
+            // Preserve notices about active transport/FPS while replacing only
+            // the persistence prefix owned by this latest settings revision.
+            const std::string pending = uiText::Settings::Saving;
+            const auto notice = videoSaveStatus_.compare(0, pending.size(), pending) == 0 ?
+                videoSaveStatus_.substr(pending.size()) : std::string{};
+            videoSaveStatus_ = std::string(saved ? uiText::Settings::Saved : uiText::Settings::NotSaved) + notice;
+            overlay_.setSaveStatus(videoSaveStatus_);
+            if (!saved) diagnostic("Video settings save failed; active preferences remain in memory.");
+        });
+    } catch (...) {
+        videoSaveStatus_ = uiText::Settings::NotSaved;
+        diagnostic("Video settings save dispatch failed; active preferences remain in memory.");
+    }
     if (foghub) {
         if (previous.codec != videoSettings_.codec || previous.bitrateMbps != videoSettings_.bitrateMbps) {
             if (requestPairedVideoReconnect()) videoSaveStatus_ += uiText::Settings::FogHubReconnectNotice;
@@ -54,11 +66,11 @@ bool ApplicationController::requestPairedVideoReconnect() {
         return false;
     }
     // Additional edits while ownership verification runs share its one result;
-    // the new transport picks up the latest saved codec/bitrate preferences.
-    if (pairedVideoReconnectPending_) return true;
+    // the new transport picks up the latest in-memory codec/bitrate preferences.
+    if (pairedVideoReconnectPending_ || pairedVideoResumeAfterClose_) return true;
     if (pending_.valid()) {
         // A different UI operation must not interrupt a healthy paid stream.
-        // Preferences are already saved; the user can retry after it completes.
+        // Preferences are queued for saving; retry after it completes.
         videoSaveStatus_ += uiText::Settings::FogHubReconnectBusyNotice;
         return false;
     }
@@ -110,20 +122,32 @@ bool ApplicationController::completePairedVideoReconnect() {
         !stopAfterTask_ && !exitAfterStop_ && !shutdownDone_ &&
         stream_ && stream_->ready() && !stream_->disconnected() && stream_->error().empty();
     if (!ready) { beginFinish("paired-quality-verification-refused"); return true; }
+    pairedVideoResumeAfterClose_ = true;
     if (!closeTransport(false)) { beginFinish("paired-quality-disconnect-refused"); return true; }
+    if (transportTeardown_.pending()) return true;
+    pairedVideoResumeAfterClose_ = false;
+    resumePairedVideoAfterClose();
+    return true;
+}
+
+void ApplicationController::resumePairedVideoAfterClose() {
+    if (stopAfterTask_ || shutdownDone_ || exitAfterStop_ || !pairedPending_ ||
+        !sessionPending_ || streamRental_.empty() || screen_ != Screen::Streaming) {
+        beginFinish("paired-quality-resume-cancelled");
+        return;
+    }
     try {
         // Retain rental ownership, recovery journal and recent-launch attribution.
         // resumeOnly forbids launching an app, creating or pairing another rental.
         if (startTransport(true)) {
             status_ = uiText::Settings::FogHubReconnectStatus;
             diagnostic("FH quality reconnect: verified same-rental resume requested.");
-            return true;
+            return;
         }
     } catch (...) {
         diagnostic("FH quality reconnect: transport setup failed; stopping owned rental.");
     }
     beginFinish("paired-quality-resume-failed");
-    return true;
 }
 
 }

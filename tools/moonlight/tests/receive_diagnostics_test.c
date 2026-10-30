@@ -19,6 +19,8 @@ typedef struct { uint16_t sequenceNumber; uint32_t timestamp, ssrc; } RTP_PACKET
 typedef struct { uint32_t frameNumber; } ENC_VIDEO_HEADER, *PENC_VIDEO_HEADER;
 typedef void* PRTPV_QUEUE_ENTRY;
 static int scenario, iterations, maximumIterations, terminated, rtpCalls;
+static unsigned recoveryPolls;
+static void FogIdrRecoveryPollDecoder(void) { recoveryPolls++; }
 static uint64_t nowUs;
 static unsigned char storage[256], encryptedStorage[256];
 static uint64_t PltGetMicroseconds(void) { nowUs += 10; return nowUs; }
@@ -63,12 +65,14 @@ int main(void) {
     for (scenario = 0; scenario <= 9; scenario++) {
         FogDiagReset();
         nowUs = 1000; iterations = 0; terminated = 0; rtpCalls = 0;
+        recoveryPolls = 0;
         maximumIterations = 2;
         run();
         FogMoonlightDiagnostics snapshot;
         FogMoonlightGetDiagnostics(&snapshot);
         const bool breaks = scenario <= 2 || scenario == 4;
         const uint64_t expectedCycles = breaks ? 1 : 2;
+        assert(recoveryPolls == expectedCycles); // includes pure socket timeouts
         assert(snapshot.videoReceiveCycleCount == expectedCycles);
         assert(snapshot.videoReceiveAllocationCount == (scenario >= 8 ? 2 : 1));
         assert(snapshot.videoReceiveLoopGapCount == expectedCycles - 1);

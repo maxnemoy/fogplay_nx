@@ -1,16 +1,21 @@
 #include "core/diagnostics/latency_histogram.hpp"
+#include "core/constants/stage1_options.hpp"
 #include "moonlight_session.hpp"
 #include "app_selection.hpp"
 #include "frame_diagnostics.hpp"
 #include "resume_retry.hpp"
 #include "transport_retry.hpp"
 #include "controller_input.hpp"
+#include "video_input_gate.hpp"
+#include "features/streaming/domain/video_limits.hpp"
 #include "core/diagnostics/thread_observation.hpp"
 #include "features/streaming/application/remote_input.hpp"
 #include "features/streaming/infrastructure/rumble_mailbox.hpp"
 #include <Settings.hpp>
 #include <Diagnostics.hpp>
 #include <FogMoonlightDiagnostics.h>
+#include <FogMoonlightRecovery.h>
+#include <FogMoonlightTermination.h>
 #include <gamestream/client.h>
 #include <gamestream/errors.h>
 #include <switch.h>
@@ -62,13 +67,16 @@ struct State {
     std::string identity, endpoint;
     std::atomic<bool> valid{true}, paired{false}, pairDone{false}, pairOK{false};
     std::atomic<bool> stop{false}, running{false}, starting{false}, streamInUse{false};
+    std::atomic<bool> workerFinished{true};
     std::atomic<bool> terminated{false}, failed{false}, decoderWaiting{true}, assemblyWaiting{true};
     std::atomic<bool> fatalFailure{false}, retryableFailure{false};
     std::atomic<bool> coreDiagnosticsReady{false};
     std::atomic<int> code{0};
     std::atomic<int> terminationCode{0};
+    std::atomic<int> terminationOrigin{FOG_TERMINATION_TRANSPORT};
     std::atomic<int> application{0};
     std::atomic<std::uint64_t> transportClosedMs{0};
+    std::atomic<std::uint64_t> lastVideoMs{0};
     std::atomic<stream::VideoCodec> selectedCodec{stream::VideoCodec::H264};
     std::atomic<int> negotiatedWidth{0}, negotiatedHeight{0}, negotiatedFps{0};
     std::atomic<std::uint64_t> frames{0}, audioFrames{0}, videoDrops{0}, audioDrops{0}, inputAccepted{0}, inputRejected{0};
@@ -112,8 +120,12 @@ void stageFailed(int, int code) { if (auto* state = active.load()) state->code =
 void terminated(int code) {
     if (auto* state = active.load()) {
         std::lock_guard<std::mutex> lock(state->mutex);
+        const auto origin = FogMoonlightGetTerminationOrigin();
+        // Retain terminal evidence even if another callback races teardown.
+        if (state->terminated && state->fatalFailure && origin != FOG_TERMINATION_HOST) return;
         state->code = code; state->terminationCode = code;
-        if (!detail::retryableTransportError(code)) state->fatalFailure = true;
+        state->terminationOrigin = origin;
+        if (state->terminationOrigin == FOG_TERMINATION_HOST || !detail::retryableTransportError(code)) state->fatalFailure = true;
         state->terminated = true; state->rumble.clear();
     }
 }
@@ -159,8 +171,7 @@ void audioSample(char* bytes, int size) {
     } catch (...) { state->fatalFailure = true; state->failed = true; state->terminated = true; state->code = -900; }
 }
 bool copyFrame(const DECODE_UNIT& unit, std::vector<std::byte>& target) {
-    constexpr std::size_t limit = 8 * 1024 * 1024;
-    if (unit.fullLength <= 0 || static_cast<std::size_t>(unit.fullLength) > limit) return false;
+    if (unit.fullLength <= 0 || static_cast<std::size_t>(unit.fullLength) > stream::MaxVideoAccessUnitBytes) return false;
     target.reserve(unit.fullLength);
     std::size_t entries = 0;
     for (auto* item = unit.bufferList; item; item = item->next) {
@@ -240,6 +251,7 @@ void drainVideo(State& state) {
                     state.assemblyWaiting = false;
                     packet.videoGeneration = state.generation;
                     state.video.push_back(std::move(packet)); ++state.frames; result = DR_OK;
+                    state.lastVideoMs = nowMs();
                     state.videoQueueHigh = std::max(state.videoQueueHigh.load(), static_cast<std::uint64_t>(state.video.size()));
                 } else ++state.videoInvalid;
             } else if (!unit) ++state.videoInvalid;
@@ -325,13 +337,21 @@ bool launch(State& state, bool resumeOnly) {
                 ++state.commandFailures;
             }
         }
+        if (code == GS_OK) {
+            // An acknowledged command owns this app even if its HTTP budget
+            // just expired. Start a distinct transport stage; never clear a
+            // manual cancellation or replay /launch because the reply was late.
+            state.application = *selected;
+            if (state.stop || !state.valid || Settings::instance().cancel_requested()) {
+                if (!state.stop) state.fail("Moonlight application request cancelled");
+                return false;
+            }
+            Settings::instance().set_timeout_ms(15000);
+            return true;
+        }
         if (applicationRequestAborted(state)) return false;
         if (resumeOnly && Clock::now() >= deadline) {
             state.fail("Moonlight application resume deadline exceeded"); return false;
-        }
-        if (code == GS_OK) {
-            if (!resumeOnly) state.application = *selected;
-            return true;
         }
         const bool retry = resumeOnly && command.operation == moonlight_diagnostics::CommandOperation::Resume &&
             Retry::retryable(command.curl,command.http,command.xmlStatus,command.xmlResult,
@@ -362,8 +382,10 @@ public:
         resumeOnly_ = connection.resumeOnly;
         state_->rumble.clear();
         state_->stop = false; state_->failed = false; state_->terminated = false;
+        state_->workerFinished = false;
         state_->fatalFailure = false; state_->retryableFailure = false;
         state_->code = 0; state_->terminationCode = 0;
+        state_->terminationOrigin = FOG_TERMINATION_TRANSPORT;
         state_->frames = 0; state_->audioFrames = 0; state_->videoDrops = 0; state_->audioDrops = 0;
         state_->inputAccepted = 0; state_->inputRejected = 0; state_->inputIgnored = 0;
         state_->accelRateHz = 0; state_->gyroRateHz = 0; lastMotionMs_ = {};
@@ -374,6 +396,7 @@ public:
         state_->selectedCodec = stream::VideoCodec::H264;
         state_->negotiatedWidth = 0; state_->negotiatedHeight = 0; state_->negotiatedFps = 0;
         state_->decoderWaiting = true; state_->assemblyWaiting = true;
+        state_->lastVideoMs = 0;
         { std::lock_guard<std::mutex> lock(state_->mutex); state_->video.clear(); state_->audio.clear(); state_->error.clear();
             state_->command = {}; state_->firstCommandFailure = {}; state_->commandFailures = 0;
             state_->commandAttempt = 0; state_->closedToResumeMs = 0; ++state_->generation; }
@@ -389,7 +412,7 @@ public:
         Settings::instance().reset_cancel();
         Settings::instance().set_timeout_ms(resumeOnly_ ? detail::ResumeRetry::BudgetMs : 25000);
         try { worker_ = std::thread(&Client::run, this); }
-        catch (...) { state_->streamInUse = false; state_->fail("Cannot start Moonlight worker"); return false; }
+        catch (...) { state_->workerFinished = true; state_->streamInUse = false; state_->fail("Cannot start Moonlight worker"); return false; }
         return true;
     }
     bool configureVideo(const fog::video::Settings& value) override {
@@ -411,7 +434,15 @@ public:
         return "FogHub 720p" + std::to_string(settings_.framesPerSecond) + " / " + std::string(stream::videoCodecName(selectedVideoCodec())) +
             " / " + std::to_string(settings_.bitrateMbps) + " Мбит/с (запрос)";
     }
-    void pump() override {}
+    void pump() override {
+        // The application keeps pumping while LiStartConnection runs. Its
+        // transport-stage deadline is independent of the acknowledged HTTP
+        // command and can interrupt a blocked core handshake.
+        if (state_->starting && Settings::instance().request_cancelled()) {
+            std::lock_guard<std::mutex> lock(state_->apiMutex);
+            if (state_->starting) LiInterruptConnection();
+        }
+    }
     void observePlayback(const stream::PlaybackObservation&) override {}
     bool poll(stream::Packet& packet) override { return take(packet, false); }
     bool pollAudio(stream::Packet& packet) override { return take(packet, true); }
@@ -486,6 +517,7 @@ public:
             " inputAccepted=" + std::to_string(state_->inputAccepted.load()) +
             " inputRejected=" + std::to_string(state_->inputRejected.load()) +
             " terminationCode=" + std::to_string(state_->terminationCode.load()) +
+            " terminationOrigin=" + (state_->terminationOrigin == FOG_TERMINATION_HOST ? "host" : "transport") +
             " retryableFailure=" + std::to_string(state_->retryableFailure.load()) +
             " fatalFailure=" + std::to_string(state_->fatalFailure.load());
     }
@@ -612,11 +644,28 @@ public:
             " accelRateHz=" + std::to_string(state_->accelRateHz.load()) + " gyroRateHz=" + std::to_string(state_->gyroRateHz.load());
     }
     bool pollVideoDiagnostic(std::string&) override { return false; }
-    bool waitingForVideoKeyframe() const override { return state_->assemblyWaiting || state_->decoderWaiting; }
+    bool waitingForVideoKeyframe() const override {
+        return state_->assemblyWaiting || state_->decoderWaiting;
+    }
+    stream::InputSuspension inputSuspension() const override {
+        const auto core = coreSnapshot();
+        const auto last = state_->lastVideoMs.load();
+        const auto now = nowMs();
+        return {core.waitingForIdr != 0, state_->assemblyWaiting || state_->decoderWaiting,
+            !last || (now >= last && now - last >= 150)};
+    }
     bool requestVideoKeyframe() override {
         std::lock_guard<std::mutex> lock(state_->apiMutex);
         if (!state_->running || state_->stop) return false;
-        LiRequestIdrFrame(); return true;
+        if (fog::stage1::localIdrRetry && state_->decoderWaiting) {
+            // Hand local decode failures to the existing core wait/retry path.
+            // The receive thread owns depacketizer state and consumes this command.
+            FogIdrRecoveryRequestDecoderRefresh();
+            std::lock_guard<std::mutex> queueLock(state_->mutex);
+            state_->videoDrops += state_->video.size(); state_->video.clear();
+            state_->assemblyWaiting = true; ++state_->generation;
+        } else LiRequestIdrFrame();
+        return true;
     }
     void setDecoderWaitingForKeyframe(bool waiting) override { state_->decoderWaiting = waiting; }
     std::string inputLatencyDiagnostics() const override {
@@ -645,12 +694,15 @@ public:
         state_->rumble.clear();
         { std::lock_guard<std::mutex> lock(state_->apiMutex); if (state_->starting) LiInterruptConnection(); }
         // Cancel pending /applist, /launch or /resume as well as LiStartConnection.
-        while (state_->streamInUse) {
+        while (!state_->workerFinished) {
             Settings::instance().request_cancel();
             { std::lock_guard<std::mutex> lock(state_->apiMutex); if (state_->starting) LiInterruptConnection(); }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         worker_.join();
+        // Pairing and other clients cannot replace the authenticated State or
+        // its process-global protocol lease until every worker has really joined.
+        state_->streamInUse = false;
         state_->rumble.clear();
     }
 private:
@@ -666,7 +718,7 @@ private:
     }
     bool retryableFailure() const {
         if (state_->fatalFailure) return false;
-        return state_->terminated ? detail::retryableTransportError(state_->terminationCode) :
+        return state_->terminated ? state_->terminationOrigin != FOG_TERMINATION_HOST && detail::retryableTransportError(state_->terminationCode) :
             state_->failed && state_->retryableFailure;
     }
     FogMoonlightDiagnostics coreSnapshot() const {
@@ -763,7 +815,7 @@ private:
                 active = state_.get();
                 { std::lock_guard<std::mutex> lock(state_->apiMutex);
                     if (!state_->stop && state_->valid && !Settings::instance().request_cancelled()) {
-                        Settings::instance().reset_cancel(); state_->starting = true;
+                        state_->starting = true;
                     }
                 }
                 int result = -1;
@@ -771,7 +823,7 @@ private:
                 { std::lock_guard<std::mutex> lock(state_->apiMutex); state_->starting = false; }
                 if (result != 0) {
                     if (!state_->stop) state_->fail("Moonlight connection failed", result,
-                        resumeOnly_ && result != -1 && detail::retryableTransportError(result));
+                        result != -1 && detail::retryableTransportError(result));
                 }
                 else {
                     started = true; state_->coreDiagnosticsReady = true;
@@ -790,26 +842,28 @@ private:
                         std::this_thread::sleep_for(std::chrono::milliseconds(3));
                     }
                     if (state_->terminated) state_->fail("Moonlight host disconnected", state_->terminationCode,
-                        detail::retryableTransportError(state_->terminationCode));
+                        state_->terminationOrigin != FOG_TERMINATION_HOST && detail::retryableTransportError(state_->terminationCode));
                 }
             }
         } catch (...) { state_->fail("Moonlight worker failed"); }
         {
             std::lock_guard<std::mutex> lock(state_->apiMutex);
             state_->running = false; state_->starting = false;
-            if (started) {
-                LiSendMultiControllerEvent(0, 0, 0, 0, 0, 0, 0, 0, 0);
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MOUSE_LEFT);
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MOUSE_RIGHT);
-                for (short key : {short(0x0d), short(0x08), short(0x09), short(0x1b)}) LiSendKeyboardEvent(key, KEY_ACTION_UP, 0);
-                LiStopConnection();
-                state_->transportClosedMs = nowMs();
-            }
-            active = nullptr;
-            state_->rumble.clear();
         }
+        // UI input only takes apiMutex long enough to observe running=false;
+        // no caller can enter a core API while stop joins its internal threads.
+        if (started) {
+            LiSendMultiControllerEvent(0, 0, 0, 0, 0, 0, 0, 0, 0);
+            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MOUSE_LEFT);
+            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MOUSE_RIGHT);
+            for (short key : {short(0x0d), short(0x08), short(0x09), short(0x1b)}) LiSendKeyboardEvent(key, KEY_ACTION_UP, 0);
+            LiStopConnection();
+            state_->transportClosedMs = nowMs();
+        }
+        active = nullptr;
+        state_->rumble.clear();
         drainCoreEvents();
-        state_->streamInUse = false;
+        state_->workerFinished = true;
         state_->changed.notify_all();
     }
 };

@@ -1,4 +1,5 @@
 #include "app/application_controller.hpp"
+#include "core/constants/stage1_options.hpp"
 #include <iomanip>
 #include <sstream>
 
@@ -18,7 +19,8 @@ void ApplicationController::samplePlayStationInput(PadState& pad) {
     const auto now=clockMs();
     const auto& sample=psSensors_.update(pad,now);
     const bool suppressed=overlay_.mode()!=fog::stream::OverlayMode::Closed || transportReconnect_.recovering() ||
-        videoRecovery_.active() || videoLossWaiting_ || !stream_ || !stream_->ready();
+        videoRecovery_.active() || videoLossWaiting_ || !stream_ || !stream_->ready() ||
+        (fog::stage1::inputFreezeGate && stream_->inputSuspended());
     psTouchTrace_.observe(sample,now,suppressed);
     if (sample.motion.valid && sample.motion.fresh) {
         float peak=0;

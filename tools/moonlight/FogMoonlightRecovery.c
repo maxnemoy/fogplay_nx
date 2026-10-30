@@ -25,9 +25,17 @@ static uint64_t retryInterval(void) { return 500000; }
 
 _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "Recovery requires lock-free atomics");
 static _Atomic unsigned long long lastRequestTick;
+static atomic_bool decoderRefreshPending;
 
 void FogIdrRecoveryReset(void) {
     atomic_store_explicit(&lastRequestTick, 0, memory_order_relaxed);
+    atomic_store_explicit(&decoderRefreshPending, false, memory_order_relaxed);
+}
+void FogIdrRecoveryRequestDecoderRefresh(void) {
+    atomic_store_explicit(&decoderRefreshPending, true, memory_order_release);
+}
+bool FogIdrRecoveryTakeDecoderRefresh(void) {
+    return atomic_exchange_explicit(&decoderRefreshPending, false, memory_order_acquire);
 }
 void FogIdrRecoveryRequested(void) {
     const uint64_t now = recoveryNow();

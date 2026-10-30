@@ -1,4 +1,5 @@
 #include "core/logging/run_log.hpp"
+#include "core/constants/stage1_options.hpp"
 #include <cerrno>
 #include <atomic>
 #include <chrono>
@@ -60,6 +61,32 @@ struct Fixture {
     std::string path(const char* name) const { return (root / name).string(); }
     ~Fixture() { resetFaults(); std::error_code ignored; std::filesystem::remove_all(root, ignored); }
 };
+void deferredSync() {
+    Fixture fixture;
+    fog::RunLog log;
+    require(log.start(fixture.root.string(), 123), "deferred sync start");
+    const auto synced = fileSyncCalls.load();
+    require(log.append("ordinary"), "deferred append");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!log.stats().writtenLines && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    require(log.stats().writtenLines == 1, "ordinary batch still written promptly");
+    if (fog::stage1::sparseDiagnostics) {
+        require(fileSyncCalls == synced, "ordinary batch does not fsync");
+        const auto syncDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+        while (fileSyncCalls < synced + 2 && std::chrono::steady_clock::now() < syncDeadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        require(fileSyncCalls >= synced + 2, "idle writer syncs within five-second deadline");
+    } else {
+        require(fileSyncCalls >= synced + 2, "baseline commits both sinks with every ordinary batch");
+    }
+    require(log.flush(), "explicit barrier syncs earlier writes");
+    require(fileSyncCalls >= synced + 2, "both sinks synced at barrier");
+    require(readFile(log.archivePath()) == "ordinary\n", "barrier retained ordinary line");
+    require(log.append("shutdown"), "shutdown append");
+    log.close();
+    require(readFile(log.archivePath()) == "ordinary\nshutdown\n", "shutdown drains unsynced lines");
+}
 void collisionAndMirror() {
     Fixture fixture;
     std::filesystem::create_directory(fixture.root / "logs");
@@ -518,7 +545,7 @@ extern "C" int __wrap_rename(const char* from, const char* to) {
 }
 int main() {
     try {
-        collisionAndMirror(); legacyMigration(); missingSources(); markerWriteFailure();
+        deferredSync(); collisionAndMirror(); legacyMigration(); missingSources(); markerWriteFailure();
         migrationRenameFailure(); markerSyncAndRotationFailures();
         renamedLegacyIsNotRepeated(); trackedMirrorMismatchAndRecovery(); linkedMirrorIsNeverTruncatedThroughArchive(); largeHistoryStartup();
         failedArchiveDirectory(); syncFailures(); mirrorFailure(); invalidLegacyAndCommit(); reuseCommitFailureRetainsMirror();

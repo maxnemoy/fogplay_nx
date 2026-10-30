@@ -305,12 +305,39 @@ void boundsAndCancellation(const std::string& directory) {
     require(disk.at("records").size() <= 4, "Disk record bound ignored");
 }
 }
+static void pauseAndResume() {
+    std::atomic_int calls{0};
+    std::atomic_bool interrupted{false};
+    fog::SteamArtworkResolver resolver([&](const auto& title, const auto& cancelled) {
+        if (++calls == 1) {
+            while (!cancelled.load()) std::this_thread::sleep_for(1ms);
+            interrupted = true;
+            return fog::SteamSearchResponse{};
+        }
+        return fog::SteamSearchResponse{200, response(title, 555)};
+    });
+    resolver.setPaused(true);
+    require(resolver.request(1, "Pause Game"), "pause accepts queue");
+    std::this_thread::sleep_for(30ms);
+    require(calls == 0, "paused resolver started network");
+    resolver.setPaused(false); entered(calls);
+    resolver.setPaused(true);
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!interrupted && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    require(interrupted, "pause did not interrupt request");
+    std::this_thread::sleep_for(30ms);
+    require(calls == 1 && resolver.stats().pending == 1, "paused request was lost or retried");
+    resolver.setPaused(false); idle(resolver);
+    require(calls == 2 && !resolver.get(1, "Pause Game").empty(), "resume did not retry without cooldown");
+    resolver.setPaused(true); resolver.stop();
+}
 int main() {
     char temporary[] = "/tmp/fogplay-steam-tests-XXXXXX";
     const auto* created = mkdtemp(temporary);
     if (!created) return 2;
     const std::string root = created;
     try {
+        pauseAndResume();
         matching(); std::cout << "matching/aliases/Unicode: passed\n";
         persistence(root + "/persistent"); std::cout << "disk/TTLs/offline/retry/rename: passed\n";
         clockRollback(root + "/clock-rollback"); std::cout << "clock rollback preserves mixed valid cache: passed\n";

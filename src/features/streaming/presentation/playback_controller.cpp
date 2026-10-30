@@ -3,6 +3,8 @@
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
 #include "features/streaming/domain/playback_drain.hpp"
+#include "features/streaming/domain/stick_deadzone.hpp"
+#include "core/constants/stage1_options.hpp"
 #include "features/playstation/domain/controller.hpp"
 
 namespace uiText = ::fog::constants::ui;
@@ -38,6 +40,10 @@ std::string ApplicationController::playbackTimings(bool takeLogTiming) const {
 }
 
 void ApplicationController::logOutputTimings(bool final) {
+    const auto inputNowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    diagnostic("Input suspension: enabled=" + std::to_string(fog::stage1::inputFreezeGate) + " " +
+        inputSuspensionStats_.text(inputNowMs),1024);
     if (media_) diagnostic("Client latency: " + media_->latencyDiagnostics(),4096);
     if (stream_) diagnostic("Input latency: " + stream_->inputLatencyDiagnostics(),1024);
     const auto threads = fog::diagnostics::threadObservationText();
@@ -83,10 +89,14 @@ bool ApplicationController::closeTransport(bool final) noexcept {
         try { logPlayStationInput(true); } catch (...) {}
     }
     releaseMouse();
+    retryKeyReleases();
     touchWasDown_ = false;
     videoRecovery_.reset();
     videoLossWaiting_ = false;
     loopTiming_.suspendPresentation();
+    inputSuspensionStats_.observe({},static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()));
+    inputFreezeWaiting_ = false;
     if (stream_) {
         try {
             logIncomingControl(true);
@@ -104,39 +114,57 @@ bool ApplicationController::closeTransport(bool final) noexcept {
                 diagnostic("Audio playback final: " + media_->audioDiagnostics(),2048);
             }
         } catch (...) { retryAllowed = false; } // Cleanup must continue; an uncertain retry must stop.
-        try {
-            if (final) stream_->close();
-            else if (!stream_->disconnectForRetry()) {
-                retryAllowed = false;
-                diagnostic("Transport retry cancelled: " + safeText(stream_->error()));
-                diagnostic("Transport final protocol: " + stream_->diagnostics(),2048);
-            }
-        } catch (...) { retryAllowed = false; }
-        try {
-            logIncomingControl(true);
-            diagnostic("Stream transport closed: " + stream_->transportTimings(),4096);
-            if (streamPlayStation_) diagnostic("PS transport input closed: " + stream_->inputDiagnostics(),3072);
-            diagnostic("Video gaps final: " + stream_->gapDiagnostics(),4096);
-            diagnostic("Stream DTLS final: " + stream_->dtlsDiagnostics(),8192);
-            diagnostic("Stream RTCP final: " + stream_->rtcpDiagnostics(),4096);
-            diagnostic("Stream mutex final: " + stream_->mutexDiagnostics(),4096);
-        } catch (...) {} // Diagnostic failure cannot prevent rental termination.
-        // A refused retry can still own an in-flight RTC call. Keep it alive
-        // until beginFinish dispatches the rental stop, then performs final close.
-        if (!final && !retryAllowed) return false;
-        stream_.reset();
+        if (streamRental_.provider == fog::ProviderId::FogHub) {
+            if (!final && !retryAllowed) return false;
+            // The old adapter stays alive in the reaper until callbacks have
+            // joined and its final retry decision is known. No new FH client
+            // may start while this mailbox is occupied.
+            if (!transportTeardown_.begin(stream_, !final)) return false;
+            transportCloseStarted_ = std::chrono::steady_clock::now();
+            try { diagnostic("Moonlight teardown scheduled; UI remains active."); } catch (...) {}
+        }
+        if (stream_) {
+            try {
+                if (final) stream_->close();
+                else if (!stream_->disconnectForRetry()) {
+                    retryAllowed = false;
+                    diagnostic("Transport retry cancelled: " + safeText(stream_->error()));
+                    diagnostic("Transport final protocol: " + stream_->diagnostics(),2048);
+                }
+            } catch (...) { retryAllowed = false; }
+            try {
+                logIncomingControl(true);
+                diagnostic("Stream transport closed: " + stream_->transportTimings(),4096);
+                if (streamPlayStation_) diagnostic("PS transport input closed: " + stream_->inputDiagnostics(),3072);
+                diagnostic("Video gaps final: " + stream_->gapDiagnostics(),4096);
+                diagnostic("Stream DTLS final: " + stream_->dtlsDiagnostics(),8192);
+                diagnostic("Stream RTCP final: " + stream_->rtcpDiagnostics(),4096);
+                diagnostic("Stream mutex final: " + stream_->mutexDiagnostics(),4096);
+            } catch (...) {} // Diagnostic failure cannot prevent rental termination.
+            // A refused retry can still own an in-flight RTC call. Keep it alive
+            // until beginFinish dispatches the rental stop, then performs final close.
+            if (!final && !retryAllowed) return false;
+            if (!final && streamRental_.provider == fog::ProviderId::Mts)
+                retryStream_ = std::move(stream_); // Retain release obligations, never old presses.
+            else stream_.reset();
+        }
     }
     mouseButtons_.reset();
+    keyReleases_.reset();
     gamepadSchedule_.reset();
     media_.reset();
     return final || retryAllowed;
 }
 
 void ApplicationController::closeStream() noexcept {
+    pairedVideoResumeAfterClose_ = false;
     pairedVideoReconnectPending_ = false;
     pairedTransportReconnectPending_ = false;
     transportReconnect_.cancel();
     closeTransport(true);
+    retryStream_.reset();
+    artwork_.setPaused(false);
+    steamArtwork_.setPaused(false);
     streamRental_ = {};
     streamPlayStation_ = false;
     relaySelection_.reset();
@@ -147,11 +175,38 @@ void ApplicationController::closeStream() noexcept {
     streamInputGate_.reset();
 }
 
+void ApplicationController::pollTransportTeardown() {
+    auto result = transportTeardown_.take();
+    if (!result.client) return;
+    try {
+        diagnostic("Moonlight teardown joined; retry=" + std::to_string(result.retry) +
+            " allowed=" + std::to_string(result.allowed));
+        diagnostic("Transport final protocol: " + result.client->diagnostics(),2048);
+        diagnostic("Video gaps final: " + result.client->gapDiagnostics(),4096);
+    } catch (...) {}
+    if (!result.allowed) {
+        // A retry refusal may still own transport resources. Dispatch the
+        // rental stop before putting that client back into final teardown.
+        pairedVideoResumeAfterClose_ = false;
+        if (!stopAfterTask_ && !shutdownDone_ && !streamRental_.empty()) {
+            stream_ = std::move(result.client);
+            stopTransportRecovery("transport-retry-terminal");
+        } else transportTeardown_.begin(result.client, false);
+        return;
+    }
+    result.client.reset();
+    // Resume is deliberately deferred to pumpStream, AFTER this frame's
+    // sampled overlay stop/cancel. A completed join cannot outrun user intent.
+}
+
 bool ApplicationController::startTransport(bool resumeOnly) {
+    if (transportTeardown_.pending())
+        throw std::runtime_error("Previous stream is still stopping");
     fog::diagnostics::beginThreadObservationEpoch();
     fog::diagnostics::observeThread("application");
     // Transport replacement must not adopt, create, or reset rental ownership.
     mouseButtons_.reset();
+    keyReleases_.reset();
     gamepadSchedule_.reset();
     videoRecovery_.reset();
     videoLossWaiting_ = false; firstFramePresented_ = false;
@@ -164,7 +219,7 @@ bool ApplicationController::startTransport(bool resumeOnly) {
     });
     auto* provider = providerServices(streamRental_.provider);
     if (!provider) throw std::runtime_error("Stream provider unavailable; stopping rental");
-    stream_ = provider->stream();
+    stream_ = retryStream_ ? std::move(retryStream_) : provider->stream();
     if (!stream_) throw std::runtime_error("Stream transport unavailable; stopping rental");
     if (!stream_->configureController(streamPlayStation_ ? ::stream::ControllerProfile::DualSense : ::stream::ControllerProfile::Xbox))
         throw std::runtime_error("Invalid controller configuration; stopping rental");
@@ -199,7 +254,7 @@ bool ApplicationController::startTransport(bool resumeOnly) {
         media_->startWorkers(*stream_, activeFramesPerSecond_);
         diagnostic("FH media workers started: independent video/audio; paced presentation fps=" + std::to_string(activeFramesPerSecond_));
     }
-    streamStarted_ = lastVideo_ = lastMediaLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
+    streamStarted_ = lastVideo_ = lastMediaLog_ = lastMetricsLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
     return started;
 }
 
@@ -213,6 +268,10 @@ void ApplicationController::recordTransportBreak() {
 
 void ApplicationController::startStream(const fog::RentalId& rental, bool createdFromCatalog,
                                       const fog::EntityId& computer) {
+    if (fog::stage1::pauseArtwork) {
+        artwork_.setPaused(true);
+        steamArtwork_.setPaused(true);
+    }
     streamPlayStation_ = (rental.provider == fog::ProviderId::Mts && fog::isPlayStationComputerId(computer)) ||
         controllerSettings_.profile == ::stream::ControllerProfile::DualSense;
     pairedVideoReconnectPending_ = false;
@@ -223,6 +282,7 @@ void ApplicationController::startStream(const fog::RentalId& rental, bool create
     sessionPending_ = true;
     transportReconnect_.reset();
     loopTiming_.reset(); loopTimingWindowAt_ = loopTimingLifetimeAt_ = std::chrono::steady_clock::now();
+    inputSuspensionStats_ = {}; inputFreezeWaiting_ = false;
     drainTiming_ = {}; presentTiming_ = {}; resetDiagnosticTiming();
     lastPumpAt_ = {}; lastProtocolLog_ = {}; pumpGapMaxUs_ = 0; outsideMeasuredPumpMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
     transportPumpTiming_ = {}; videoFeedTiming_ = {}; decoderResetTiming_ = {}; audioFeedTiming_ = {}; prepareTiming_ = {};
@@ -306,13 +366,6 @@ void ApplicationController::drainStreamAudio() {
 }
 void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     samplePlayStationInput(pad);
-    // Menu/finish intent wins over a due retry, including backoff with no Client.
-    bool overlayHandled = false;
-    const bool wasRecovering = transportReconnect_.recovering();
-    if (wasRecovering && screen_ == Screen::Streaming) {
-        overlayHandled = handleStreamOverlay(pad, held, down);
-        if (screen_ != Screen::Streaming || stopAfterTask_ || streamRental_.empty()) return;
-    }
     const auto pumpAt = std::chrono::steady_clock::now();
     std::uint64_t pumpGapUs = 0;
     const auto previousPumpWorkUs = lastPumpWorkUs_;
@@ -330,6 +383,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         const auto transportStarted = std::chrono::steady_clock::now();
         stream_->pump();
         retryMouseReleases();
+        retryKeyReleases();
         retryGamepadRelease();
         logIncomingControl();
         if (streamRental_.provider == fog::ProviderId::FogHub)
@@ -344,7 +398,8 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             diagnostic("Stream stage: " + streamState);
         }
         // Build the mutex-protected snapshot only when a log is actually due.
-        if (stateChanged || !stream_->error().empty() || pumpAt-lastProtocolLog_ >= std::chrono::seconds(5)) {
+        if (stateChanged || !stream_->error().empty() ||
+            pumpAt-lastProtocolLog_ >= std::chrono::seconds(fog::stage1::sparseDiagnostics ? 15 : 5)) {
             const auto details = stream_->diagnostics();
             if (details != lastStreamDiagnostics_) {
                 lastStreamDiagnostics_ = details;
@@ -357,19 +412,35 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             lastProtocolLog_ = pumpAt;
         }
         if (!stream_->error().empty()) diagnostic("Stream error: " + safeText(stream_->error()));
-        if (!handleTransportState(pumpAt)) return;
     }
+    // Consume transport events before overlay commands; menu/stop intent still
+    // precedes every retry/replacement. No decode, conversion or upload has run.
+    bool overlayHandled = false;
+    if (screen_ == Screen::Streaming) {
+        overlayHandled = handleStreamOverlay(pad, held, down);
+        if (screen_ != Screen::Streaming || stopAfterTask_ || streamRental_.empty()) return;
+    }
+    if (!handleTransportState(pumpAt)) return;
     if (!advanceTransportRecovery(std::chrono::steady_clock::now())) return;
-    media_->checkAudioRecovery();
     const bool lossWaiting = stream_->waitingForVideoKeyframe();
     if (lossWaiting && !videoLossWaiting_) {
         loopTiming_.suspendPresentation();
         suspendVideoInput();
     }
     videoLossWaiting_ = lossWaiting;
+    const auto suspension = fog::stage1::inputFreezeGate ? stream_->inputSuspension() : stream::InputSuspension{};
+    const auto inputObservedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    inputSuspensionStats_.observe(suspension,inputObservedMs);
+    if (suspension.suspended() && !inputFreezeWaiting_) {
+        // Input-only freeze: preserve LoopTiming's displayed-frame anchor and
+        // the existing keyframe/recovery banner semantics.
+        suspendVideoInput();
+    }
+    inputFreezeWaiting_ = suspension.suspended();
     const auto diagnosticNow = std::chrono::steady_clock::now();
     // SD lines are durable: drain a bounded event ring at most once per second,
-    // not on each RTP packet. Five-second counters include suppressed events.
+    // not on each RTP packet. Periodic counters include suppressed events.
     if (diagnosticNow - lastVideoEventLog_ >= std::chrono::seconds(1)) {
         std::string event;
         if (stream_->pollVideoDiagnostic(event)) diagnostic("Video RTP event: " + event);
@@ -393,6 +464,11 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             diagnostic("Video chain resync: worker generation=" + std::to_string(generation));
         }
     }
+    // All current prohibitions (transport, menu, loss, decoder error and worker
+    // generation) have been applied. Send the sampled state before media work;
+    // a frame prepared below can only resume input on the next fresh sample.
+    if (fog::stage1::earlyInput) sendStreamInput(pad, held, overlayHandled);
+    media_->checkAudioRecovery();
     drainStreamAudio();
     stream::Packet packet;
     int drained = 0;
@@ -401,11 +477,14 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     const auto queuedBeforeDrain = stream_->queuedVideoPackets();
     const auto drainPolicy = streamRental_.provider == fog::ProviderId::FogHub
         ? fog::stream::PlaybackDrainPolicy::BoundedQueue
-        : fog::stream::PlaybackDrainPolicy::PresentationFirst;
-    fog::stream::PlaybackDrainBudget drainBudget(queuedBeforeDrain, stream_->queuedVideoAgeMs(), drainPolicy);
+        : fog::stage1::mtsCatchup ? (fog::stage1::mtsCatchupAgeGuard
+            ? fog::stream::PlaybackDrainPolicy::PresentationFirst
+            : fog::stream::PlaybackDrainPolicy::ImmediatePresentationFirst)
+        : fog::stream::PlaybackDrainPolicy::LegacyPresentationFirst;
+    fog::stream::PlaybackDrainBudget drainBudget(queuedBeforeDrain, stream_->queuedVideoAgeMs(), drainPolicy, activeFramesPerSecond_);
     if (drainBudget.catchup()) ++catchupWindows_;
     // Keep compressed references in FIFO order. Bound both work time and the
-    // number of video frames before input, presentation, and audio get a turn.
+    // number of video frames before presentation, audio and the next input turn.
     while (!media_->workersRunning()) {
         const auto elapsedUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now()-drainStarted).count());
@@ -500,7 +579,8 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         // Queue recovery may finish before the decoder produces an image. Resume
         // only after this generation has successfully prepared a visible frame.
         videoLossWaiting_ = stream_->waitingForVideoKeyframe();
-        streamInputGate_.videoPrepared(transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe());
+        streamInputGate_.videoPrepared(transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe() ||
+            (fog::stage1::inputFreezeGate && stream_->inputSuspended()));
         if (!firstFramePresented_) {
             diagnostic(media_->hardwareVideo() ? "First video frame prepared (hardware)." : "First video frame prepared (software).");
             firstFramePresented_ = true;
@@ -509,7 +589,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     drainTiming_.record(drainStarted);
     const auto measuredAt = std::chrono::steady_clock::now();
     lastPumpWorkUs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(measuredAt-pumpAt).count());
-    // One alert per second at most; the five-second aggregates count all stalls.
+    // One alert per second at most; periodic aggregates count all stalls.
     // The previous measured work distinguishes an app-thread gap from slow media work.
     if (pumpGapUs >= 50000 || lastPumpWorkUs_ >= 50000) {
         ++slowPlaybackCycles_;
@@ -537,7 +617,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe(),
         media_->videoWidth(), media_->videoHeight()});
     const auto now = std::chrono::steady_clock::now();
-    if (now-lastMediaLog_ >= std::chrono::seconds(5)) {
+    if (now-lastMediaLog_ >= std::chrono::seconds(fog::stage1::sparseDiagnostics ? 15 : 5)) {
         diagnostic("Media video=" + std::to_string(media_->videoFrames()) +
             " opus=" + std::to_string(media_->audioPackets()) +
             " hardware=" + std::to_string(media_->hardwareVideo()) +
@@ -554,6 +634,11 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         if (!serverPerformance.empty()) diagnostic("Server performance: " + serverPerformance,2048);
         const auto controlDelivery = stream_->controlDeliveryDiagnostics();
         if (!controlDelivery.empty()) diagnostic("Control delivery: " + controlDelivery,2048);
+        lastMediaLog_ = now;
+    }
+    // Keep the short latency/loop windows comparable with the 5-second base,
+    // independently of the less frequent verbose transport/decoder dumps.
+    if (now-lastMetricsLog_ >= std::chrono::seconds(5)) {
         logOutputTimings(false);
         const auto timings = playbackTimings(true);
         drainTiming_ = {}; presentTiming_ = {};
@@ -562,7 +647,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         drainVideoTotal_ = drainVideoMax_ = drainVideoBudgetHits_ = 0;
         videoQueueWaitMaxMs_ = audioQueueWaitMaxMs_ = slowPlaybackCycles_ = 0;
         diagnostic(timings,2048);
-        lastMediaLog_ = now;
+        lastMetricsLog_ = now;
     }
     if (videoRecovery_.expired(now)) throw std::runtime_error("Video recovery deadline reached; stopping rental");
     if (!transportReconnect_.recovering() && (!firstFramePresented_ || !stream_->ready()) &&
@@ -573,9 +658,21 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         now-lastVideo_ >= std::chrono::seconds(firstFramePresented_ ? 10 : 30)) {
         retryTransport("media-timeout"); return;
     }
-    if (screen_ != Screen::Streaming) return;
-    if (!wasRecovering) overlayHandled = handleStreamOverlay(pad, held, down);
-    const bool inputAllowed = streamInputGate_.gamepadAllowed(overlayHandled);
+    if (!fog::stage1::earlyInput) sendStreamInput(pad, held, overlayHandled);
+
+}
+
+void ApplicationController::sendStreamInput(PadState& pad, u64 held, bool overlayHandled) {
+    if (screen_ != Screen::Streaming || stopAfterTask_ || exitAfterStop_ || !stream_ || !media_) return;
+    const auto now = std::chrono::steady_clock::now();
+    const bool inputAllowed = firstFramePresented_ &&
+        streamInputGate_.gamepadAllowed(overlayHandled) &&
+        !stream_->waitingForVideoKeyframe() && !media_->waitingForVideoKeyframe() &&
+        (!fog::stage1::inputFreezeGate || !stream_->inputSuspended()) &&
+        (media_->workersRunning() ? media_->workerVideoGeneration() == lastVideoGeneration_
+            : stream_->currentVideoGeneration() == lastVideoGeneration_) &&
+        !stream_->disconnected() && stream_->recoveryState() == stream::RecoveryState::Connected &&
+        !videoRecovery_.expired(now) && now-lastVideo_ < std::chrono::seconds(10);
     dispatchPlayStationInput(inputAllowed && !transportReconnect_.recovering() && !videoRecovery_.active() &&
         !videoLossWaiting_ && stream_->ready());
     if (!inputAllowed || (streamPlayStation_ && !psNativeInput_.contactsInitialized())) return;
@@ -593,7 +690,9 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         fog::playstation::applyExtraButtons(gamepad.buttons,psTouching);
     }
     const auto left = padGetStickPos(&pad,0), right = padGetStickPos(&pad,1);
-    gamepad.axes = {axis(left.x),-axis(left.y),axis(right.x),-axis(right.y)};
+    const auto leftAxes = fog::stage1::radialDeadzone ? fog::stream::radialStick(left.x,left.y) : fog::stream::cursorStick(left.x,left.y);
+    const auto rightAxes = fog::stage1::radialDeadzone ? fog::stream::radialStick(right.x,right.y) : fog::stream::cursorStick(right.x,right.y);
+    gamepad.axes = {leftAxes.x,-leftAxes.y,rightAxes.x,-rightAxes.y};
     gamepad.leftTrigger = (held & HidNpadButton_ZL) ? 1.0f : 0.0f;
     gamepad.rightTrigger = (held & HidNpadButton_ZR) ? 1.0f : 0.0f;
     if (!gamepadSchedule_.due(gamepad, now)) return;

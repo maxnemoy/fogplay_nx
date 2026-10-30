@@ -1,5 +1,6 @@
 #pragma once
 #include "features/streaming/domain/streaming_client.hpp"
+#include "features/streaming/infrastructure/control_queue.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -64,6 +65,7 @@ public:
     bool pollVideoDiagnostic(std::string& event) override;
     bool pollControlDiagnostic(std::string& event, bool final = false) override;
     bool waitingForVideoKeyframe() const override;
+    std::uint64_t currentVideoGeneration() const override;
     bool requestVideoKeyframe() override; // Best effort PLI on open video tracks; no transport reset.
     // Decoder recovery is independent of transport assembly and quality mode.
     // Keep requesting IDR until the owner successfully prepares decoded output.
@@ -98,7 +100,7 @@ public:
     void receiveControlForTesting(const std::string& text);
     void blockIceForTesting(bool blocked, unsigned stage = 0);
     void blockControlForTesting(bool blocked);
-    void blockControlSendForTesting(bool blocked);
+    void blockControlSendForTesting(bool blocked, bool reject = false);
     void advanceControlForTesting(unsigned milliseconds);
 #endif
 private:
@@ -107,5 +109,10 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::string caPath_, random5suffix_;
+    // Retry carries release-only obligations for this rental. No press, stick,
+    // pointer movement, or historical current-state sample crosses generations.
+    std::string retryInputHash_;
+    std::vector<ControlQueue::Message> retryInputReleases_;
+    bool retryInputReset_ = false;
 };
 }

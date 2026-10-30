@@ -39,6 +39,8 @@ manifest = {
     "libraries": {path.name: digest(path) for path in sorted((PREFIX / "lib").glob("*.a"))},
     "diagnostic_headers": {
         "FogMoonlightDiagnostics.h": digest(PREFIX / "include/FogMoonlightDiagnostics.h"),
+        "FogMoonlightRecovery.h": digest(PREFIX / "include/FogMoonlightRecovery.h"),
+        "FogMoonlightTermination.h": digest(PREFIX / "include/FogMoonlightTermination.h"),
     },
     "curl": json.loads((PREFIX / "curl-build.json").read_text()),
     "portlibs": {

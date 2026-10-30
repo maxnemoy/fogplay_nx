@@ -21,6 +21,8 @@ try:
     for name, expected in manifest["diagnostic_headers"].items():
         assert digest(prefix / "include" / name) == expected
     assert "FogMoonlightDiagnostics.h" in manifest["diagnostic_headers"]
+    assert "FogMoonlightRecovery.h" in manifest["diagnostic_headers"]
+    assert "FogMoonlightTermination.h" in manifest["diagnostic_headers"]
     for name, expected in manifest["libraries"].items():
         assert digest(prefix / "lib" / name) == expected
     for name in ("libgamestream.a", "libmoonlight-common-c.a", "libmoonlight-curl.a", "libenet.a"):

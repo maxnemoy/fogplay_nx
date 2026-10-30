@@ -55,6 +55,19 @@ bool ApplicationController::handleTransportState(std::chrono::steady_clock::time
 }
 
 bool ApplicationController::advanceTransportRecovery(std::chrono::steady_clock::time_point now) {
+    if (pairedVideoResumeAfterClose_ && now - transportCloseStarted_ >= std::chrono::seconds(15)) {
+        stopTransportRecovery("paired-quality-close-deadline"); return false;
+    }
+    if (transportTeardown_.pending()) {
+        if (transportReconnect_.deadlineExpired(now))
+            stopTransportRecovery("transport-reconnect-deadline");
+        return false;
+    }
+    if (pairedVideoResumeAfterClose_) {
+        pairedVideoResumeAfterClose_ = false;
+        resumePairedVideoAfterClose();
+        return false;
+    }
     switch (transportReconnect_.poll(now)) {
         case fog::stream::TransportReconnect::Action::Stop:
             stopTransportRecovery("transport-reconnect-deadline"); return false;

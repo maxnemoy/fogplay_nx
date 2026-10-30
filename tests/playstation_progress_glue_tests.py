@@ -54,7 +54,9 @@ struct FakeServices {
 };
 }
 std::string safeText(const std::string& value) {return value;}
-void diagnostic(const std::string&) {}
+std::mutex diagnosticMutex;
+std::vector<std::string> diagnostics;
+void diagnostic(const std::string& text) {std::lock_guard<std::mutex> lock(diagnosticMutex);diagnostics.push_back(text);}
 namespace fogplay {
 enum class Screen {PlayStation,PlayStationDetails,Games,Checkout};
 struct ApplicationController {
@@ -86,6 +88,7 @@ int main() {
     using fogplay::ApplicationController;
     using fogplay::Screen;
     for(int failureCase=0;failureCase<4;++failureCase) {
+        diagnostics.clear();
         std::promise<void> featuredPublished, releasePrimary;
         auto gate=releasePrimary.get_future().share();
         fog::loader=[&,gate](fog::FakeRepository& repository,const fog::CatalogProgress& progress,const fog::CatalogCancellation&) {
@@ -107,6 +110,13 @@ int main() {
         if(failureCase==3) assert(!app.playStationError_.empty() && app.playStationLoadedAt_==std::chrono::steady_clock::time_point{});
         else assert(app.playStationError_.empty() && app.playStationLoadedAt_!=std::chrono::steady_clock::time_point{});
         if(failureCase==1) assert(app.playStationComputers_.size()==7); // FH outage cannot block MTS checkout.
+        unsigned featuredFailures=0,primaryFailures=0;
+        for(const auto& text:diagnostics) {
+            featuredFailures+=text=="PlayStation provider failed: worker=playstation-featured";
+            primaryFailures+=text=="PlayStation provider failed: worker=playstation-catalog";
+            assert(text.find("FH outage")==std::string::npos || text.find("PlayStation refresh failed:")==0);
+        }
+        assert(featuredFailures==unsigned(bool(failureCase&1)) && primaryFailures==unsigned(bool(failureCase&2)));
     }
     for(int scenario=0;scenario<5;++scenario) {
         std::promise<void> published,finish;
