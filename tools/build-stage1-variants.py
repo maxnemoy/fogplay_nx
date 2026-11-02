@@ -52,11 +52,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profiles", nargs="+", choices=PROFILES, default=list(PROFILES))
     parser.add_argument("--jobs", type=int, default=6)
+    parser.add_argument("--mts-media-workers", type=int, choices=(0, 1), default=0,
+                        help="Keep 0 for Stage 1 P4 comparisons; 1 selects the Stage 3 media path")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     profiles = list(dict.fromkeys(args.profiles))
-    # Leave dist with the ordinary release configuration, never an experiment.
+    # Leave dist with full Stage 1 features and the explicitly selected media
+    # path. The default synchronous matrix isolates P4, not ordinary Stage 3.
     if "full" in profiles:
         profiles.remove("full")
     profiles.append("full")
@@ -70,7 +73,8 @@ def main():
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     # Resolve/rebuild dependencies BEFORE capturing the fixed experiment inputs.
     warmup = os.environ.copy()
-    warmup.update(STAGE1_PROFILE="full", BOUNDED_SYNC_AUDIO="0", JOBS=str(args.jobs))
+    warmup.update(STAGE1_PROFILE="full", BOUNDED_SYNC_AUDIO="0", JOBS=str(args.jobs),
+                  MTS_MEDIA_WORKERS=str(args.mts_media_workers))
     with (output / "prepare.log").open("w") as log:
         subprocess.run(["bash", "build.sh"], cwd=ROOT, env=warmup, stdout=log, stderr=subprocess.STDOUT, check=True)
     if source_digest() != source:
@@ -90,6 +94,7 @@ def main():
         env["STAGE1_PROFILE"] = profile
         env["BOUNDED_SYNC_AUDIO"] = "0"  # S16 is selected only by the profile mask.
         env["JOBS"] = str(args.jobs)
+        env["MTS_MEDIA_WORKERS"] = str(args.mts_media_workers)
         print(f"Building {profile} (mask={PROFILES[profile]})", flush=True)
         with (target / "build.log").open("w") as log:
             subprocess.run(["bash", "build.sh"], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
@@ -104,6 +109,7 @@ def main():
         if digest(target / "fogplay_nx.nro") != verification["nro_sha256"] or digest(target / "fogplay_nx-sd.zip") != verification["archive_sha256"]:
             raise RuntimeError("Copied artifact digest mismatch")
         result = dict(verification, profile=profile, feature_mask=PROFILES[profile],
+                      mts_media_workers=bool(args.mts_media_workers),
                       mts_catchup_age_guard=bool(PROFILES[profile] & 128) and profile != "p4_legacy",
                       source_sha256=source, dependency_sha256=dependency_hash, base_commit=head)
         (target / "experiment.json").write_text(json.dumps(result, indent=2) + "\n")

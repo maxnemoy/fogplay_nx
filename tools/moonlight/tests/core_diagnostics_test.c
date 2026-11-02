@@ -6,6 +6,8 @@
 #include <string.h>
 #include <sched.h>
 
+static atomic_int queueWaitEntered;
+
 // Exercise the real prepared LinkedBlockingQueue with native pthread primitives.
 int PltCreateMutex(PLT_MUTEX* mutex) { return pthread_mutex_init(mutex, NULL); }
 void PltDeleteMutex(PLT_MUTEX* mutex) { assert(pthread_mutex_destroy(mutex) == 0); }
@@ -18,7 +20,49 @@ int PltCreateConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex) {
 void PltDeleteConditionVariable(PLT_COND* cond) { assert(pthread_cond_destroy(cond) == 0); }
 void PltSignalConditionVariable(PLT_COND* cond) { assert(pthread_cond_signal(cond) == 0); }
 void PltWaitForConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex) {
+    atomic_fetch_add(&queueWaitEntered, 1);
     assert(pthread_cond_wait(cond, mutex) == 0);
+}
+
+typedef struct QueueWait {
+    PLINKED_BLOCKING_QUEUE queue;
+    void* data;
+    int result;
+} QueueWait;
+static void* waitQueue(void* context) {
+    QueueWait* wait = context;
+    wait->result = LbqWaitForQueueElement(wait->queue, &wait->data);
+    return NULL;
+}
+static void queueWakeTests(void) {
+    LINKED_BLOCKING_QUEUE queue;
+    assert(LbqInitializeLinkedBlockingQueue(&queue, 4) == 0);
+    void* data = NULL;
+    // A user wake persists even before a consumer enters the core wait.
+    LbqSignalQueueUserWake(&queue);
+    assert(LbqWaitForQueueElement(&queue, &data) == LBQ_USER_WAKE);
+    int payload = 7;
+    LINKED_BLOCKING_QUEUE_ENTRY entry = {0};
+    assert(LbqOfferQueueItem(&queue, &payload, &entry) == LBQ_SUCCESS);
+    LbqSignalQueueUserWake(&queue);
+    assert(LbqWaitForQueueElement(&queue, &data) == LBQ_USER_WAKE);
+    assert(LbqWaitForQueueElement(&queue, &data) == LBQ_SUCCESS && data == &payload);
+    for (unsigned scenario = 0; scenario < 3; ++scenario) {
+        atomic_store(&queueWaitEntered, 0);
+        QueueWait wait = {&queue, NULL, -999};
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, waitQueue, &wait) == 0);
+        // The producer takes the same queue mutex: a wake racing registration
+        // cannot be lost between this hook and pthread_cond_wait's unlock.
+        while (!atomic_load(&queueWaitEntered)) sched_yield();
+        if (scenario == 0) LbqSignalQueueUserWake(&queue);
+        else if (scenario == 1) assert(LbqOfferQueueItem(&queue, &payload, &entry) == LBQ_SUCCESS);
+        else LbqSignalQueueShutdown(&queue);
+        assert(pthread_join(thread, NULL) == 0);
+        assert(wait.result == (scenario == 0 ? LBQ_USER_WAKE : scenario == 1 ? LBQ_SUCCESS : LBQ_INTERRUPTED));
+        if (scenario == 1) assert(wait.data == &payload);
+    }
+    assert(LbqDestroyLinkedBlockingQueue(&queue) == NULL);
 }
 
 static atomic_int running;
@@ -401,6 +445,7 @@ int main(void) {
 #define CHECK_ZERO(name) assert(snapshot.name == 0);
     FOG_DIAG_FIELDS(CHECK_ZERO)
 #undef CHECK_ZERO
-    puts("Moonlight atomic diagnostics and real queue instrumentation passed");
+    queueWakeTests();
+    puts("Moonlight atomic diagnostics, real queue instrumentation and sticky/blocking wake/shutdown passed");
     return 0;
 }

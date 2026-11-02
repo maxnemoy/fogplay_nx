@@ -1,5 +1,9 @@
 # Stage 0: streaming thread and queue ownership
 
+Historical baseline before Stage 3. The current ownership model is documented
+in [STAGE3_IMPLEMENTATION.md](STAGE3_IMPLEMENTATION.md); retain this record for
+comparison with 0.6.27 and earlier implementations.
+
 This describes the current implementation, checked against the working tree on
 2026-10-29. It is a source-level ownership map, not console/runtime acceptance.
 Stage 0 preserves the existing MTS synchronous media path and FH media workers.

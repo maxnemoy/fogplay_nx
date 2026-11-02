@@ -12,17 +12,18 @@ struct Harness {
     std::uint64_t now = 0;
     std::vector<Action> actions;
     Profile profile = Profile::Low;
-    bool refresh = true, overload = false, staticSource = false, send = true;
+    bool refresh = true, overload = false, decoderOverload = false, staticSource = false, send = true;
     unsigned presentedPerTick = 3, decodedPerTick = 3, supersededPerTick = 0;
     unsigned presentedExtraPerSecond = 0, decodedExtraPerSecond = 0, supersededExtraPerSecond = 0;
-    unsigned workPerFrameUs = 3000;
+    unsigned workPerFrameUs = 3000, decoderWorkPerFrameUs = 3000;
     double sourceFps = 30;
     unsigned audioDroppedPerTick = 0, audioUnderrunsPerTick = 0;
-    explicit Harness(int framesPerSecond = 30) {
+    explicit Harness(int framesPerSecond = 30, bool workerVideo = false) {
         sourceFps = framesPerSecond;
         presentedPerTick = decodedPerTick = static_cast<unsigned>(framesPerSecond / 10);
         assert(controller.configureFramesPerSecond(framesPerSecond));
         sample.width = 1920; sample.height = 1080;
+        sample.workerVideo = workerVideo;
         readTelemetry(server,Json{{"preset", "LOW"}, {"fps", sourceFps}}, now);
         controller.enable(true, now);
         controller.observe(now, sample, server);
@@ -48,6 +49,8 @@ struct Harness {
                 sample.decodedFrames += decoded;
                 sample.supersededFrames += supersededPerTick + (now % 1000 == 0 ? supersededExtraPerSecond : 0);
                 sample.workUs += overload ? 100000 : decoded * workPerFrameUs;
+                if (sample.workerVideo)
+                    sample.decoderWorkUs += decoderOverload ? 100000 : decoded * decoderWorkPerFrameUs;
             }
             sample.audioDropped += audioDroppedPerTick; sample.audioUnderruns += audioUnderrunsPerTick;
             if (refresh && now % 2000 == 0) readTelemetry(server,Json{{"preset", wireProfile(profile)}, {"fps", sourceFps}}, now);
@@ -65,6 +68,105 @@ struct Harness {
     }
 };
 int main() {
+    {
+        // A worker resync after every 800ms recovery must not erase cumulative
+        // damage before the two-second policy window can evaluate it. Compare
+        // the real Controller with the synchronous path for each loss signal.
+        for (const auto counter : {&Sample::recoveries,&Sample::missing,&Sample::errors}) {
+            std::vector<Action> synchronous;
+            for (const bool workers : {false,true}) {
+                Harness h(60,workers); h.profile = Profile::High;
+                for (unsigned recovery = 0; recovery < 20; ++recovery) {
+                    h.ticks(7);
+                    h.sample.*counter += counter == &Sample::missing ? 4 : 1;
+                    if (workers) ++h.sample.videoGeneration;
+                    h.ticks(1);
+                }
+                assert(h.actions == std::vector<Action>{Action::Degrade});
+                assert(h.event("reason=transport-decode-trouble"));
+                if (!workers) synchronous = h.actions;
+                else assert(h.actions == synchronous);
+                assert(std::string(h.controller.reason()) != "sample-gap");
+            }
+        }
+    }
+    {
+        // Repeated generation transitions without loss-counter rollback still
+        // invalidate upgrade evidence. Only a fresh stable period may enhance.
+        Harness h(60,true); h.advance(20);
+        for (unsigned transition = 0; transition < 20; ++transition) {
+            h.ticks(7); ++h.sample.videoGeneration; h.ticks(1);
+        }
+        assert(h.actions.empty());
+        h.advance(29); assert(h.actions.empty());
+        h.advance(3); assert(h.actions == std::vector<Action>{Action::Enhance});
+    }
+    {
+        // A free UI must not hide a saturated independent decoder worker.
+        Harness h(60,true); h.profile = Profile::High;
+        h.workPerFrameUs = 500; h.decoderOverload = true;
+        h.advance(6); assert(h.actions == std::vector<Action>{Action::Degrade});
+        const auto diagnostics = h.controller.diagnostics();
+        assert(diagnostics.find("uiVideoBusy=0.030") != std::string::npos);
+        assert(diagnostics.find("decoderVideoBusy=1.000") != std::string::npos);
+        assert(diagnostics.find("videoBusy=1.000") != std::string::npos);
+        assert(std::string(h.controller.reason()) == "video-work-overload");
+    }
+    {
+        // Per-frame decode cost also applies at 60 FPS when the worker only
+        // manages 30 FPS: busy alone (48%) does not describe the bottleneck.
+        Harness h(60,true); h.profile = Profile::High;
+        h.workPerFrameUs = 500; h.decoderWorkPerFrameUs = 16000;
+        h.presentedPerTick = h.decodedPerTick = 3;
+        h.advance(6); assert(h.actions == std::vector<Action>{Action::Degrade});
+        assert(h.controller.diagnostics().find("decoderVideoMs=16.00") != std::string::npos);
+        assert(h.controller.diagnostics().find("decoderVideoBusy=0.480") != std::string::npos);
+        assert(std::string(h.controller.reason()) == "video-work-overload");
+    }
+    {
+        // Once decode capacity returns, collect a new full headroom interval.
+        Harness h(60,true); h.workPerFrameUs = 500; h.decoderOverload = true;
+        h.advance(40); assert(h.actions.empty());
+        h.decoderOverload = false; h.advance(30); assert(h.actions.empty());
+        h.advance(4); assert(h.actions == std::vector<Action>{Action::Enhance});
+        assert(h.controller.diagnostics().find("decoderVideoBusy=0.180") != std::string::npos);
+    }
+    {
+        // Two concurrent 51%-busy domains each have capacity. Summing them
+        // would invent 102% utilization and prevent a legitimate enhancement.
+        Harness h(30,true); h.workPerFrameUs = h.decoderWorkPerFrameUs = 17000;
+        h.advance(32); assert(h.actions == std::vector<Action>{Action::Enhance});
+        const auto diagnostics = h.controller.diagnostics();
+        assert(diagnostics.find("videoBusy=0.510") != std::string::npos);
+        assert(diagnostics.find("uiVideoBusy=0.510") != std::string::npos);
+        assert(diagnostics.find("decoderVideoBusy=0.510") != std::string::npos);
+    }
+    {
+        for (unsigned boundary = 0; boundary < 3; ++boundary) {
+            Harness h(30,true); h.advance(20); assert(h.actions.empty());
+            // Retained counters across generation changes, independent worker
+            // counter resets, and a switch to sync all interrupt evidence.
+            if (boundary == 0) ++h.sample.videoGeneration;
+            if (boundary == 1) h.sample.decoderWorkUs = 0;
+            if (boundary == 2) h.sample.workerVideo = false;
+            h.advance(30); assert(h.actions.empty());
+            h.advance(4); assert(h.actions == std::vector<Action>{Action::Enhance});
+        }
+    }
+    {
+        // Switching from a cheap synchronous sample to worker mode must not
+        // reuse the old headroom while the newly visible decoder is saturated.
+        Harness h(60); h.workPerFrameUs = 500; h.advance(20);
+        h.sample.workerVideo = true; h.decoderOverload = true;
+        h.advance(40); assert(h.actions.empty());
+        assert(h.controller.diagnostics().find("workerVideo=1") != std::string::npos);
+    }
+    {
+        // A synchronous caller does not inherit a stale worker's utilization.
+        Harness h(30); h.sample.decoderWorkUs = 1000000000;
+        h.advance(34); assert(h.actions == std::vector<Action>{Action::Enhance});
+        assert(h.controller.diagnostics().find("decoderVideoBusy=0.000") != std::string::npos);
+    }
     {
         Harness h(60); assert(!h.controller.configureFramesPerSecond(0));
         assert(!h.controller.configureFramesPerSecond(144));

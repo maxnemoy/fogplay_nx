@@ -6,6 +6,7 @@
 #include "features/streaming/domain/h264_rtp.hpp"
 #include "features/streaming/infrastructure/video_rtp_handler.hpp"
 #include "features/streaming/infrastructure/stream_queue.hpp"
+#include "features/streaming/infrastructure/spsc_video_queue.hpp"
 #include "features/streaming/infrastructure/async_control_sender.hpp"
 #include "features/streaming/infrastructure/async_ice_snapshot.hpp"
 #include "features/streaming/infrastructure/rtcp_feedback_worker.hpp"
@@ -29,6 +30,9 @@
 #include <deque>
 #include <stdexcept>
 #include <utility>
+#include <condition_variable>
+#include <thread>
+#include "core/diagnostics/thread_observation.hpp"
 
 namespace stream {
 using Clock = std::chrono::steady_clock;
@@ -111,9 +115,143 @@ struct Client::Impl {
     };
     struct Shared {
         TimedMutex mutex;
-        bool stopped = false;
+        mutable TimedMutex videoMutex;
+        mutable std::mutex telemetryMutex;
+        mutable std::mutex audioMutex;
+        SpscVideoQueue videoQueue;
+        // A single atomic authorization snapshot: zero is closed, a finite
+        // deadline is verified TURN, max is unrestricted direct transport.
+        // In particular, zero never means unbounded authorization.
+        std::atomic<std::uint64_t> mediaAllowedUntilMs{0}, publishedVideoGeneration{0};
+        std::atomic<VideoCodec> workerCodec{VideoCodec::H264};
+        std::shared_ptr<MediaSignals> signals;
+        struct VideoIngress {
+            std::vector<std::byte> bytes;
+            std::uint64_t receivedMs = 0;
+        };
+        std::mutex ingressMutex;
+        // Shared accepts exactly one video track. Its RTC feedback closure
+        // captures that track weakly, so register it once instead of copying a
+        // std::function for every RTP packet. Transfer to the assembly owner
+        // under ingressMutex; only that owner subsequently uses videoFeedback.
+        rtc::message_callback ingressFeedback;
+        bool feedbackRegistered = false;
+        std::condition_variable ingressWake;
+        std::deque<VideoIngress> ingress;
+        std::size_t ingressBytes = 0;
+        std::uint64_t assemblyWakeVersion = 0;
+        bool assemblyStopping = false, ingressOverflow = false;
+        std::optional<VideoCodec> assemblyCodec;
+        std::atomic<std::uint64_t> ingressDrops{0};
+        std::thread assemblyWorker;
+        ~Shared() { stopAssembly(); }
+        void revokeMedia() {
+            mediaAllowedUntilMs.store(0, std::memory_order_release);
+            if (signals) signals->notifyAll();
+        }
+        bool allowsMedia() const {
+            const auto until = mediaAllowedUntilMs.load(std::memory_order_acquire);
+            return until && videoNow() < until;
+        }
+        void stopAssembly() noexcept {
+            {
+                std::lock_guard<std::mutex> lock(ingressMutex);
+                assemblyStopping = true;
+            }
+            revokeMedia(); ingressWake.notify_all();
+            if (assemblyWorker.joinable()) assemblyWorker.join();
+        }
+        void startAssembly() {
+            assemblyWorker = std::thread([this] { runAssembly(); });
+        }
+        void wakeAssembly() {
+            { std::lock_guard<std::mutex> lock(ingressMutex); ++assemblyWakeVersion; }
+            ingressWake.notify_one();
+        }
+        void configureAssembly(VideoCodec codec) {
+            {
+                std::lock_guard<std::mutex> lock(ingressMutex);
+                assemblyCodec = codec;
+                ingress.clear(); ingressBytes = 0;
+            }
+            workerCodec.store(codec, std::memory_order_release);
+            ingressWake.notify_one();
+        }
+        void runAssembly() noexcept {
+            fog::diagnostics::observeThread("mts-assembly");
+            auto maintenanceAt = Clock::time_point::max();
+            std::uint64_t observedWake = 0;
+            for (;;) {
+                VideoIngress input;
+                bool hasInput = false, overflow = false;
+                std::optional<VideoCodec> codec;
+                {
+                    std::unique_lock<std::mutex> lock(ingressMutex);
+                    // No idle poll: only pending repair/assembly or queue-age
+                    // deadlines use a timer. Packets, commands and dequeues wake
+                    // the owner through a revision checked under this mutex.
+                    ingressWake.wait_until(lock, maintenanceAt, [this, observedWake] {
+                        return assemblyStopping || ingressOverflow || assemblyCodec || !ingress.empty() ||
+                            observedWake != assemblyWakeVersion;
+                    });
+                    if (assemblyStopping) return;
+                    observedWake = assemblyWakeVersion;
+                    overflow = std::exchange(ingressOverflow, false);
+                    codec = std::exchange(assemblyCodec, std::nullopt);
+                    if (ingressFeedback) videoFeedback = std::exchange(ingressFeedback, rtc::message_callback{});
+                    if (!ingress.empty()) {
+                        input = std::move(ingress.front()); ingress.pop_front();
+                        ingressBytes -= input.bytes.size(); hasInput = true;
+                    }
+                }
+                try {
+                    if (codec) {
+                        TimedMutex::Guard lock(videoMutex, TimedMutex::Scope::Callback);
+                        if (!stopped) {
+                            if (video.stats().received) ++videoGeneration;
+                            video = H264RtpAssembler(*codec); videoFault = 0;
+                            video.enableNack(repair.config().nack());
+                            publishedVideoGeneration.store(videoGeneration, std::memory_order_release);
+                            if (signals) signals->video.notify();
+                        }
+                    }
+                    if (overflow) {
+                        TimedMutex::Guard lock(videoMutex, TimedMutex::Scope::Callback);
+                        if (!stopped) resyncQueue(true, videoNow());
+                    }
+                    if (hasInput) processVideoRtp(input.bytes.data(), input.bytes.size(), input.receivedMs);
+                    else {
+                        {
+                            TimedMutex::Guard lock(videoMutex, TimedMutex::Scope::Client);
+                            if (stopped) return;
+                            video.tick(videoNow(), videoFrameBudget()); drainVideo();
+                        }
+                        sendNacks();
+                    }
+                    {
+                        TimedMutex::Guard lock(videoMutex, TimedMutex::Scope::Client);
+                        maintenanceAt = Clock::time_point::max();
+                        if (!stopped && (video.pendingPackets() || video.assemblyBytes()))
+                            maintenanceAt = Clock::now() + std::chrono::milliseconds(10);
+                        std::uint64_t oldestGeneration = 0;
+                        if (!stopped && videoQueue.oldestGeneration(oldestGeneration) && oldestGeneration == videoGeneration) {
+                            const auto now = videoNow();
+                            const auto age = videoQueue.age(now);
+                            const auto untilExpiry = age > MediaQueue::MaxVideoAgeMs ? 0 : MediaQueue::MaxVideoAgeMs + 1 - age;
+                            maintenanceAt = std::min(maintenanceAt, Clock::now() + std::chrono::milliseconds(untilExpiry));
+                        }
+                    }
+                } catch (...) {
+                    TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
+                    callbackFailure = true; revokeMedia();
+                    return;
+                }
+            }
+        }
+        std::atomic<bool> stopped{false};
         bool eventOverflow = false;
         bool callbackFailure = false;
+        bool terminalMediaEvent = false;
         IncomingControl::Kind terminalControl = IncomingControl::Kind::Ignored;
         std::size_t eventBytes = 0, eventHigh = 0;
         std::uint64_t eventDropped = 0;
@@ -134,37 +272,58 @@ struct Client::Impl {
         std::uint64_t routeRevision = 0;
         Clock::time_point routeCapturedAt{};
         std::string pendingPong;
-        std::uint64_t qualityTimeOffset = 0, eventDelayHighMs = 0;
+        std::atomic<std::uint64_t> qualityTimeOffset{0};
+        std::uint64_t eventDelayHighMs = 0;
         Clock::time_point lastVideo{};
         H264RtpAssembler video;
         RtpRepair repair;
         rtc::message_callback videoFeedback;
         std::uint64_t nackSendErrors = 0;
-        bool videoTrack = false;
+        std::uint64_t ingressWaitSamples = 0, ingressWaitTotalMs = 0, ingressWaitMaxMs = 0;
+        std::atomic<bool> videoTrack{false};
         std::uint64_t videoFault = 0, videoGeneration = 0, queueResyncs = 0, queueCapacity = 0, queueAge = 0;
-        std::uint64_t pliRequests = 0, receivedVideoBytes = 0, lastRtpMs = 0, lastAudioMs = 0, lastControlMs = 0;
+        std::uint64_t pliRequests = 0;
+        std::atomic<std::uint64_t> receivedVideoBytes{0}, lastRtpMs{0}, lastAudioMs{0};
+        std::uint64_t lastControlMs = 0;
         std::uint64_t lastPeerMs = 0, lastIceMs = 0, lastGatheringMs = 0;
         rtc::PeerConnection::State peerState = rtc::PeerConnection::State::New;
         rtc::PeerConnection::IceState iceState = rtc::PeerConnection::IceState::New;
         rtc::PeerConnection::GatheringState gatheringState = rtc::PeerConnection::GatheringState::New;
         void reconcileFault() {
             if (videoFault == video.stats().faultSerial) return;
-            media.clearVideo(); videoFault = video.stats().faultSerial; ++videoGeneration;
+            videoFault = video.stats().faultSerial; ++videoGeneration;
+            publishedVideoGeneration.store(videoGeneration, std::memory_order_release);
+            if (signals) signals->video.notify();
         }
         void resyncQueue(bool capacity, std::uint64_t now) {
             ++queueResyncs;
             if (capacity) ++queueCapacity; else ++queueAge;
-            media.clearVideo(); video.requestResync(now); reconcileFault();
+            video.requestResync(now); reconcileFault();
+        }
+        void recordVideoPressure(MediaQueue::PressureReason reason, std::uint64_t now, std::size_t size = 0) {
+            std::lock_guard<std::mutex> audioLock(audioMutex);
+            media.recordVideoPressure(reason, now, size);
+            media.lastPressure.videoCount = videoQueue.size();
+            media.lastPressure.videoBytes = videoQueue.bytes();
+            media.lastPressure.videoAgeMs = videoQueue.age(now);
         }
         void expireMedia(std::uint64_t now) {
-            media.expireAudio(now);
-            if (media.age(Kind::Video, now) > MediaQueue::MaxVideoAgeMs) {
-                media.recordVideoPressure(MediaQueue::PressureReason::Age, now); resyncQueue(false, now);
+            {
+                std::lock_guard<std::mutex> audioLock(audioMutex);
+                media.expireAudio(now);
+                media.videoAgeHighMs = std::max(media.videoAgeHighMs, videoQueue.age(now));
+                media.bytesHigh = std::max(media.bytesHigh, videoQueue.bytes() + media.audioBytes);
+            }
+            std::uint64_t oldestGeneration = 0;
+            if (videoQueue.oldestGeneration(oldestGeneration) && oldestGeneration == videoGeneration &&
+                videoQueue.age(now) > MediaQueue::MaxVideoAgeMs) {
+                recordVideoPressure(MediaQueue::PressureReason::Age, now); resyncQueue(false, now);
             }
         }
         std::size_t videoFrameBudget() const {
-            return media.videoCount >= MediaQueue::MaxVideo ? 0 :
-                std::min(std::size_t(2), MediaQueue::MaxVideo - media.videoCount);
+            const auto count = videoQueue.size();
+            return count >= MediaQueue::MaxVideo ? 0 :
+                std::min(std::size_t(2), MediaQueue::MaxVideo - count);
         }
         void drainVideo() {
             const auto now = videoNow();
@@ -173,12 +332,21 @@ struct Client::Impl {
             while (video.poll(frame)) {
                 Packet packet{Kind::Video, std::move(frame.data), frame.timestamp,
                               frame.firstSequence, frame.lastSequence, now, videoGeneration, frame.firstPacketMs};
-                if (!media.push(std::move(packet), now)) { resyncQueue(true, now); return; }
+                const auto size = packet.data.size();
+                if (!videoQueue.push(std::move(packet))) {
+                    recordVideoPressure(videoQueue.size() >= MediaQueue::MaxVideo ?
+                        MediaQueue::PressureReason::Count : MediaQueue::PressureReason::Bytes, now, size);
+                    resyncQueue(true, now); return;
+                }
+                { std::lock_guard<std::mutex> audioLock(audioMutex);
+                  media.videoHigh = std::max(media.videoHigh, std::max(std::size_t(1), videoQueue.size()));
+                  media.bytesHigh = std::max(media.bytesHigh, videoQueue.bytes() + media.audioBytes); }
+                if (signals) signals->video.notify();
                 lastVideo = Clock::now();
             }
         }
         bool normalizeVideo(rtc::binary& packet, bool control) {
-            TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
+            TimedMutex::Guard lock(videoMutex, TimedMutex::Scope::Callback);
             if (stopped) return false;
             if (control) return repair.acceptControl(packet);
             const auto now = videoNow();
@@ -187,39 +355,67 @@ struct Client::Impl {
             });
         }
         void sendNacks() {
-            rtc::message_callback send; std::vector<std::byte> packet;
+            std::vector<std::byte> packet;
             {
-                TimedMutex::Guard lock(mutex, TimedMutex::Scope::Client);
+                TimedMutex::Guard lock(videoMutex, TimedMutex::Scope::Client);
                 if (stopped || !videoFeedback) return;
-                packet = repair.nack(video.takeNacks(videoNow())); send = videoFeedback;
+                packet = repair.nack(video.takeNacks(videoNow()));
             }
             // Weak transport callback, outside the shared mutex. A failed feedback
             // send does not terminate a rental; the bounded IDR fallback remains.
-            transmitNack(std::move(packet), send, TimedMutex::Scope::Client);
+            transmitNack(std::move(packet), videoFeedback, TimedMutex::Scope::Client);
         }
         void transmitNack(std::vector<std::byte> packet, const rtc::message_callback& send, TimedMutex::Scope scope) {
             if (!packet.empty()) try { send(rtc::make_message(std::move(packet), rtc::Message::Control)); }
-            catch (...) { TimedMutex::Guard lock(mutex, scope); ++nackSendErrors; }
+            catch (...) { TimedMutex::Guard lock(videoMutex, scope); ++nackSendErrors; }
         }
         void videoRtp(const std::byte* bytes, std::size_t size, std::uint64_t receivedMs, const rtc::message_callback& send) {
+            if (!size || size > H264RtpAssembler::MaxPendingBytes) return;
+            {
+                std::lock_guard<std::mutex> lock(ingressMutex);
+                if (assemblyStopping) return;
+                if (!feedbackRegistered && send) {
+                    ingressFeedback = send;
+                    feedbackRegistered = true;
+                }
+                if (ingress.size() >= 1024 || size > 4 * 1024 * 1024 - ingressBytes) {
+                    ingress.clear(); ingressBytes = 0; ingressOverflow = true; ++ingressDrops;
+                } else {
+                    ingress.push_back({{bytes, bytes + size}, receivedMs});
+                    ingressBytes += size;
+                }
+            }
+            ingressWake.notify_one();
+        }
+        void processVideoRtp(const std::byte* bytes, std::size_t size, std::uint64_t receivedMs) {
             std::vector<std::byte> feedback;
             {
-                TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
+                TimedMutex::Guard lock(videoMutex, TimedMutex::Scope::Callback);
                 if (stopped) return;
-                videoFeedback = send;
-                lastRtpMs = videoNow(); receivedVideoBytes += size;
+                const auto now = videoNow();
+                lastRtpMs = now; receivedVideoBytes += size;
+                // The receive stamp precedes normalization/RTCP and ingress.
+                // Reuse the existing processing clock read: this measures
+                // wall-clock receive-to-assembly delay, not assembly CPU time.
+                if (receivedMs && now >= receivedMs) {
+                    const auto waitMs = now - receivedMs;
+                    ++ingressWaitSamples; ingressWaitTotalMs += waitMs;
+                    ingressWaitMaxMs = std::max(ingressWaitMaxMs, waitMs);
+                }
                 expireMedia(lastRtpMs);
                 video.receive(bytes, size, lastRtpMs, videoFrameBudget(), receivedMs); drainVideo();
                 feedback = repair.nack(video.takeNacks(lastRtpMs));
             }
-            transmitNack(std::move(feedback), send, TimedMutex::Scope::Callback);
+            transmitNack(std::move(feedback), videoFeedback, TimedMutex::Scope::Callback);
         }
         std::string videoDiagnostics() const {
+            TimedMutex::Guard videoLock(videoMutex, TimedMutex::Scope::Diagnostics);
+            std::lock_guard<std::mutex> audioLock(audioMutex);
             const auto now = videoNow();
-            return video.diagnostics() + repair.diagnostics() + " nackSendErrors=" + std::to_string(nackSendErrors) + " queue=" + std::to_string(media.packets.size()) +
-                " queueBytes=" + std::to_string(media.videoBytes + media.audioBytes) +
-                " videoQueue=" + std::to_string(media.videoCount) + " audioQueue=" + std::to_string(media.audioCount) +
-                " videoAgeMs=" + std::to_string(media.age(Kind::Video, now)) +
+            return video.diagnostics() + repair.diagnostics() + " nackSendErrors=" + std::to_string(nackSendErrors) + " queue=" + std::to_string(videoQueue.size() + media.audioCount) +
+                " queueBytes=" + std::to_string(videoQueue.bytes() + media.audioBytes) +
+                " videoQueue=" + std::to_string(videoQueue.size()) + " audioQueue=" + std::to_string(media.audioCount) +
+                " videoAgeMs=" + std::to_string(videoQueue.age(now)) +
                 " audioAgeMs=" + std::to_string(media.age(Kind::Audio, now)) +
                 " videoAgeHighMs=" + std::to_string(media.videoAgeHighMs) +
                 " audioAgeHighMs=" + std::to_string(media.audioAgeHighMs) +
@@ -228,9 +424,15 @@ struct Client::Impl {
                 " queueResync=" + std::to_string(queueResyncs) + " queueCapacity=" + std::to_string(queueCapacity) +
                 " queueAge=" + std::to_string(queueAge) + " audioDrop=" + std::to_string(media.audioDropped) +
                 " audioReject=" + std::to_string(media.audioRejected) + " videoGeneration=" + std::to_string(videoGeneration) +
-                " pli=" + std::to_string(pliRequests);
+                " pli=" + std::to_string(pliRequests) + " videoQueueOwner=assembly videoQueueSpsc=1 ingressDrops=" +
+                std::to_string(ingressDrops.load(std::memory_order_relaxed)) +
+                " ingressWaitScope=receive-to-assembly ingressWaitSamples=" + std::to_string(ingressWaitSamples) +
+                " ingressWaitTotalMs=" + std::to_string(ingressWaitTotalMs) +
+                " ingressWaitAvgMs=" + std::to_string(ingressWaitSamples ? ingressWaitTotalMs / ingressWaitSamples : 0) +
+                " ingressWaitMaxMs=" + std::to_string(ingressWaitMaxMs);
         }
         std::string transportDiagnostics() const {
+            std::lock_guard<std::mutex> telemetryLock(telemetryMutex);
             const auto now = videoNow();
             const auto age = [now](std::uint64_t at) -> long long { return at ? static_cast<long long>(now - at) : -1; };
             return " peerState=" + std::to_string(static_cast<int>(peerState)) +
@@ -255,7 +457,17 @@ struct Client::Impl {
                 e.type == EventType::Description || e.type == EventType::Channel || e.type == EventType::ChannelOpen) {
                 if (iceWorker) iceWorker->invalidate();
                 if (relay && controlSender) controlSender->allow(false);
+                if (relay) revokeMedia();
             }
+            if (e.type == EventType::WsClosed || e.type == EventType::Failure ||
+                (e.type == EventType::PeerState && (e.peerState == rtc::PeerConnection::State::Disconnected ||
+                    e.peerState == rtc::PeerConnection::State::Failed || e.peerState == rtc::PeerConnection::State::Closed)) ||
+                (e.type == EventType::IceState && (e.iceState == rtc::PeerConnection::IceState::Disconnected ||
+                    e.iceState == rtc::PeerConnection::IceState::Failed || e.iceState == rtc::PeerConnection::IceState::Closed))) revokeMedia();
+            // Unlike live peer/ICE state, a queued close/failure has no other
+            // sticky state field. Preserve it across a pump's batch-swap gap so
+            // its final publication cannot reopen a revoked media gate.
+            if (e.type == EventType::WsClosed || e.type == EventType::Failure) terminalMediaEvent = true;
             if (e.type == EventType::PeerState) { peerState = e.peerState; lastPeerMs = now; }
             if (e.type == EventType::IceState) { iceState = e.iceState; lastIceMs = now; }
             if (e.type == EventType::GatheringState) { gatheringState = e.gatheringState; lastGatheringMs = now; }
@@ -286,20 +498,38 @@ struct Client::Impl {
             }
             e.arrivedMs = now;
             const auto bytes = e.text.size() + e.mid.size();
-            if (events.size() >= 128 || eventBytes + bytes > 1024 * 1024) { eventOverflow = true; ++eventDropped; return; }
+            if (events.size() >= 128 || eventBytes + bytes > 1024 * 1024) { eventOverflow = true; ++eventDropped; revokeMedia(); return; }
             eventBytes += bytes; events.push_back(std::move(e));
             eventHigh = std::max(eventHigh, events.size());
         }
         void controlMessage(const std::string& text) {
             const auto message = IncomingControl::classify(text);
+            const auto now = videoNow();
             std::shared_ptr<AsyncControlSender> sender;
             {
                 TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
                 if (stopped) return;
-                lastControlMs = videoNow();
-                incoming.receive(message, lastControlMs + qualityTimeOffset);
+                lastControlMs = now;
+                if (message.kind == IncomingControl::Kind::Close || message.kind == IncomingControl::Kind::Error ||
+                    message.kind == IncomingControl::Kind::Invalid) {
+                    terminalControl = message.kind;
+                    revokeMedia();
+                    rumble.clear();
+                }
+                if (message.kind == IncomingControl::Kind::Rumble && terminalControl == IncomingControl::Kind::Ignored) {
+                    auto value = message.rumble;
+                    value.receivedAtMs = now;
+                    rumble.put(value);
+                }
+                sender = controlSender;
+                if (!sender && message.kind == IncomingControl::Kind::Ping) pendingPong = message.pong;
+            }
+            {
+                std::lock_guard<std::mutex> telemetryLock(telemetryMutex);
+                if (stopped) return;
+                incoming.receive(message, now + qualityTimeOffset.load(std::memory_order_relaxed));
                 if (message.kind == IncomingControl::Kind::Stats) {
-                    try { serverPerformance.receive(message.data, lastControlMs); }
+                    try { serverPerformance.receive(message.data, now); }
                     catch (...) {} // Optional telemetry cannot terminate playback.
                 }
                 if (message.kind == IncomingControl::Kind::Stats && message.data.contains("resolutions")) {
@@ -315,21 +545,9 @@ struct Client::Impl {
                     const auto classification = std::string(" parsed=") + IncomingControl::kindName(message.kind);
                     description.key += classification;
                     description.sample += classification;
-                    incomingEvents.receive(description, lastControlMs);
+                    incomingEvents.receive(description, now);
                 }
                 catch (...) {} // Losing a diagnostic sample must not end the stream.
-                if (message.kind == IncomingControl::Kind::Close || message.kind == IncomingControl::Kind::Error ||
-                    message.kind == IncomingControl::Kind::Invalid) {
-                    terminalControl = message.kind;
-                    rumble.clear();
-                }
-                if (message.kind == IncomingControl::Kind::Rumble && terminalControl == IncomingControl::Kind::Ignored) {
-                    auto value = message.rumble;
-                    value.receivedAtMs = lastControlMs;
-                    rumble.put(value);
-                }
-                sender = controlSender;
-                if (!sender && message.kind == IncomingControl::Kind::Ping) pendingPong = message.pong;
             }
             if (message.kind == IncomingControl::Kind::Ping) {
                 // Pong dispatch is independent of the application's frame pump,
@@ -337,7 +555,7 @@ struct Client::Impl {
                 if (!sender) return; // Channel publication will transfer the bounded latest pong.
                 if (!sender->enqueue(message.pong, ControlQueue::Mode::Pong)) {
                     {
-                        TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
+                        std::lock_guard<std::mutex> telemetryLock(telemetryMutex);
                         if (stopped) return;
                         incoming.pongFailed();
                     }
@@ -353,30 +571,34 @@ struct Client::Impl {
             }
         }
         void packet(Kind kind, rtc::binary bytes, std::uint32_t timestamp) {
-            TimedMutex::Guard lock(mutex, TimedMutex::Scope::Callback);
             if (stopped) return;
             const auto now = videoNow();
-            expireMedia(now);
-            if (kind == Kind::Audio) lastAudioMs = now;
-            if (!media.push({kind, std::move(bytes), timestamp, 0, 0, now, videoGeneration}, now))
-                resyncQueue(true, now);
+            if (kind != Kind::Audio) throw std::logic_error("Video packet bypassed assembly owner");
+            lastAudioMs = now;
+            {
+                std::lock_guard<std::mutex> audioLock(audioMutex);
+                if (stopped) return;
+                media.push({kind, std::move(bytes), timestamp, 0, 0, now,
+                    publishedVideoGeneration.load(std::memory_order_acquire)}, now);
+                media.bytesHigh = std::max(media.bytesHigh, videoQueue.bytes() + media.audioBytes);
+            }
+            if (signals) signals->audio.notify();
         }
     };
     template<class F> static void callback(const std::weak_ptr<Shared>& weak, F&& fn) noexcept {
         auto shared = weak.lock();
         if (!shared) return;
-        {
-            TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Callback);
-            if (shared->stopped) return;
-        }
+        if (shared->stopped.load(std::memory_order_acquire)) return;
         try { fn(*shared); }
         catch (const std::exception&) {
             TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Callback);
             shared->callbackFailure = true;
+            shared->revokeMedia();
         } catch (...) {
             // Unknown callback failures must also reach the owner, without leaking SDP/credentials.
             TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Callback);
             shared->callbackFailure = true;
+            shared->revokeMedia();
         }
     }
     std::shared_ptr<Shared> shared;
@@ -449,6 +671,7 @@ struct Client::Impl {
         if (iceWorker) iceWorker->invalidate();
         if (controlSender && relay) controlSender->allow(false);
         if (relay) isReady = false;
+        if (relay && shared) shared->revokeMedia();
         routeSnapshotSchedule.invalidate();
     }
     void addCandidateProof(rtc::Candidate candidate) {
@@ -466,6 +689,22 @@ struct Client::Impl {
             routeCapturedAt != Clock::time_point{} && Clock::now() - routeCapturedAt < std::chrono::milliseconds(RouteSnapshotSchedule::IntervalMs * 2);
     }
     bool routeAllowed() const { return !relay || (currentRoute() && route.isTurn()); }
+    void publishMediaGate() {
+        if (!shared) return;
+        TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
+        const bool peerBad = shared->peerState == rtc::PeerConnection::State::Disconnected ||
+            shared->peerState == rtc::PeerConnection::State::Failed || shared->peerState == rtc::PeerConnection::State::Closed;
+        const bool iceBad = shared->iceState == rtc::PeerConnection::IceState::Disconnected ||
+            shared->iceState == rtc::PeerConnection::IceState::Failed || shared->iceState == rtc::PeerConnection::IceState::Closed;
+        const bool allowed = running && !closingForRetry && !shared->stopped && !shared->eventOverflow &&
+            !shared->callbackFailure && !shared->terminalMediaEvent && shared->terminalControl == IncomingControl::Kind::Ignored &&
+            !peerBad && !iceBad && routeAllowed();
+        const auto deadline = !allowed ? 0 : !relay ? std::numeric_limits<std::uint64_t>::max() :
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                routeCapturedAt.time_since_epoch()).count()) + RouteSnapshotSchedule::IntervalMs * 2;
+        const bool changed = shared->mediaAllowedUntilMs.exchange(deadline, std::memory_order_acq_rel) != deadline;
+        if (changed && shared->signals) shared->signals->notifyAll();
+    }
     rtc::Candidate selectedLocal, selectedRemote;
     unsigned routeSelections = 0, routeEventDrops = 0;
     std::deque<std::string> routeEvents;
@@ -648,7 +887,7 @@ struct Client::Impl {
         const auto now = Clock::now();
         if (qualityAttempt != Clock::time_point{} && now - qualityAttempt < std::chrono::seconds(1)) return;
         // RTCP needs the real remote SSRC learned from video RTP first.
-        { TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
+        { TimedMutex::Guard lock(shared->videoMutex, TimedMutex::Scope::Client);
           if (!shared->video.stats().received) return; }
         qualityAttempt = now;
         try {
@@ -823,7 +1062,9 @@ struct Client::Impl {
         if (shared) {
             TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
             shared->rumble.clear();
+            shared->revokeMedia();
         }
+        if (shared) shared->stopAssembly();
         // Publish stop intent before querying any RTC locks. The worker drops
         // pending old-generation states immediately, then releases held input.
         if (controlSender) controlSender->requestStop(neutralControl());
@@ -858,18 +1099,24 @@ struct Client::Impl {
             // allocation failure while snapshotting counters or event strings.
             try {
                 finalVideoDiagnostics = shared->videoDiagnostics() + qualityDiagnostics();
-                finalGapDiagnostics = shared->video.gapDiagnostics();
-                finalQueueDiagnostics = shared->media.pressureText();
+                { TimedMutex::Guard videoLock(shared->videoMutex, TimedMutex::Scope::Diagnostics);
+                  finalGapDiagnostics = shared->video.gapDiagnostics(); }
+                { std::lock_guard<std::mutex> audioLock(shared->audioMutex);
+                  finalQueueDiagnostics = shared->media.pressureText(); }
                 finalTransportDiagnostics = shared->transportDiagnostics();
-                finalMutexDiagnostics = TimedMutex::diagnostics(lock.snapshot());
+                finalMutexDiagnostics = TimedMutex::diagnostics(lock.snapshot(), "event") + " | " +
+                    TimedMutex::diagnostics(shared->videoMutex.snapshot(), "video");
                 std::string videoEvent;
-                while (shared->video.pollEvent(videoEvent)) finalVideoEvents.push_back(std::move(videoEvent));
+                { TimedMutex::Guard videoLock(shared->videoMutex, TimedMutex::Scope::Diagnostics);
+                  while (shared->video.pollEvent(videoEvent)) finalVideoEvents.push_back(std::move(videoEvent)); }
                 std::string controlEvent;
-                while (finalControlEvents.size() < 33 && shared->incomingEvents.poll(controlEvent, videoNow(), true))
-                    finalControlEvents.push_back(std::move(controlEvent));
+                { std::lock_guard<std::mutex> telemetryLock(shared->telemetryMutex);
+                  while (finalControlEvents.size() < 33 && shared->incomingEvents.poll(controlEvent, videoNow(), true))
+                    finalControlEvents.push_back(std::move(controlEvent)); }
             } catch (...) {}
             abandonedEvents.swap(shared->events);
-            abandonedPackets.swap(shared->media.packets);
+            { std::lock_guard<std::mutex> audioLock(shared->audioMutex);
+              abandonedPackets.swap(shared->media.packets); }
             shared->eventBytes = 0;
         }
         if (channel) {
@@ -939,10 +1186,13 @@ struct Client::Impl {
         // The owner sees error() this frame and can dispatch rental termination
         // before close()/retry joins the worker. Keep transport ownership intact
         // until that explicit lifecycle boundary; callbacks cannot grow queues.
-        if (controlSender || iceWorker || rtcpWorker) {
+        // Media consumers can already exist before createPeer installs any RTC
+        // worker. Preserve Shared/Impl until their owner has joined them too.
+        if (shared || controlSender || iceWorker || rtcpWorker) {
             if (shared) {
                 TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
                 shared->stopped = true;
+                shared->revokeMedia();
                 shared->rumble.clear();
             }
             running = false; isReady = false; state = "Failed";
@@ -1023,7 +1273,7 @@ struct Client::Impl {
                         if (const auto text = std::get_if<std::string>(&msg))
                             st.controlMessage(*text);
                         else if (const auto bytes = std::get_if<rtc::binary>(&msg)) {
-                            TimedMutex::Guard lock(st.mutex, TimedMutex::Scope::Callback);
+                            std::lock_guard<std::mutex> telemetryLock(st.telemetryMutex);
                             if (!st.stopped) {
                                 try { st.incomingEvents.receive({"binary", "event=<binary> bytes=" +
                                     std::to_string(bytes->size())}, videoNow()); }
@@ -1055,7 +1305,7 @@ struct Client::Impl {
                 if (desc.type() == "video") {
                     kind = Kind::Video;
                     {
-                        TimedMutex::Guard lock(s.mutex, TimedMutex::Scope::Callback);
+                        TimedMutex::Guard lock(s.videoMutex, TimedMutex::Scope::Callback);
                         if (s.stopped) return;
                         if (s.videoTrack) throw TransportError(fog::constants::error::Stream::DuplicateVideoTrack);
                         s.videoTrack = true;
@@ -1147,10 +1397,7 @@ struct Client::Impl {
             operation = "offer.filter";
             const auto sdp = protocol::filterOffer(offer.at("sdp").get<std::string>(), videoSettings.codec);
             selectedCodec = protocol::offeredVideoCodec(sdp);
-            {
-                TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
-                shared->video = H264RtpAssembler(selectedCodec);
-            }
+            shared->configureAssembly(selectedCodec);
             operation = "offer.mids";
             mids = protocol::mediaMids(sdp);
             if (mids.empty() || mids.size() > 16 || std::any_of(mids.begin(), mids.end(), [](const std::string& mid) { return mid.empty() || mid.size() > 64; }))
@@ -1314,10 +1561,15 @@ struct Client::Impl {
                     },
                     [weak](bool sent) {
                         callback(weak, [sent](Shared& s) {
-                            TimedMutex::Guard lock(s.mutex, TimedMutex::Scope::Callback);
+                            std::lock_guard<std::mutex> telemetryLock(s.telemetryMutex);
                             if (!s.stopped) { if (sent) s.incoming.pongSent(); else s.incoming.pongFailed(); }
                         });
                     }, protocol::gamepad(Gamepad{}, playStation).dump(), retryInputReleases, retryInputReset);
+                const std::weak_ptr<AsyncControlSender> weakSender(controlSender);
+                dc->setBufferedAmountLowThreshold(64 * 1024);
+                dc->onBufferedAmountLow([weakSender] {
+                    if (const auto sender = weakSender.lock()) sender->notifyWritable();
+                });
                 retryInputReleases.clear(); retryInputReset = false;
                 TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
                 if (!shared->pendingPong.empty()) {
@@ -1452,6 +1704,7 @@ void Client::blockControlSendForTesting(bool blocked, bool reject) {
     fixture->blocked = blocked; fixture->reject = reject; fixture->condition.notify_all();
 }
 void Client::advanceControlForTesting(unsigned milliseconds) { if (impl_->controlSender) impl_->controlSender->advance(milliseconds); }
+void Client::publishMediaAdmissionForTesting() { impl_->publishMediaGate(); }
 void Client::elapseForTesting(unsigned seconds) {
     const auto elapsed = std::chrono::seconds(seconds);
     auto& i = *impl_;
@@ -1464,7 +1717,8 @@ void Client::elapseForTesting(unsigned seconds) {
     if (i.shared) {
         TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
         i.shared->qualityTimeOffset = i.qualityTimeOffset;
-        if (i.shared->lastVideo != Clock::time_point{}) i.shared->lastVideo -= elapsed;
+        { TimedMutex::Guard videoLock(i.shared->videoMutex, TimedMutex::Scope::Client);
+          if (i.shared->lastVideo != Clock::time_point{}) i.shared->lastVideo -= elapsed; }
     }
 }
 #endif
@@ -1496,11 +1750,13 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
     }
     i.hash = hash; i.suffix = suffix; i.clientHash = hash + suffix;
     i.shared = std::make_shared<Impl::Shared>();
+    i.shared->signals = mediaSignals();
     i.started = i.lastWs = i.lastHeartbeat = i.lastPli = i.rateAt = Clock::now();
     i.running = true; i.state = "Opening signaling";
     i.autoQuality.configureFramesPerSecond(i.videoSettings.framesPerSecond);
     i.autoQuality.enable(i.videoSettings.quality == 0, i.qualityNow());
     try {
+        i.shared->startAssembly();
         rtc::WebSocketConfiguration config;
         config.caCertificatePemFile = caPath;
         config.connectionTimeout = std::chrono::milliseconds(25000);
@@ -1532,8 +1788,11 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
 void Client::pump() {
     auto& i = *impl_;
     if (!i.running || !i.shared) return;
+    struct PublishGate {
+        Impl& impl;
+        ~PublishGate() { impl.publishMediaGate(); }
+    } publishGate{i};
     TransportStageScope pumpTiming{i.pumpTiming};
-    { TransportStageScope timing{i.nackTiming}; i.shared->sendNacks(); }
     bool eventOverflow, callbackFailure, needsPli, statsPending;
     quality::Telemetry stats;
     std::optional<ResolutionScale::Table> resolutions;
@@ -1542,10 +1801,10 @@ void Client::pump() {
     try {
         TransportStageScope timing{i.receiveTiming};
         TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
-        i.shared->video.tick(videoNow(), i.shared->videoFrameBudget()); i.shared->drainVideo();
         eventOverflow = i.shared->eventOverflow; callbackFailure = i.shared->callbackFailure;
-        needsPli = i.shared->videoTrack && (i.shared->video.needsPli() || i.decoderWaiting);
-        lastVideo = i.shared->lastVideo;
+        { TimedMutex::Guard videoLock(i.shared->videoMutex, TimedMutex::Scope::Client);
+          needsPli = i.shared->videoTrack && (i.shared->video.needsPli() || i.decoderWaiting);
+          lastVideo = i.shared->lastVideo; }
         const auto now = Clock::now();
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - i.rateAt).count();
         if (ms >= 1000) {
@@ -1553,12 +1812,13 @@ void Client::pump() {
             i.lastRateBytes = i.shared->receivedVideoBytes; i.rateAt = now;
             i.rateKnown = true;
         }
-        statsPending = i.shared->incoming.takeStats(stats, i.qualityNow());
-        i.invalidResolutionTables = i.shared->invalidResolutionTables;
-        if (i.shared->resolutionsPending) {
-            resolutions = i.shared->resolutions;
-            i.shared->resolutionsPending = false;
-        }
+        { std::lock_guard<std::mutex> telemetryLock(i.shared->telemetryMutex);
+          statsPending = i.shared->incoming.takeStats(stats, i.qualityNow());
+          i.invalidResolutionTables = i.shared->invalidResolutionTables;
+          if (i.shared->resolutionsPending) {
+              resolutions = i.shared->resolutions;
+              i.shared->resolutionsPending = false;
+          } }
         for (const auto& event : i.shared->events)
             i.shared->eventDelayHighMs = std::max(i.shared->eventDelayHighMs, videoNow() - event.arrivedMs);
         events.swap(i.shared->events); i.shared->eventBytes = 0;
@@ -1648,7 +1908,7 @@ void Client::pump() {
                 }
             if (requested) {
                 i.lastPli = now;
-                TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
+                TimedMutex::Guard lock(i.shared->videoMutex, TimedMutex::Scope::Client);
                 ++i.shared->pliRequests;
             }
         }
@@ -1668,18 +1928,39 @@ void Client::pump() {
       }
 }
 bool Client::poll(Packet& packet) {
-    auto& i = *impl_;
-    if (!i.shared || !i.running || !i.routeAllowed()) return false;
-    TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
-    i.shared->expireMedia(videoNow());
-    return i.shared->media.pop(packet);
+    return pollVideo(packet) || pollAudio(packet);
+}
+bool Client::pollVideo(Packet& packet) {
+    const auto shared = impl_->shared;
+    if (!shared) return false;
+    std::uint64_t generation = 0;
+    while (shared->videoQueue.nextGeneration(generation)) {
+        if (generation != shared->publishedVideoGeneration.load(std::memory_order_acquire)) {
+            Packet discarded;
+            shared->videoQueue.pop(discarded);
+            shared->wakeAssembly();
+            continue;
+        }
+        if (!shared->allowsMedia()) return false;
+        if (!shared->videoQueue.pop(packet)) return false;
+        shared->wakeAssembly();
+        // A producer can invalidate the chain while the slot is moved. Never
+        // expose its data as the new generation or after a revoked route.
+        if (packet.videoGeneration == shared->publishedVideoGeneration.load(std::memory_order_acquire) &&
+            shared->allowsMedia()) return true;
+    }
+    return false;
+}
+bool Client::mediaAdmissionAllowed() const {
+    const auto shared = impl_->shared;
+    return shared && shared->allowsMedia();
 }
 bool Client::pollAudio(Packet& packet) {
-    auto& i = *impl_;
-    if (!i.shared || !i.running || !i.routeAllowed()) return false;
-    TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
-    i.shared->expireMedia(videoNow());
-    return i.shared->media.popAudio(packet);
+    const auto shared = impl_->shared;
+    if (!shared || !shared->allowsMedia()) return false;
+    std::lock_guard<std::mutex> lock(shared->audioMutex);
+    shared->media.expireAudio(videoNow());
+    return shared->allowsMedia() && shared->media.popAudio(packet);
 }
 bool Client::pollRumble(Rumble& rumble) {
     auto& i = *impl_;
@@ -1694,8 +1975,7 @@ bool Client::pollRumble(Rumble& rumble) {
 }
 std::uint64_t Client::queuedVideoAgeMs() const {
     if (!impl_->shared) return 0;
-    TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
-    return impl_->shared->media.age(Kind::Video, videoNow());
+    return impl_->shared->videoQueue.age(videoNow());
 }
 bool Client::configureVideo(const fog::video::Settings& settings) {
     if (impl_->running || !fog::video::valid(settings)) return false;
@@ -1727,7 +2007,10 @@ bool Client::updateVideoSettings(const fog::video::Settings& settings) {
     }
     return true;
 }
-VideoCodec Client::selectedVideoCodec() const { return impl_->selectedCodec; }
+VideoCodec Client::selectedVideoCodec() const {
+    const auto shared = impl_->shared;
+    return shared ? shared->workerCodec.load(std::memory_order_acquire) : impl_->selectedCodec;
+}
 std::string Client::qualityStatus() const {
     const auto& i = *impl_;
     char rates[160];
@@ -1749,8 +2032,7 @@ std::string Client::qualityStatus() const {
 }
 std::size_t Client::queuedVideoPackets() const {
     if (!impl_->shared) return 0;
-    TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
-    return impl_->shared->media.videoCount;
+    return impl_->shared->videoQueue.size();
 }
 void Client::observePlayback(const PlaybackObservation& observation) {
     auto& i = *impl_;
@@ -1759,18 +2041,22 @@ void Client::observePlayback(const PlaybackObservation& observation) {
     sample.frames = observation.presentedFrames; sample.decodedFrames = observation.decodedFrames;
     sample.supersededFrames = observation.supersededFrames;
     sample.workUs = observation.workUs; sample.errors = observation.errors;
+    sample.decoderWorkUs = observation.decoderWorkUs; sample.videoGeneration = observation.videoGeneration;
+    sample.workerVideo = observation.workerVideo;
     sample.audioUnderruns = observation.audioUnderruns; sample.audioResets = observation.audioResets;
     sample.recovering = observation.recovering; sample.width = observation.width; sample.height = observation.height;
     {
         TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
-        const auto& stats = i.shared->video.stats();
-        sample.missing = stats.missing; sample.faults = stats.faultSerial; sample.recoveries = stats.resyncs; sample.pressure = stats.pressure;
-        sample.recovering |= i.shared->video.waiting();
+        { TimedMutex::Guard videoLock(i.shared->videoMutex, TimedMutex::Scope::Client);
+          const auto& stats = i.shared->video.stats();
+          sample.missing = stats.missing; sample.faults = stats.faultSerial; sample.recoveries = stats.resyncs; sample.pressure = stats.pressure;
+          sample.recovering |= i.shared->video.waiting(); }
         // Auto sees only work left AFTER this frame's bounded drain. A transient
         // predrain burst is not evidence of sustained decoder congestion.
-        sample.audioDropped = i.shared->media.audioDropped;
-        sample.queuedVideo = i.shared->media.videoCount;
-        sample.oldestVideoMs = i.shared->media.age(Kind::Video, videoNow());
+        { std::lock_guard<std::mutex> audioLock(i.shared->audioMutex);
+          sample.audioDropped = i.shared->media.audioDropped; }
+        sample.queuedVideo = i.shared->videoQueue.size();
+        sample.oldestVideoMs = i.shared->videoQueue.age(videoNow());
     }
     const auto now = i.qualityNow();
     const auto action = i.autoQuality.observe(now, sample, i.serverStats);
@@ -1820,6 +2106,7 @@ bool Client::disconnectForRetry() {
     {
         TimedMutex::Guard lock(i.shared->mutex, TimedMutex::Scope::Client);
         i.shared->stopped = true;
+        i.shared->revokeMedia();
         i.shared->rumble.clear();
     }
     i.closingForRetry = true;
@@ -1872,16 +2159,18 @@ std::string Client::mutexDiagnostics() const {
         TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Diagnostics);
         snapshot = lock.snapshot();
     }
-    return TimedMutex::diagnostics(snapshot);
+    return TimedMutex::diagnostics(snapshot, "event") + " | " +
+        TimedMutex::diagnostics(impl_->shared->videoMutex.snapshot(), "video");
 }
 std::string Client::queueDiagnostics() const {
     if (!impl_->shared) return impl_->finalQueueDiagnostics;
     TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Diagnostics);
+    std::lock_guard<std::mutex> audioLock(impl_->shared->audioMutex);
     return impl_->shared->media.pressureText();
 }
 std::string Client::gapDiagnostics() const {
     if (!impl_->shared) return impl_->finalGapDiagnostics;
-    TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Diagnostics);
+    TimedMutex::Guard lock(impl_->shared->videoMutex, TimedMutex::Scope::Diagnostics);
     return impl_->shared->video.gapDiagnostics();
 }
 std::string Client::videoDiagnostics() const {
@@ -1898,7 +2187,7 @@ bool Client::pollVideoDiagnostic(std::string& event) {
     }
     if (impl_->autoQuality.pollEvent(event)) return true;
     if (impl_->shared) {
-        TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Diagnostics);
+        TimedMutex::Guard lock(impl_->shared->videoMutex, TimedMutex::Scope::Diagnostics);
         return impl_->shared->video.pollEvent(event);
     }
     if (impl_->finalVideoEvents.empty()) return false;
@@ -1906,7 +2195,7 @@ bool Client::pollVideoDiagnostic(std::string& event) {
 }
 bool Client::pollControlDiagnostic(std::string& event, bool final) {
     if (impl_->shared) {
-        TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Diagnostics);
+        std::lock_guard<std::mutex> telemetryLock(impl_->shared->telemetryMutex);
         if (!impl_->shared->incomingEvents.poll(event, videoNow(), final)) return false;
     } else {
         if (impl_->finalControlEvents.empty()) return false;
@@ -1918,13 +2207,12 @@ bool Client::pollControlDiagnostic(std::string& event, bool final) {
 }
 bool Client::waitingForVideoKeyframe() const {
     if (!impl_->shared) return false;
-    TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
+    TimedMutex::Guard lock(impl_->shared->videoMutex, TimedMutex::Scope::Client);
     return impl_->shared->videoTrack && impl_->shared->video.waiting();
 }
 std::uint64_t Client::currentVideoGeneration() const {
     if (!impl_->shared) return 0;
-    TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
-    return impl_->shared->videoGeneration;
+    return impl_->shared->publishedVideoGeneration.load(std::memory_order_acquire);
 }
 void Client::setDecoderWaitingForKeyframe(bool waiting) { impl_->decoderWaiting = waiting; }
 bool Client::requestVideoKeyframe() {
@@ -1939,7 +2227,7 @@ bool Client::requestVideoKeyframe() {
         if (requested) {
             impl_->lastPli = Clock::now();
             if (impl_->shared) {
-                TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
+                TimedMutex::Guard lock(impl_->shared->videoMutex, TimedMutex::Scope::Client);
                 ++impl_->shared->pliRequests;
             }
         }
@@ -1950,7 +2238,7 @@ std::string Client::serverPerformanceDiagnostics() const {
     if (!impl_->shared) return {};
     ServerPerformance snapshot;
     {
-        TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Client);
+        std::lock_guard<std::mutex> telemetryLock(impl_->shared->telemetryMutex);
         snapshot = impl_->shared->serverPerformance;
     }
     return snapshot.diagnostics(videoNow());

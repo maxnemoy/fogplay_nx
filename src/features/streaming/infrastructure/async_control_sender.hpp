@@ -159,8 +159,15 @@ private:
         return true;
     }
 public:
+    // RTC's buffered-amount-low callback publishes readiness. A revision also
+    // retains a callback that races the unlocked availability probe.
+    void notifyWritable() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++writableRevision_; condition_.notify_one();
+    }
     void allow(bool allowed) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (allowed_ != allowed) ++writableRevision_;
         allowed_ = allowed; condition_.notify_one();
     }
     std::string inputLatencyDiagnostics() const {
@@ -386,6 +393,7 @@ private:
                 if (!allowed_ || blocked_ || backpressure_ || operationStalled_ || failure_ != Failure::None ||
                     (queue_.empty() && pongs_.empty() && recovery_.empty())) continue;
                 transportActive_ = true; operationAt_ = now();
+                const auto readiness = writableRevision_;
                 lock.unlock();
                 bool available = false;
                 Failure failure = Failure::None;
@@ -398,9 +406,20 @@ private:
                 if (failure != Failure::None) { failure_ = failure; continue; }
                 if (stopping_ || !allowed_ || blocked_ || backpressure_ || operationStalled_) continue;
                 if (!available) {
-                    // Avoid spinning when RTC's bounded buffer is full; route or
-                    // shutdown publication still wakes this wait immediately.
-                    condition_.wait_for(lock, std::chrono::milliseconds(5)); continue;
+                    // Wait for buffer/route readiness, not a 5-ms retry loop.
+                    // Only the oldest local obligation's deadline is timed.
+                    const auto ms = now();
+                    auto oldest = ms;
+                    if (!queue_.empty()) oldest = std::min(oldest, queue_.front().enqueuedMs);
+                    if (!pongs_.empty()) oldest = std::min(oldest, pongs_.front().enqueuedMs);
+                    if (!recovery_.empty()) oldest = std::min(oldest, recoveryProgressAt_);
+                    const auto age = ms - oldest;
+                    const auto remaining = age < ControlQueue::StallMs ? ControlQueue::StallMs - age : 0;
+                    condition_.wait_for(lock, std::chrono::milliseconds(remaining), [&] {
+                        return stopping_ || !allowed_ || blocked_ || backpressure_ || operationStalled_ ||
+                            failure_ != Failure::None || readiness != writableRevision_;
+                    });
+                    continue;
                 }
                 ControlQueue::Message message;
                 // Complete protocol initialization before releasing persistent
@@ -452,6 +471,7 @@ private:
     bool acceptedTouchDown_ = false, sentTouchDown_ = false, psKnown_ = false;
     std::uint32_t acceptedButtons_ = 0;
     std::uint64_t psSequence_ = 0;
+    std::uint64_t writableRevision_ = 0;
     std::uint64_t offsetMs_ = 0, inFlightAt_ = 0, operationAt_ = 0, recoveryProgressAt_ = 0, pongRejected_ = 0;
     std::size_t inFlightBytes_ = 0, pongStreak_ = 0;
     std::string neutral_;

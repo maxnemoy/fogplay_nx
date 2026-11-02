@@ -31,6 +31,33 @@ struct Fake {
 };
 int main() {
     {
+        Fake output;
+        std::atomic<unsigned> probes{0};
+        std::atomic<bool> writable{false};
+        Sender sender([&] { ++probes; return writable.load(); }, [&](const auto& text) { output.send(text); });
+        sender.allow(true); assert(sender.enqueue("wait-for-writable"));
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!probes && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        assert(probes == 1);
+        std::this_thread::sleep_for(60ms);
+        assert(probes == 1); // No periodic availability probes during pressure.
+        writable = true; sender.notifyWritable(); output.awaitSize(1); sender.stop();
+    }
+    {
+        Fake output;
+        std::promise<void> probing, release;
+        auto gate = release.get_future().share();
+        std::atomic<unsigned> probes{0};
+        Sender sender([&] {
+            if (++probes == 1) { probing.set_value(); gate.wait(); return false; }
+            return true;
+        }, [&](const auto& text) { output.send(text); });
+        sender.allow(true); assert(sender.enqueue("notification-during-probe"));
+        probing.get_future().wait();
+        sender.notifyWritable(); release.set_value();
+        output.awaitSize(1); sender.stop(); // Wake preceding wait must be retained.
+    }
+    {
         // All physical buttons, including both digital triggers, remain ordered
         // while only the newest analog snapshot within each held state survives.
         Fake fake; fake.block = true;

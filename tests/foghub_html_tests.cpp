@@ -295,6 +295,8 @@ void computerBonusPrices() {
     check(page.totalItems == 271 && page.nextPath == "/game/preview?id=70&page=2&per-page=24");
     check(parseComputers(replace(bonus, "+10|25%", "+5%"), "70").rows[0].pricePerHour == "60");
     check(parseComputers(replace(bonus, "60₽", "60.50₽"), "70").rows[0].pricePerHour == "60.50");
+    check(parseComputers(replace(bonus, "60₽", "60₽/час"), "70").rows[0].pricePerHour == "60");
+    rejects([&] { parseComputers(replace(bonus, "60₽", "60₽/мин"), "70"); });
     check(parseComputers(replace(html, "Играть FH 35₽", "<small>Играть FH</small> 35₽"), "70").rows[0].pricePerHour == "35");
     check(parseComputers(replace(bonus, label, "Играть FH 60₽ " + badge), "70").rows[0].pricePerHour == "60");
     for (const auto* malformed : {"+0%", "+101%", "+05%", "+10|0%", "+10|101%", "+10|25|30%", "10|25%", "+5% бонусов", "+5% 99₽", "+x%", "", "Онлайн"})

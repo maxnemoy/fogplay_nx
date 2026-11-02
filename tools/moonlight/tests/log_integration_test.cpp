@@ -9,6 +9,15 @@ extern "C" {
 #include <fstream>
 #include <iterator>
 
+namespace {
+moonlight_diagnostics::Sink bridgeSink = nullptr;
+std::atomic<bool> idleJournalObserved{false};
+void observeIdleJournal(const std::string& message) {
+    bridgeSink(message);
+    if (message.find("core_us=4100 ") != std::string::npos) idleJournalObserved = true;
+}
+}
+
 int main() {
     const auto previous = std::filesystem::current_path();
     const auto directory = std::filesystem::temp_directory_path() /
@@ -22,6 +31,8 @@ int main() {
             // Same bridge used by FogHubServices, installed before host work.
             fogplay::MoonlightDiagnosticsBridge bridge;
             assert(moonlight_diagnostics::sink.load());
+            bridgeSink = moonlight_diagnostics::sink.load();
+            moonlight_diagnostics::sink = &observeIdleJournal;
             moonlight::MoonlightSession session((directory / "identity").string());
             pair(session);
             auto client = session.create(); assert(client);
@@ -41,9 +52,19 @@ int main() {
             FogDiagSetWaitingForIdr(0, 0, 3700);
             FogDiagIdrAssembled(77, 3800);
             FogDiagThreadStarted("VideoRecv", 2, -2, 7, 59, 0, 3900);
+            initialVideoFrames = 0;
             assert(client->start({rental()}));
             eventually([&] { return client->ready(); });
-            client->close(); // joins producer and performs the final real drain
+            std::thread mediaOwner([&] { stream::Packet packet; assert(!client->pollVideo(packet)); });
+            eventually([&] { return videoWaitBlocked.load(); });
+            FogDiagSetWaitingForIdr(1,5,4000);
+            FogDiagIdrRequested(4100);
+            // The lifecycle diagnostic deadline still drains the real journal
+            // while Media waits indefinitely in the core for the next frame.
+            eventually([&] { return idleJournalObserved.load(); });
+            assert(videoWaitBlocked);
+            client->close(); mediaOwner.join();
+            moonlight_diagnostics::sink = bridgeSink;
         }
         assert(fogplay::diagnostics::runLog.flush());
         std::ifstream file(fogplay::diagnostics::runLog.archivePath());
@@ -54,6 +75,7 @@ int main() {
         }
         assert(text.find("connection=1 wait=2") != std::string::npos);
         assert(text.find("frame=77") != std::string::npos);
+        assert(text.find("core_us=4100 ") != std::string::npos);
         assert(text.find("Moonlight IDR journal missed=") != std::string::npos);
         assert(text.find("Moonlight thread role=VideoRecv connection=1 core=2") != std::string::npos);
         assert(fogplay::diagnostics::runLog.stats().droppedLines == 0);

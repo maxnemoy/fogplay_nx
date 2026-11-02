@@ -51,8 +51,12 @@ struct Telemetry {
 
 struct Sample {
     // Session totals: frames counts only new frames successfully presented.
-    // Decoder work belongs to decodedFrames, including frames superseded before presentation.
+    // Synchronous work includes decode/conversion/upload. With workerVideo,
+    // workUs measures UI preparation/upload and decoderWorkUs measures the
+    // independent worker's decode/conversion, including superseded frames.
     std::uint64_t frames = 0, decodedFrames = 0, supersededFrames = 0, workUs = 0, errors = 0;
+    std::uint64_t decoderWorkUs = 0, videoGeneration = 0;
+    bool workerVideo = false;
     // Audio loss counters exclude startup/recovery priming and intentional resets.
     std::uint64_t audioDropped = 0, audioUnderruns = 0;
     std::uint64_t audioResets = 0; // Intentional PCM clears interrupt headroom, not proof of overload.
@@ -97,14 +101,22 @@ public:
             sample.frames < base_.frames || sample.decodedFrames < base_.decodedFrames ||
             sample.supersededFrames < base_.supersededFrames || sample.audioDropped < base_.audioDropped ||
             sample.audioUnderruns < base_.audioUnderruns || sample.audioResets < base_.audioResets ||
-            sample.workUs < base_.workUs || sample.errors < base_.errors ||
+            sample.workUs < base_.workUs || sample.decoderWorkUs < base_.decoderWorkUs || sample.errors < base_.errors ||
+            sample.workerVideo != base_.workerVideo ||
             sample.missing < base_.missing || sample.faults < base_.faults ||
             sample.recoveries < base_.recoveries || sample.pressure < base_.pressure) {
             base_ = sample; baseAt_ = lastObserve_ = now; sampled_ = true;
             stable_ = false; interrupted_ = sample.recovering; queueWindows_ = deliveryWindows_ = audioWindows_ = 0;
             lagging_ = false; lagSince_ = now; maxOldestVideoMs_ = sample.oldestVideoMs;
+            workerVideo_ = sample.workerVideo;
+            workMs_ = busy_ = uiWorkMs_ = uiBusy_ = decoderWorkMs_ = decoderBusy_ = 0;
             decide("sample-gap", now); return Action::None;
         }
+        // Recovery generations retain cumulative work and loss counters. A
+        // new decoder/reference chain invalidates upgrade headroom, but must
+        // not restart the loss window: frequent resyncs are themselves damage
+        // evidence and still need to trigger a downgrade.
+        if (sample.videoGeneration != base_.videoGeneration) stable_ = false;
         lastObserve_ = now;
         maxOldestVideoMs_ = std::max(maxOldestVideoMs_, sample.oldestVideoMs);
         // A batch can be deep immediately after reception without being slow.
@@ -118,6 +130,7 @@ public:
         if (now - baseAt_ < 2000) return Action::None;
         const double elapsed = static_cast<double>(now - baseAt_);
         const auto frames = sample.frames - base_.frames, work = sample.workUs - base_.workUs;
+        const auto decoderWork = sample.decoderWorkUs - base_.decoderWorkUs;
         const auto decoded = sample.decodedFrames - base_.decodedFrames;
         const auto superseded = sample.supersededFrames - base_.supersededFrames;
         const auto audioDropped = sample.audioDropped - base_.audioDropped;
@@ -128,8 +141,16 @@ public:
         const auto recoveries = sample.recoveries - base_.recoveries;
         fps_ = frames * 1000.0 / elapsed;
         decodedFps_ = decoded * 1000.0 / elapsed;
-        workMs_ = decoded ? work / (1000.0 * decoded) : 0;
-        busy_ = work / (1000.0 * elapsed);
+        uiWorkMs_ = decoded ? work / (1000.0 * decoded) : 0;
+        uiBusy_ = work / (1000.0 * elapsed);
+        decoderWorkMs_ = sample.workerVideo && decoded ? decoderWork / (1000.0 * decoded) : 0;
+        decoderBusy_ = sample.workerVideo ? decoderWork / (1000.0 * elapsed) : 0;
+        // These domains run concurrently. Adding their durations would invent
+        // saturation of one thread and reject real headroom. Both must have
+        // capacity, so the slower domain controls the existing thresholds.
+        workMs_ = std::max(uiWorkMs_, decoderWorkMs_);
+        busy_ = std::max(uiBusy_, decoderBusy_);
+        workerVideo_ = sample.workerVideo;
         const bool dimensions = sample.width > 0 && sample.height > 0 && sample.width <= 1920 && sample.height <= 1080;
         const bool contiguous = !interrupted_ && elapsed <= 3000;
         const auto oldest = maxOldestVideoMs_; maxOldestVideoMs_ = 0;
@@ -215,11 +236,12 @@ public:
     bool pending() const { return pending_ != Action::None; }
     double fps() const { return fps_; }
     std::string diagnostics() const {
-        char out[640];
-        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d autoTargetFps=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u autoCapCoalesced=%llu autoGoodMs=%llu autoEvidenceMs=%llu autoPaused=%d",
+        char out[896];
+        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d autoTargetFps=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u autoCapCoalesced=%llu autoGoodMs=%llu autoEvidenceMs=%llu autoPaused=%d workerVideo=%d uiVideoMs=%.2f decoderVideoMs=%.2f uiVideoBusy=%.3f decoderVideoBusy=%.3f",
             enabled_, reason_, pending(), framesPerSecond_, fps_, decodedFps_, workMs_, busy_, attemptsUp_, attemptsDown_, downgradeStreak_,
             static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_, static_cast<unsigned long long>(capCoalesced_),
-            static_cast<unsigned long long>(stable_ ? headroomGoodMs_ : 0), static_cast<unsigned long long>(headroomSpan()), stable_ && headroomPaused_);
+            static_cast<unsigned long long>(stable_ ? headroomGoodMs_ : 0), static_cast<unsigned long long>(headroomSpan()), stable_ && headroomPaused_,
+            workerVideo_, uiWorkMs_, decoderWorkMs_, uiBusy_, decoderBusy_);
         return out;
     }
     bool pollEvent(std::string& out) {
@@ -285,9 +307,10 @@ private:
     }
     void event(const char* state, std::uint64_t now) {
         if (events_.size() >= 32) events_.pop_front();
-        char values[448];
-        std::snprintf(values, sizeof(values), " sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f downgrades=%u nextUpMs=%llu queueWindows=%u deliveryWindows=%u audioWindows=%u goodMs=%llu evidenceMs=%llu paused=%d", fps_, decodedFps_, workMs_, busy_, downgradeStreak_, static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_,
-            static_cast<unsigned long long>(stable_ ? headroomGoodMs_ : 0), static_cast<unsigned long long>(headroomSpan()), stable_ && headroomPaused_);
+        char values[640];
+        std::snprintf(values, sizeof(values), " sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f downgrades=%u nextUpMs=%llu queueWindows=%u deliveryWindows=%u audioWindows=%u goodMs=%llu evidenceMs=%llu paused=%d workerVideo=%d uiVideoMs=%.2f decoderVideoMs=%.2f uiVideoBusy=%.3f decoderVideoBusy=%.3f", fps_, decodedFps_, workMs_, busy_, downgradeStreak_, static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_,
+            static_cast<unsigned long long>(stable_ ? headroomGoodMs_ : 0), static_cast<unsigned long long>(headroomSpan()), stable_ && headroomPaused_,
+            workerVideo_, uiWorkMs_, decoderWorkMs_, uiBusy_, decoderBusy_);
         events_.push_back(std::string("qualityEvent=") + state + " ms=" + std::to_string(now) +
             " reason=" + reason_ + " profile=" + name(observed_) + values);
     }
@@ -306,6 +329,8 @@ private:
     Sample base_;
     int framesPerSecond_ = 30;
     double fps_ = 0, decodedFps_ = 0, workMs_ = 0, busy_ = 0;
+    double uiWorkMs_ = 0, uiBusy_ = 0, decoderWorkMs_ = 0, decoderBusy_ = 0;
+    bool workerVideo_ = false;
     const char* reason_ = "manual";
     std::deque<std::string> events_;
 };

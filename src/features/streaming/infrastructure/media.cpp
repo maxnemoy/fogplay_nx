@@ -68,6 +68,16 @@ struct StageTiming {
     }
     std::uint64_t average() const { const auto count = calls.load(); return count ? total.load() / count : 0; }
 };
+struct WorkScope {
+    StageTiming& timing;
+    DecoderClock::time_point start = DecoderClock::now();
+    ~WorkScope() { timing.record(start); }
+};
+struct FrameCompletionScope {
+    std::shared_ptr<::stream::VideoFrameCompletion> completion;
+    bool decoded = false;
+    ~FrameCompletionScope() { if (completion) completion->complete(decoded); }
+};
 }
 struct Media::Impl {
     SDL_Renderer* renderer;
@@ -138,6 +148,8 @@ struct Media::Impl {
     detail::VideoParameters parameters;
     StageTiming sendTiming, receiveTiming, transferTiming, scaleTiming, uploadTiming;
     StageTiming videoQueueWait, audioQueueWait;
+    StageTiming workerDecodeTiming, workerConvertTiming;
+    std::atomic<std::uint64_t> loadGeneration{0};
     std::uint64_t hardwareEventsBeforePacket = 0;
     int lastFrameFormat = AV_PIX_FMT_NONE, lastCpuFormat = AV_PIX_FMT_NONE;
     int lastColorspace = AVCOL_SPC_UNSPECIFIED, lastRange = AVCOL_RANGE_UNSPECIFIED;
@@ -150,8 +162,10 @@ struct Media::Impl {
     std::atomic<std::uint64_t> epoch{0}, transportGeneration{0};
     std::atomic<std::uint64_t> underruns{0}, audioResets{0};
     std::thread videoWorker, audioWorker;
-    std::mutex wakeMutex, readyMutex, errorMutex, snapshotMutex;
-    std::condition_variable wake;
+    std::mutex readyMutex, errorMutex, snapshotMutex;
+    std::shared_ptr<::stream::MediaSignals> signals;
+    ::stream::StreamingClient* workerClient = nullptr; // Joined before client teardown.
+    bool boundedWorkerAudio = true;
     detail::MediaFrameQueue readyFrames;
     std::deque<Media::WorkerError> errors;
     std::string videoSnapshot, audioSnapshot;
@@ -198,7 +212,7 @@ struct Media::Impl {
         waiting = true;
         resetRequested = true;
         discardReady();
-        wake.notify_all();
+        if (workerClient) workerClient->wakeMediaWaiters();
     }
     void reportError(const ::stream::Packet* failed) noexcept {
         try {
@@ -214,12 +228,6 @@ struct Media::Impl {
         }
     }
     std::exception_ptr emergencyError;
-    void idle(bool commands = false) {
-        std::unique_lock<std::mutex> lock(wakeMutex);
-        wake.wait_for(lock, std::chrono::milliseconds(2), [this, commands] {
-            return stopping.load() || (commands && resetRequested.load());
-        });
-    }
     void decodeVideo(const std::byte* data, std::size_t size,
         std::uint64_t firstPacketMs = 0, std::uint64_t enqueueMs = 0);
     void decodeAudio(const std::byte* data, std::size_t size, std::uint64_t enqueueMs = 0);
@@ -616,10 +624,13 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
     bool paused = false, haveGeneration = false;
     std::uint64_t lastGeneration = 0;
     while (!stopping) {
+        const auto wakeSequence = signals->video.sequence();
         ::stream::Packet incoming;
         bool hasPacket = false;
         try {
             if (resetRequested.load()) {
+                ++loadGeneration;
+                WorkScope work{workerDecodeTiming};
                 resetInProgress = true;
                 resetRequested.exchange(false);
                 const bool change = codecRequested.exchange(false);
@@ -630,36 +641,59 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
                 publishVideo(true);
                 resetInProgress = false;
             }
-            if (paused) { idle(true); continue; }
-            if (!client.poll(incoming)) {
+            if (paused) {
+                if (!stopping && !resetRequested) signals->video.wait(wakeSequence, std::chrono::seconds(1));
+                continue;
+            }
+            if (!client.pollVideo(incoming, wakeSequence)) {
                 // Sparse snapshots need an idle refresh after the last frame.
                 // The control profile retains the original frame/reset/error
                 // publication sites instead of formatting on every empty poll.
                 if (fog::stage1::sparseDiagnostics) publishVideo();
-                idle(true); continue;
+                if (!stopping && !resetRequested) signals->video.wait(wakeSequence, std::chrono::seconds(1));
+                continue;
             }
             hasPacket = true;
+            FrameCompletionScope completion{incoming.completion};
+            if (incoming.kind != ::stream::Kind::Video)
+                throw std::logic_error("Video consumer received non-video packet");
             recordQueueWait(incoming, videoQueueWait);
             const auto decodeEpoch = epoch.load();
+            const auto sourceGeneration = client.currentVideoGeneration();
+            if (!client.mediaAdmissionAllowed() || (sourceGeneration && incoming.videoGeneration != sourceGeneration)) {
+                discardReady();
+                continue;
+            }
             const auto selected = client.selectedVideoCodec();
             const bool codecChanged = selected != videoCodec;
-            if (codecChanged) { changeCodec(selected); discardReady(); }
-            if (haveGeneration && incoming.videoGeneration != lastGeneration) {
-                if (!codecChanged) resetVideo();
-                discardReady();
+            {
+                WorkScope work{workerDecodeTiming};
+                if (!haveGeneration || codecChanged || incoming.videoGeneration != lastGeneration) ++loadGeneration;
+                if (codecChanged) { changeCodec(selected); discardReady(); }
+                if (haveGeneration && incoming.videoGeneration != lastGeneration) {
+                    if (!codecChanged) resetVideo();
+                    discardReady();
+                }
+                lastGeneration = incoming.videoGeneration;
+                haveGeneration = true;
+                transportGeneration = lastGeneration;
+                decodeVideo(incoming.data.data(), incoming.data.size(), incoming.firstPacketMs, incoming.enqueueMs);
             }
-            lastGeneration = incoming.videoGeneration;
-            haveGeneration = true;
-            transportGeneration = lastGeneration;
-            decodeVideo(incoming.data.data(), incoming.data.size(), incoming.firstPacketMs, incoming.enqueueMs);
             if (pending) {
+                WorkScope work{workerConvertTiming};
                 auto output = convertPending();
+                output.transportGeneration = incoming.videoGeneration;
                 clearPending();
                 std::lock_guard<std::mutex> lock(readyMutex);
-                if (decodeEpoch == epoch.load() && !resetRequested && !stopping)
+                const auto currentGeneration = client.currentVideoGeneration();
+                if (decodeEpoch == epoch.load() && !resetRequested && !stopping && client.mediaAdmissionAllowed() &&
+                    (!currentGeneration || incoming.videoGeneration == currentGeneration))
                     supersededFrames += readyFrames.push(std::move(output), incoming.timestamp, DecoderClock::now());
                 else ++supersededFrames;
             }
+            const auto completedGeneration = client.currentVideoGeneration();
+            completion.decoded = !awaitingIdr && decodeEpoch == epoch.load() && !resetRequested && !stopping &&
+                client.mediaAdmissionAllowed() && (!completedGeneration || incoming.videoGeneration == completedGeneration);
             publishVideo();
         } catch (...) {
             resetInProgress = false;
@@ -675,10 +709,14 @@ void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
     bool paused = false;
     auto nextQueueObservation = DecoderClock::now();
     while (!stopping) {
+        const auto wakeSequence = signals->audio.sequence();
         ::stream::Packet incoming;
         bool hasPacket = false;
         try {
-            if (paused) { idle(); continue; }
+            if (paused) {
+                if (!stopping) signals->audio.wait(wakeSequence, std::chrono::seconds(1));
+                continue;
+            }
             if (audioRecovery.expired(DecoderClock::now()))
                 throw AudioPlaybackError("Audio recovery deadline exhausted; stopping rental");
             if (!fog::stage1::sparseDiagnostics) observeAudioQueue();
@@ -692,8 +730,15 @@ void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
             // Never backpressure the compressed FIFO from SDL: doing so keeps
             // a permanent backlog after a stall. Decode every packet and admit
             // only useful PCM, retaining Opus state while catching up.
-            if (!client.pollAudio(incoming)) { idle(); continue; }
+            if (!client.pollAudio(incoming)) {
+                // SDL queue observations and recovery deadlines still need a
+                // bounded maintenance wake, independent of packet arrival.
+                if (!stopping) signals->audio.wait(wakeSequence, std::chrono::milliseconds(20));
+                continue;
+            }
             hasPacket = true;
+            if (incoming.kind != ::stream::Kind::Audio)
+                throw std::logic_error("Audio consumer received non-audio packet");
             recordQueueWait(incoming, audioQueueWait);
             decodeAudio(incoming.data.data(), incoming.data.size(), incoming.enqueueMs);
             publishAudio();
@@ -705,12 +750,16 @@ void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
         }
     }
 }
-void Media::startWorkers(::stream::StreamingClient& client, int fps) {
+void Media::startWorkers(::stream::StreamingClient& client, int fps, WorkerPolicy policy) {
     auto& m = *impl_;
     m.requireApplicationThread();
     if (m.workers) throw std::logic_error("Media workers already running");
     if (fps < 1 || fps > 120) throw std::invalid_argument("Invalid media worker frame rate");
     m.workerFps = fps;
+    m.signals = client.mediaSignals();
+    m.workerClient = &client;
+    m.boundedWorkerAudio = policy == WorkerPolicy::FogHub || m.boundedSyncAudio;
+    ++m.loadGeneration;
     m.displayPaced = false;
 #ifdef __SWITCH__
     SDL_RendererInfo rendererInfo{};
@@ -742,10 +791,12 @@ void Media::stopWorkers() noexcept {
     auto& m = *impl_;
     assert(std::this_thread::get_id() == m.applicationThread);
     m.stopping = true;
-    m.wake.notify_all();
+    if (m.workerClient) m.workerClient->wakeMediaWaiters();
     if (m.videoWorker.joinable()) m.videoWorker.join();
     if (m.audioWorker.joinable()) m.audioWorker.join();
     m.workers = false;
+    m.signals.reset();
+    m.workerClient = nullptr;
     m.discardReady();
 }
 bool Media::workersRunning() const { return impl_->workers; }
@@ -763,6 +814,9 @@ bool Media::takeWorkerError(WorkerError& output) {
     return true;
 }
 std::uint64_t Media::workerVideoGeneration() const { return impl_->transportGeneration; }
+Media::WorkerVideoLoad Media::workerVideoLoad() const {
+    return {impl_->workerDecodeTiming.total.load(), impl_->workerConvertTiming.total.load(), impl_->loadGeneration.load()};
+}
 bool Media::supportsH265() {
     const auto* codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
     if (!codec) return false;
@@ -894,12 +948,13 @@ void Media::Impl::decodeAudio(const std::byte* data, std::size_t size, std::uint
     }
     // Drop stale queued audio after a scheduling stall instead of increasing latency.
     const auto queued = observeAudioQueue();
-    if (!workers && !boundedSyncAudio && queued > detail::AudioQueueMetrics::bytesPerSecond / 5) {
+    const bool boundedAudio = workers ? boundedWorkerAudio : boundedSyncAudio;
+    if (!boundedAudio && queued > detail::AudioQueueMetrics::bytesPerSecond / 5) {
         SDL_ClearQueuedAudio(audioDevice);
         audioMetrics.cleared(queued);
     }
     auto selected = detail::AudioLatencyPolicy::Selection{0, static_cast<std::uint32_t>(count), false, false};
-    if (workers || boundedSyncAudio) {
+    if (boundedAudio) {
         const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             DecoderClock::now().time_since_epoch()).count());
         const auto residence = enqueueMs && enqueueMs <= now ? now - enqueueMs : 0;
@@ -953,6 +1008,12 @@ bool Media::preparePresentation(DecoderClock::time_point presentationSlot) {
         if (!m.readyFrames.take(output, m.displayPaced ? DecoderClock::now() : presentationSlot, dropped)) return false;
     }
     m.supersededFrames += dropped;
+    const auto sourceGeneration = m.workerClient->currentVideoGeneration();
+    if (!m.workerClient->mediaAdmissionAllowed() ||
+        (sourceGeneration && output.transportGeneration != sourceGeneration)) {
+        ++m.supersededFrames;
+        return false;
+    }
     const bool uploaded = m.upload(output);
     if (uploaded && m.displayPaced) m.refreshPrepared = true;
     return uploaded;

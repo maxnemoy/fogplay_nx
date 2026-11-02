@@ -6,7 +6,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 source = (root / 'src/features/streaming/infrastructure/moonlight/moonlight_session.cpp').read_text()
 helpers = source[source.index('    bool accepted(int result)'):source.index('    static short axis(')]
-optional = source[source.index('    bool send(const fog::remote::Touch&'):source.index('    bool take(stream::Packet&')]
+optional = source[source.index('    bool send(const fog::remote::Touch&'):source.index('    void run() noexcept')]
 program = r'''
 #include "features/streaming/infrastructure/moonlight/controller_input.hpp"
 #include "features/playstation/infrastructure/native_input.hpp"

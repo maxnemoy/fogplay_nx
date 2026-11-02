@@ -65,15 +65,18 @@ class Client final : public stream::StreamingClient {
 public:
     std::mutex mutex;
     std::deque<stream::Packet> video, audio;
-    std::atomic<unsigned> polls{0};
-    void push(const Bytes& bytes, bool sound = false, std::uint64_t generation = 1, std::uint32_t timestamp = 0) {
+    std::atomic<unsigned> polls{0}, videoPolls{0}, audioPolls{0};
+    void push(const Bytes& bytes, bool sound = false, std::uint64_t generation = 1, std::uint32_t timestamp = 0,
+              std::shared_ptr<stream::VideoFrameCompletion> completion = {}) {
         std::lock_guard<std::mutex> lock(mutex);
         stream::Packet packet; packet.kind = sound ? stream::Kind::Audio : stream::Kind::Video;
         packet.data = bytes; packet.videoGeneration = generation; packet.timestamp = timestamp;
+        packet.completion = std::move(completion);
         packet.enqueueMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count()) - 7;
         packet.firstPacketMs = packet.enqueueMs - 43;
         (sound ? audio : video).push_back(std::move(packet));
+        (sound ? mediaSignals()->audio : mediaSignals()->video).notify();
     }
     void pushAudioBatch(const std::vector<Bytes>& packets, std::size_t first, std::size_t count, std::uint64_t ageMs) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -83,9 +86,18 @@ public:
             stream::Packet packet; packet.kind = stream::Kind::Audio; packet.data = packets.at(i);
             packet.enqueueMs = now - ageMs; audio.push_back(std::move(packet));
         }
+        mediaSignals()->audio.notify();
     }
-    bool poll(stream::Packet& packet) override { return pop(video, packet); }
-    bool pollAudio(stream::Packet& packet) override { return pop(audio, packet); }
+    void pushMisrouted(const Bytes& bytes, bool toVideo) {
+        std::lock_guard<std::mutex> lock(mutex);
+        stream::Packet packet; packet.data = bytes;
+        packet.kind = toVideo ? stream::Kind::Audio : stream::Kind::Video;
+        (toVideo ? video : audio).push_back(std::move(packet));
+        (toVideo ? mediaSignals()->video : mediaSignals()->audio).notify();
+    }
+    bool poll(stream::Packet& packet) override { ++videoPolls; return pop(video, packet); }
+    bool pollVideo(stream::Packet& packet) override { return poll(packet); }
+    bool pollAudio(stream::Packet& packet) override { ++audioPolls; return pop(audio, packet); }
     bool pop(std::deque<stream::Packet>& queue, stream::Packet& packet) {
         std::lock_guard<std::mutex> lock(mutex); ++polls;
         if (queue.empty()) return false;
@@ -161,6 +173,11 @@ extern "C" Uint32 __wrap_SDL_GetQueuedAudioSize(SDL_AudioDeviceID device) {
     return __real_SDL_GetQueuedAudioSize(device);
 }
 static std::atomic<int> failAudioQueue{0}, failAudioOpen{0}, failAudioDecode{0};
+static std::atomic<bool> holdAudioDevice{false};
+extern "C" void __real_SDL_PauseAudioDevice(SDL_AudioDeviceID, int);
+extern "C" void __wrap_SDL_PauseAudioDevice(SDL_AudioDeviceID device, int pause) {
+    __real_SDL_PauseAudioDevice(device, pause || holdAudioDevice);
+}
 extern "C" int __real_SDL_QueueAudio(SDL_AudioDeviceID, const void*, Uint32);
 extern "C" int __wrap_SDL_QueueAudio(SDL_AudioDeviceID device, const void* data, Uint32 size) {
     const auto failures = failAudioQueue.load();
@@ -175,6 +192,7 @@ extern "C" SDL_AudioDeviceID __wrap_SDL_OpenAudioDevice(const char* device, int 
 }
 static std::mutex audioCaptureMutex;
 static std::vector<std::uint64_t> audioHashes;
+static std::atomic<unsigned> audioDecodeCalls{0}, videoDecodeCalls{0};
 static std::uint64_t pcmHash(const opus_int16* pcm, int count) {
     std::uint64_t result = 1469598103934665603ULL;
     for (int i = 0; i < count * 2; ++i) { result ^= static_cast<std::uint16_t>(pcm[i]); result *= 1099511628211ULL; }
@@ -183,6 +201,7 @@ static std::uint64_t pcmHash(const opus_int16* pcm, int count) {
 extern "C" int __real_opus_decode(OpusDecoder*, const unsigned char*, opus_int32, opus_int16*, int, int);
 extern "C" int __wrap_opus_decode(OpusDecoder* decoder, const unsigned char* data, opus_int32 size,
     opus_int16* pcm, int frames, int fec) {
+    ++audioDecodeCalls;
     if (failAudioDecode > 0) { --failAudioDecode; return OPUS_INTERNAL_ERROR; }
     const int result = __real_opus_decode(decoder, data, size, pcm, frames, fec);
     if (captureAudio && result > 0) {
@@ -193,6 +212,7 @@ extern "C" int __wrap_opus_decode(OpusDecoder* decoder, const unsigned char* dat
 static std::thread::id applicationThread;
 static std::atomic<bool> wrongThread{false}, failSend{false}, blockSend{false}, enteredSend{false};
 static std::atomic<unsigned> hevcOpens{0};
+static std::atomic<unsigned> scaleDelayUs{0};
 static std::mutex gateMutex;
 static std::condition_variable gate;
 extern "C" int __real_avcodec_open2(AVCodecContext*, const AVCodec*, AVDictionary**);
@@ -202,6 +222,7 @@ extern "C" int __wrap_avcodec_open2(AVCodecContext* context, const AVCodec* code
 }
 extern "C" int __real_avcodec_send_packet(AVCodecContext*, const AVPacket*);
 extern "C" int __wrap_avcodec_send_packet(AVCodecContext* context, const AVPacket* packet) {
+    ++videoDecodeCalls;
     if (std::this_thread::get_id() == applicationThread) wrongThread = true;
     if (blockSend) {
         enteredSend = true; gate.notify_all();
@@ -215,6 +236,7 @@ extern "C" int __real_sws_scale(SwsContext*, const uint8_t* const[], const int[]
 extern "C" int __wrap_sws_scale(SwsContext* context, const uint8_t* const source[], const int sourceStride[],
     int y, int h, uint8_t* const destination[], const int destinationStride[]) {
     if (std::this_thread::get_id() == applicationThread) wrongThread = true;
+    if (const auto delay = scaleDelayUs.exchange(0)) std::this_thread::sleep_for(std::chrono::microseconds(delay));
     return __real_sws_scale(context, source, sourceStride, y, h, destination, destinationStride);
 }
 extern "C" int __real_SDL_UpdateYUVTexture(SDL_Texture*, const SDL_Rect*, const Uint8*, int, const Uint8*, int, const Uint8*, int);
@@ -565,7 +587,10 @@ static void idlePublications(SDL_Renderer* renderer) {
     std::cout << "Idle publications sparse=" << fog::stage1::sparseDiagnostics << " duration_ms=" << elapsedMs
         << " polls=" << client.polls << " video=" << video << " audio=" << audio
         << " queue_observations=" << observations << '\n';
-    check(client.polls >= 20, "idle publication test did not exercise worker polling");
+    check(client.videoPolls >= 1 && client.videoPolls <= 2,
+        "empty video worker still wakes for frequent polling");
+    check(client.audioPolls >= 3 && client.audioPolls <= 4 + elapsedMs / 20 &&
+        client.polls <= 6 + elapsedMs / 20, "empty media workers exceeded maintenance wake cadence");
     if (fog::stage1::sparseDiagnostics) {
         check(video <= 2 + elapsedMs / 1000 && audio <= 2 + elapsedMs / 1000,
             "sparse idle diagnostic formatting exceeded one-second cadence");
@@ -578,6 +603,103 @@ static void idlePublications(SDL_Renderer* renderer) {
         check(observations >= audio,
             "control profile lost original audio queue observations");
     }
+}
+static void workerReadinessAndLoad(SDL_Renderer* renderer, const std::vector<Bytes>& units) {
+    Client client;
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    media.startWorkers(client,60,fog::Media::WorkerPolicy::Mts);
+    until([&] { return client.videoPolls >= 1; });
+    std::this_thread::sleep_for(10ms);
+    struct ReleaseGate { ~ReleaseGate() { blockSend = false; gate.notify_all(); scaleDelayUs = 0; } } releaseGate;
+    const auto initial = media.workerVideoLoad();
+    blockSend = true; enteredSend = false; scaleDelayUs = 6000;
+    const auto published = std::chrono::steady_clock::now();
+    client.push(units[0]);
+    until([] { return enteredSend.load(); });
+    check(std::chrono::steady_clock::now() - published < 500ms,
+        "notified video waited for the one-second maintenance timeout");
+    const auto observed = std::chrono::steady_clock::now();
+    (void)media.workerVideoLoad();
+    check(!media.preparePresentation(), "blocked decoder prepared output");
+    check(std::chrono::steady_clock::now() - observed < 100ms,
+        "UI workload observation waited for blocked decoder");
+    std::this_thread::sleep_for(60ms);
+    blockSend = false; gate.notify_all();
+    until([&] { const auto load = media.workerVideoLoad();
+        return load.decodeUs >= initial.decodeUs + 50000 && load.convertUs >= initial.convertUs + 5000; });
+    until([&] { return media.preparePresentation(); });
+    check(media.draw(), "worker load test failed to upload its real frame");
+    const auto decoded = media.workerVideoLoad();
+    check(decoded.generation > initial.generation, "first transport generation was not exposed in workload");
+    client.push(units[0],false,9,1500);
+    until([&] { return media.workerVideoGeneration() == 9 && media.workerVideoLoad().generation > decoded.generation; });
+    const auto changed = media.workerVideoLoad();
+    check(changed.decodeUs >= decoded.decodeUs && changed.convertUs >= decoded.convertUs,
+        "transport generation reset cumulative worker costs");
+    const auto resetAt = std::chrono::steady_clock::now();
+    media.resetVideoDecoder();
+    until([&] { return media.workerVideoLoad().generation > changed.generation; });
+    check(std::chrono::steady_clock::now() - resetAt < 500ms,
+        "decoder command did not wake an idle video worker");
+    const auto stopping = std::chrono::steady_clock::now();
+    media.stopWorkers();
+    check(std::chrono::steady_clock::now() - stopping < 500ms,
+        "stop waited for media maintenance timeout");
+    check(!wrongThread, "MTS decode/conversion/upload thread affinity violated");
+    std::cout << "Worker notifications/load: immediate video readiness, blocked decode and conversion costs, nonblocking UI, generation/reset and joined idle stop PASS\n";
+}
+static void wrongKindIsolation(SDL_Renderer* renderer, const std::vector<Bytes>& units) {
+    Client client;
+    fog::Media media(renderer,stream::VideoCodec::H264,true);
+    const auto soundPacket = sound();
+    const auto videoBefore = videoDecodeCalls.load(), audioBefore = audioDecodeCalls.load();
+    media.startWorkers(client,60,fog::Media::WorkerPolicy::Mts);
+    client.pushMisrouted(soundPacket,true); client.pushMisrouted(units[0],false);
+    bool videoRejected = false, audioRejected = false;
+    until([&] {
+        fog::Media::WorkerError error;
+        while (media.takeWorkerError(error)) {
+            check(error.hasPacket, "wrong-kind error lost offending packet metadata");
+            try { std::rethrow_exception(error.error); }
+            catch (const std::logic_error& failure) {
+                videoRejected |= std::string(failure.what()).find("non-video") != std::string::npos;
+                audioRejected |= std::string(failure.what()).find("non-audio") != std::string::npos;
+            }
+        }
+        return videoRejected && audioRejected;
+    });
+    check(videoDecodeCalls == videoBefore && audioDecodeCalls == audioBefore,
+        "misrouted compressed packet reached the wrong decoder");
+    check(media.videoFrames() == 0 && media.audioPackets() == 0, "wrong-kind packet advanced decoded counters");
+    media.stopWorkers();
+    std::cout << "Worker packet kinds: misrouted Opus/video rejected before either decoder PASS\n";
+}
+static void mtsWorkerAudioPolicy(SDL_Renderer* renderer) {
+    const auto packets = audioSequence(24);
+    struct ReleaseAudio { ~ReleaseAudio() { holdAudioDevice = false; } } release;
+    holdAudioDevice = true;
+    for (const auto policy : {fog::Media::WorkerPolicy::Mts,fog::Media::WorkerPolicy::FogHub}) {
+        Client client;
+        fog::Media media(renderer,stream::VideoCodec::H264,true);
+        media.startWorkers(client,60,policy);
+        client.pushAudioBatch(packets,0,packets.size(),400);
+        until([&] { return media.audioPackets() == packets.size(); });
+        media.stopWorkers();
+        const auto diagnostics = media.audioDiagnostics();
+        const bool bounded = policy == fog::Media::WorkerPolicy::FogHub || fog::stage1::boundedSyncAudio;
+        if (bounded) {
+            check(metric(diagnostics,"audio_max_queued_ms") <= 80 && media.audioQueueResets() == 0,
+                "FH/S16 worker audio lost bounded output policy");
+            check(metric(diagnostics,"audio_pcm_discarded_packets") > 0,
+                "bounded worker admitted all stale PCM");
+        } else {
+            check(metric(diagnostics,"audio_pcm_discarded_packets") == 0,
+                "MTS worker silently enabled the unmeasured S16 PCM policy");
+            check(metric(diagnostics,"audio_max_queued_ms") > 200 && media.audioQueueResets() > 0,
+                "MTS worker failed to retain legacy greater-than-200ms queue clear");
+        }
+    }
+    std::cout << "MTS worker audio: legacy 200ms clear retained, FH/S16 bounded policy separate, every Opus packet decoded PASS\n";
 }
 static void packetPublicationCadence(SDL_Renderer* renderer) {
     if (fog::stage1::sparseDiagnostics) return;
@@ -826,6 +948,30 @@ static void audioRecoveryWorker(SDL_Renderer* renderer, const std::vector<Bytes>
         "persistent audio failure lost typed fatal event or blocked video");
     media.stopWorkers(); failAudioQueue = 0;
 }
+struct Completion final : stream::VideoFrameCompletion {
+    std::atomic<unsigned> calls{0};
+    std::atomic<bool> success{false};
+    void complete(bool decoded) noexcept override { success = decoded; ++calls; }
+};
+static void decoderCompletion(SDL_Renderer* renderer, const std::vector<Bytes>& units) {
+    Client client;
+    fog::Media media(renderer, stream::VideoCodec::H264, true);
+    media.startWorkers(client,60);
+    auto accepted = std::make_shared<Completion>();
+    client.push(units[0],false,1,0,accepted);
+    until([&] { return accepted->calls.load() != 0; });
+    check(accepted->calls == 1 && accepted->success, "core frame acknowledged before successful decode/conversion");
+    auto rejected = std::make_shared<Completion>();
+    failSend = true;
+    client.push(units[1],false,1,3000,rejected);
+    until([&] { return rejected->calls.load() != 0; });
+    check(rejected->calls == 1 && !rejected->success, "decoder failure was acknowledged as DR_OK");
+    fog::Media::WorkerError error;
+    until([&] { return media.takeWorkerError(error); });
+    check(error.hasPacket && error.packet.completion == rejected, "decoder error lost frame context");
+    media.stopWorkers();
+    check(rejected->calls == 1, "retained diagnostic packet acknowledged the frame twice");
+}
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
     applicationThread = std::this_thread::get_id();
@@ -836,7 +982,8 @@ int main(int argc, char** argv) {
     if (!renderer) return 4;
     int result = 0;
     try { idlePublications(renderer); packetPublicationCadence(renderer); pacing(); audioPolicy(); synchronousAudioPolicy(renderer); audioRecoveryPolicy(); audioRecoverySync(renderer); audioCatchup(renderer);
-        const auto units = load(argv[1]); workers(renderer, units, 30); workers(renderer, units, 60);
+        const auto units = load(argv[1]); workerReadinessAndLoad(renderer,units); wrongKindIsolation(renderer,units); mtsWorkerAudioPolicy(renderer);
+        decoderCompletion(renderer, units); workers(renderer, units, 30); workers(renderer, units, 60);
         audioRecoveryWorkerBacklog(renderer); audioRecoveryWorker(renderer, units); }
     catch (const std::exception& error) { blockSend = false; gate.notify_all(); std::cerr << error.what() << '\n'; result = 1; }
     SDL_DestroyRenderer(renderer); SDL_FreeSurface(surface); SDL_Quit();

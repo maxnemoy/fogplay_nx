@@ -36,6 +36,8 @@ public:
     // Application thread, once per frame after draining packets. Counters are cumulative per session.
     void observePlayback(const PlaybackObservation& observation) override;
     bool poll(Packet& packet) override;
+    bool pollVideo(Packet& packet) override;
+    bool mediaAdmissionAllowed() const override;
     bool pollAudio(Packet& packet) override; // Audio FIFO, independent of queued compressed video.
     bool pollRumble(Rumble& rumble) override; // Latest slot-0 feedback, drained on the application thread.
     std::uint64_t queuedVideoAgeMs() const override;
@@ -102,6 +104,8 @@ public:
     void blockControlForTesting(bool blocked);
     void blockControlSendForTesting(bool blocked, bool reject = false);
     void advanceControlForTesting(unsigned milliseconds);
+    // Reproduce callback evidence arriving between batch swap and final owner publication.
+    void publishMediaAdmissionForTesting();
 #endif
 private:
     bool startEndpoint(const std::string& hash, const std::string& suffix,

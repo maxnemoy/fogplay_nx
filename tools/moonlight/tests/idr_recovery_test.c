@@ -240,8 +240,35 @@ static void ordinaryWaitDoesNotGainTimeoutRetry(void) {
     clockUs += 1000000; init(false); assert(!localDecoderRecovery);
     FogIdrRecoveryPollDecoder(); assert(events == 0); done();
 }
+static void pullRendererAdmissionAndRefresh(void) {
+    init(false);
+    VideoCallbacks.capabilities = CAPABILITY_PULL_RENDERER;
+    VIDEO_FRAME_HANDLE handle;
+    PDECODE_UNIT unit;
+    // Actual prepared SDK entry points: a wake before wait is sticky, even
+    // when a frame is already queued. The frame is retained for the next pull.
+    frame(1, true, true);
+    assert(LiGetPendingVideoFrames() == 1);
+    LiWakeWaitForVideoFrame();
+    assert(!LiWaitForNextVideoFrame(&handle, &unit));
+    assert(LiGetPendingVideoFrames() == 1);
+    assert(LiWaitForNextVideoFrame(&handle, &unit));
+    assert(unit->frameNumber == 1 && unit->frameType == FRAME_TYPE_IDR);
+    LiCompleteVideoFrame(handle, DR_OK);
+    assert(LiGetPendingVideoFrames() == 0 && idrFrameProcessed);
+    frame(2, false, true);
+    assert(LiWaitForNextVideoFrame(&handle, &unit) && unit->frameNumber == 2);
+    LiCompleteVideoFrame(handle, DR_NEED_IDR);
+    assert(waitingForIdrFrame && LiGetPendingVideoFrames() == 0);
+    frame(3, true, true);
+    assert(LiWaitForNextVideoFrame(&handle, &unit) && unit->frameType == FRAME_TYPE_IDR);
+    LiCompleteVideoFrame(handle, DR_OK);
+    assert(!waitingForIdrFrame && LiGetPendingVideoFrames() == 0);
+    done();
+}
 int main(void) {
     timedRetriesAndRelease(); lossGatingAndReferenceSafety(); controlOutcomesAndReset(); staleSamples(); localDecoderRecoveryScenarios(); ordinaryWaitDoesNotGainTimeoutRetry();
-    puts("Prepared IDR wait/retry, reference safety, dispatch and reset tests passed");
+    pullRendererAdmissionAndRefresh();
+    puts("Prepared IDR wait/retry, reference safety, dispatch, reset and actual pull/wake/completion tests passed");
     return 0;
 }

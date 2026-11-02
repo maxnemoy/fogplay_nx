@@ -216,10 +216,38 @@ void computerPreviewBonusPrice() {
     for (const auto* action : {"onclick='unsafe()'", "data-method='post'", "target='_blank'", "download"})
         rejects([&] { parseComputerPreview(replace(bonus, "href=\"/pc/play?id=1838\"", std::string(action) + " href=\"/pc/play?id=1838\""), "1838"); });
 }
+void computerPreviewCurrentTemplate() {
+    const auto html = fixture("computer-preview-hourly-headingless-excerpt");
+    const auto pc = parseComputerPreview(html,"1838");
+    check(pc.id == "1838" && pc.name == "f4bX8" && pc.owner == "Karahun" &&
+        pc.online && !pc.busy && pc.fhAvailable && pc.pricePerHour == "25");
+    check(parseComputerPreview(replace(html,"25₽/час","25.50₽/час"),"1838").pricePerHour == "25.50");
+    check(parseComputerPreview(replace(html,"25₽/час","25₽"),"1838").pricePerHour == "25");
+    check(!parseComputerPreview(replace(html,"Онлайн","Занят"),"1838").fhAvailable);
+    check(!parseComputerPreview(replace(html,"href=\"/pc/play?id=1838\"","href=\"/pc/click-play?id=1838\""),"1838").fhAvailable);
+    rejects([&] { parseComputerPreview(html,"1836"); });
+    rejects([&] { parseComputerPreview(replace(html,"<title>f4bX8</title>","<title>f4bX10</title>"),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"<title>f4bX8</title>",""),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"class=\"pc-view\"","class=\"other-view\""),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"<div class=\"pc-view\">","<div class=\"pc-view\"></div><div>"),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"</main>","<div class='pc-view'></div></main>"),"1838"); });
+    // An actual heading remains authoritative; contradictory/duplicate
+    // headings cannot be bypassed merely by a matching document title.
+    rejects([&] { parseComputerPreview(replace(html,"</main>","<h1>Компьютер f4bX10 19</h1></main>"),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"</main>","<h1>Компьютер f4bX8 19</h1><h1>Компьютер f4bX8 19</h1></main>"),"1838"); });
+    for (const auto* unit : {"/мин", "/сутки", "/Час", " /час", "/час 99₽", "/час/час", "/час unknown"})
+        rejects([&] { parseComputerPreview(replace(html,"25₽/час",std::string("25₽")+unit),"1838"); });
+    for (const auto* amount : {"0", "0.00", "-25", "25.5", "25.000", "25₽ 99"})
+        rejects([&] { parseComputerPreview(replace(html,"25₽/час",std::string(amount)+"₽/час"),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"href=\"/pc/play?id=1838\"","href=\"/pc/play?id=1836\""),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"href=\"/pc/play?id=1838\"","href=\"/pc/play?id=1838&amp;gameId=70\""),"1838"); });
+    for (const auto* action : {"onclick='unsafe()'", "data-method='post'", "target='_blank'", "download"})
+        rejects([&] { parseComputerPreview(replace(html,"href=\"/pc/play?id=1838\"",std::string(action)+" href=\"/pc/play?id=1838\""),"1838"); });
+}
 }
 int main() {
     try {
-        endpoints(); forms(); success(); reviewRequired(); bonusChoice(); closeActions(); computerPreview(); computerPreviewBonusPrice();
+        endpoints(); forms(); success(); reviewRequired(); bonusChoice(); closeActions(); computerPreview(); computerPreviewBonusPrice(); computerPreviewCurrentTemplate();
         std::cout << "FogHub rental HTML parser tests passed (" << checks << " checks)\n";
         return 0;
     } catch (const std::exception& error) {

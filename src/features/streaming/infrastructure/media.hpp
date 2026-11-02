@@ -32,6 +32,10 @@ public:
 // Optional workers consume the transport's synchronized compressed queues.
 class Media {
 public:
+    enum class WorkerPolicy { FogHub, Mts };
+    struct WorkerVideoLoad {
+        std::uint64_t decodeUs = 0, convertUs = 0, generation = 0;
+    };
     // Install before starting workers. Reporter executes on an observer thread;
     // it must only enqueue diagnostics, never call UI/media or block on storage.
     void setVideoStallReporter(std::function<void(const std::string&)> reporter);
@@ -60,11 +64,13 @@ public:
     // Video errors pause decode until the application applies its recovery policy
     // and resetVideoDecoder(). Audio recovers independently; only an exhausted
     // recovery budget or an unexpected failure pauses audio and reports an error.
-    void startWorkers(::stream::StreamingClient& client, int fps);
+    void startWorkers(::stream::StreamingClient& client, int fps, WorkerPolicy policy = WorkerPolicy::FogHub);
     void stopWorkers() noexcept;
     bool workersRunning() const;
     bool takeWorkerError(WorkerError& error);
     std::uint64_t workerVideoGeneration() const;
+    // Cumulative worker costs, independently measured from UI upload work.
+    WorkerVideoLoad workerVideoLoad() const;
     void video(const std::byte* data, std::size_t size,
         std::uint64_t firstPacketMs = 0, std::uint64_t enqueueMs = 0);
     // Recreate video resources, retaining the last texture, counters and audio.

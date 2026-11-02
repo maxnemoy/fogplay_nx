@@ -646,8 +646,119 @@ static void signalingDiagnostics() {
     std::cout << "Safe STOMP diagnostics: handshake acceptance/buffering/rejection, partial frames, commands, silence, terminal errors and redaction passed\n";
 }
 
+static void startupFailureWithMediaConsumers() {
+    {
+        Fixture fixture("0,4000",false);
+        stream::Client client;
+        assert(client.startForTesting("fixture","abcde","ws://127.0.0.1:"+std::to_string(fixture.server->port())+"/ws/"));
+        std::atomic<bool> stopping{false};
+        std::atomic<unsigned> samples{0};
+        std::thread consumer([&] {
+            while (!stopping.load()) {
+                stream::Packet packet;
+                assert(!client.pollVideo(packet) && !client.pollAudio(packet));
+                assert(!client.mediaAdmissionAllowed());
+                (void)client.currentVideoGeneration();
+                (void)client.selectedVideoCodec();
+                ++samples;
+                std::this_thread::yield();
+            }
+        });
+        // This fails before createPeer installs control/ICE/RTCP workers. The
+        // production fail path must retain Shared while the consumer is live.
+        while (samples<100) std::this_thread::yield();
+        client.failThenReceiveForTesting("{}",false); client.pump();
+        assert(!client.error().empty() && client.retryableError());
+        const auto afterFailure=samples.load()+100;
+        while (samples<afterFailure) std::this_thread::yield();
+        stopping=true; consumer.join(); client.close();
+    }
+    stream::Client::cleanupRuntime();
+    std::cout << "MTS startup failure before createPeer retains media-consumer lifetime through owner join PASS\n";
+}
+
+static void concurrentMediaConsumers() {
+    startupFailureWithMediaConsumers();
+    for (bool hevc : {false,true}) {
+        {
+            Fixture fixture("4000,4000",true,hevc);
+            stream::Client client;
+            if (hevc) { fog::video::Settings settings; settings.codec=stream::VideoCodec::H265; assert(client.configureVideo(settings)); }
+            assert(client.startForTesting("fixture","abcde","ws://127.0.0.1:"+std::to_string(fixture.server->port())+"/ws/"));
+            std::atomic<bool> stopping{false}, pauseVideo{false};
+            std::atomic<unsigned> videos{0}, audios{0};
+            const auto signals=client.mediaSignals();
+            std::thread video([&] {
+                std::uint32_t timestamp=0;
+                while (!stopping.load()) {
+                    const auto revision=signals->video.sequence();
+                    stream::Packet packet;
+                    if (!pauseVideo && client.pollVideo(packet)) {
+                        assert(packet.kind==stream::Kind::Video && packet.data.size()>3);
+                        assert(packet.timestamp>timestamp); timestamp=packet.timestamp;
+                        assert(packet.firstPacketMs && packet.enqueueMs>=packet.firstPacketMs);
+                        assert(client.selectedVideoCodec()==(hevc ? stream::VideoCodec::H265 : stream::VideoCodec::H264));
+                        ++videos;
+                    } else signals->video.wait(revision,std::chrono::milliseconds(100));
+                }
+            });
+            std::thread audio([&] {
+                std::uint32_t timestamp=0;
+                while (!stopping.load()) {
+                    const auto revision=signals->audio.sequence();
+                    stream::Packet packet;
+                    if (client.pollAudio(packet)) {
+                        assert(packet.kind==stream::Kind::Audio && packet.data==rtc::binary({std::byte{0xf8},std::byte{0xff},std::byte{0xfe}}));
+                        assert(packet.timestamp>timestamp); timestamp=packet.timestamp;
+                        ++audios;
+                    } else signals->audio.wait(revision,std::chrono::milliseconds(20));
+                }
+            });
+            const auto started=Clock::now();
+            while (Clock::now()-started<std::chrono::seconds(4) && (videos<30 || audios<30)) {
+                fixture.pump(); client.pump(); fixture.sendMedia();
+                assert(client.error().empty());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(client.ready() && videos>=30 && audios>=30);
+            const auto generation=client.currentVideoGeneration();
+            pauseVideo=true;
+            const auto paused=Clock::now();
+            while (Clock::now()-paused<std::chrono::milliseconds(350)) {
+                fixture.pump(); client.pump(); fixture.sendMedia();
+                std::this_thread::sleep_for(std::chrono::milliseconds(3));
+            }
+            assert(client.currentVideoGeneration()>generation);
+            const auto before=videos.load(); pauseVideo=false; signals->video.notify();
+            const auto resume=Clock::now();
+            while (Clock::now()-resume<std::chrono::seconds(2) && videos<before+5) {
+                fixture.pump(); client.pump(); fixture.sendMedia();
+                assert(client.error().empty());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            assert(videos>=before+5 && audios>30);
+            // Callback-side terminal evidence closes admission before pump.
+            if (hevc) {
+                client.failThenReceiveForTesting("{}",false);
+                client.publishMediaAdmissionForTesting();
+            } else client.receiveControlForTesting(R"({"id":"close"})");
+            assert(!client.mediaAdmissionAllowed());
+            stopping=true; const auto joinAt=Clock::now(); signals->notifyAll();
+            video.join(); audio.join();
+            assert(Clock::now()-joinAt<std::chrono::milliseconds(300));
+            stream::Packet packet; assert(!client.pollVideo(packet) && !client.pollAudio(packet));
+            client.pump(); assert(!client.error().empty() && client.retryableError()==hevc);
+            client.close();
+        }
+        stream::Client::cleanupRuntime();
+    }
+    std::cout << "MTS actual RTC: concurrent isolated audio/video consumers, H264/HEVC codec/origin, generation expiry/overflow recovery, callback admission and joined wakeup PASS\n";
+}
+
 int main(int argc, char** argv) {
     const bool turnOnly = argc == 2 && std::string(argv[1]) == "--turn-only";
+    if (!turnOnly) concurrentMediaConsumers();
+    if (argc == 2 && std::string(argv[1]) == "--media-workers-only") return 0;
     if (!turnOnly) rumbleLifecycle();
     if (!turnOnly) controlDiagnosticsLifecycle();
     if (!turnOnly) signalingDiagnostics();
@@ -937,6 +1048,10 @@ int main(int argc, char** argv) {
             client.setRouteSnapshotTimeForTesting(2000); settleIce();
             assert(client.diagnostics().substr(client.diagnostics().find(" iceGeneration="), 18) == generation);
             assert(!client.ready() && !client.sendGamepad(heldPad));
+            // A closed required-TURN publication is zero/closed in the single
+            // atomic admission snapshot; it can never mean unlimited access.
+            client.publishMediaAdmissionForTesting();
+            assert(!client.mediaAdmissionAllowed());
             client.blockControlForTesting(false);
             for (unsigned tick = 0; tick < 20; ++tick) {
                 client.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -967,6 +1082,8 @@ int main(int argc, char** argv) {
             // Never reuse the preceding TURN proof when the selected pair disappears.
             client.clearSelectedCandidatesForTesting(); settleIce();
             assert(pairCount(client) == verifiedQueries + 2 && !client.ready());
+            client.publishMediaAdmissionForTesting();
+            assert(!client.mediaAdmissionAllowed());
             assert(client.diagnostics().find("routeCurrent=0") != std::string::npos);
             assert(!client.sendGamepad(stream::Gamepad{}) && !client.requestVideoKeyframe());
             stream::Packet unavailable; assert(!client.poll(unavailable));

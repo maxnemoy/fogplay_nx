@@ -377,7 +377,11 @@ std::string playPrice(xmlNode* link) {
         }
     }
     label = normalized(label);
-    const std::string prefix = "Играть FH ", suffix = "₽";
+    const std::string prefix = "Играть FH ", hourlySuffix = "₽/час";
+    // Current cards spell out the hourly unit. Keep the older bare-ruble
+    // label too; no other unit, extra text or second amount is price evidence.
+    const std::string suffix = label.size() >= hourlySuffix.size() &&
+        label.compare(label.size() - hourlySuffix.size(), hourlySuffix.size(), hourlySuffix) == 0 ? hourlySuffix : "₽";
     require(label.rfind(prefix, 0) == 0 && label.size() > prefix.size() + suffix.size() &&
         label.compare(label.size() - suffix.size(), suffix.size(), suffix) == 0);
     const auto price = label.substr(prefix.size(), label.size() - prefix.size() - suffix.size());
@@ -755,9 +759,13 @@ ComputerRow parseComputerPreview(const std::string& html, const std::string& com
     identifier(computerId);
     auto doc = document(html);
     auto* main = mainNode(doc.get(), {}, false);
+    const auto headings = select(main, ".//h1");
+    require(headings.size() <= 1);
+    auto* summary = headings.empty() ?
+        one(main, ".//div[contains(concat(' ',normalize-space(@class),' '),' pc-view ')]") : main;
     // The PC detail page has one bordered summary card, independent from its
     // paginated games. Never use game play links as current PC price evidence.
-    auto* card = one(main, ".//div[contains(concat(' ',normalize-space(@class),' '),' rounded ') and contains(concat(' ',normalize-space(@class),' '),' p-3 ')]/div");
+    auto* card = one(summary, ".//div[contains(concat(' ',normalize-space(@class),' '),' rounded ') and contains(concat(' ',normalize-space(@class),' '),' p-3 ')]/div");
     const auto previews = links(card, "/pc/preview");
     require(previews.size() == 1);
     const auto identity = query(attr(previews.front(), "href"), "/pc/preview");
@@ -766,7 +774,13 @@ ComputerRow parseComputerPreview(const std::string& html, const std::string& com
     ComputerRow row;
     row.id = computerId; row.name = text(previews.front());
     require(!row.name.empty() && row.name.size() <= 128);
-    require(text(one(main, ".//h1")).rfind("Компьютер " + row.name + " ", 0) == 0);
+    if (!headings.empty()) require(text(headings.front()).rfind("Компьютер " + row.name + " ", 0) == 0);
+    else {
+        // The current PC template comments out h1. Retain independent page
+        // identity through its exact title and PC container, in addition to
+        // the selected preview ID and paid-action ID checked below.
+        require(text(one(xmlDocGetRootElement(doc.get()), "/html/head/title")) == row.name);
+    }
     const auto owners = links(card, "/promo/");
     require(owners.size() == 1); row.owner = text(owners.front());
     row.description = text(one(card, "./div[2]/small"));

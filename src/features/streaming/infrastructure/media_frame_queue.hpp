@@ -21,6 +21,7 @@ public:
         Clock::time_point due{};
         Clock::time_point readyAt{};
         VideoFrameOrigin origin;
+        std::uint64_t transportGeneration = 0;
     };
     struct Stats {
         std::uint64_t readyEmpty = 0, timingCadenceBlocked = 0, timingRtpBlocked = 0;

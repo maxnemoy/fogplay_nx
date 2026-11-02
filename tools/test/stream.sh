@@ -5,6 +5,7 @@ if ! python3 tools/rtc/manifest.py check host; then
     bash tools/rtc/build.sh host
 fi
 mkdir -p work/logs
+bash tools/test/spsc-video-queue.sh
 bash tools/test/stream-input.sh
 bash tools/test/reconnect.sh
 bash tools/test/server-performance.sh
@@ -31,3 +32,6 @@ g++ "${flags[@]}" -DSTREAM_RTC_TESTS src/features/streaming/infrastructure/strea
 ./work/stream_tests_rtc | tee work/logs/stream-tests.log
 g++ "${flags[@]}" -DFOG_STREAM_TESTING src/features/streaming/infrastructure/stream.cpp src/features/streaming/infrastructure/stream_protocol.cpp src/features/streaming/application/remote_input.cpp tests/stream_integration.cpp -Wl,--wrap=sendto "${libs[@]}" -o work/stream_integration
 timeout 60 ./work/stream_integration | tee work/logs/stream-integration.log
+
+# Keep the sanitizer-backed two-consumer regression in the normal host gate.
+bash tools/test/mts-worker-consumers.sh

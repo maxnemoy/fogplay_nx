@@ -5,6 +5,7 @@
 #include "features/streaming/domain/remote_input.hpp"
 #include "features/streaming/domain/rumble.hpp"
 #include "features/streaming/domain/input_suspension.hpp"
+#include "features/streaming/domain/media_signal.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,13 @@
 
 namespace stream {
 enum class Kind { Video, Audio };
+class VideoFrameCompletion {
+public:
+    virtual ~VideoFrameCompletion() = default;
+    // Idempotent, bounded acknowledgement on the video consumer. Providers
+    // retaining a decoder/core handle must fail closed if abandoned.
+    virtual void complete(bool decoded) noexcept = 0;
+};
 struct Packet {
     Kind kind = Kind::Video;
     std::vector<std::byte> data;
@@ -24,12 +32,17 @@ struct Packet {
     // Earliest received RTP packet of this video AU, in local steady milliseconds.
     // Distinct from assembled queue admission. Zero means unavailable.
     std::uint64_t firstPacketMs = 0;
+    std::shared_ptr<VideoFrameCompletion> completion{};
 };
 struct PlaybackObservation {
     std::uint64_t presentedFrames = 0, decodedFrames = 0, supersededFrames = 0;
     std::uint64_t workUs = 0, errors = 0, audioUnderruns = 0, audioResets = 0;
     bool recovering = false;
     int width = 0, height = 0;
+    // Cumulative video decode + conversion work on a separate worker. Never
+    // add overlapping UI and worker times as utilization of one thread.
+    std::uint64_t decoderWorkUs = 0, videoGeneration = 0;
+    bool workerVideo = false;
 };
 struct Gamepad {
     std::array<int, 18> buttons{};
@@ -62,7 +75,23 @@ public:
     // Application thread, once per frame after draining packets. Counters are cumulative per session.
     virtual void observePlayback(const PlaybackObservation& observation) = 0;
     virtual bool poll(Packet& packet) = 0;
+    // Independent consumers: pollVideo must never remove an audio packet.
+    // Legacy poll remains for synchronous callers. Client lifetime/start/close
+    // stay on the application owner; stop/join consumers before replacing it.
+    virtual bool pollVideo(Packet& packet) = 0;
+    // Blocking adapters retain a wake issued between the caller's last check
+    // and entry into their pull. Nonblocking adapters use the ordinary path.
+    virtual bool pollVideo(Packet& packet, std::uint64_t observedWakeSequence) {
+        (void)observedWakeSequence;
+        return pollVideo(packet);
+    }
     virtual bool pollAudio(Packet& packet) = 0; // Audio FIFO, independent of queued compressed video.
+    const std::shared_ptr<MediaSignals>& mediaSignals() const { return mediaSignals_; }
+    // Stop/reset must interrupt both readiness waits and a provider's blocking
+    // frame pull. This must not join workers or close the transport.
+    virtual void wakeMediaWaiters() { mediaSignals_->notifyAll(); }
+    // Worker/UI-safe admission snapshot; provider overrides cannot query SDKs.
+    virtual bool mediaAdmissionAllowed() const { return true; }
     virtual std::uint64_t queuedVideoAgeMs() const = 0;
     virtual std::size_t queuedVideoPackets() const = 0;
     virtual bool ready() const = 0;
@@ -113,6 +142,10 @@ public:
     virtual bool pollRumble(Rumble&) { return false; }
     virtual bool sendInput(const fog::remote::Input& input) = 0;
     virtual void close() = 0;
+private:
+    // Stable across transport retries. Producers retain a shared reference;
+    // consumers are joined before client destruction.
+    std::shared_ptr<MediaSignals> mediaSignals_ = std::make_shared<MediaSignals>();
 };
 class StreamingClientFactory {
 public:

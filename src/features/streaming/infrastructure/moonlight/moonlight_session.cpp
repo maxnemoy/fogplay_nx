@@ -59,7 +59,6 @@ bool validHost(const std::string& host) {
     return host.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") == std::string::npos;
 }
 struct State {
-    static constexpr std::size_t VideoCapacity = 4;
     bool ownsLease = false;
     SERVER_DATA host{};
     STREAM_CONFIGURATION config{};
@@ -82,13 +81,19 @@ struct State {
     std::atomic<std::uint64_t> frames{0}, audioFrames{0}, videoDrops{0}, audioDrops{0}, inputAccepted{0}, inputRejected{0};
     std::atomic<std::uint64_t> inputIgnored{0};
     std::atomic<unsigned short> accelRateHz{0}, gyroRateHz{0};
-    std::atomic<std::uint64_t> videoFullYields{0}, videoQueueHigh{0}, videoBatchMax{0}, videoQueueAgeMaxMs{0};
     std::atomic<std::uint64_t> videoInvalid{0}, videoWaitDrops{0}, videoResyncs{0};
     detail::FrameDiagnostics trace;
     stream::RumbleMailbox rumble;
     mutable std::mutex mutex, apiMutex;
     std::condition_variable changed;
-    std::deque<stream::Packet> video, audio;
+    std::shared_ptr<stream::MediaSignals> mediaSignals = std::make_shared<stream::MediaSignals>();
+    // The media-video owner pulls directly from the core. Teardown closes this
+    // gate, wakes the core wait and joins all in-flight frame scopes before
+    // destroying the core's queue. No SDK call is made while holding mutex.
+    mutable std::mutex pullMutex;
+    std::condition_variable pullChanged;
+    bool pullOpen = false, pullActive = false;
+    std::deque<stream::Packet> audio;
     std::string message = "Moonlight ready for pairing", error;
     std::uint64_t generation = 1;
     moonlight_diagnostics::CommandSnapshot command;
@@ -109,6 +114,7 @@ struct State {
             if (!retryable) fatalFailure = true;
             failed = true; rumble.clear(); }
         changed.notify_all();
+        mediaSignals->notifyAll();
     }
 };
 // Core callbacks are process-global. An exclusive protocol lease prevents two
@@ -119,14 +125,18 @@ void stageStarting(int) {}
 void stageFailed(int, int code) { if (auto* state = active.load()) state->code = code; }
 void terminated(int code) {
     if (auto* state = active.load()) {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        const auto origin = FogMoonlightGetTerminationOrigin();
-        // Retain terminal evidence even if another callback races teardown.
-        if (state->terminated && state->fatalFailure && origin != FOG_TERMINATION_HOST) return;
-        state->code = code; state->terminationCode = code;
-        state->terminationOrigin = origin;
-        if (state->terminationOrigin == FOG_TERMINATION_HOST || !detail::retryableTransportError(code)) state->fatalFailure = true;
-        state->terminated = true; state->rumble.clear();
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            const auto origin = FogMoonlightGetTerminationOrigin();
+            // Retain terminal evidence even if another callback races teardown.
+            if (state->terminated && state->fatalFailure && origin != FOG_TERMINATION_HOST) return;
+            state->code = code; state->terminationCode = code;
+            state->terminationOrigin = origin;
+            if (state->terminationOrigin == FOG_TERMINATION_HOST || !detail::retryableTransportError(code)) state->fatalFailure = true;
+            state->terminated = true; state->rumble.clear();
+        }
+        state->changed.notify_all();
+        state->mediaSignals->notifyAll();
     }
 }
 void rumble(unsigned short controller, unsigned short lowFrequency, unsigned short highFrequency) {
@@ -165,10 +175,16 @@ void audioSample(char* bytes, int size) {
         if (!bytes || size <= 0 || size > 4096) { ++state->audioDrops; return; }
         stream::Packet packet; packet.kind = stream::Kind::Audio; packet.enqueueMs = nowMs();
         packet.data.resize(static_cast<std::size_t>(size)); std::memcpy(packet.data.data(), bytes, size);
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->audio.size() >= 20) { ++state->audioDrops; state->audio.pop_front(); }
-        state->audio.push_back(std::move(packet)); ++state->audioFrames;
-    } catch (...) { state->fatalFailure = true; state->failed = true; state->terminated = true; state->code = -900; }
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->audio.size() >= 20) { ++state->audioDrops; state->audio.pop_front(); }
+            state->audio.push_back(std::move(packet)); ++state->audioFrames;
+        }
+        state->mediaSignals->audio.notify();
+    } catch (...) {
+        state->fatalFailure = true; state->failed = true; state->terminated = true; state->code = -900;
+        state->changed.notify_all(); state->mediaSignals->notifyAll();
+    }
 }
 bool copyFrame(const DECODE_UNIT& unit, std::vector<std::byte>& target) {
     if (unit.fullLength <= 0 || static_cast<std::size_t>(unit.fullLength) > stream::MaxVideoAccessUnitBytes) return false;
@@ -213,65 +229,146 @@ void drainCoreEvents() noexcept {
         if (missed) moonlight_diagnostics::emit("Moonlight IDR journal missed=" + std::to_string(missed) + " through_seq=" + std::to_string(cursor));
     } catch (...) { /* Optional diagnostics cannot terminate the session worker. */ }
 }
-void drainVideo(State& state) {
-    VIDEO_FRAME_HANDLE handle; PDECODE_UNIT unit;
-    unsigned budget = 0;
-    while (budget < 8 && !state.stop) {
+class CoreFrameCompletion final : public stream::VideoFrameCompletion {
+public:
+    CoreFrameCompletion(std::shared_ptr<State> state, VIDEO_FRAME_HANDLE handle, std::uint64_t generation)
+        : state_(std::move(state)),handle_(handle),generation_(generation) {}
+    ~CoreFrameCompletion() override { complete(false); }
+    void complete(bool decoded) noexcept override {
+        if (completed_.exchange(true)) return;
+        bool accepted;
         {
-            const auto lockStarted = detail::steadyUs();
-            std::lock_guard<std::mutex> lock(state.mutex);
-            state.trace.queueLock.add(detail::steadyUs() - lockStarted);
-            // This worker is the sole producer. Leave complete frames in the
-            // core's bounded queue until the consumer has room, preserving FIFO.
-            if (state.video.size() >= State::VideoCapacity) { ++state.videoFullYields; break; }
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            accepted = decoded && !state_->stop && !state_->failed && !state_->terminated &&
+                generation_ == state_->generation;
+            if (!accepted) {
+                ++state_->videoDrops;
+                if (!state_->assemblyWaiting) { ++state_->generation; ++state_->videoResyncs; }
+                state_->assemblyWaiting = true;
+            }
         }
-        if (!LiPollNextVideoFrame(&handle, &unit)) { ++state.trace.emptyPolls; break; }
-        ++budget;
-        if (unit) state.trace.frame(static_cast<std::uint32_t>(unit->frameNumber), unit->frameType == FRAME_TYPE_IDR,
-            unit->fullLength, unit->receiveTimeUs, unit->enqueueTimeUs, LiGetMicroseconds(), unit->frameHostProcessingLatency);
-        int result = DR_NEED_IDR;
-        try {
-            if (unit && (!state.assemblyWaiting || unit->frameType == FRAME_TYPE_IDR)) {
-                stream::Packet packet;
-                const auto copyStarted = detail::steadyUs();
-                const bool copied = copyFrame(*unit, packet.data);
-                state.trace.copy.add(detail::steadyUs() - copyStarted);
-                if (copied) {
-                    packet.timestamp = unit->rtpTimestamp; packet.enqueueMs = nowMs();
-                    // Core timestamps can use a different epoch. Preserve
-                    // elapsed receipt age, never copy the absolute epoch.
-                    const auto coreNowUs = LiGetMicroseconds();
-                    if (unit->receiveTimeUs && coreNowUs >= unit->receiveTimeUs) {
-                        const auto ageMs = (coreNowUs - unit->receiveTimeUs) / 1000;
-                        if (packet.enqueueMs >= ageMs) packet.firstPacketMs = packet.enqueueMs - ageMs;
-                    }
-                    const auto lockStarted = detail::steadyUs();
-                    std::lock_guard<std::mutex> lock(state.mutex);
-                    state.trace.queueLock.add(detail::steadyUs() - lockStarted);
+        const auto began = detail::steadyUs();
+        LiCompleteVideoFrame(handle_, accepted ? DR_OK : DR_NEED_IDR);
+        state_->trace.completion.add(detail::steadyUs() - began);
+        if (!accepted) state_->mediaSignals->video.notify();
+        { std::lock_guard<std::mutex> lock(state_->pullMutex); state_->pullActive = false; }
+        state_->pullChanged.notify_all();
+    }
+private:
+    std::shared_ptr<State> state_;
+    VIDEO_FRAME_HANDLE handle_;
+    std::uint64_t generation_;
+    std::atomic<bool> completed_{false};
+};
+bool pullVideo(State& state, stream::Packet& packet, bool wait, std::uint64_t observedWake,
+               const std::shared_ptr<State>& owner = nullptr) {
+    {
+        std::lock_guard<std::mutex> lock(state.pullMutex);
+        if (!state.pullOpen || state.pullActive || state.stop || state.failed || state.terminated ||
+            (wait && state.mediaSignals->video.sequence() != observedWake)) return false;
+        state.pullActive = true;
+    }
+    // This scope includes both the blocking pull and completion. A terminal
+    // callback may close admission concurrently, but cannot destroy the queue
+    // or decoder unit until completion releases this scope.
+    struct PullScope {
+        State& state;
+        bool owns = true;
+        ~PullScope() {
+            if (!owns) return;
+            { std::lock_guard<std::mutex> lock(state.pullMutex); state.pullActive = false; }
+            state.pullChanged.notify_all();
+        }
+    } scope{state};
+    VIDEO_FRAME_HANDLE handle{}; PDECODE_UNIT unit{};
+    state.trace.worker(detail::steadyUs());
+    const bool received = wait ? LiWaitForNextVideoFrame(&handle, &unit) : LiPollNextVideoFrame(&handle, &unit);
+    if (!received) {
+        if (!wait) ++state.trace.emptyPolls;
+        else {
+            // A sticky core wake can outlive the receipt being decoded when
+            // stop/reset signalled it. Re-enter LiWait on the next iteration,
+            // rather than sleeping on the unrelated application signal for 1s.
+            state.mediaSignals->video.notify();
+        }
+        return false;
+    }
+    const auto processingStarted = detail::steadyUs();
+    int result = DR_NEED_IDR;
+    // Every successfully pulled handle is completed exactly once, including
+    // allocation failures and shutdown racing the copy.
+    struct FrameScope {
+        State& state;
+        VIDEO_FRAME_HANDLE handle;
+        int& result;
+        bool owns = true;
+        ~FrameScope() {
+            if (!owns) return;
+            const auto completeStarted = detail::steadyUs();
+            LiCompleteVideoFrame(handle, result);
+            state.trace.completion.add(detail::steadyUs() - completeStarted);
+        }
+    } frame{state,handle,result};
+    if (state.stop || state.failed || state.terminated) return false;
+    if (unit) state.trace.frame(static_cast<std::uint32_t>(unit->frameNumber), unit->frameType == FRAME_TYPE_IDR,
+        unit->fullLength, unit->receiveTimeUs, unit->enqueueTimeUs, LiGetMicroseconds(), unit->frameHostProcessingLatency);
+    std::uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        generation = state.generation;
+    }
+    try {
+        if (unit && (!state.assemblyWaiting || unit->frameType == FRAME_TYPE_IDR)) {
+            stream::Packet output;
+            const auto copyStarted = detail::steadyUs();
+            const bool copied = copyFrame(*unit, output.data);
+            state.trace.copy.add(detail::steadyUs() - copyStarted);
+            if (copied) {
+                output.timestamp = unit->rtpTimestamp; output.enqueueMs = nowMs();
+                // Core timestamps can use a different epoch. Preserve elapsed
+                // receipt age rather than copying an absolute core timestamp.
+                const auto coreNowUs = LiGetMicroseconds();
+                if (unit->receiveTimeUs && coreNowUs >= unit->receiveTimeUs) {
+                    const auto ageMs = (coreNowUs - unit->receiveTimeUs) / 1000;
+                    if (output.enqueueMs >= ageMs) output.firstPacketMs = output.enqueueMs - ageMs;
+                }
+                const auto lockStarted = detail::steadyUs();
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.trace.queueLock.add(detail::steadyUs() - lockStarted);
+                // A decoder command issued during the copy invalidates this
+                // frame; an old IDR must not be labelled as the new generation.
+                if (generation == state.generation && !state.stop && !state.failed && !state.terminated) {
                     state.assemblyWaiting = false;
-                    packet.videoGeneration = state.generation;
-                    state.video.push_back(std::move(packet)); ++state.frames; result = DR_OK;
+                    output.videoGeneration = generation;
+                    if (wait) {
+                        if (!owner) throw std::logic_error("Blocking pull requires retained session state");
+                        output.completion = std::make_shared<CoreFrameCompletion>(owner,handle,generation);
+                    }
+                    packet = std::move(output); ++state.frames; result = DR_OK;
+                    if (wait) { frame.owns = false; scope.owns = false; }
                     state.lastVideoMs = nowMs();
-                    state.videoQueueHigh = std::max(state.videoQueueHigh.load(), static_cast<std::uint64_t>(state.video.size()));
-                } else ++state.videoInvalid;
-            } else if (!unit) ++state.videoInvalid;
-            else ++state.videoWaitDrops;
-        } catch (...) { state.fatalFailure = true; state.failed = true; state.terminated = true; state.code = -901; }
-        if (result != DR_OK) {
+                }
+            } else ++state.videoInvalid;
+        } else if (!unit) ++state.videoInvalid;
+        else ++state.videoWaitDrops;
+    } catch (...) {
+        state.fatalFailure = true; state.failed = true; state.terminated = true; state.code = -901;
+        state.changed.notify_all(); state.mediaSignals->notifyAll();
+    }
+    if (result != DR_OK) {
+        {
             std::lock_guard<std::mutex> lock(state.mutex);
             ++state.videoDrops;
-            if (!state.assemblyWaiting) {
-                state.videoDrops += state.video.size(); state.video.clear();
-                ++state.generation; ++state.videoResyncs;
-            }
+            if (!state.assemblyWaiting) { ++state.generation; ++state.videoResyncs; }
             state.assemblyWaiting = true;
         }
-        const auto completeStarted = detail::steadyUs();
-        LiCompleteVideoFrame(handle, result);
-        state.trace.completion.add(detail::steadyUs() - completeStarted);
-        if (state.failed) break;
+        // Media's generic empty-queue wait must immediately re-enter the core
+        // pull after a rejected AU. The replacement IDR wakes the core queue,
+        // not an application producer queue (which no longer exists).
+        state.mediaSignals->video.notify();
     }
-    state.videoBatchMax = std::max(state.videoBatchMax.load(), static_cast<std::uint64_t>(budget));
+    state.trace.drain.add(detail::steadyUs() - processingStarted);
+    return result == DR_OK;
 }
 void freeApps(APP_LIST* app) {
     while (app) { auto* next = app->next; std::free(app->name); std::free(app); app = next; }
@@ -389,7 +486,6 @@ public:
         state_->frames = 0; state_->audioFrames = 0; state_->videoDrops = 0; state_->audioDrops = 0;
         state_->inputAccepted = 0; state_->inputRejected = 0; state_->inputIgnored = 0;
         state_->accelRateHz = 0; state_->gyroRateHz = 0; lastMotionMs_ = {};
-        state_->videoFullYields = 0; state_->videoQueueHigh = 0; state_->videoBatchMax = 0; state_->videoQueueAgeMaxMs = 0;
         state_->videoInvalid = 0; state_->videoWaitDrops = 0; state_->videoResyncs = 0;
         state_->trace.reset();
         state_->coreDiagnosticsReady = false;
@@ -397,7 +493,9 @@ public:
         state_->negotiatedWidth = 0; state_->negotiatedHeight = 0; state_->negotiatedFps = 0;
         state_->decoderWaiting = true; state_->assemblyWaiting = true;
         state_->lastVideoMs = 0;
-        { std::lock_guard<std::mutex> lock(state_->mutex); state_->video.clear(); state_->audio.clear(); state_->error.clear();
+        // No callbacks or previous pull/consumer threads remain at this point.
+        state_->mediaSignals = mediaSignals();
+        { std::lock_guard<std::mutex> lock(state_->mutex); state_->audio.clear(); state_->error.clear();
             state_->command = {}; state_->firstCommandFailure = {}; state_->commandFailures = 0;
             state_->commandAttempt = 0; state_->closedToResumeMs = 0; ++state_->generation; }
         state_->config.width = 1280; state_->config.height = 720; state_->config.fps = settings_.framesPerSecond;
@@ -444,8 +542,32 @@ public:
         }
     }
     void observePlayback(const stream::PlaybackObservation&) override {}
-    bool poll(stream::Packet& packet) override { return take(packet, false); }
-    bool pollAudio(stream::Packet& packet) override { return take(packet, true); }
+    bool poll(stream::Packet& packet) override { return pullVideo(*state_, packet, false, 0); }
+    bool pollVideo(stream::Packet& packet) override {
+        return pollVideo(packet, state_->mediaSignals->video.sequence());
+    }
+    bool pollVideo(stream::Packet& packet, std::uint64_t observedWake) override {
+        return pullVideo(*state_, packet, true, observedWake, state_);
+    }
+    bool mediaAdmissionAllowed() const override {
+        return state_->valid && state_->running && !state_->stop && !state_->failed && !state_->terminated && !state_->assemblyWaiting;
+    }
+    std::uint64_t currentVideoGeneration() const override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        return state_->generation;
+    }
+    void wakeMediaWaiters() override {
+        // Increment before taking the pull gate. A caller that has sampled the
+        // old sequence but has not entered the core yet must refuse to block.
+        state_->mediaSignals->notifyAll();
+        std::lock_guard<std::mutex> lock(state_->pullMutex);
+        if (state_->pullOpen && state_->pullActive) LiWakeWaitForVideoFrame();
+    }
+    bool pollAudio(stream::Packet& packet) override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->audio.empty() || state_->stop || state_->failed || state_->terminated) return false;
+        packet = std::move(state_->audio.front()); state_->audio.pop_front(); return true;
+    }
     bool pollRumble(stream::Rumble& value) override {
         std::lock_guard<std::mutex> lock(state_->mutex);
         if (!state_->valid || !state_->running || state_->stop || state_->failed || state_->terminated) {
@@ -453,11 +575,11 @@ public:
         }
         return state_->rumble.take(value);
     }
-    std::uint64_t queuedVideoAgeMs() const override {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        return state_->video.empty() ? 0 : nowMs() - state_->video.front().enqueueMs;
-    }
-    std::size_t queuedVideoPackets() const override { std::lock_guard<std::mutex> lock(state_->mutex); return state_->video.size(); }
+    // There is no intermediate assembled-video queue. Core pending depth is
+    // available in the synchronized diagnostic snapshot; frame age is measured
+    // from the decode unit carried directly to Media.
+    std::uint64_t queuedVideoAgeMs() const override { return 0; }
+    std::size_t queuedVideoPackets() const override { return coreSnapshot().decodeQueuePending; }
     bool ready() const override { return state_ && state_->running && !state_->stop && !state_->failed && !state_->terminated; }
     std::string status() const override { std::lock_guard<std::mutex> lock(state_->mutex); return state_->message; }
     std::string error() const override { std::lock_guard<std::mutex> lock(state_->mutex); return state_->error; }
@@ -621,9 +743,7 @@ public:
     std::string queueDiagnostics() const override {
         const auto core = coreSnapshot();
         return "Moonlight video_drop=" + std::to_string(state_->videoDrops.load()) + " audio_drop=" + std::to_string(state_->audioDrops.load()) +
-            " video_capacity=" + std::to_string(State::VideoCapacity) + " video_high=" + std::to_string(state_->videoQueueHigh.load()) +
-            " video_full_yields=" + std::to_string(state_->videoFullYields.load()) + " video_batch_max=" + std::to_string(state_->videoBatchMax.load()) +
-            " video_age_max_ms=" + std::to_string(state_->videoQueueAgeMaxMs.load()) +
+            " video_pull=1 application_video_queue=0" +
             " invalid_frames=" + std::to_string(state_->videoInvalid.load()) + " waiting_idr_drops=" + std::to_string(state_->videoWaitDrops.load()) +
             " invalid_resyncs=" + std::to_string(state_->videoResyncs.load()) +
             " core_pending=" + std::to_string(core.decodeQueuePending) +
@@ -662,7 +782,6 @@ public:
             // The receive thread owns depacketizer state and consumes this command.
             FogIdrRecoveryRequestDecoderRefresh();
             std::lock_guard<std::mutex> queueLock(state_->mutex);
-            state_->videoDrops += state_->video.size(); state_->video.clear();
             state_->assemblyWaiting = true; ++state_->generation;
         } else LiRequestIdrFrame();
         return true;
@@ -690,14 +809,23 @@ public:
     }
     void close() override {
         if (!worker_.joinable()) return;
-        state_->stop = true;
+        { std::lock_guard<std::mutex> lock(state_->mutex); state_->stop = true; }
         state_->rumble.clear();
-        { std::lock_guard<std::mutex> lock(state_->apiMutex); if (state_->starting) LiInterruptConnection(); }
-        // Cancel pending /applist, /launch or /resume as well as LiStartConnection.
-        while (!state_->workerFinished) {
-            Settings::instance().request_cancel();
-            { std::lock_guard<std::mutex> lock(state_->apiMutex); if (state_->starting) LiInterruptConnection(); }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        state_->changed.notify_all();
+        state_->mediaSignals->notifyAll();
+        // LiStartConnection resets its interrupt flag during initialization.
+        // A cancellation delivered after starting=true but before that reset
+        // must be repeated. Use a condition deadline, preserving prompt final
+        // completion notifications and never holding mutex over core APIs.
+        {
+            std::unique_lock<std::mutex> lock(state_->mutex);
+            while (!state_->workerFinished) {
+                lock.unlock();
+                Settings::instance().request_cancel();
+                { std::lock_guard<std::mutex> api(state_->apiMutex); if (state_->starting) LiInterruptConnection(); }
+                lock.lock();
+                state_->changed.wait_for(lock, std::chrono::milliseconds(10), [&] { return state_->workerFinished.load(); });
+            }
         }
         worker_.join();
         // Pairing and other clients cannot replace the authenticated State or
@@ -788,16 +916,6 @@ private:
         if (result == 0) last = now;
         return accepted(result);
     }
-    bool take(stream::Packet& packet, bool audio) {
-        std::lock_guard<std::mutex> lock(state_->mutex); auto& queue = audio ? state_->audio : state_->video;
-        if (queue.empty()) return false;
-        if (!audio) {
-            const auto now = nowMs();
-            const auto age = now >= queue.front().enqueueMs ? now - queue.front().enqueueMs : 0;
-            state_->videoQueueAgeMaxMs = std::max(state_->videoQueueAgeMaxMs.load(), age);
-        }
-        packet = std::move(queue.front()); queue.pop_front(); return true;
-    }
     void run() noexcept {
         fog::diagnostics::observeThread("moonlight-session");
         bool started = false;
@@ -827,19 +945,23 @@ private:
                 }
                 else {
                     started = true; state_->coreDiagnosticsReady = true;
+                    { std::lock_guard<std::mutex> lock(state_->pullMutex); state_->pullOpen = true; }
                     { std::lock_guard<std::mutex> lock(state_->apiMutex);
                         LiSendControllerArrivalEvent(0, 1, detail::controllerType(profile_),
                             detail::controllerButtons(profile_), detail::controllerCapabilities(profile_));
                         state_->running = true;
                     }
+                    state_->mediaSignals->notifyAll();
                     state_->status(("Moonlight stream active: 720p" + std::to_string(settings_.framesPerSecond)).c_str());
-                    while (!state_->stop && !state_->terminated) {
-                        const auto began = detail::steadyUs();
-                        state_->trace.worker(began);
-                        drainVideo(*state_);
+                    while (!state_->stop && !state_->failed && !state_->terminated) {
                         drainCoreEvents();
-                        state_->trace.drain.add(detail::steadyUs() - began);
-                        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                        // Journaling remains live even during an indefinite core
+                        // frame wait. This is a sparse diagnostic deadline, not
+                        // a video/audio readiness poll.
+                        std::unique_lock<std::mutex> lock(state_->mutex);
+                        state_->changed.wait_for(lock, std::chrono::seconds(1), [&] {
+                            return state_->stop || state_->failed || state_->terminated;
+                        });
                     }
                     if (state_->terminated) state_->fail("Moonlight host disconnected", state_->terminationCode,
                         state_->terminationOrigin != FOG_TERMINATION_HOST && detail::retryableTransportError(state_->terminationCode));
@@ -850,6 +972,14 @@ private:
             std::lock_guard<std::mutex> lock(state_->apiMutex);
             state_->running = false; state_->starting = false;
         }
+        {
+            std::unique_lock<std::mutex> lock(state_->pullMutex);
+            state_->pullOpen = false;
+            if (started && state_->pullActive) LiWakeWaitForVideoFrame();
+            state_->pullChanged.wait(lock, [&] { return !state_->pullActive; });
+        }
+        state_->changed.notify_all();
+        state_->mediaSignals->notifyAll();
         // UI input only takes apiMutex long enough to observe running=false;
         // no caller can enter a core API while stop joins its internal threads.
         if (started) {
@@ -863,7 +993,7 @@ private:
         active = nullptr;
         state_->rumble.clear();
         drainCoreEvents();
-        state_->workerFinished = true;
+        { std::lock_guard<std::mutex> lock(state_->mutex); state_->workerFinished = true; }
         state_->changed.notify_all();
     }
 };

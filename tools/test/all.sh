@@ -15,6 +15,7 @@ python3 tests/stage1_build_inputs_tests.py
 python3 -m unittest discover -s tools/diagnostics -p "test_*.py"
 bash tools/test/thread-observation.sh
 bash tools/test/transport-teardown.sh
+bash tools/test/media-signals.sh
 bash tools/test/stage0-metrics.sh
 bash tools/test/video-latency.sh
 bash tools/test/app-diagnostics.sh

@@ -5,6 +5,7 @@
 #include "features/streaming/domain/playback_drain.hpp"
 #include "features/streaming/domain/stick_deadzone.hpp"
 #include "core/constants/stage1_options.hpp"
+#include "core/constants/stage3_options.hpp"
 #include "features/playstation/domain/controller.hpp"
 
 namespace uiText = ::fog::constants::ui;
@@ -250,10 +251,11 @@ bool ApplicationController::startTransport(bool resumeOnly) {
     overlay_.setSaveStatus(videoSaveStatus_);
     lastStreamState_.clear(); lastStreamDiagnostics_.clear();
     const bool started = stream_->start({streamRental_, resumeOnly});
-    if (started && !rtcTransport) {
-        media_->startWorkers(*stream_, activeFramesPerSecond_);
-        diagnostic("FH media workers started: independent video/audio; paced presentation fps=" + std::to_string(activeFramesPerSecond_));
+    if (started && (!rtcTransport || fog::stage3::mtsMediaWorkers)) {
+        media_->startWorkers(*stream_, activeFramesPerSecond_, rtcTransport ? fog::Media::WorkerPolicy::Mts : fog::Media::WorkerPolicy::FogHub);
+        diagnostic(std::string(rtcTransport ? "MTS" : "FH") + " media workers started: independent video/audio; paced presentation fps=" + std::to_string(activeFramesPerSecond_));
     }
+    if (rtcTransport) diagnostic("Stage3 options mts_media_workers=" + std::to_string(fog::stage3::mtsMediaWorkers));
     streamStarted_ = lastVideo_ = lastMediaLog_ = lastMetricsLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
     return started;
 }
@@ -482,7 +484,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
             : fog::stream::PlaybackDrainPolicy::ImmediatePresentationFirst)
         : fog::stream::PlaybackDrainPolicy::LegacyPresentationFirst;
     fog::stream::PlaybackDrainBudget drainBudget(queuedBeforeDrain, stream_->queuedVideoAgeMs(), drainPolicy, activeFramesPerSecond_);
-    if (drainBudget.catchup()) ++catchupWindows_;
+    if (!media_->workersRunning() && drainBudget.catchup()) ++catchupWindows_;
     // Keep compressed references in FIFO order. Bound both work time and the
     // number of video frames before presentation, audio and the next input turn.
     while (!media_->workersRunning()) {
@@ -612,10 +614,11 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     }
     // Presentation counts come from the preceding completed RenderPresent, never
     // repeated drawing of an old texture or decoding alone.
+    const auto workerLoad = media_->workerVideoLoad();
     if (streamRental_.provider == fog::ProviderId::Mts) stream_->observePlayback({media_->presentedFrames(), media_->videoFrames(), media_->supersededFrames(),
         videoWorkUs_, videoDecodeErrors_, media_->audioUnderruns(), media_->audioQueueResets(),
         transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe(),
-        media_->videoWidth(), media_->videoHeight()});
+        media_->videoWidth(), media_->videoHeight(), workerLoad.decodeUs + workerLoad.convertUs, workerLoad.generation, media_->workersRunning()});
     const auto now = std::chrono::steady_clock::now();
     if (now-lastMediaLog_ >= std::chrono::seconds(fog::stage1::sparseDiagnostics ? 15 : 5)) {
         diagnostic("Media video=" + std::to_string(media_->videoFrames()) +
@@ -639,6 +642,11 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
     // Keep the short latency/loop windows comparable with the 5-second base,
     // independently of the less frequent verbose transport/decoder dumps.
     if (now-lastMetricsLog_ >= std::chrono::seconds(5)) {
+        diagnostic("Playback load: workers=" + std::to_string(media_->workersRunning()) +
+            " generation=" + std::to_string(workerLoad.generation) +
+            " workerDecodeUs=" + std::to_string(workerLoad.decodeUs) +
+            " workerConvertUs=" + std::to_string(workerLoad.convertUs) +
+            " uiVideoUs=" + std::to_string(videoWorkUs_));
         logOutputTimings(false);
         const auto timings = playbackTimings(true);
         drainTiming_ = {}; presentTiming_ = {};

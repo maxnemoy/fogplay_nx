@@ -17,6 +17,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <condition_variable>
+#include <mutex>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -31,6 +33,11 @@ std::atomic<int> connectionResult{0};
 std::atomic<int> connectionStarts{0}, decoderRefreshes{0}, idrRequests{0};
 std::atomic<bool> coreWaiting{false}, cancelAfterCommand{false};
 std::atomic<bool> holdConnection{false}, connectionHeld{false};
+std::atomic<bool> resetConnectionInterrupt{false}, connectionInitEntered{false};
+std::atomic<bool> connectionLostFirstInterrupt{false}, connectionSawRepeatedInterrupt{false};
+std::atomic<int> connectionInterruptBaseline{0};
+std::mutex connectionInitMutex;
+std::condition_variable connectionInitChanged;
 std::atomic<int> frameBytes{4}, frameCompletions{0}, frameCompletionResult{DR_OK};
 std::atomic<int> stopTermination{INT_MIN};
 std::atomic<bool> stopFromHost{false}, holdStop{false}, stopHeld{false};
@@ -47,7 +54,14 @@ std::string initializedEndpoint;
 int buttonFlags = 0, mouseButton = 0, keyCode = 0;
 short leftY = 0, wheelAmount = 0;
 unsigned char leftTrigger = 0;
-int videoReturned = 0;
+std::mutex videoMutex;
+std::condition_variable videoChanged;
+unsigned pendingVideoFrames = 0;
+bool videoUserWake = false, videoInFlight = false;
+std::atomic<unsigned> initialVideoFrames{1}, videoWaits{0}, videoPolls{0}, videoWakes{0};
+std::atomic<bool> videoWaitBlocked{false};
+std::atomic<bool> holdBeforeVideoWait{false}, beforeVideoWaitHeld{false};
+std::atomic<bool> holdVideoCompletion{false}, videoCompletionHeld{false};
 int expectedVideoFormats = VIDEO_FORMAT_H264 | VIDEO_FORMAT_H265;
 int expectedFps = 30;
 int negotiatedFormat = VIDEO_FORMAT_H264;
@@ -180,6 +194,21 @@ int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION config, PCONNEC
     PDECODER_RENDERER_CALLBACKS video, PAUDIO_RENDERER_CALLBACKS audio, void*, int, void*, int) {
     ++connectionStarts;
     assert(config->fps == expectedFps && config->supportedVideoFormats == expectedVideoFormats);
+    if (resetConnectionInterrupt.exchange(false)) {
+        std::unique_lock<std::mutex> lock(connectionInitMutex);
+        connectionInitEntered = true;
+        // Reproduce the pinned core's initialization reset after the adapter
+        // has published starting=true. The first interrupt is discarded; only
+        // a later one may release this synthetic handshake.
+        connectionLostFirstInterrupt = connectionInitChanged.wait_for(lock, std::chrono::milliseconds(500), [] {
+            return interrupts.load() > connectionInterruptBaseline.load();
+        });
+        const auto discarded = interrupts.load();
+        connectionSawRepeatedInterrupt = connectionInitChanged.wait_for(lock, std::chrono::milliseconds(500), [discarded] {
+            return interrupts.load() > discarded;
+        });
+        return ETIMEDOUT;
+    }
     terminateConnection = listeners->connectionTerminated;
     assert(listeners->rumble);
     rumbleConnection = listeners->rumble;
@@ -197,7 +226,11 @@ int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION config, PCONNEC
     for (int i = 1; i <= audioBurst; i++) {
         char bytes[2]{static_cast<char>(i), 2}; audio->decodeAndPlaySample(bytes, 2);
     }
-    videoReturned = 0;
+    {
+        std::lock_guard<std::mutex> lock(videoMutex);
+        assert(!videoInFlight);
+        pendingVideoFrames = initialVideoFrames; videoUserWake = false;
+    }
     if (holdConnection.exchange(false)) {
         const auto before = interrupts.load(); connectionHeld = true;
         while (interrupts == before) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -207,6 +240,7 @@ int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION config, PCONNEC
     return connectionResult;
 }
 void LiStopConnection() {
+    { std::lock_guard<std::mutex> lock(videoMutex); assert(!videoInFlight); }
     stopHeld = true;
     while (holdStop) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     stopHeld = false;
@@ -218,9 +252,16 @@ void LiStopConnection() {
     }
     ++stops;
 }
-void LiInterruptConnection() { ++interrupts; }
+void LiInterruptConnection() {
+    { std::lock_guard<std::mutex> lock(connectionInitMutex); ++interrupts; }
+    connectionInitChanged.notify_all();
+}
 bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* handle, PDECODE_UNIT* unit) {
-    if (videoReturned++) return false;
+    ++videoPolls;
+    std::lock_guard<std::mutex> lock(videoMutex);
+    if (!pendingVideoFrames) return false;
+    assert(!videoInFlight);
+    --pendingVideoFrames; videoInFlight = true;
     static std::vector<char> bytes;
     bytes.assign(static_cast<std::size_t>(frameBytes.load()), 0);
     static LENTRY entry{}; entry.data = bytes.data(); entry.length = frameBytes;
@@ -229,8 +270,42 @@ bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* handle, PDECODE_UNIT* unit) {
     frame.receiveTimeUs = LiGetMicroseconds() - 42000;
     *unit = &frame; *handle = reinterpret_cast<VIDEO_FRAME_HANDLE>(1); return true;
 }
+bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* handle, PDECODE_UNIT* unit) {
+    ++videoWaits;
+    if (holdBeforeVideoWait) {
+        beforeVideoWaitHeld = true;
+        while (holdBeforeVideoWait) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        beforeVideoWaitHeld = false;
+    }
+    {
+        std::unique_lock<std::mutex> lock(videoMutex);
+        videoWaitBlocked = !pendingVideoFrames && !videoUserWake;
+        videoChanged.wait(lock, [] { return pendingVideoFrames || videoUserWake; });
+        videoWaitBlocked = false;
+        if (videoUserWake) { videoUserWake = false; return false; }
+    }
+    return LiPollNextVideoFrame(handle, unit);
+}
+void LiWakeWaitForVideoFrame() {
+    { std::lock_guard<std::mutex> lock(videoMutex); videoUserWake = true; }
+    ++videoWakes;
+    videoChanged.notify_all();
+}
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE, int result) {
+    if (holdVideoCompletion) {
+        videoCompletionHeld = true;
+        while (holdVideoCompletion) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        videoCompletionHeld = false;
+    }
+    std::lock_guard<std::mutex> lock(videoMutex);
+    assert(videoInFlight); videoInFlight = false;
+    if (result == DR_NEED_IDR) pendingVideoFrames = 0;
     frameCompletionResult = result; ++frameCompletions;
+}
+void completePacket(stream::Packet& packet, bool decoded) {
+    assert(packet.completion);
+    packet.completion->complete(decoded);
+    packet.completion.reset();
 }
 void LiRequestIdrFrame() { ++idrRequests; }
 extern "C" void FogIdrRecoveryRequestDecoderRefresh() { ++decoderRefreshes; }
@@ -558,6 +633,181 @@ void blockingStopScenarios(const std::filesystem::path& path) {
     assert(closed && !client->ready());
 }
 
+void connectionInterruptResetScenarios(const std::filesystem::path& path) {
+    moonlight::MoonlightSession session(path.string());
+    currentApp = 0; listedApp = 42; ambiguousApps = false; failPair = false;
+    pair(session);
+    auto client = session.create(); assert(client);
+    connectionInitEntered = false; connectionLostFirstInterrupt = false; connectionSawRepeatedInterrupt = false;
+    connectionInterruptBaseline = interrupts.load(); resetConnectionInterrupt = true;
+    assert(client->start({rental()}));
+    eventually([] { return connectionInitEntered.load(); });
+    const auto began = std::chrono::steady_clock::now();
+    client->close();
+    const auto elapsed = std::chrono::steady_clock::now() - began;
+    assert(connectionLostFirstInterrupt && connectionSawRepeatedInterrupt);
+    assert(interrupts >= connectionInterruptBaseline + 2);
+    assert(elapsed < std::chrono::milliseconds(250) && !client->ready());
+}
+
+void blockingPullScenarios(const std::filesystem::path& path) {
+    moonlight::MoonlightSession session(path.string());
+    currentApp = 0; listedApp = 42; ambiguousApps = false; failPair = false;
+    frameBytes = 4; initialVideoFrames = 0;
+    pair(session);
+    auto client = session.create(); assert(client);
+    const auto completedAtStart = frameCompletions.load();
+    const auto wakesAtStart = videoWakes.load();
+    assert(client->start({rental()}));
+    eventually([&] { return client->ready(); });
+    stream::Packet packet;
+    std::atomic<bool> returned{false}, pulled{false};
+    std::thread owner([&] { pulled = client->pollVideo(packet); returned = true; });
+    eventually([&] { return videoWaitBlocked.load(); });
+    const auto waits = videoWaits.load(), polls = videoPolls.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    assert(videoWaitBlocked && videoWaits == waits && videoPolls == polls);
+    {
+        std::lock_guard<std::mutex> lock(videoMutex);
+        pendingVideoFrames = 1;
+    }
+    videoChanged.notify_all();
+    eventually([&] { return returned.load(); }); owner.join();
+    assert(pulled && packet.kind == stream::Kind::Video);
+    assert(packet.completion && frameCompletions == completedAtStart && videoInFlight);
+    client->wakeMediaWaiters(); // Reset races decode while the receipt still owns the core handle.
+    packet.completion->complete(true);
+    packet.completion->complete(false); // Idempotent, even if a retained error copy retries completion.
+    packet.completion.reset();
+    assert(frameCompletions == completedAtStart + 1 && frameCompletionResult == DR_OK);
+    const auto stickyRevision = client->mediaSignals()->video.sequence();
+    assert(!client->pollVideo(packet,stickyRevision));
+    assert(client->mediaSignals()->video.sequence() != stickyRevision);
+    // A stop after the consumer captured a revision but before pull entry must
+    // return without entering the blocking SDK call.
+    const auto oldRevision = client->mediaSignals()->video.sequence();
+    client->wakeMediaWaiters();
+    const auto waitsBeforeStale = videoWaits.load();
+    assert(!client->pollVideo(packet,oldRevision) && videoWaits == waitsBeforeStale);
+    // A wake between scope admission and the core's actual condition wait is
+    // sticky in the pinned core, even before its wait has been registered.
+    returned = false; pulled = false; holdBeforeVideoWait = true;
+    owner = std::thread([&] { pulled = client->pollVideo(packet); returned = true; });
+    eventually([&] { return beforeVideoWaitHeld.load(); });
+    client->wakeMediaWaiters(); holdBeforeVideoWait = false;
+    eventually([&] { return returned.load(); }); owner.join(); assert(!pulled);
+    returned = false;
+    owner = std::thread([&] { pulled = client->pollVideo(packet); returned = true; });
+    eventually([&] { return videoWaitBlocked.load(); });
+    const auto began = std::chrono::steady_clock::now();
+    client->close();
+    owner.join();
+    assert(std::chrono::steady_clock::now() - began < std::chrono::seconds(1));
+    assert(returned && !pulled && videoWakes == wakesAtStart + 3 && !videoInFlight && !videoWaitBlocked);
+
+    // An automatic host termination has the same wake/join guarantee even
+    // before the application has dispatched close on its teardown worker.
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    returned = false;
+    owner = std::thread([&] { pulled = client->pollVideo(packet); returned = true; });
+    eventually([&] { return videoWaitBlocked.load(); });
+    FogMoonlightNotifyHostTermination(terminateConnection.load(),ML_ERROR_GRACEFUL_TERMINATION);
+    eventually([&] { return returned.load(); }); owner.join();
+    assert(!pulled && !client->retryableError()); client->close();
+
+    // The core must outlive completion of a handle already admitted by Media.
+    initialVideoFrames = 1; holdVideoCompletion = true; returned = false;
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    const auto stopsBeforeHeldFrame = stops.load();
+    owner = std::thread([&] { pulled = client->pollVideo(packet); completePacket(packet,true); returned = true; });
+    eventually([&] { return videoCompletionHeld.load(); });
+    FogMoonlightNotifyHostTermination(terminateConnection.load(),ML_ERROR_GRACEFUL_TERMINATION);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    assert(stops == stopsBeforeHeldFrame && !returned);
+    holdVideoCompletion = false;
+    eventually([&] { return returned.load(); }); owner.join(); client->close();
+    assert(stops == stopsBeforeHeldFrame + 1 && !videoInFlight);
+
+    // Until the decoder asks, frames remain in the core queue. Direct pulls
+    // complete each handle in order without a second producer/consumer queue.
+    initialVideoFrames = 8;
+    const auto completedBeforeBurst = frameCompletions.load();
+    assert(client->start({rental()}));
+    eventually([&] { return client->ready(); });
+    const auto fullPolls = videoPolls.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    assert(videoPolls == fullPolls && frameCompletions == completedBeforeBurst);
+    for (unsigned i = 0; i < 8; ++i) { assert(client->pollVideo(packet)); completePacket(packet,true); }
+    assert(frameCompletions == completedBeforeBurst + 8);
+    client->close();
+
+    // Rejected access units complete once with NEED_IDR. A later replacement
+    // IDR opens a fresh queue generation and wakes the video consumer.
+    initialVideoFrames = 1; frameBytes = 4;
+    const auto completedBeforeInvalid = frameCompletions.load();
+    assert(client->start({rental()}));
+    eventually([&] { return client->ready(); });
+    assert(client->pollVideo(packet) && client->mediaAdmissionAllowed());
+    completePacket(packet,true);
+    const auto oldGeneration = client->currentVideoGeneration();
+    assert(packet.videoGeneration == oldGeneration);
+    frameBytes = static_cast<int>(stream::MaxVideoAccessUnitBytes + 1);
+    {
+        std::lock_guard<std::mutex> lock(videoMutex); pendingVideoFrames = 1;
+    }
+    const auto rejectionRevision = client->mediaSignals()->video.sequence();
+    assert(!client->pollVideo(packet,rejectionRevision) && frameCompletions == completedBeforeInvalid + 2);
+    assert(frameCompletionResult == DR_NEED_IDR);
+    assert(client->currentVideoGeneration() == oldGeneration + 1 && !client->mediaAdmissionAllowed());
+    // This is Media's generic false-poll fallback. It must not sleep for its
+    // 1-second diagnostic deadline before re-entering the replacement-IDR wait.
+    const auto rejectionWaitStarted = std::chrono::steady_clock::now();
+    client->mediaSignals()->video.wait(rejectionRevision,std::chrono::seconds(1));
+    assert(std::chrono::steady_clock::now() - rejectionWaitStarted < std::chrono::milliseconds(200));
+    frameBytes = 4;
+    {
+        std::lock_guard<std::mutex> lock(videoMutex);
+        pendingVideoFrames = 1;
+    }
+    videoChanged.notify_all();
+    assert(client->pollVideo(packet) && frameCompletions == completedBeforeInvalid + 2);
+    completePacket(packet,true);
+    assert(frameCompletions == completedBeforeInvalid + 3);
+    assert(frameCompletionResult == DR_OK && packet.data.size() == 4 && packet.videoGeneration == oldGeneration + 1);
+    assert(client->mediaAdmissionAllowed());
+    // A syntactically valid copied AU is not acknowledged until the decoder
+    // confirms it. Decode failure and abandoned receipts request a new IDR.
+    {
+        std::lock_guard<std::mutex> lock(videoMutex); pendingVideoFrames = 1;
+    }
+    assert(client->pollVideo(packet));
+    const auto beforeDecodeFailure = frameCompletions.load();
+    packet.completion->complete(false); packet.completion->complete(true); packet.completion.reset();
+    assert(frameCompletions == beforeDecodeFailure + 1 && frameCompletionResult == DR_NEED_IDR);
+    assert(!client->mediaAdmissionAllowed() && client->currentVideoGeneration() == oldGeneration + 2);
+    {
+        std::lock_guard<std::mutex> lock(videoMutex); pendingVideoFrames = 1;
+    }
+    assert(client->pollVideo(packet));
+    const auto beforeAbandon = frameCompletions.load();
+    packet.completion.reset();
+    assert(frameCompletions == beforeAbandon + 1 && frameCompletionResult == DR_NEED_IDR);
+    client->close();
+    initialVideoFrames = 1;
+
+    // Completion may win before close starts waiting, or race its predicate.
+    // Repeat both orders; finished publication must use the waiter mutex.
+    for (unsigned iteration = 0; iteration < 32; ++iteration) {
+        assert(client->start({rental()})); eventually([&] { return client->ready(); });
+        if (iteration & 1) {
+            FogMoonlightNotifyHostTermination(terminateConnection.load(),ML_ERROR_GRACEFUL_TERMINATION);
+            std::this_thread::yield();
+        }
+        client->close();
+        assert(!client->ready());
+    }
+}
+
 void frameRateScenarios(const std::filesystem::path& path) {
     moonlight::MoonlightSession session(path.string());
     currentApp = 0; listedApp = 42; ambiguousApps = false; failPair = false;
@@ -608,17 +858,22 @@ void videoRecoveryScenarios(const std::filesystem::path& path) {
                           static_cast<int>(stream::MaxVideoAccessUnitBytes + 1)}) {
         frameBytes = size; const auto before = frameCompletions.load();
         assert(client->start({rental()})); eventually([&] { return client->ready(); });
-        eventually([&] { return frameCompletions > before; });
         const bool accepted = size <= static_cast<int>(stream::MaxVideoAccessUnitBytes);
-        assert(frameCompletionResult == (accepted ? DR_OK : DR_NEED_IDR));
+        const auto revision = client->mediaSignals()->video.sequence();
         stream::Packet packet;
         assert(client->poll(packet) == accepted);
+        assert(frameCompletions == before + 1 && frameCompletionResult == (accepted ? DR_OK : DR_NEED_IDR));
+        if (!accepted) {
+            assert(client->mediaSignals()->video.sequence() != revision);
+            assert(!client->mediaAdmissionAllowed());
+        }
         if (accepted) assert(packet.data.size() == static_cast<std::size_t>(size));
         assert(client->error().empty());
         client->close();
     }
     frameBytes = 4;
-    assert(client->start({rental()})); eventually([&] { return client->queuedVideoPackets() == 1; });
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    stream::Packet initial; assert(client->poll(initial));
     client->setDecoderWaitingForKeyframe(false);
     assert(!client->waitingForVideoKeyframe());
     coreWaiting = true;
@@ -633,7 +888,7 @@ void videoRecoveryScenarios(const std::filesystem::path& path) {
         assert(client->queuedVideoPackets() == 0);
     } else {
         assert(decoderRefreshes == refreshBefore && idrRequests == idrBefore + 1);
-        assert(client->queuedVideoPackets() == 1);
+        assert(client->queuedVideoPackets() == 0);
     }
     assert(client->waitingForVideoKeyframe());
     client->close();
@@ -673,7 +928,7 @@ int main() {
                 "rcvbuf(requested,selected,actual)=98303,65535,131070", "set_failures=2 last_set_error=12 query_ok=1 query_error=0"}) {
             assert(timings.find(field) != std::string::npos);
         }
-        eventually([&] { return client->queuedVideoPackets() == 1; });
+        eventually([&] { return client->ready(); });
         const auto gaps = client->gapDiagnostics();
         assert(gaps.find("rtp_reject_seq=") != std::string::npos &&
             gaps.find("fec_abandoned_parity_missing_max=") != std::string::npos &&
@@ -753,6 +1008,8 @@ int main() {
     retryScenarios(path / "resume-tests");
     networkRecoveryScenarios(path / "network-recovery-tests");
     blockingStopScenarios(path / "blocking-stop-tests");
+    connectionInterruptResetScenarios(path / "connection-interrupt-reset-tests");
+    blockingPullScenarios(path / "blocking-pull-tests");
     rumbleScenarios(path / "rumble-tests");
     frameRateScenarios(path / "frame-rate-tests");
     videoRecoveryScenarios(path / "video-recovery-tests");
