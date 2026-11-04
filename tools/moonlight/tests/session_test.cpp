@@ -951,6 +951,13 @@ int main() {
         negotiatedFormat = VIDEO_FORMAT_H265; audioBurst = 25;
         assert(client->start({rental()})); eventually([&] { return client->ready(); });
         assert(client->selectedVideoCodec() == stream::VideoCodec::H265);
+        const auto audioDiagnostics = client->queueDiagnostics();
+        assert(audioDiagnostics.find("audio_drop=5") != std::string::npos);
+        assert(audioDiagnostics.find("audio_overflow_drop=5") != std::string::npos);
+        assert(audioDiagnostics.find("audio_invalid_drop=0") != std::string::npos);
+        assert(audioDiagnostics.find("audio_drop_video_waiting=5") != std::string::npos);
+        assert(audioDiagnostics.find("audio_drop_video_stalled=5") != std::string::npos);
+        assert(audioDiagnostics.find("audio_drop_last_queue_age_ms=") != std::string::npos);
         for (int i = 6; i <= 25; i++) {
             assert(client->pollAudio(packet) && packet.data.size() == 2);
             assert(static_cast<int>(packet.data[0]) == i);

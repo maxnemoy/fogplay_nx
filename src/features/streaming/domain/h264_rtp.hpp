@@ -4,6 +4,7 @@
 #include "features/streaming/domain/media_annexb.hpp"
 #include "features/streaming/domain/video_limits.hpp"
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -70,6 +71,7 @@ public:
     static constexpr std::size_t MaxPending = 256, MaxPendingBytes = 2 * 1024 * 1024;
     static constexpr std::size_t MaxFrameBytes = MaxVideoAccessUnitBytes, MaxFrames = 8;
     const Stats& stats() const { return stats_; }
+    std::uint64_t repairedPackets() const { return repairPackets_; }
     bool waiting() const { return waiting_; }
     bool needsPli() const { return waiting_; }
     std::size_t pendingPackets() const { return pending_.size(); }
@@ -165,6 +167,8 @@ public:
         frame = std::move(frames_.front()); frames_.pop_front();
         frameBytes_ -= frame.data.size(); return true;
     }
+    // Latest transport round trip (SCTP) for classifying NACK arrivals; 0 = unknown.
+    void observeRoundTrip(std::uint64_t ms) { roundTripMs_ = ms; }
     bool pollEvent(std::string& event) {
         if (events_.empty()) return false;
         event = std::move(events_.front()); events_.pop_front(); return true;
@@ -179,6 +183,13 @@ public:
             " nackFirstArrivalLastMs=" + std::to_string(arrivalLastMs_) +
             " nackFirstArrivalMeanMs=" + std::to_string(arrivalMeanMs_) + " nackFirstArrivalMaxMs=" + std::to_string(arrivalMaxMs_) +
             " nackArrivalDeviationMs=" + std::to_string(arrivalDeviationMs_) +
+            " nackArrivalP50Ms=" + std::to_string(arrivalPercentile(50)) +
+            " nackArrivalP95Ms=" + std::to_string(arrivalPercentile(95)) +
+            " nackArrivalBucketMs=" + std::to_string(ArrivalBucketMs) +
+            " nackRoundTripMs=" + std::to_string(roundTripMs_) +
+            " nackArrivalBeforeRtt=" + std::to_string(arrivalBeforeRtt_) +
+            " nackArrivalAfterRtt=" + std::to_string(arrivalAfterRtt_) +
+            " nackArrivalRttUnknown=" + std::to_string(arrivalRttUnknown_) +
             " nackHistory=" + std::to_string(history_.size()) + " nackHistoryEvicted=" + std::to_string(historyEvicted_) +
             " catchupYields=" + std::to_string(catchupYields_) +
             " rtp=" + std::to_string(stats_.received) +
@@ -568,6 +579,18 @@ private:
     }
     static constexpr std::uint64_t HistoryMs = 2000;
     static constexpr std::size_t MaxHistory = 512;
+    static constexpr std::uint64_t ArrivalBucketMs = 10;
+    static constexpr std::size_t ArrivalBuckets = HistoryMs / ArrivalBucketMs + 1;
+    std::uint64_t arrivalPercentile(unsigned percentile) const {
+        if (!arrivalSamples_) return 0;
+        const auto rank = (arrivalSamples_ * percentile + 99) / 100;
+        std::uint64_t seen = 0;
+        for (std::size_t i = 0; i < arrivalHistogram_.size(); ++i) {
+            seen += arrivalHistogram_[i];
+            if (seen >= rank) return std::min<std::uint64_t>(i * ArrivalBucketMs, HistoryMs);
+        }
+        return HistoryMs;
+    }
     void recordExpiredRequest(Request& request, GapExpiry& summary, const Request* retired = nullptr) {
         const auto first = retired ? std::min(request.diagnosticFirstMs, retired->diagnosticFirstMs) : request.diagnosticFirstMs;
         const auto last = retired ? std::max(request.diagnosticLastMs, retired->diagnosticLastMs) : request.diagnosticLastMs;
@@ -664,6 +687,12 @@ private:
         }
         const auto sample = now - request.firstMs;
         ++arrivalSamples_; if (late) ++lateSamples_; if (request.attempts > 1) ++retrySamples_;
+        // Classification aid, not proof: an arrival sooner than the observed
+        // SCTP round trip is most likely a delayed/reordered original rather
+        // than the answer to this NACK. That RTT is an estimate from another
+        // exchange (freshness, channel priority and NACK send time vary).
+        if (!roundTripMs_) ++arrivalRttUnknown_; else if (sample < roundTripMs_) ++arrivalBeforeRtt_; else ++arrivalAfterRtt_;
+        ++arrivalHistogram_[std::min<std::size_t>(sample / ArrivalBucketMs, ArrivalBuckets - 1)];
         arrivalLastMs_ = sample; arrivalMaxMs_ = std::max(arrivalMaxMs_, sample);
         if (arrivalSamples_ == 1) { arrivalMeanMs_ = sample; arrivalDeviationMs_ = std::max(std::uint64_t(5), sample / 4); }
         else {
@@ -685,7 +714,9 @@ private:
     std::uint64_t nackPackets_ = 0, repairPackets_ = 0;
     std::uint64_t repairMs_ = RepairMs, gapRepairMs_ = RepairMs;
     std::uint64_t arrivalSamples_ = 0, lateSamples_ = 0, retrySamples_ = 0;
+    std::uint64_t roundTripMs_ = 0, arrivalBeforeRtt_ = 0, arrivalAfterRtt_ = 0, arrivalRttUnknown_ = 0;
     std::uint64_t arrivalLastMs_ = 0, arrivalMeanMs_ = 0, arrivalMaxMs_ = 0, arrivalDeviationMs_ = 0;
+    std::array<std::uint64_t, ArrivalBuckets> arrivalHistogram_{};
     std::uint64_t historyEvicted_ = 0, catchupYields_ = 0;
     std::uint64_t expiredGaps_ = 0, expiredPackets_ = 0, expiredNoNackGaps_ = 0, expiredUnrequestedPackets_ = 0;
     std::uint64_t expiredNackAttempts_ = 0, maxExpiryOvershootMs_ = 0, matchedLatePackets_ = 0;

@@ -1,6 +1,8 @@
 #pragma once
 #include "features/streaming/domain/streaming_client.hpp"
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 
 namespace fog::stream {
 // Every observed button edge bypasses analog cadence. Rejected samples never
@@ -18,8 +20,13 @@ public:
             now < acceptedAt_ || now - acceptedAt_ >= AnalogInterval;
     }
     void accepted(const ::stream::Gamepad& value, Time now) {
+        for (std::size_t i = 0; i < value.buttons.size(); ++i)
+            if (value.buttons[i] && (!initialized_ || !accepted_.buttons[i])) { ++pressEdges_; break; }
         accepted_ = value; acceptedAt_ = now; initialized_ = true;
     }
+    // Monotonic count of accepted states that newly pressed a button; lets
+    // pending overlay text stop before input that may move the remote focus.
+    std::uint64_t pressEdges() const { return pressEdges_; }
     template<class Send> void suspend(Send&& send) {
         initialized_ = false;
         releasePending_ = true;
@@ -30,6 +37,7 @@ public:
     }
 private:
     bool initialized_ = false, releasePending_ = false;
+    std::uint64_t pressEdges_ = 0;
     ::stream::Gamepad accepted_{};
     Time acceptedAt_{};
 };

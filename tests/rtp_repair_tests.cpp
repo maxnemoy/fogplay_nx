@@ -38,7 +38,22 @@ static void adaptiveRepairTests() {
         A::Frame f; assert(a.poll(f) && f.timestamp == 300 && f.firstSequence == 100 && f.lastSequence == 102);
         assert(a.stats().resyncs == 0 && a.stats().gaps == 0 && metric(a,"repairedPackets") == 1);
         assert(metric(a,"nackArrivalSamples") == 1 && metric(a,"nackFirstArrivalLastMs") == 140);
+        assert(metric(a,"nackArrivalP50Ms") == 140 && metric(a,"nackArrivalP95Ms") == 140);
+        assert(metric(a,"nackArrivalBucketMs") == 10);
         assert(metric(a,"repairWindowMs") == A::MaxRepairMs && metric(a,"nackLateSamples") == 0);
+        assert(metric(a,"nackRoundTripMs") == 0 && metric(a,"nackArrivalRttUnknown") == 1); // No transport RTT yet.
+        assert(metric(a,"nackArrivalBeforeRtt") == 0 && metric(a,"nackArrivalAfterRtt") == 0);
+    }
+    {
+        // Arrivals are classified against the observed round trip: sooner is
+        // most likely a delayed original (no RTX), later may be a repair.
+        A before; fragmentGap(before); before.observeRoundTrip(100);
+        feed(before,101,300,false,{0x7c,0x01,0x22},32); // NACK at 23 ms -> arrival 9 ms.
+        assert(metric(before,"nackRoundTripMs") == 100 && metric(before,"nackArrivalBeforeRtt") == 1);
+        assert(metric(before,"nackArrivalAfterRtt") == 0 && metric(before,"nackArrivalRttUnknown") == 0);
+        A after; fragmentGap(after); after.observeRoundTrip(100);
+        feed(after,101,300,false,{0x7c,0x01,0x22},163); // Arrival 140 ms.
+        assert(metric(after,"nackArrivalAfterRtt") == 1 && metric(after,"nackArrivalBeforeRtt") == 0);
     }
     {
         A a; fragmentGap(a); a.takeNacks(113); // Retry makes the responsible send ambiguous.

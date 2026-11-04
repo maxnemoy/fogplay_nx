@@ -10,6 +10,37 @@ void validateDimension(int value) {
     if (value < 1 || value > 8192)
         throw std::invalid_argument(fog::constants::error::Stream::RemoteInputDimensionMustBeBetween1And8192);
 }
+// Physical key of a scalar on a US keyboard; scalars without a known key map to themselves.
+std::uint32_t physicalKey(std::uint32_t scalar) {
+    if (scalar >= 'A' && scalar <= 'Z') return scalar - 'A' + 'a';
+    static constexpr char shifted[] = "!@#$%^&*()_+{}|:\"<>?~";
+    static constexpr char base[] = "1234567890-=[]\\;',./`";
+    for (std::size_t i = 0; shifted[i]; ++i) if (scalar == static_cast<unsigned char>(shifted[i])) return static_cast<unsigned char>(base[i]);
+    if (scalar >= 0x410 && scalar <= 0x42f) scalar += 0x20; // Cyrillic capitals
+    if (scalar == 0x401) scalar = 0x451;                     // Ё
+    // ЙЦУКЕН lowercase letters in U+0430..U+044F order, then ё, mapped to their US key.
+    static constexpr char cyrillic[] = "f,dult;pbqrkvyjghcnea[wxio]sm'.z";
+    if (scalar >= 0x430 && scalar <= 0x44f) return static_cast<unsigned char>(cyrillic[scalar - 0x430]);
+    if (scalar == 0x451) return '`';
+    return scalar;
+}
+}
+std::vector<std::string> typingSegments(const std::string& utf8) {
+    validateText(utf8);
+    std::vector<std::string> segments;
+    std::uint32_t previous = 0;
+    for (std::size_t i = 0; i < utf8.size();) {
+        const auto lead = static_cast<unsigned char>(utf8[i]);
+        const std::size_t count = lead <= 0x7f ? 1 : lead <= 0xdf ? 2 : lead <= 0xef ? 3 : 4;
+        std::uint32_t scalar = count == 1 ? lead : count == 2 ? (lead & 0x1f) : count == 3 ? (lead & 0x0f) : (lead & 0x07);
+        for (std::size_t j = 1; j < count; ++j) scalar = (scalar << 6) | (static_cast<unsigned char>(utf8[i + j]) & 0x3f);
+        const auto key = physicalKey(scalar);
+        if (segments.empty() || key == previous) segments.emplace_back();
+        segments.back().append(utf8, i, count);
+        previous = key;
+        i += count;
+    }
+    return segments;
 }
 void validateText(const std::string& input) {
     if (input.size() > 512)

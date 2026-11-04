@@ -112,7 +112,44 @@ static void schemaLimit() {
     assert(!incoming.poll(event, 1005, true));
 }
 
+static void lossRecoveryValues() {
+    // MTS announces its loss-recovery/FEC configuration on the control channel.
+    // Bounded flags, numbers and identifier strings are logged; nothing else.
+    const auto features = Diagnostics::describe(Json{{"id", "network_features_state"}, {"network_features", {
+        {"flags", {{"fec_group_limit", true}, {"fresh_metrics", false}, {"packet_recovery", true}, {"repair_deadlines", true}}},
+        {"parameters", {{"metric_stale_ms", 1500}, {"metric_window_ms", 2000}, {"recovery_max_hold_ms", 120},
+            {"recovery_nack_retries", 2}, {"ratio", 0.25}, {"huge", 5000000000LL}, {"mode", "with spaces"},
+            {"session_hash", "secret-hash"}}}}}}, 393);
+    assert(features.sample.find("packet_recovery:true") != std::string::npos);
+    assert(features.sample.find("fresh_metrics:false") != std::string::npos);
+    assert(features.sample.find("recovery_max_hold_ms:120") != std::string::npos);
+    assert(features.sample.find("recovery_nack_retries:2") != std::string::npos);
+    assert(features.sample.find("metric_window_ms:2000") != std::string::npos);
+    assert(features.sample.find("ratio:number") != std::string::npos && features.sample.find("0.25") == std::string::npos);
+    assert(features.sample.find("huge:integer") != std::string::npos && features.sample.find("5000000000") == std::string::npos);
+    assert(features.sample.find("mode:string") != std::string::npos && features.sample.find("with spaces") == std::string::npos);
+    assert(features.sample.find("session_hash:<redacted>") != std::string::npos && features.sample.find("secret") == std::string::npos);
+    assert(features.key.find("true") == std::string::npos && features.key.find("120") == std::string::npos); // schema bucket stays value-free
+    const auto params = Diagnostics::describe(Json{{"id", "params"}, {"fecMaskType", "bursty"}, {"fecfactor", 30},
+        {"useUnequalProtection", false}}, 76);
+    assert(params.sample.find("fecMaskType:bursty") != std::string::npos);
+    assert(params.sample.find("fecfactor:30") != std::string::npos && params.sample.find("useUnequalProtection:false") != std::string::npos);
+    // Allowlist, not a blacklist: unknown fields in these messages keep types
+    // only (validation probe: credential/input leaked with a value blacklist).
+    const auto unknown = Diagnostics::describe(Json{{"id", "params"}, {"credential", "SYNTHETIC_SECRET"},
+        {"input", "SyntheticUserInput"}, {"account_number", 12345}, {"admin", true}, {"fecMaskType", "SYNTHETICMASK"},
+        {"fecfactor", 30}, {"network", {{"flags_extra", "SYNTHETIC_FLAG"}}}}, 100);
+    for (const auto* leaked : {"SYNTHETIC_SECRET", "SyntheticUserInput", "12345", "admin:true", "SYNTHETICMASK", "SYNTHETIC_FLAG"})
+        assert(unknown.sample.find(leaked) == std::string::npos);
+    assert(unknown.sample.find("credential:string") != std::string::npos && unknown.sample.find("input:string") != std::string::npos);
+    assert(unknown.sample.find("account_number:integer") != std::string::npos && unknown.sample.find("admin:bool") != std::string::npos);
+    assert(unknown.sample.find("fecMaskType:string") != std::string::npos && unknown.sample.find("fecfactor:30") != std::string::npos);
+    // Other messages keep type-only samples.
+    const auto stats = Diagnostics::describe(Json{{"id", "stats"}, {"fecfactor", 30}}, 10);
+    assert(stats.sample.find("fecfactor:integer") != std::string::npos && stats.sample.find("30") == std::string::npos);
+}
+
 int main() {
-    descriptions(); rateAndCoalescing(); schemaLimit();
+    descriptions(); rateAndCoalescing(); schemaLimit(); lossRecoveryValues();
     std::cout << "Incoming control diagnostics: redacted schema discovery, labels, bounds, coalescing, rate limits, overflow and final flush PASS\n";
 }

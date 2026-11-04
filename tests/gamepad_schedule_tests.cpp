@@ -58,5 +58,16 @@ int main() {
         }
     }
     assert(packets == 63);
-    std::cout << "Gamepad schedule: immediate button/trigger edges, 16ms analog, rejected sends, menu neutral retry and fresh transport PASS\n";
+    // Press edges count accepted new presses only: holds, releases, axes and
+    // rejected (never accepted) samples do not count; reset keeps the count.
+    Schedule edges; stream::Gamepad pad;
+    edges.accepted(pad, now); assert(edges.pressEdges() == 0);
+    pad.axes[0] = 1; edges.accepted(pad, now + 20ms); assert(edges.pressEdges() == 0);
+    pad.buttons[1] = 1; assert(edges.pressEdges() == 0); // Not accepted yet.
+    edges.accepted(pad, now + 21ms); assert(edges.pressEdges() == 1);
+    edges.accepted(pad, now + 40ms); assert(edges.pressEdges() == 1); // Held.
+    pad.buttons[2] = 1; edges.accepted(pad, now + 41ms); assert(edges.pressEdges() == 2);
+    pad.buttons[1] = pad.buttons[2] = 0; edges.accepted(pad, now + 42ms); assert(edges.pressEdges() == 2);
+    edges.reset(); pad.buttons[1] = 1; edges.accepted(pad, now + 43ms); assert(edges.pressEdges() == 3);
+    std::cout << "Gamepad schedule: immediate button/trigger edges, 16ms analog, rejected sends, menu neutral retry, fresh transport and press edges PASS\n";
 }

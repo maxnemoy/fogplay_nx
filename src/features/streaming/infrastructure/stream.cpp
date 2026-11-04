@@ -4,6 +4,8 @@
 #include "features/streaming/infrastructure/dtls_diagnostics.hpp"
 #include "features/streaming/infrastructure/stream_protocol.hpp"
 #include "features/streaming/domain/h264_rtp.hpp"
+#include "features/streaming/domain/recovery_pli_schedule.hpp"
+#include "features/streaming/infrastructure/remote_candidates.hpp"
 #include "features/streaming/infrastructure/video_rtp_handler.hpp"
 #include "features/streaming/infrastructure/stream_queue.hpp"
 #include "features/streaming/infrastructure/spsc_video_queue.hpp"
@@ -141,6 +143,9 @@ struct Client::Impl {
         std::size_t ingressBytes = 0;
         std::uint64_t assemblyWakeVersion = 0;
         bool assemblyStopping = false, ingressOverflow = false;
+#ifdef FOG_STREAM_TESTING
+        bool assemblyPaused = false;
+#endif
         std::optional<VideoCodec> assemblyCodec;
         std::atomic<std::uint64_t> ingressDrops{0};
         std::thread assemblyWorker;
@@ -195,6 +200,13 @@ struct Client::Impl {
                             observedWake != assemblyWakeVersion;
                     });
                     if (assemblyStopping) return;
+#ifdef FOG_STREAM_TESTING
+                    if (assemblyPaused) {
+                        ingressWake.wait(lock, [this] { return assemblyStopping || !assemblyPaused; });
+                        if (assemblyStopping) return;
+                        continue;
+                    }
+#endif
                     observedWake = assemblyWakeVersion;
                     overflow = std::exchange(ingressOverflow, false);
                     codec = std::exchange(assemblyCodec, std::nullopt);
@@ -646,6 +658,7 @@ struct Client::Impl {
     std::string hash, clientHash, suffix, state = "Idle", failure, pendingTransportFailure;
     Clock::time_point started{}, lastWs{}, lastHeartbeat{}, lastPli{};
     std::chrono::milliseconds heartbeat{0}, incomingHeartbeat{0};
+    RecoveryPliSchedule recoveryPli;
     bool running = false, stompConnected = false, remoteSet = false, channelOpen = false;
     bool isReady = false, decoderWaiting = false, retryableFailure = false, closingForRetry = false;
     bool relay = false, routeSelected = false, routeCurrent = false, wasReady = false;
@@ -835,9 +848,11 @@ struct Client::Impl {
     }
     fog::video::Settings videoSettings;
     VideoCodec selectedCodec = VideoCodec::H264;
-    bool qualityPending = true;
+    std::string offeredLossProtection = "none";
+    bool qualityPending = true, bitratePending = true;
+    std::uint64_t observedVideoGeneration = 0;
     unsigned qualityRequests = 0;
-    Clock::time_point qualityAttempt{}, rateAt{};
+    Clock::time_point qualityAttempt{}, bitrateAttempt{}, rateAt{};
     std::uint64_t lastRateBytes = 0;
     double receiveMbps = 0;
     quality::Telemetry serverStats;
@@ -869,6 +884,7 @@ struct Client::Impl {
             static_cast<long long>(serverStats.fps.age(now)), serverStats.codec.known ? serverStats.codec.value.c_str() : "unknown",
             static_cast<long long>(serverStats.codec.age(now)), qualityRequests, qualityPending ? 1 : 0);
         return std::string(numbers) + autoQuality.diagnostics() +
+            " offerLossProtection=" + offeredLossProtection +
             " scaleTarget=1280x720 scaleAttempts=" + std::to_string(resolutionScale.attempts()) +
             " scaleQueued=" + std::to_string(resolutionScale.accepted()) +
             " scaleRejected=" + std::to_string(resolutionScale.rejected()) +
@@ -883,19 +899,32 @@ struct Client::Impl {
             qualityEvent(std::string("qualityEvent=stats-profile profile=") + quality::name(serverStats.profile.value));
     }
     void applyQuality() {
-        if (!qualityPending || !channelOpen || !routeAllowed()) return;
+        if ((!qualityPending && !bitratePending) || !channelOpen || !routeAllowed()) return;
         const auto now = Clock::now();
-        if (qualityAttempt != Clock::time_point{} && now - qualityAttempt < std::chrono::seconds(1)) return;
+        const auto due = [now](Clock::time_point attempt) {
+            return attempt == Clock::time_point{} || now - attempt >= std::chrono::seconds(1);
+        };
+        // REMB and the quality command keep independent 1-s retry intervals:
+        // a video-generation REMB repeat must not hasten an unsent command.
+        // A pending REMB goes first; the command follows only once it was sent.
+        const bool bitrateDue = bitratePending && due(bitrateAttempt);
+        const bool qualityDue = !bitratePending && qualityPending && due(qualityAttempt);
+        if (!bitrateDue && !qualityDue) return;
         // RTCP needs the real remote SSRC learned from video RTP first.
         { TimedMutex::Guard lock(shared->videoMutex, TimedMutex::Scope::Client);
           if (!shared->video.stats().received) return; }
-        qualityAttempt = now;
         try {
-            bool sent = false;
-            for (const auto& track : tracks)
-                if (track->description().type() == "video" && track->isOpen())
-                    sent |= track->requestBitrate(static_cast<unsigned>(videoSettings.bitrateMbps) * 1000000u);
-            if (!sent) return;
+            if (bitratePending) {
+                bitrateAttempt = now;
+                bool sent = false;
+                for (const auto& track : tracks)
+                    if (track->description().type() == "video" && track->isOpen())
+                        sent |= track->requestBitrate(static_cast<unsigned>(videoSettings.bitrateMbps) * 1000000u);
+                if (!sent) return;
+                bitratePending = false;
+            }
+            if (!qualityPending || !due(qualityAttempt)) return;
+            qualityAttempt = now;
             static constexpr const char* commands[]{"set_autoquality", "set_lowquality", "set_midquality", "set_highquality", "set_ultraquality"};
             if (!control(Json{{"id", commands[videoSettings.quality]}}.dump())) return;
             ++qualityRequests;
@@ -924,7 +953,7 @@ struct Client::Impl {
     std::deque<std::string> finalVideoEvents;
     std::deque<std::string> finalControlEvents;
     const char* operation = "idle";
-    unsigned offers = 0, candidatesReceived = 0, emptyCandidates = 0, heartbeatsSent = 0;
+    unsigned offers = 0, candidatesReceived = 0, emptyCandidates = 0, hostnameCandidatesSkipped = 0, heartbeatsSent = 0;
     // Application-thread counters. A non-throwing WebSocket send is local
     // acceptance; false means buffered, never a broker receipt or rejection.
     struct SignalingSendCounts {
@@ -945,6 +974,7 @@ struct Client::Impl {
     std::string diagnostics() const {
         return routeDiagnostics() + " " + finalIceDiagnostics + " operation=" + operation + " offers=" + std::to_string(offers) +
             " candidates=" + std::to_string(candidatesReceived) + " emptyCandidates=" + std::to_string(emptyCandidates) +
+            " hostnameCandidatesSkipped=" + std::to_string(hostnameCandidatesSkipped) +
             " hbOutMs=" + std::to_string(heartbeat.count()) + " hbInMs=" + std::to_string(incomingHeartbeat.count()) +
             " hbSent=" + std::to_string(heartbeatsSent) +
             " wsAgeMs=" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - lastWs).count()) +
@@ -1375,6 +1405,10 @@ struct Client::Impl {
         const auto value = candidate.at("candidate").get<std::string>();
         operation = "candidate.apply";
         rtc::Candidate parsed(value, mid);
+        // One hostname candidate must not end a paid session: skip it and keep
+        // the numeric ones. If none can connect, the retryable connection
+        // deadline still applies. Embedded offer candidates: offer.candidates.
+        if (!detail::resolvableWithoutLookup(parsed)) { ++hostnameCandidatesSkipped; return; }
         peer->addRemoteCandidate(parsed);
         addCandidateProof(std::move(parsed));
     }
@@ -1395,7 +1429,9 @@ struct Client::Impl {
             const auto offer = Json::parse(decoded);
             if (offer.at("type") != "offer") throw TransportError(fog::constants::error::Stream::InvalidOfferType);
             operation = "offer.filter";
-            const auto sdp = protocol::filterOffer(offer.at("sdp").get<std::string>(), videoSettings.codec);
+            const auto originalSdp = offer.at("sdp").get<std::string>();
+            offeredLossProtection = protocol::offeredVideoLossProtection(originalSdp);
+            const auto sdp = protocol::filterOffer(originalSdp, videoSettings.codec);
             selectedCodec = protocol::offeredVideoCodec(sdp);
             shared->configureAssembly(selectedCodec);
             operation = "offer.mids";
@@ -1420,6 +1456,10 @@ struct Client::Impl {
                 if (!(*media)->hasSSRC(repair.mediaSsrc)) (*media)->addSSRC(repair.mediaSsrc, std::nullopt);
                 if (!(*media)->hasSSRC(repair.rtxSsrc)) (*media)->addSSRC(repair.rtxSsrc, std::nullopt);
             }
+            // setRemoteDescription() applies embedded candidates through the
+            // same hostname rejection as trickled ones; filter them first.
+            operation = "offer.candidates";
+            hostnameCandidatesSkipped += detail::dropUnresolvableCandidates(remote);
             operation = "offer.set-remote";
             peer->setRemoteDescription(remote);
             for (const auto& embedded : remote.candidates()) addCandidateProof(embedded);
@@ -1705,6 +1745,12 @@ void Client::blockControlSendForTesting(bool blocked, bool reject) {
 }
 void Client::advanceControlForTesting(unsigned milliseconds) { if (impl_->controlSender) impl_->controlSender->advance(milliseconds); }
 void Client::publishMediaAdmissionForTesting() { impl_->publishMediaGate(); }
+void Client::pauseAssemblyForTesting(bool paused) {
+    const auto shared = impl_->shared;
+    if (!shared) return;
+    { std::lock_guard<std::mutex> lock(shared->ingressMutex); shared->assemblyPaused = paused; }
+    shared->ingressWake.notify_all();
+}
 void Client::elapseForTesting(unsigned seconds) {
     const auto elapsed = std::chrono::seconds(seconds);
     auto& i = *impl_;
@@ -1804,7 +1850,14 @@ void Client::pump() {
         eventOverflow = i.shared->eventOverflow; callbackFailure = i.shared->callbackFailure;
         { TimedMutex::Guard videoLock(i.shared->videoMutex, TimedMutex::Scope::Client);
           needsPli = i.shared->videoTrack && (i.shared->video.needsPli() || i.decoderWaiting);
-          lastVideo = i.shared->lastVideo; }
+          lastVideo = i.shared->lastVideo;
+          i.shared->video.observeRoundTrip(i.sctpRtt ? static_cast<std::uint64_t>(std::max<std::int64_t>(0, i.sctpRtt->count())) : 0);
+          if (i.observedVideoGeneration != i.shared->videoGeneration) {
+              i.observedVideoGeneration = i.shared->videoGeneration;
+              i.bitratePending = true; i.bitrateAttempt = {}; // The quality command keeps its own interval.
+              i.qualityEvent("qualityEvent=video-generation generation=" +
+                  std::to_string(i.observedVideoGeneration) + " remb=repeat");
+          } }
         const auto now = Clock::now();
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - i.rateAt).count();
         if (ms >= 1000) {
@@ -1898,8 +1951,13 @@ void Client::pump() {
             i.sendSignaling(std::string("\n"));
             i.lastHeartbeat = now; ++i.heartbeatsSent;
         }
+        // Manual quality paces keyframe requests within and across recovery
+        // episodes; Auto keeps its fixed interval and restarts the schedule.
+        if (i.videoSettings.quality == 0) i.recoveryPli.reset();
+        else i.recoveryPli.update(needsPli, lastVideo != Clock::time_point{} && now - lastVideo < std::chrono::seconds(1), now);
+        const auto recoveryPliInterval = i.videoSettings.quality == 0 ? std::chrono::milliseconds(250) : i.recoveryPli.interval();
         if (i.routeAllowed() && ((i.videoSettings.keyframeSeconds > 0 && now - i.lastPli >= std::chrono::seconds(i.videoSettings.keyframeSeconds)) ||
-            (needsPli && now - i.lastPli >= std::chrono::milliseconds(250)))) {
+            (needsPli && now - i.lastPli >= recoveryPliInterval))) {
             TransportStageScope timing{i.pliTiming};
             bool requested = false;
             for (const auto& track : i.tracks)
@@ -1908,6 +1966,7 @@ void Client::pump() {
                 }
             if (requested) {
                 i.lastPli = now;
+                if (needsPli && i.videoSettings.quality != 0) i.recoveryPli.requested();
                 TimedMutex::Guard lock(i.shared->videoMutex, TimedMutex::Scope::Client);
                 ++i.shared->pliRequests;
             }
@@ -1999,7 +2058,7 @@ bool Client::updateVideoSettings(const fog::video::Settings& settings) {
                                settings.quality != impl_->videoSettings.quality;
     impl_->videoSettings = settings;
     if (remoteChanged) {
-        impl_->qualityPending = true; impl_->qualityAttempt = {};
+        impl_->qualityPending = true; impl_->bitratePending = true; impl_->qualityAttempt = impl_->bitrateAttempt = {};
         impl_->qualityEvent("qualityEvent=settings quality=" + std::to_string(settings.quality) +
                             " capMbps=" + std::to_string(settings.bitrateMbps));
         impl_->autoQuality.enable(false, impl_->qualityNow());
@@ -2050,6 +2109,7 @@ void Client::observePlayback(const PlaybackObservation& observation) {
         { TimedMutex::Guard videoLock(i.shared->videoMutex, TimedMutex::Scope::Client);
           const auto& stats = i.shared->video.stats();
           sample.missing = stats.missing; sample.faults = stats.faultSerial; sample.recoveries = stats.resyncs; sample.pressure = stats.pressure;
+          sample.receivedPackets = stats.received; sample.repairedPackets = i.shared->video.repairedPackets();
           sample.recovering |= i.shared->video.waiting(); }
         // Auto sees only work left AFTER this frame's bounded drain. A transient
         // predrain burst is not evidence of sustained decoder congestion.
@@ -2216,7 +2276,15 @@ std::uint64_t Client::currentVideoGeneration() const {
 }
 void Client::setDecoderWaitingForKeyframe(bool waiting) { impl_->decoderWaiting = waiting; }
 bool Client::requestVideoKeyframe() {
-    if (!impl_->running || !impl_->routeAllowed() || Clock::now() - impl_->lastPli < std::chrono::milliseconds(250)) return false;
+    if (!impl_->running || !impl_->routeAllowed()) return false;
+    const auto now = Clock::now();
+    // While the decoder waits for a keyframe this is a recovery request
+    // (recoverVideoError): manual quality applies the same episode schedule as
+    // pump() and counts the episode. Other requests keep the 250 ms guard.
+    const bool recovery = impl_->decoderWaiting && impl_->videoSettings.quality != 0;
+    if (recovery) impl_->recoveryPli.update(true, true, now);
+    const auto interval = recovery ? impl_->recoveryPli.interval() : std::chrono::milliseconds(250);
+    if (now - impl_->lastPli < interval) return false;
     bool requested = false;
     try {
         for (const auto& track : impl_->tracks) {
@@ -2225,7 +2293,8 @@ bool Client::requestVideoKeyframe() {
             }
         }
         if (requested) {
-            impl_->lastPli = Clock::now();
+            impl_->lastPli = now;
+            if (recovery) impl_->recoveryPli.requested();
             if (impl_->shared) {
                 TimedMutex::Guard lock(impl_->shared->videoMutex, TimedMutex::Scope::Client);
                 ++impl_->shared->pliRequests;

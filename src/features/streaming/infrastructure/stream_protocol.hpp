@@ -37,6 +37,8 @@ std::vector<IceServer> iceServers(const Json& initMessage);
 // Keep one video codec per track, preferring HEVC only when explicitly selected.
 // HEVC without a supported base-layer/no-DONL mode falls back to H.264.
 std::string filterOffer(const std::string& sdp, VideoCodec preferred = VideoCodec::H264);
+// Fixed codec names only; the original SDP is never exposed in diagnostics.
+std::string offeredVideoLossProtection(const std::string& sdp);
 // Validate active filtered tracks and return their common selected video codec.
 RtpRepairConfig videoRepairConfig(const std::string& mediaSdp);
 VideoCodec offeredVideoCodec(const std::string& filteredSdp);

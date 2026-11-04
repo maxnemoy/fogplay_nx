@@ -18,6 +18,8 @@ g++ "${flags[@]}" tests/incoming_control_tests.cpp -o work/incoming_control_test
 ./work/incoming_control_tests | tee work/logs/incoming-control-tests.log
 g++ "${flags[@]}" tests/incoming_control_diagnostics_tests.cpp -o work/incoming_control_diagnostics_tests
 ./work/incoming_control_diagnostics_tests | tee work/logs/incoming-control-diagnostics-tests.log
+g++ "${flags[@]}" tests/remote_candidates_tests.cpp "${libs[@]}" -o work/remote_candidates_tests
+./work/remote_candidates_tests | tee work/logs/remote-candidates-tests.log
 g++ "${flags[@]}" tests/transport_history_tests.cpp -o work/transport_history_tests
 ./work/transport_history_tests | tee work/logs/transport-history-tests.log
 g++ "${flags[@]}" tests/route_snapshot_schedule_tests.cpp -o work/route_snapshot_schedule_tests
@@ -26,6 +28,8 @@ g++ "${flags[@]}" tests/stream_queue_tests.cpp -o work/stream_queue_tests
 ./work/stream_queue_tests | tee work/logs/stream-queue-tests.log
 g++ "${flags[@]}" tests/auto_quality_tests.cpp -o work/auto_quality_tests
 ./work/auto_quality_tests | tee work/logs/auto-quality-tests.log
+g++ "${flags[@]}" tests/recovery_pli_schedule_tests.cpp -o work/recovery_pli_schedule_tests
+./work/recovery_pli_schedule_tests | tee work/logs/recovery-pli-schedule-tests.log
 g++ "${flags[@]}" tests/resolution_scale_tests.cpp -o work/resolution_scale_tests
 ./work/resolution_scale_tests | tee work/logs/resolution-scale-tests.log
 g++ "${flags[@]}" -DSTREAM_RTC_TESTS src/features/streaming/infrastructure/stream.cpp src/features/streaming/infrastructure/stream_protocol.cpp tests/stream_tests.cpp "${libs[@]}" -o work/stream_tests_rtc

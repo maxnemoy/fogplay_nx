@@ -403,11 +403,13 @@ void isolatedFeaturedCardFailures() {
     const std::vector<std::string> ids{"1838","1836","1233","1232","1231","1235","1237","1230"};
     for (const auto invalid : {0U,3U,8U}) {
         Setup s;
+        std::vector<std::size_t> sizes;
         for (std::size_t i=0;i<ids.size();++i) {
             auto page=std::regex_replace(fixture("computer-preview-card-excerpt.html"),std::regex("1838"),ids[i]);
             // A mismatched action must reject the entire card, even when
             // other cards remain usable. The bad card is never launchable.
             if (invalid==8 || i==invalid) replace(page,"/pc/play?id="+ids[i],"/pc/play?id=999999");
+            sizes.push_back(page.size());
             s.web.responses.push_back({"/pc/preview?id="+ids[i],html(page)});
         }
         unsigned updates=0;
@@ -424,8 +426,26 @@ void isolatedFeaturedCardFailures() {
         }
         assert(s.web.gets==8 && s.web.responses.empty() && s.web.posts==0);
         assert(s.diagnostics.size()==(invalid==8 ? 8U : 1U));
-        for (std::size_t i=0;i<s.diagnostics.size();++i)
-            assert(s.diagnostics[i]=="FogHub featured catalog: card-skipped id="+ids[invalid==8 ? i : invalid]+" reason=invalid-response");
+        for (std::size_t i=0;i<s.diagnostics.size();++i) {
+            const auto card=invalid==8 ? i : invalid;
+            assert(s.diagnostics[i]=="FogHub featured catalog: card-skipped id="+ids[card]+
+                " reason=invalid-response stage=play bytes="+std::to_string(sizes[card]));
+        }
+    }
+    {
+        // A 200 HTML page that is not a PC page (bot check, maintenance)
+        // fails before the card: logged as such, without its content.
+        Setup s;
+        const std::string challenge="<html><head><title>Checking your browser secret</title></head><body><main>wait</main></body></html>";
+        s.web.responses.push_back({"/pc/preview?id=1838",html(challenge)});
+        for (std::size_t i=1;i<ids.size();++i)
+            s.web.responses.push_back({"/pc/preview?id="+ids[i],html(std::regex_replace(fixture("computer-preview-card-excerpt.html"),std::regex("1838"),ids[i]))});
+        assert(s.catalog.playStationComputers().size()==7 && s.diagnostics.size()==1);
+        const auto& line=s.diagnostics.front();
+        assert(line.rfind("FogHub featured catalog: card-skipped id=1838 reason=invalid-response stage=",0)==0);
+        assert(line.find("stage=play")==std::string::npos && line.find("stage=value")==std::string::npos);
+        assert(line.find(" bytes="+std::to_string(challenge.size()))!=std::string::npos);
+        assert(line.find("secret")==std::string::npos && line.find("Checking")==std::string::npos);
     }
     Setup outage;
     outage.web.responses.push_back({"/pc/preview?id=1838",{503,"untrusted response secret",{},"text/html"}});

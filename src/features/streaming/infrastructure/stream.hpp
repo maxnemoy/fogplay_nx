@@ -106,6 +106,7 @@ public:
     void advanceControlForTesting(unsigned milliseconds);
     // Reproduce callback evidence arriving between batch swap and final owner publication.
     void publishMediaAdmissionForTesting();
+    void pauseAssemblyForTesting(bool paused);
 #endif
 private:
     bool startEndpoint(const std::string& hash, const std::string& suffix,

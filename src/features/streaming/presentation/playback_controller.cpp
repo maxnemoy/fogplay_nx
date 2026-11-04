@@ -91,6 +91,7 @@ bool ApplicationController::closeTransport(bool final) noexcept {
     }
     releaseMouse();
     retryKeyReleases();
+    typedText_.clear(); // Remaining text is never typed through a replacement transport.
     touchWasDown_ = false;
     videoRecovery_.reset();
     videoLossWaiting_ = false;
@@ -386,6 +387,7 @@ void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
         stream_->pump();
         retryMouseReleases();
         retryKeyReleases();
+        pumpTypedText();
         retryGamepadRelease();
         logIncomingControl();
         if (streamRental_.provider == fog::ProviderId::FogHub)

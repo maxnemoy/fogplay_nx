@@ -95,5 +95,31 @@ int main() {
     assert(multibyte.size() == 512);
     assert(unicodeText(multibyte)["data"]["input"].get<std::string>().size() == 684);
     rejects([&] { unicodeText(multibyte + "a"); });
-    std::cout << "Remote input tests passed (mouse/button/wheel/key/UTF-8/UTF-16LE/Base64/bounds)\n";
+    // Typing segments split before a character typed with the previous character's physical key.
+    using Segments = std::vector<std::string>;
+    const std::vector<std::pair<std::string, Segments>> typing{
+        {"", {}},
+        {"Somebodytext1991!", {"Somebodytext19", "91", "!"}}, // reported: host typed "Somebodytext19!"
+        {"hello", {"hel", "lo"}},
+        {"aA", {"a", "A"}},
+        {"99(", {"9", "9", "("}},                                // ( is Shift+9
+        {"88(", {"8", "8("}},
+        {"abc 1 1", {"abc 1 1"}},
+        {"a/?b", {"a/", "?b"}},
+        {u8"фa", {u8"ф", "a"}},                       // Cyrillic ef shares the A key
+        {u8"Аа", {u8"А", u8"а"}},           // capital and small A
+        {u8"Ё`", {u8"Ё", "`"}},                        // Yo shares the backtick key
+        {u8"б,", {u8"б", ","}},                        // be shares the comma key
+        {u8"привет", {u8"привет"}},
+        {u8"\U0001f600\U0001f600x", {u8"\U0001f600", u8"\U0001f600x"}},
+    };
+    for (const auto& [input, expected] : typing) {
+        const auto segments = fog::remote::typingSegments(input);
+        assert(segments == expected);
+        std::string joined;
+        for (const auto& segment : segments) { assert(!segment.empty()); joined += segment; }
+        assert(joined == input);
+    }
+    for (const auto& input : invalid) rejects([&] { fog::remote::typingSegments(input); });
+    std::cout << "Remote input tests passed (mouse/button/wheel/key/UTF-8/UTF-16LE/Base64/bounds/typing segments)\n";
 }

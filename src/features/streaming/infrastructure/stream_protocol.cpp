@@ -302,6 +302,47 @@ VideoCodec commonOfferCodec(const std::vector<std::string>& input, VideoCodec pr
 }
 
 }
+std::string offeredVideoLossProtection(const std::string& sdp) {
+    if (sdp.size() > MaxFrame) throw Error(fog::constants::error::Stream::SDPLimitExceeded);
+    const auto input = lines(sdp);
+    std::set<std::string> found;
+    for (std::size_t begin = 0; begin < input.size();) {
+        if (input[begin].rfind("m=", 0) != 0) { ++begin; continue; }
+        auto end = begin + 1;
+        while (end < input.size() && input[end].rfind("m=", 0) != 0) ++end;
+        std::istringstream media(input[begin]);
+        std::string type, port, transport, id;
+        media >> type >> port >> transport;
+        if (type != "m=video") { begin = end; continue; }
+        bool receiving = true;
+        std::set<int> offered;
+        while (media >> id) offered.insert(decimal(id));
+        for (auto i = begin + 1; i < end; ++i)
+            if (input[i] == "a=inactive" || input[i] == "a=recvonly") receiving = false;
+        if (type == "m=video" && port != "0" && receiving) {
+            for (auto i = begin + 1; i < end; ++i) {
+                if (input[i].rfind("a=rtpmap:", 0) != 0) continue;
+                std::istringstream map(input[i].substr(9));
+                std::string codec;
+                map >> id >> codec;
+                if (!offered.count(decimal(id))) continue;
+                codec = normalized(codec);
+                for (const char* name : {"ulpfec", "red", "flexfec"})
+                    if (codec == std::string(name) + "/90000") found.insert(name);
+                // Browsers advertise the draft FlexFEC name; report it as the same family.
+                if (codec == "flexfec-03/90000") found.insert("flexfec");
+            }
+        }
+        begin = end;
+    }
+    if (found.empty()) return "none";
+    std::string result;
+    for (const auto& name : found) {
+        if (!result.empty()) result += ',';
+        result += name;
+    }
+    return result;
+}
 std::string filterOffer(const std::string& sdp, VideoCodec preferred) {
     if (sdp.size() > MaxFrame) throw Error(fog::constants::error::Stream::SDPLimitExceeded);
     auto input = lines(sdp);

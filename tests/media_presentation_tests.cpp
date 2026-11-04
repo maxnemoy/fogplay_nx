@@ -340,6 +340,22 @@ static void audioObservations() {
     check(metrics.resets == 1 && Metrics::milliseconds(metrics.discardedBytes) == 220 &&
         metrics.emptyObservations == 3 && metrics.prolongedEmptyObservations == 2,
         "intentional queue reset counted an underrun or lost discarded duration");
+    // Floor: minimum level per 10-s window separates retained latency from bursts.
+    Metrics floor;
+    const auto ms = [](std::uint64_t value) { return static_cast<std::uint32_t>(value * Metrics::bytesPerSecond / 1000); };
+    floor.observe(ms(20), start);
+    floor.observe(ms(180), start + 5s);           // Burst peak, not retained.
+    floor.observe(ms(30), start + 9s);
+    check(floor.floorWindows == 0, "audio floor window closed early");
+    floor.observe(ms(40), start + 10s);
+    check(floor.floorWindows == 1 && Metrics::milliseconds(floor.lastFloorBytes) == 20 &&
+        floor.elevatedFloorWindows == 0, "audio burst peak was reported as retained latency");
+    floor.observe(ms(160), start + 12s);
+    floor.observe(ms(150), start + 15s);
+    floor.observe(ms(170), start + 20s);
+    check(floor.floorWindows == 2 && Metrics::milliseconds(floor.lastFloorBytes) == 150 &&
+        Metrics::milliseconds(floor.maximumFloorBytes) == 150 && floor.elevatedFloorWindows == 1,
+        "retained audio latency floor was not reported");
 }
 static Bytes opusPacket() {
     int error = 0;

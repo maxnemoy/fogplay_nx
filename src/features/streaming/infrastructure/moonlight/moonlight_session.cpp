@@ -79,6 +79,9 @@ struct State {
     std::atomic<stream::VideoCodec> selectedCodec{stream::VideoCodec::H264};
     std::atomic<int> negotiatedWidth{0}, negotiatedHeight{0}, negotiatedFps{0};
     std::atomic<std::uint64_t> frames{0}, audioFrames{0}, videoDrops{0}, audioDrops{0}, inputAccepted{0}, inputRejected{0};
+    std::atomic<std::uint64_t> audioOverflowDrops{0}, audioInvalidDrops{0};
+    std::atomic<std::uint64_t> audioDropsVideoWaiting{0}, audioDropsVideoStalled{0};
+    std::atomic<std::uint64_t> audioDropLastMs{0}, audioDropLastQueueAgeMs{0}, audioDropLastVideoAgeMs{0};
     std::atomic<std::uint64_t> inputIgnored{0};
     std::atomic<unsigned short> accelRateHz{0}, gyroRateHz{0};
     std::atomic<std::uint64_t> videoInvalid{0}, videoWaitDrops{0}, videoResyncs{0};
@@ -172,12 +175,22 @@ void audioSample(char* bytes, int size) {
     auto* state = active.load();
     if (!state || state->stop) return;
     try {
-        if (!bytes || size <= 0 || size > 4096) { ++state->audioDrops; return; }
-        stream::Packet packet; packet.kind = stream::Kind::Audio; packet.enqueueMs = nowMs();
+        if (!bytes || size <= 0 || size > 4096) { ++state->audioDrops; ++state->audioInvalidDrops; return; }
+        const auto now = nowMs();
+        stream::Packet packet; packet.kind = stream::Kind::Audio; packet.enqueueMs = now;
         packet.data.resize(static_cast<std::size_t>(size)); std::memcpy(packet.data.data(), bytes, size);
         {
             std::lock_guard<std::mutex> lock(state->mutex);
-            if (state->audio.size() >= 20) { ++state->audioDrops; state->audio.pop_front(); }
+            if (state->audio.size() >= 20) {
+                ++state->audioDrops; ++state->audioOverflowDrops;
+                if (state->assemblyWaiting || state->decoderWaiting) ++state->audioDropsVideoWaiting;
+                const auto lastVideo = state->lastVideoMs.load();
+                if (!lastVideo || now < lastVideo || now - lastVideo >= 150) ++state->audioDropsVideoStalled;
+                state->audioDropLastMs = now;
+                state->audioDropLastQueueAgeMs = now >= state->audio.front().enqueueMs ? now - state->audio.front().enqueueMs : 0;
+                state->audioDropLastVideoAgeMs = lastVideo && now >= lastVideo ? now - lastVideo : 0;
+                state->audio.pop_front();
+            }
             state->audio.push_back(std::move(packet)); ++state->audioFrames;
         }
         state->mediaSignals->audio.notify();
@@ -484,6 +497,9 @@ public:
         state_->code = 0; state_->terminationCode = 0;
         state_->terminationOrigin = FOG_TERMINATION_TRANSPORT;
         state_->frames = 0; state_->audioFrames = 0; state_->videoDrops = 0; state_->audioDrops = 0;
+        state_->audioOverflowDrops = 0; state_->audioInvalidDrops = 0;
+        state_->audioDropsVideoWaiting = 0; state_->audioDropsVideoStalled = 0;
+        state_->audioDropLastMs = 0; state_->audioDropLastQueueAgeMs = 0; state_->audioDropLastVideoAgeMs = 0;
         state_->inputAccepted = 0; state_->inputRejected = 0; state_->inputIgnored = 0;
         state_->accelRateHz = 0; state_->gyroRateHz = 0; lastMotionMs_ = {};
         state_->videoInvalid = 0; state_->videoWaitDrops = 0; state_->videoResyncs = 0;
@@ -743,6 +759,13 @@ public:
     std::string queueDiagnostics() const override {
         const auto core = coreSnapshot();
         return "Moonlight video_drop=" + std::to_string(state_->videoDrops.load()) + " audio_drop=" + std::to_string(state_->audioDrops.load()) +
+            " audio_overflow_drop=" + std::to_string(state_->audioOverflowDrops.load()) +
+            " audio_invalid_drop=" + std::to_string(state_->audioInvalidDrops.load()) +
+            " audio_drop_video_waiting=" + std::to_string(state_->audioDropsVideoWaiting.load()) +
+            " audio_drop_video_stalled=" + std::to_string(state_->audioDropsVideoStalled.load()) +
+            " audio_drop_last_ms=" + std::to_string(state_->audioDropLastMs.load()) +
+            " audio_drop_last_queue_age_ms=" + std::to_string(state_->audioDropLastQueueAgeMs.load()) +
+            " audio_drop_last_video_age_ms=" + std::to_string(state_->audioDropLastVideoAgeMs.load()) +
             " video_pull=1 application_video_queue=0" +
             " invalid_frames=" + std::to_string(state_->videoInvalid.load()) + " waiting_idr_drops=" + std::to_string(state_->videoWaitDrops.load()) +
             " invalid_resyncs=" + std::to_string(state_->videoResyncs.load()) +

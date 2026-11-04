@@ -27,6 +27,7 @@
 #include "features/streaming/domain/stream_input_gate.hpp"
 #include "features/streaming/domain/mouse_buttons.hpp"
 #include "features/streaming/domain/key_releases.hpp"
+#include "features/streaming/domain/typed_text.hpp"
 #include "features/streaming/domain/gamepad_schedule.hpp"
 #include "features/streaming/domain/loop_timing.hpp"
 #include "core/logging/run_log.hpp"
@@ -188,6 +189,8 @@ private:
     void releaseMouse() noexcept;
     void retryMouseReleases() noexcept;
     void retryKeyReleases() noexcept;
+    void pumpTypedText() noexcept;
+    std::uint64_t remotePresses() const noexcept;
     void retryGamepadRelease() noexcept;
     void neutralizeStreamInput();
     void suspendVideoInput();
@@ -333,6 +336,8 @@ private:
     bool touchWasDown_ = false, touchDrag_ = false;
     fog::stream::MouseButtons mouseButtons_;
     fog::stream::KeyReleases keyReleases_;
+    fog::stream::TypedText typedText_;
+    std::uint64_t typedTextPresses_ = 0, mousePresses_ = 0;
     fog::stream::GamepadSchedule gamepadSchedule_;
     float pointerX_ = 640.0f, pointerY_ = 360.0f;
     std::chrono::steady_clock::time_point mouseAt_{}, lastPointerSent_{}, overlayNoticeAt_{}, overlayHintAt_{};

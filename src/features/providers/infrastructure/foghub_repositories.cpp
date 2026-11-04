@@ -433,8 +433,10 @@ std::vector<Computer> Catalog::playStationComputers(const CatalogProgress& progr
         const auto page = session_.readPublic(std::string("/pc/preview?id=")+id);
         if (cancelled && cancelled()) fail(RepositoryErrorKind::Unavailable,"FogHub catalog cancelled");
         Computer computer;
+        const char* stage = "document";
         try {
-            const auto row = parseComputerPreview(page,id);
+            const auto row = parseComputerPreview(page,id,&stage);
+            stage = "value";
             computer.id = {ProviderId::FogHub,row.id}; computer.name = row.name;
             computer.listed = true;
             computer.availability = row.busy ? Availability::Busy : row.online ? Availability::Online : Availability::Offline;
@@ -447,8 +449,11 @@ std::vector<Computer> Catalog::playStationComputers(const CatalogProgress& progr
         } catch (const RepositoryError& error) {
             if (error.kind() != RepositoryErrorKind::InvalidResponse) throw;
             // The selected ID is fixed locally. Never log HTML, credentials,
-            // response values or exception text from an unverified card.
-            session_.catalogDiagnostic(std::string("card-skipped id=")+id+" reason=invalid-response");
+            // response values or exception text from an unverified card. The
+            // fixed parser step and body size separate a non-PC page (bot check,
+            // maintenance: document/container/card) from a changed PC card.
+            session_.catalogDiagnostic(std::string("card-skipped id=")+id+" reason=invalid-response stage="+stage+
+                " bytes="+std::to_string(page.size()));
             continue;
         }
         result.push_back(std::move(computer));

@@ -342,7 +342,9 @@ struct Media::Impl {
             "audio_pcm_discarded_packets=%llu audio_pcm_discarded_ms=%llu audio_stale_packets=%llu "
             "audio_overflow_packets=%llu audio_catchups=%llu audio_worker_refill_ms=40 audio_worker_max_ms=80 audio_worker_stale_ms=60 "
             "audio_bad_packets=%llu audio_decoder_errors=%llu audio_output_errors=%llu audio_recovery_attempts=%llu "
-            "audio_recovery_failures=%llu audio_recovery_discarded_packets=%llu audio_recovery_pending=%d audio_recovery_limit=3/60s audio_recovery_deadline_ms=10000 audio_sync_bounded=%d",
+            "audio_recovery_failures=%llu audio_recovery_discarded_packets=%llu audio_recovery_pending=%d audio_recovery_limit=3/60s audio_recovery_deadline_ms=10000 audio_sync_bounded=%d "
+            "audio_floor_last_ms=%llu audio_floor_max_ms=%llu audio_floor_windows=%llu audio_floor_elevated_windows=%llu "
+            "audio_floor_window_ms=10000 audio_floor_elevated_ms=100",
             static_cast<unsigned long long>(packets),
             static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(bytes)),
             static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.maximumBytes)),
@@ -364,7 +366,11 @@ struct Media::Impl {
             static_cast<unsigned long long>(audioRecoveryAttempts),
             static_cast<unsigned long long>(audioRecoveryFailures),
             static_cast<unsigned long long>(audioRecoveryDiscardedPackets), audioResetNeeded ? 1 : 0,
-            boundedSyncAudio ? 1 : 0);
+            boundedSyncAudio ? 1 : 0,
+            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.lastFloorBytes)),
+            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.maximumFloorBytes)),
+            static_cast<unsigned long long>(audioMetrics.floorWindows),
+            static_cast<unsigned long long>(audioMetrics.elevatedFloorWindows));
         return text.data();
     }
     int sendPacket() {

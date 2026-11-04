@@ -15,5 +15,7 @@ g++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/playstation_controller_tests.cp
 
 g++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/mouse_buttons_tests.cpp -o work/mouse_buttons_tests
 ./work/mouse_buttons_tests | tee work/logs/mouse-buttons-tests.log
+g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer -Isrc tests/typed_text_tests.cpp -o work/typed_text_tests
+./work/typed_text_tests | tee work/logs/typed-text-tests.log
 g++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/gamepad_schedule_tests.cpp -o work/gamepad_schedule_tests
 ./work/gamepad_schedule_tests | tee work/logs/gamepad-schedule-tests.log

@@ -2,6 +2,7 @@
 // Deterministic application-thread Auto policy. Monotonic milliseconds; no RTC or platform dependencies.
 #include <optional>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -61,6 +62,7 @@ struct Sample {
     std::uint64_t audioDropped = 0, audioUnderruns = 0;
     std::uint64_t audioResets = 0; // Intentional PCM clears interrupt headroom, not proof of overload.
     std::uint64_t missing = 0, faults = 0, recoveries = 0, pressure = 0;
+    std::uint64_t receivedPackets = 0, repairedPackets = 0;
     std::size_t queuedVideo = 0;
     std::uint64_t oldestVideoMs = 0; // Residual queue after this playback slice, not a receive peak.
     bool recovering = false;
@@ -68,6 +70,16 @@ struct Sample {
 };
 enum class Action { None, Enhance, Degrade };
 inline const char* command(Action value) { return value == Action::Enhance ? "enhancequality" : "degradequality"; }
+enum class PauseCause { None, Loss, Superseded, Audio, Other };
+inline const char* name(PauseCause value) {
+    switch (value) {
+        case PauseCause::Loss: return "loss";
+        case PauseCause::Superseded: return "superseded";
+        case PauseCause::Audio: return "audio";
+        case PauseCause::Other: return "other";
+        default: return "none";
+    }
+}
 class Controller {
 public:
     bool configureFramesPerSecond(int value) {
@@ -104,7 +116,8 @@ public:
             sample.workUs < base_.workUs || sample.decoderWorkUs < base_.decoderWorkUs || sample.errors < base_.errors ||
             sample.workerVideo != base_.workerVideo ||
             sample.missing < base_.missing || sample.faults < base_.faults ||
-            sample.recoveries < base_.recoveries || sample.pressure < base_.pressure) {
+            sample.recoveries < base_.recoveries || sample.pressure < base_.pressure ||
+            sample.receivedPackets < base_.receivedPackets || sample.repairedPackets < base_.repairedPackets) {
             base_ = sample; baseAt_ = lastObserve_ = now; sampled_ = true;
             stable_ = false; interrupted_ = sample.recovering; queueWindows_ = deliveryWindows_ = audioWindows_ = 0;
             lagging_ = false; lagSince_ = now; maxOldestVideoMs_ = sample.oldestVideoMs;
@@ -139,6 +152,8 @@ public:
         const auto errors = sample.errors - base_.errors, missing = sample.missing - base_.missing;
         const auto faults = sample.faults - base_.faults, pressure = sample.pressure - base_.pressure;
         const auto recoveries = sample.recoveries - base_.recoveries;
+        const auto received = sample.receivedPackets - base_.receivedPackets;
+        const auto repaired = sample.repairedPackets - base_.repairedPackets;
         fps_ = frames * 1000.0 / elapsed;
         decodedFps_ = decoded * 1000.0 / elapsed;
         uiWorkMs_ = decoded ? work / (1000.0 * decoded) : 0;
@@ -196,20 +211,44 @@ public:
                 deliveryTrouble ? "video-delivery-loss" : "audio-playback-loss", now);
             return Action::Degrade;
         }
-        const bool headroom = contiguous && !sample.recovering && !errors && !missing && !faults && !recoveries && !pressure && !audioResets &&
+        const bool cleanTransport = !missing && !faults && !recoveries;
+        // One repaired packet loss in a sufficiently large window is not a
+        // capacity failure. It pauses good-time accumulation below rather than
+        // becoming healthy evidence; repeated losses therefore never upgrade.
+        const bool toleratedTransport = missing == 1 && faults <= 1 && recoveries <= 1 &&
+            repaired >= 1 && received >= 500;
+        const bool headroom = contiguous && !sample.recovering && !errors && (cleanTransport || toleratedTransport) &&
+            !pressure && !audioResets &&
             // Brief young batches are normal, but every healthy window
             // must demonstrate that old queued video was actually drained.
             oldest <= 100 && !sustainedQueue && frames && fps_ >= expected * 0.85 && workMs_ <= 20 * frameBudgetScale && busy_ < 0.65 &&
             server.fps.fresh(now);
-        const bool healthy = headroom && superseded == capCoalesced_ && !audioDropped && !audioUnderruns;
+        const bool supersededExcess = superseded != capCoalesced_;
+        const bool audioIssue = audioDropped || audioUnderruns;
+        const bool healthy = headroom && cleanTransport && !supersededExcess && !audioIssue;
         if (!healthy) {
             // One small isolated loss pauses an existing experiment. It adds
-            // no good time and cannot excuse work/age/fault/recovery evidence.
+            // no good time and cannot excuse work, age or audio evidence.
             const bool mild = headroom && superseded - capCoalesced_ <= std::max<std::uint64_t>(4, decoded / 20) &&
                 audioDropped <= 1 && audioUnderruns <= 1;
             if (mild && stable_ && !headroomPaused_ && elapsed <= 3000) {
                 recordHeadroom(now, static_cast<std::uint64_t>(elapsed), false);
+                // Fixed cause so a tolerated packet loss is not confused with
+                // superseded frames (both used to read only "headroom-paused").
+                pauseCause_ = !cleanTransport ? PauseCause::Loss : supersededExcess ? PauseCause::Superseded :
+                    audioIssue ? PauseCause::Audio : PauseCause::Other;
+                ++pauseCounts_[static_cast<std::size_t>(pauseCause_)];
                 headroomPaused_ = true; decide("headroom-paused", now); return Action::None;
+            }
+            if (contiguous) {
+                // Not exclusive: a window may fail for several reasons at once.
+                const bool load = workMs_ > 20 * frameBudgetScale || busy_ >= 0.65;
+                const bool delivery = !frames || fps_ < expected * 0.85 || oldest > 100 || sustainedQueue || !server.fps.fresh(now);
+                rejectLoss_ += !cleanTransport || sample.recovering || errors || pressure;
+                rejectSuperseded_ += supersededExcess;
+                rejectAudio_ += audioIssue || audioResets;
+                rejectLoad_ += load;
+                rejectDelivery_ += delivery;
             }
             stable_ = false; decide(contiguous ? "insufficient-headroom" : "recovery-window", now); return Action::None;
         }
@@ -236,12 +275,21 @@ public:
     bool pending() const { return pending_ != Action::None; }
     double fps() const { return fps_; }
     std::string diagnostics() const {
-        char out[896];
-        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d autoTargetFps=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u autoCapCoalesced=%llu autoGoodMs=%llu autoEvidenceMs=%llu autoPaused=%d workerVideo=%d uiVideoMs=%.2f decoderVideoMs=%.2f uiVideoBusy=%.3f decoderVideoBusy=%.3f",
+        char out[1280];
+        std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d autoTargetFps=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u autoCapCoalesced=%llu autoGoodMs=%llu autoEvidenceMs=%llu autoPaused=%d workerVideo=%d uiVideoMs=%.2f decoderVideoMs=%.2f uiVideoBusy=%.3f decoderVideoBusy=%.3f"
+            " autoPauseCause=%s autoPauseLoss=%llu autoPauseSuperseded=%llu autoPauseAudio=%llu autoPauseOther=%llu"
+            " autoRejectLoss=%llu autoRejectSuperseded=%llu autoRejectAudio=%llu autoRejectLoad=%llu autoRejectDelivery=%llu",
             enabled_, reason_, pending(), framesPerSecond_, fps_, decodedFps_, workMs_, busy_, attemptsUp_, attemptsDown_, downgradeStreak_,
             static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_, static_cast<unsigned long long>(capCoalesced_),
             static_cast<unsigned long long>(stable_ ? headroomGoodMs_ : 0), static_cast<unsigned long long>(headroomSpan()), stable_ && headroomPaused_,
-            workerVideo_, uiWorkMs_, decoderWorkMs_, uiBusy_, decoderBusy_);
+            workerVideo_, uiWorkMs_, decoderWorkMs_, uiBusy_, decoderBusy_, name(pauseCause_),
+            static_cast<unsigned long long>(pauseCounts_[static_cast<std::size_t>(PauseCause::Loss)]),
+            static_cast<unsigned long long>(pauseCounts_[static_cast<std::size_t>(PauseCause::Superseded)]),
+            static_cast<unsigned long long>(pauseCounts_[static_cast<std::size_t>(PauseCause::Audio)]),
+            static_cast<unsigned long long>(pauseCounts_[static_cast<std::size_t>(PauseCause::Other)]),
+            static_cast<unsigned long long>(rejectLoss_), static_cast<unsigned long long>(rejectSuperseded_),
+            static_cast<unsigned long long>(rejectAudio_), static_cast<unsigned long long>(rejectLoad_),
+            static_cast<unsigned long long>(rejectDelivery_));
         return out;
     }
     bool pollEvent(std::string& out) {
@@ -326,6 +374,9 @@ private:
     std::deque<HeadroomWindow> headroom_;
     std::uint64_t headroomGoodMs_ = 0;
     bool headroomPaused_ = false;
+    PauseCause pauseCause_ = PauseCause::None;
+    std::array<std::uint64_t, 5> pauseCounts_{};
+    std::uint64_t rejectLoss_ = 0, rejectSuperseded_ = 0, rejectAudio_ = 0, rejectLoad_ = 0, rejectDelivery_ = 0;
     Sample base_;
     int framesPerSecond_ = 30;
     double fps_ = 0, decodedFps_ = 0, workMs_ = 0, busy_ = 0;

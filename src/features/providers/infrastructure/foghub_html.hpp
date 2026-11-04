@@ -44,7 +44,9 @@ AccountPage parseAccount(const std::string& html);
 HistoryPage parseHistory(const std::string& html);
 GamesPage parseGames(const std::string& html);
 ComputersPage parseComputers(const std::string& html, const std::string& gameId);
-ComputerRow parseComputerPreview(const std::string& html, const std::string& computerId);
+// On failure, *stage names the fixed verification step that rejected the page
+// (document, container, card, identity, title, owner, play); never page content.
+ComputerRow parseComputerPreview(const std::string& html, const std::string& computerId, const char** stage = nullptr);
 MoonlightEndpoint parseMoonlightEndpoint(const std::string& value);
 ConnectForm parseConnectForm(const std::string& html, const std::string& expectedComputerId);
 // Empty when a PIN form already exists; otherwise returns only the explicit

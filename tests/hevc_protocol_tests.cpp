@@ -45,5 +45,16 @@ int main() {
     assert(rejects(offer())); // Unfiltered mixed codecs cannot be treated as selected.
     assert(rejects("v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 98\r\na=rtpmap:98 H265/90000\r\n"));
     assert(rejects("m=video 9 UDP/TLS/RTP/SAVPF 98\r\na=rtpmap:98 H265/90000\r\na=fmtp:98 sprop-max-don-diff=1\r\n"));
-    std::cout<<"HEVC SDP tests passed: H264 default, HEVC preference, unsupported-mode fallback, global track consistency, strict selected-codec validation\n";
+    assert(offeredVideoLossProtection(offer()) == "none");
+    assert(offeredVideoLossProtection(offer() + "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n") == "none");
+    auto fecOffer = offer();
+    fecOffer.replace(fecOffer.find("96 98 99"), 8, "96 98 99 100 101 102");
+    fecOffer += "a=rtpmap:100 ulpfec/90000\r\na=rtpmap:101 red/90000\r\na=rtpmap:102 flexfec/90000\r\n";
+    assert(offeredVideoLossProtection(fecOffer) == "flexfec,red,ulpfec");
+    assert(filterOffer(fecOffer).find("ulpfec") == std::string::npos);
+    auto draftFlexOffer = offer();
+    draftFlexOffer.replace(draftFlexOffer.find("96 98 99"), 8, "96 98 99 100");
+    draftFlexOffer += "a=rtpmap:100 flexfec-03/90000\r\n";
+    assert(offeredVideoLossProtection(draftFlexOffer) == "flexfec");
+    std::cout<<"HEVC SDP tests passed: H264 default, HEVC preference, unsupported-mode fallback, global track consistency, strict selected-codec validation, loss-protection diagnostics\n";
 }

@@ -137,7 +137,7 @@ public:
             } else ++it;
         }
     }
-    std::atomic<unsigned> remb{0};
+    std::atomic<unsigned> remb{0}, rembPackets{0};
     void incoming(rtc::message_vector& messages, const rtc::message_callback& send) override {
         // Regular RR and REMB share one SRTCP datagram. Inspect every RTCP
         // member, preserving the original compound for the remaining chain.
@@ -202,7 +202,7 @@ public:
                 const auto exp = std::to_integer<unsigned>(msg->at(17)) >> 2;
                 const auto mantissa = ((std::to_integer<unsigned>(msg->at(17)) & 3) << 16) |
                     (std::to_integer<unsigned>(msg->at(18)) << 8) | std::to_integer<unsigned>(msg->at(19));
-                assert(exp < 16); remb = mantissa << exp;
+                assert(exp < 16); remb = mantissa << exp; ++rembPackets;
             }
         }
     }
@@ -231,6 +231,7 @@ struct Fixture {
     std::vector<std::string> advertisedRelayCandidates;
     std::vector<std::string> mids;
     std::string pendingOffer;
+    bool sentHostnameCandidate = false;
     std::uint32_t frame = 0;
     std::string heartbeat;
     std::chrono::milliseconds serverHeartbeatInterval{0};
@@ -425,12 +426,31 @@ struct Fixture {
                 if (rtc::Candidate(e.text).type() == rtc::Candidate::Type::Relayed) advertisedRelayCandidates.push_back(e.text);
                 const auto it = std::find(mids.begin(), mids.end(), e.mid);
                 assert(it != mids.end());
+                if (!sentHostnameCandidate) {
+                    // Hosts may advertise an mDNS/hostname candidate. The Switch
+                    // RTC build cannot resolve it; the client must skip it and
+                    // connect through the numeric candidates (0.6.29 stopped the
+                    // paid rental with "Hostname ICE candidates are not supported").
+                    sentHostnameCandidate = true;
+                    const Json hostname{{"candidate", "candidate:1 1 UDP 2122252543 fixture-peer.local 50000 typ host"},
+                                        {"sdpMLineIndex", std::distance(mids.begin(), it)}};
+                    signal({{"id", "candidate"}, {"data", stream::protocol::base64Encode(hostname.dump())}});
+                }
                 // Deliberately omit sdpMid; exercise index resolution on the client.
                 const Json c{{"candidate", e.text}, {"sdpMLineIndex", std::distance(mids.begin(), it)}};
                 signal({{"id", "candidate"}, {"data", stream::protocol::base64Encode(c.dump())}});
                 if (!pendingOffer.empty()) {
-                    // Exercise the client's early-candidate queue before its remote description.
-                    signal({{"id", "offer"}, {"data", stream::protocol::base64Encode(pendingOffer)}});
+                    // Exercise the client's early-candidate queue before its remote description,
+                    // and a hostname candidate embedded in the offer SDP itself: libdatachannel
+                    // applies embedded candidates inside setRemoteDescription().
+                    auto offerJson = Json::parse(pendingOffer);
+                    auto sdp = offerJson.at("sdp").get<std::string>();
+                    const auto midAt = sdp.find("a=mid:");
+                    const auto lineEnd = midAt == std::string::npos ? midAt : sdp.find("\r\n", midAt);
+                    assert(lineEnd != std::string::npos);
+                    sdp.insert(lineEnd + 2, "a=candidate:9 1 UDP 2122252543 fixture-embedded.local 50003 typ host\r\n");
+                    offerJson["sdp"] = sdp;
+                    signal({{"id", "offer"}, {"data", stream::protocol::base64Encode(offerJson.dump())}});
                     pendingOffer.clear();
                 }
             } else if (e.type == Event::Control) {
@@ -721,6 +741,20 @@ static void concurrentMediaConsumers() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             assert(client.ready() && videos>=30 && audios>=30);
+            const auto rembBefore = fixture.feedback->rembPackets.load();
+            assert(rembBefore > 0);
+            const auto ingressDrops = [&] {
+                const auto diagnostic = client.videoDiagnostics();
+                return std::stoull(diagnostic.substr(diagnostic.find("ingressDrops=") + 13));
+            };
+            client.pauseAssemblyForTesting(true);
+            const auto ingressBefore = ingressDrops();
+            for (unsigned sent = 0; sent < 2000 && ingressDrops() == ingressBefore; ++sent) {
+                fixture.pump(); fixture.sendMedia();
+                if (sent % 20 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            assert(ingressDrops() > ingressBefore);
+            client.pauseAssemblyForTesting(false);
             const auto generation=client.currentVideoGeneration();
             pauseVideo=true;
             const auto paused=Clock::now();
@@ -737,6 +771,7 @@ static void concurrentMediaConsumers() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             assert(videos>=before+5 && audios>30);
+            assert(fixture.feedback->rembPackets > rembBefore);
             // Callback-side terminal evidence closes admission before pump.
             if (hevc) {
                 client.failThenReceiveForTesting("{}",false);
@@ -918,6 +953,10 @@ int main(int argc, char** argv) {
         assert(videos >= 3 && audios >= 3 && fixture.feedback->plis > 0);
         assert(fixture.remoteControls == expectedRemoteInputs);
         assert(client.diagnostics().find("emptyCandidates=3") != std::string::npos);
+        // One trickled and one SDP-embedded hostname candidate were skipped.
+        assert(client.diagnostics().find("hostnameCandidatesSkipped=2") != std::string::npos);
+        assert(client.diagnostics().find("fixture-peer.local") == std::string::npos);
+        assert(client.diagnostics().find("fixture-embedded.local") == std::string::npos);
         assert(client.videoDiagnostics().find("waitIdr=0") != std::string::npos);
         assert(client.selectedVideoCodec() == (fixture.hevc ? stream::VideoCodec::H265 : stream::VideoCodec::H264));
         assert(fixture.feedback->remb == 15000000 && fixture.qualityCommand == "set_autoquality");
@@ -1316,6 +1355,42 @@ int main(int argc, char** argv) {
         }
         assert(fixture.feedback->remb == 30000000 && fixture.qualityCommand == "set_highquality");
         assert(client.error().empty() && client.ready());
+        if (round == 0) {
+            const auto pliCount = [](const std::string& diagnostic) {
+                return std::stoull(diagnostic.substr(diagnostic.find(" pli=") + 5));
+            };
+            const auto beforeManualPli = pliCount(client.videoDiagnostics());
+            client.setDecoderWaitingForKeyframe(true);
+            client.elapseForTesting(1); client.pump();
+            const auto firstManualPli = pliCount(client.videoDiagnostics());
+            assert(firstManualPli > beforeManualPli);
+            client.elapseForTesting(1); client.pump();
+            const auto secondManualPli = pliCount(client.videoDiagnostics());
+            assert(secondManualPli > firstManualPli);
+            client.elapseForTesting(1); client.pump();
+            const auto thirdManualPli = pliCount(client.videoDiagnostics());
+            assert(thirdManualPli > secondManualPli);
+            client.elapseForTesting(1); client.pump();
+            assert(pliCount(client.videoDiagnostics()) == thirdManualPli);
+            client.elapseForTesting(1); client.pump();
+            assert(pliCount(client.videoDiagnostics()) > thirdManualPli);
+            client.setDecoderWaitingForKeyframe(false); client.pump();
+            // Decoder-error recovery requests directly (recoverVideoError). Under
+            // manual quality that request follows the episode schedule and
+            // counts the episode: the 2nd episode waits 500 ms, the 3rd 1000 ms.
+            client.setDecoderWaitingForKeyframe(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            assert(!client.requestVideoKeyframe()); // 250 ms guard alone would accept.
+            client.elapseForTesting(1);
+            assert(client.requestVideoKeyframe());
+            client.setDecoderWaitingForKeyframe(false); client.pump(); // Quick recovery ends the episode.
+            client.setDecoderWaitingForKeyframe(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            assert(!client.requestVideoKeyframe()); // Uncounted episode would allow 500 ms.
+            client.elapseForTesting(1);
+            assert(client.requestVideoKeyframe());
+            client.setDecoderWaitingForKeyframe(false); client.pump();
+        }
         const auto adaptationsBeforeManual = fixture.adaptations.size();
         for (unsigned step=0; step<350; ++step) {
             fixture.pump(); client.pump();
@@ -1343,13 +1418,19 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         assert(fixture.feedback->plis == plisBefore); // No unconditional periodic PLI by default.
+        // The recovery burst above can consume the fixture's cached sender SSRC.
+        // Restore the known media source before checking periodic RTCP itself.
+        fixture.feedback->reportSsrc = 1234;
         settings.keyframeSeconds = 2; assert(client.updateVideoSettings(settings));
         client.elapseForTesting(3); client.pump();
         for (int tick=0; tick<10 && fixture.feedback->plis == plisBefore; ++tick) {
             fixture.pump(); std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        if (fixture.feedback->plis <= plisBefore)
+            std::cerr << "Periodic PLI missing: round=" << round << " before=" << plisBefore
+                      << " after=" << fixture.feedback->plis << " video=" << client.videoDiagnostics() << "\n";
         assert(fixture.feedback->plis > plisBefore);
-        // PLI requests share a 250 ms rate limit with transport-loss recovery.
+        // Direct PLI requests retain the 250 ms minimum interval; manual recovery backs off further.
         client.elapseForTesting(1);
         assert(client.requestVideoKeyframe());
         assert(!client.requestVideoKeyframe());

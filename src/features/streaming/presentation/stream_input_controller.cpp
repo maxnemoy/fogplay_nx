@@ -225,18 +225,55 @@ void ApplicationController::overlayAction(const fog::stream::OverlayAction& acti
     }
     if (action.type == Action::SendText) {
         // Text is transient and never included in diagnostics or saved files.
-        const bool sent = sendRemote(fog::remote::unicodeText(action.text));
-        overlayNotice_ = sent ? uiText::Stream::TextSent : uiText::Stream::TextSendFailed;
-        overlayNoticeAt_ = std::chrono::steady_clock::now();
+        // Segments at repeated physical keys are paced by pumpStream(); a new
+        // text queues behind any unsent remainder instead of replacing it.
+        if (!typedText_.active()) typedTextPresses_ = remotePresses();
+        typedText_.appendText(fog::remote::typingSegments(action.text), std::chrono::steady_clock::now());
+        pumpTypedText();
         return;
     }
     const char* code = action.type == Action::Enter ? "Enter" : action.type == Action::Tab ? "Tab" :
                        action.type == Action::Backspace ? "Backspace" : "Escape";
+    if (typedText_.active()) {
+        // Enter/Tab/... must not overtake text that is still being typed.
+        typedText_.appendKey(code, std::chrono::steady_clock::now());
+        return;
+    }
     const bool pressed = sendRemote(fog::remote::key(true,code));
     // Always attempt key-up, even if the channel changed while sending.
     const bool released = sendRemote(fog::remote::key(false,code));
     overlayNotice_ = pressed && released ? uiText::Stream::KeySent : uiText::Stream::ControlUnavailable;
     overlayNoticeAt_ = std::chrono::steady_clock::now();
+}
+
+std::uint64_t ApplicationController::remotePresses() const noexcept {
+    return gamepadSchedule_.pressEdges() + mousePresses_;
+}
+
+void ApplicationController::pumpTypedText() noexcept {
+    using Result = fog::stream::TypedText::Result;
+    using Kind = fog::stream::TypedText::Kind;
+    const auto now = std::chrono::steady_clock::now();
+    if (typedText_.active() && remotePresses() != typedTextPresses_) {
+        // A gamepad or mouse press already reached the PC and may have moved
+        // its focus; never type the remainder into another field or form.
+        typedText_.cancel();
+        try { overlayNotice_ = uiText::Stream::TextSendCancelled; } catch (...) {}
+        overlayNoticeAt_ = now;
+        return;
+    }
+    const auto result = typedText_.pump(now, [this](const fog::stream::TypedText::Item& item) {
+        try {
+            if (item.kind == Kind::Text) return sendRemote(fog::remote::unicodeText(item.value));
+            if (!sendRemote(fog::remote::key(true,item.value))) return false;
+            sendRemote(fog::remote::key(false,item.value)); // A refused key-up stays pending in keyReleases_.
+            return true;
+        } catch (...) { return false; }
+    });
+    if (result != Result::Completed && result != Result::Failed) return;
+    try { overlayNotice_ = result == Result::Completed ? uiText::Stream::TextSent : uiText::Stream::TextSendFailed; }
+    catch (...) {}
+    overlayNoticeAt_ = now;
 }
 
 bool ApplicationController::handleStreamOverlay(PadState& pad, u64 held, u64 down) {
@@ -315,7 +352,9 @@ void ApplicationController::updateMouse(PadState& pad,u64 held,u64 down,const Hi
         lastPointerSent_ = now;
     }
     mouseButtons_.update(left,right,[this](bool pressed, int button) {
-        return sendRemote(fog::remote::mouseButton(pressed,button));
+        const bool sent = sendRemote(fog::remote::mouseButton(pressed,button));
+        if (sent && pressed) ++mousePresses_; // Stops pending overlay text (pumpTypedText).
+        return sent;
     });
     if (down & HidNpadButton_L) sendRemote(fog::remote::wheel(-32));
     if (down & HidNpadButton_R) sendRemote(fog::remote::wheel(32));

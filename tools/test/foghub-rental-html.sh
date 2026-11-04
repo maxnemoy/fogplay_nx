@@ -11,3 +11,5 @@ g++ -std=c++17 -Wall -Wextra -Werror -Isrc \
     src/features/providers/infrastructure/foghub_html.cpp tests/foghub_rental_html_tests.cpp \
     "${xml_flags[@]}" -o work/foghub_rental_html_tests
 ./work/foghub_rental_html_tests | tee work/logs/foghub-rental-html-tests.log
+g++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/html_raw_text_tests.cpp -o work/html_raw_text_tests
+./work/html_raw_text_tests | tee work/logs/html-raw-text-tests.log

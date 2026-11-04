@@ -244,10 +244,23 @@ void computerPreviewCurrentTemplate() {
     for (const auto* action : {"onclick='unsafe()'", "data-method='post'", "target='_blank'", "download"})
         rejects([&] { parseComputerPreview(replace(html,"href=\"/pc/play?id=1838\"",std::string(action)+" href=\"/pc/play?id=1838\""),"1838"); });
 }
+void computerPreviewLivePage() {
+    // Complete public page captured on 04.11.2026 (CSRF values redacted). Its
+    // infinite-scroll script keeps "<div>...</div>" in JavaScript strings; the
+    // Switch libxml2 2.9.8 parser rejected every card at stage=document.
+    const auto html = fixture("computer-preview-2026-11-04");
+    check(html.find("IASSpinnerExtension") != std::string::npos && html.find("</div>\"}") != std::string::npos);
+    const char* stage = "unset";
+    const auto pc = parseComputerPreview(html,"1838",&stage);
+    check(pc.id == "1838" && pc.name == "f4bX8" && pc.online && !pc.busy && pc.fhAvailable && pc.pricePerHour == "25");
+    rejects([&] { parseComputerPreview(html,"1836"); });
+    // The script blanking never hides page structure: removing the PC card still fails.
+    rejects([&] { parseComputerPreview(replace(html,"class=\"pc-view\"","class=\"other-view\""),"1838"); });
+}
 }
 int main() {
     try {
-        endpoints(); forms(); success(); reviewRequired(); bonusChoice(); closeActions(); computerPreview(); computerPreviewBonusPrice(); computerPreviewCurrentTemplate();
+        endpoints(); forms(); success(); reviewRequired(); bonusChoice(); closeActions(); computerPreview(); computerPreviewBonusPrice(); computerPreviewCurrentTemplate(); computerPreviewLivePage();
         std::cout << "FogHub rental HTML parser tests passed (" << checks << " checks)\n";
         return 0;
     } catch (const std::exception& error) {

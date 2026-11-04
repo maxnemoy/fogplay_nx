@@ -17,7 +17,7 @@ struct Harness {
     unsigned presentedExtraPerSecond = 0, decodedExtraPerSecond = 0, supersededExtraPerSecond = 0;
     unsigned workPerFrameUs = 3000, decoderWorkPerFrameUs = 3000;
     double sourceFps = 30;
-    unsigned audioDroppedPerTick = 0, audioUnderrunsPerTick = 0;
+    unsigned audioDroppedPerTick = 0, audioUnderrunsPerTick = 0, receivedPacketsPerTick = 0;
     explicit Harness(int framesPerSecond = 30, bool workerVideo = false) {
         sourceFps = framesPerSecond;
         presentedPerTick = decodedPerTick = static_cast<unsigned>(framesPerSecond / 10);
@@ -53,6 +53,7 @@ struct Harness {
                     sample.decoderWorkUs += decoderOverload ? 100000 : decoded * decoderWorkPerFrameUs;
             }
             sample.audioDropped += audioDroppedPerTick; sample.audioUnderruns += audioUnderrunsPerTick;
+            sample.receivedPackets += receivedPacketsPerTick;
             if (refresh && now % 2000 == 0) readTelemetry(server,Json{{"preset", wireProfile(profile)}, {"fps", sourceFps}}, now);
             const auto action = controller.observe(now, sample, server);
             if (action != Action::None) {
@@ -609,6 +610,53 @@ int main() {
             }
             assert(h.actions.empty());
             assert(h.controller.diagnostics().find("autoEvidenceMs=40000") != std::string::npos);
+        }
+    }
+    {
+        // One low-rate, repaired loss pauses an existing experiment but does
+        // not erase its earlier good windows or trigger a quality downgrade.
+        Harness h(60); h.receivedPacketsPerTick = 300; h.advance(28);
+        ++h.sample.missing; ++h.sample.repairedPackets; ++h.sample.faults; ++h.sample.recoveries;
+        h.advance(2);
+        assert(h.actions.empty() && std::string(h.controller.reason()) == "headroom-paused");
+        assert(h.controller.diagnostics().find("autoGoodMs=26000") != std::string::npos);
+        h.advance(4); assert(h.actions == std::vector<Action>{Action::Enhance});
+    }
+    {
+        // Pause and rejection causes are classified: a tolerated packet loss,
+        // a small supersede excess and an audio drop must not read the same.
+        Harness loss(60); loss.receivedPacketsPerTick = 300; loss.advance(28);
+        ++loss.sample.missing; ++loss.sample.repairedPackets; loss.advance(2);
+        auto text = loss.controller.diagnostics();
+        assert(text.find("autoPauseCause=loss") != std::string::npos && text.find("autoPauseLoss=1 ") != std::string::npos);
+        assert(text.find("autoPauseSuperseded=0 ") != std::string::npos);
+        Harness superseded(60); superseded.advance(28); ++superseded.sample.supersededFrames; superseded.advance(2);
+        text = superseded.controller.diagnostics();
+        assert(std::string(superseded.controller.reason()) == "headroom-paused");
+        assert(text.find("autoPauseCause=superseded") != std::string::npos && text.find("autoPauseSuperseded=1 ") != std::string::npos);
+        assert(text.find("autoPauseLoss=0 ") != std::string::npos);
+        Harness audio(60); audio.advance(28); ++audio.sample.audioDropped; audio.advance(2);
+        assert(audio.controller.diagnostics().find("autoPauseCause=audio") != std::string::npos);
+        // Persistent excess supersedes (source above the display cap without
+        // filled slots) are rejected as superseded, not as packet loss.
+        Harness rejected(60); rejected.advance(2);
+        for (unsigned window = 0; window < 5; ++window) { rejected.sample.supersededFrames += 20; rejected.advance(2); }
+        text = rejected.controller.diagnostics();
+        assert(std::string(rejected.controller.reason()) == "insufficient-headroom");
+        assert(text.find("autoRejectSuperseded=0 ") == std::string::npos && text.find("autoRejectLoss=0 ") != std::string::npos);
+        assert(rejected.actions.empty());
+    }
+    {
+        // A loss in every window is not healthy evidence, even when each loss
+        // individually meets the repair and rate limits. Unrepaired loss is hard evidence.
+        for (const bool repairedLoss : {false, true}) {
+            Harness h(60); h.receivedPacketsPerTick = 300;
+            for (unsigned window = 0; window < 20; ++window) {
+                ++h.sample.missing; ++h.sample.faults; ++h.sample.recoveries;
+                if (repairedLoss) ++h.sample.repairedPackets;
+                h.advance(2);
+            }
+            assert(h.actions.empty());
         }
     }
     {

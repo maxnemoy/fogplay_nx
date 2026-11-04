@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,20 +16,23 @@ public:
     struct Description { std::string key, sample; };
     static Description describe(const nlohmann::json& data, std::size_t bytes) {
         std::string id = "<missing>";
-        bool rumble = false;
+        bool rumble = false, values = false;
         if (data.is_object()) {
             const auto item = data.find("id");
             if (item != data.end()) {
                 id = item->is_string() ? label(item->get_ref<const std::string&>()) : "<invalid>";
                 rumble = id == "gamepad_notification";
+                // Server loss-recovery/FEC configuration. Only allowlisted
+                // fields print values (lossRecoveryValue); others keep types.
+                values = id == "network_features_state" || id == "params";
             }
         }
-        std::size_t schemaBudget = 12, sampleBudget = 12;
+        std::size_t schemaBudget = 12, sampleBudget = values ? 32 : 12;
         const auto prefix = "id=" + id;
         Description result;
-        result.key = prefix + " schema=" + shape(data, 0, schemaBudget, false, false);
+        result.key = prefix + " schema=" + shape(data, 0, schemaBudget, false, false, false, {});
         result.sample = prefix + " bytes=" + std::to_string(bytes) + " fields=" +
-            shape(data, 0, sampleBudget, true, rumble);
+            shape(data, 0, sampleBudget, true, rumble, values, {});
         return result;
     }
     void receive(const Description& description, std::uint64_t nowMs) {
@@ -108,8 +112,47 @@ private:
         if (value.is_string()) return "string";
         return "binary";
     }
+    // Explicit allowlist for the MTS loss-recovery/FEC messages: booleans inside
+    // a "flags" object or useUnequalProtection, numbers of fecfactor and
+    // recovery_*/metric_* parameters, and fecMaskType only with a known value.
+    // Every other field, including unknown future ones, keeps its type only.
+    static bool lossRecoveryValue(const std::string& key, const std::string& parent, const nlohmann::json& value) {
+        if (value.is_boolean()) return parent == "flags" || key == "useUnequalProtection";
+        if (value.is_number())
+            return key == "fecfactor" || key.rfind("recovery_", 0) == 0 || key.rfind("metric_", 0) == 0;
+        if (value.is_string() && key == "fecMaskType") {
+            const auto& text = value.get_ref<const std::string&>();
+            for (const auto* known : {"random", "bursty", "kFecMaskRandom", "kFecMaskBursty"})
+                if (text == known) return true;
+        }
+        return false;
+    }
+    // Prints a bounded scalar; anything unbounded keeps its type name.
+    static std::string leaf(const nlohmann::json& value) {
+        if (value.is_boolean()) return value.get<bool>() ? "true" : "false";
+        if (value.is_number_unsigned()) {
+            const auto number = value.get<std::uint64_t>();
+            return number <= 1000000000u ? std::to_string(number) : "integer";
+        }
+        if (value.is_number_integer()) {
+            const auto number = value.get<std::int64_t>();
+            return number >= -1000000000 && number <= 1000000000 ? std::to_string(number) : "integer";
+        }
+        if (value.is_number_float()) {
+            const auto number = value.get<double>();
+            if (!(number >= -1e9 && number <= 1e9)) return "number";
+            char text[32];
+            std::snprintf(text, sizeof(text), "%.4g", number);
+            return text;
+        }
+        if (value.is_string()) {
+            const auto text = label(value.get_ref<const std::string&>());
+            return text == "<invalid>" || text.size() > 32 ? "string" : text;
+        }
+        return type(value);
+    }
     static std::string shape(const nlohmann::json& value, unsigned depth, std::size_t& budget,
-                             bool sample, bool rumble) {
+                             bool sample, bool rumble, bool values, const std::string& parent) {
         if (value.is_object()) {
             if (depth >= 3) return "object{...}";
             std::string out = "{";
@@ -124,7 +167,9 @@ private:
                 if (key == "<invalid>" || sensitive(key)) out += "<redacted>";
                 else if (sample && rumble && depth == 0 && (key == "index" || key == "large_motor" || key == "small_motor") &&
                     item->is_number_integer() && *item >= 0 && *item <= 65535) out += std::to_string(item->get<unsigned>());
-                else out += shape(item.value(), depth + 1, budget, sample, rumble);
+                else if (sample && values && !item->is_structured() && lossRecoveryValue(key, parent, item.value()))
+                    out += leaf(item.value());
+                else out += shape(item.value(), depth + 1, budget, sample, rumble, values, key);
             }
             return bounded(out + '}', 640);
         }
@@ -133,7 +178,7 @@ private:
             std::string out = "[";
             for (std::size_t n = 0; n < std::min<std::size_t>(2, value.size()); ++n) {
                 if (n) out += ',';
-                out += shape(value[n], depth + 1, budget, sample, rumble);
+                out += shape(value[n], depth + 1, budget, sample, rumble, values, parent);
             }
             if (value.size() > 2) out += ",...";
             return bounded(out + ']', 640);

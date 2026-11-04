@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "features/providers/infrastructure/foghub_html.hpp"
+#include "features/providers/infrastructure/html_raw_text.hpp"
 #include "core/domain/repository_error.hpp"
 #include "features/session/domain/session_rating.hpp"
 #include <libxml/HTMLparser.h>
@@ -152,10 +153,14 @@ void bounds(xmlNode* node, unsigned depth, std::size_t& count) {
 }
 struct ParseErrors { bool invalid{false}; };
 bool toleratedError(const xmlError* error) {
-    // libxml2's HTML4 tree builder reports these for actual site templates:
-    // HTML5 main/nav and an optional p end tag after block content. Semantic
-    // page/table/card checks below still require complete expected structure.
+    // libxml2's HTML4 tree builder (2.9.8 on Switch) reports these for actual
+    // site templates: HTML5 main/nav, an optional p end tag after block
+    // content, a malformed attribute (class='class='...'') and an entity
+    // without ';' (&nbsp). HTML5 parsers, including the host libxml2 2.15,
+    // accept them silently. Semantic page/table/card checks below still
+    // require complete expected structure.
     return !error || error->level < XML_ERR_ERROR || error->code == XML_HTML_UNKNOWN_TAG ||
+        error->code == XML_ERR_NAME_REQUIRED || error->code == XML_ERR_ENTITYREF_SEMICOL_MISSING ||
         (error->code == XML_ERR_TAG_NAME_MISMATCH && error->str1 && std::string(error->str1) == "p");
 }
 #if LIBXML_VERSION >= 21200
@@ -173,8 +178,10 @@ void contextParseError(void* data, const xmlError* error) {
 }
 #endif
 void quietError(void*, const char*, ...) {}
-Doc document(const std::string& html) {
-    require(!html.empty() && html.size() <= maxBytes && html.find('\0') == std::string::npos);
+Doc document(const std::string& source) {
+    require(!source.empty() && source.size() <= maxBytes && source.find('\0') == std::string::npos);
+    // Script/style text is opaque to every parser here; see html_raw_text.hpp.
+    const auto html = withoutRawTextContent(source);
     const auto folded = lower(html);
     // No DTD/entity declarations are needed by these pages. The HTML parser is
     // memory-only, NONET, without NOENT/DTDLOAD or relaxed resource limits.
@@ -755,17 +762,23 @@ GamesPage parseGames(const std::string& html) {
     return page;
 }
 
-ComputerRow parseComputerPreview(const std::string& html, const std::string& computerId) {
+ComputerRow parseComputerPreview(const std::string& html, const std::string& computerId, const char** stage) {
+    const auto at = [stage](const char* name) { if (stage) *stage = name; };
+    at("identity");
     identifier(computerId);
+    at("document");
     auto doc = document(html);
     auto* main = mainNode(doc.get(), {}, false);
+    at("container");
     const auto headings = select(main, ".//h1");
     require(headings.size() <= 1);
     auto* summary = headings.empty() ?
         one(main, ".//div[contains(concat(' ',normalize-space(@class),' '),' pc-view ')]") : main;
     // The PC detail page has one bordered summary card, independent from its
     // paginated games. Never use game play links as current PC price evidence.
+    at("card");
     auto* card = one(summary, ".//div[contains(concat(' ',normalize-space(@class),' '),' rounded ') and contains(concat(' ',normalize-space(@class),' '),' p-3 ')]/div");
+    at("identity");
     const auto previews = links(card, "/pc/preview");
     require(previews.size() == 1);
     const auto identity = query(attr(previews.front(), "href"), "/pc/preview");
@@ -774,6 +787,7 @@ ComputerRow parseComputerPreview(const std::string& html, const std::string& com
     ComputerRow row;
     row.id = computerId; row.name = text(previews.front());
     require(!row.name.empty() && row.name.size() <= 128);
+    at("title");
     if (!headings.empty()) require(text(headings.front()).rfind("Компьютер " + row.name + " ", 0) == 0);
     else {
         // The current PC template comments out h1. Retain independent page
@@ -781,6 +795,7 @@ ComputerRow parseComputerPreview(const std::string& html, const std::string& com
         // the selected preview ID and paid-action ID checked below.
         require(text(one(xmlDocGetRootElement(doc.get()), "/html/head/title")) == row.name);
     }
+    at("owner");
     const auto owners = links(card, "/promo/");
     require(owners.size() == 1); row.owner = text(owners.front());
     row.description = text(one(card, "./div[2]/small"));
@@ -789,6 +804,7 @@ ComputerRow parseComputerPreview(const std::string& html, const std::string& com
         if (label == "Онлайн") row.online = true;
         if (label == "Занят") row.busy = true;
     }
+    at("play");
     const auto play = links(card, "/pc/play");
     require(play.size() <= 1);
     if (!play.empty()) {

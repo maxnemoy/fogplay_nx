@@ -1,5 +1,6 @@
 #include "features/providers/infrastructure/foghub_review_html.hpp"
 #include "features/providers/infrastructure/foghub_html.hpp"
+#include "features/providers/infrastructure/html_raw_text.hpp"
 #include "core/domain/repository_error.hpp"
 #include <libxml/HTMLparser.h>
 #include <libxml/xpath.h>
@@ -41,7 +42,9 @@ void bounds(xmlNode* node,unsigned depth,std::size_t& count) {
     for (;node;node=node->next) { require(++count<=60000 && depth<=96); if(node->children) bounds(node->children,depth+1,count); }
 }
 bool tolerated(const xmlError* error) {
+    // Same benign HTML4-parser (Switch libxml2 2.9.8) reports as foghub_html.cpp.
     return !error || error->level<XML_ERR_ERROR || error->code==XML_HTML_UNKNOWN_TAG ||
+        error->code==XML_ERR_NAME_REQUIRED || error->code==XML_ERR_ENTITYREF_SEMICOL_MISSING ||
         (error->code==XML_ERR_TAG_NAME_MISMATCH && error->str1 && std::string(error->str1)=="p");
 }
 struct Errors { bool invalid=false; };
@@ -57,8 +60,9 @@ void quiet(void*,const char*,...) {}
 #if LIBXML_VERSION >= 21300
 void contextError(void* data,const xmlError* error) { if(!tolerated(error)) static_cast<Errors*>(data)->invalid=true; }
 #endif
-Doc document(const std::string& html) {
-    require(!html.empty() && html.size()<=2*1024*1024 && html.find('\0')==std::string::npos);
+Doc document(const std::string& source) {
+    require(!source.empty() && source.size()<=2*1024*1024 && source.find('\0')==std::string::npos);
+    const auto html=withoutRawTextContent(source); // Script/style text is opaque here.
     auto folded=html; for(auto& c:folded) c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     require(folded.find("<!entity")==std::string::npos && folded.find("<![")==std::string::npos);
     std::unique_ptr<htmlParserCtxt,decltype(&htmlFreeParserCtxt)> context(htmlNewParserCtxt(),htmlFreeParserCtxt);

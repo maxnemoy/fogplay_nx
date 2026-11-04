@@ -149,6 +149,7 @@ inline constexpr char KeyframeRequested[] = "Ключевой кадр запр�
 inline constexpr char KeyframeRequestFailed[] = "Не удалось запросить кадр: видеоканал недоступен.";
 inline constexpr char TextSent[] = "Текст отправлен на ПК.";
 inline constexpr char TextSendFailed[] = "Не удалось передать текст: канал управления недоступен.";
+inline constexpr char TextSendCancelled[] = "Отправка текста прервана: на ПК передано нажатие.";
 inline constexpr char KeySent[] = "Клавиша передана на ПК.";
 inline constexpr char ControlUnavailable[] = "Канал управления недоступен.";
 inline constexpr char Space[] = "Пробел";
