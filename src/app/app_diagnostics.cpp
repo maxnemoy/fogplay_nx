@@ -1,5 +1,7 @@
 #include "core/constants/app_info.hpp"
+#include "core/diagnostics/diagnostic_profile.hpp"
 #include "core/constants/stage1_options.hpp"
+#include "features/streaming/domain/input_experiments.hpp"
 #include "core/constants/storage_paths.hpp"
 #include "app/app_diagnostics.hpp"
 #include "platform/switch/switch_runtime.hpp"
@@ -70,6 +72,20 @@ void diagnostic(const std::string& text, std::size_t maximum) {
     diagnosticTiming.record(started);
 }
 
+std::uint64_t diagnosticElapsedMs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now()-startupAt).count());
+}
+bool deferredDiagnostic(std::unique_ptr<const fog::RunLog::DeferredRecord> record, fog::RunLog::Admission admission) noexcept {
+    const auto began=std::chrono::steady_clock::now();
+    // Typed records are only emitted by active playback; startup remains the
+    // existing bounded prepared-line buffer with its original ordering.
+    const bool accepted=runLog.appendDeferred(std::move(record),admission);
+    std::lock_guard<std::mutex> lock(diagnosticMutex);
+    diagnosticTiming.record(began);
+    return accepted;
+}
+
 StartupStage::StartupStage(const char* name)
     : name_(name), began_(std::chrono::steady_clock::now()), exceptions_(std::uncaught_exceptions()) {
     diagnostic(std::string("Startup stage=")+name_+" begin");
@@ -90,7 +106,15 @@ void firstUiFramePresented() {
 LogSession::LogSession() {
     startupAt = std::chrono::steady_clock::now();
     diagnostic(std::string(fog::constants::common::Title) + " startup. Live session candidate; tested LAN AV stack. No credentials logged.");
+    // RTP events carry absolute steady-clock milliseconds, while line prefixes
+    // measure time since startupAt. Publish the origin before buffered events;
+    // neither coordinate implies UTC. Millisecond truncation costs at most 1 ms.
+    diagnostic("Diagnostic clock: schema=1 clock=steady startupEpochMs=" + std::to_string(
+        std::chrono::duration_cast<std::chrono::milliseconds>(startupAt.time_since_epoch()).count()) +
+        " resolutionMs=1");
+    diagnostic(std::string("Diagnostic profile: schema=1 profile=") + fog::metrics::diagnosticProfileName());
     diagnostic(fog::stage1::diagnostics());
+    diagnostic(fog::input_options::diagnostics());
     diagnostic("Startup main_entered; time before main (loader/SD executable read) is not measured");
 }
 void LogSession::start() {

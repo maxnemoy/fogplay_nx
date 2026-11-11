@@ -1,4 +1,5 @@
 #include "platform/switch/rumble.hpp"
+#include "features/streaming/application/rumble_diagnostics_formatter.hpp"
 #include "features/streaming/infrastructure/rumble_mailbox.hpp"
 #include <algorithm>
 #include <cassert>
@@ -237,6 +238,34 @@ void profileChanges() {
     output.setMode(static_cast<Mode>(99), 56);
     assert(output.diagnostics().find("mapping=disabled") != std::string::npos);
 }
+void numericTelemetry() {
+    namespace t=stream::telemetry::rumble;
+    t::Snapshot captured;
+    std::string frozen;
+    {
+        fogplay::platform::Rumble owner;
+        const auto calls=sent.size();const auto binds=initializes;
+        captured=owner.captureTelemetry();
+        assert(sent.size()==calls&&initializes==binds);
+        frozen=t::rumbleText(captured);
+        assert(frozen=="Rumble received=0 applied=0 stops=0 failures=0 result=0 npad=-1 style=0 handles=0 mapping=balanced");
+        assert(owner.diagnostics()==frozen);
+        for(const auto mode:{fog::rumble::Mode::Balanced,fog::rumble::Mode::DualBand,fog::rumble::Mode::Chromium,fog::rumble::Mode::Disabled}){
+            owner.setMode(mode,100);
+            assert(t::rumbleText(owner.captureTelemetry())==owner.diagnostics());
+            assert(owner.diagnostics().find(std::string("mapping=")+fog::rumble::modeId(mode))!=std::string::npos);
+        }
+        PadState pad{true,false};stream::Rumble effect{0,30000,10000,0,200};owner.update(pad,&effect,true,201);
+        assert(t::rumbleText(captured)==frozen);
+    }
+    assert(t::rumbleText(captured)==frozen);
+    captured.received=captured.applied=captured.stops=captured.failures=UINT64_MAX;
+    captured.result=captured.style=captured.handles=UINT32_MAX;captured.npad=INT32_MIN;captured.mapping=t::Mapping::DualBand;
+    const auto maximum=t::rumbleText(captured);
+    assert(maximum.find("received=18446744073709551615")!=std::string::npos&&maximum.find("npad=-2147483648")!=std::string::npos);
+    assert(maximum.size()<512&&maximum.substr(maximum.size()-17)=="mapping=dual-band");
+}
+
 }
 std::uint32_t hidGetNpadStyleSet(HidNpadIdType) { return style; }
 Result hidInitializeVibrationDevices(HidVibrationDeviceHandle* handles, s32 count,
@@ -262,5 +291,6 @@ int main() {
     profiles();
     profileChanges();
     quiet();
+    numericTelemetry();
     std::cout << "Rumble: timing, routing, three profiles, isolated motors, off, profile changes, errors and teardown PASS\n";
 }

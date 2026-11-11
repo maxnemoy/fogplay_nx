@@ -1,4 +1,5 @@
 #pragma once
+#include "features/streaming/domain/network_telemetry.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
@@ -33,6 +34,17 @@ public:
 
     void reset() noexcept { fields_ = {}; }
 
+    telemetry::network::PerformanceSnapshot numericSnapshot(std::uint64_t now) const noexcept {
+        telemetry::network::PerformanceSnapshot out;out.capturedAtMs=now;out.staleAfterMs=StaleAfterMs;
+        for(std::size_t i=0;i<fields_.size();++i){
+            const auto& field=fields_[i];auto& copy=out.fields[i];
+            copy.value=field.value;copy.sampledAtMs=field.at;copy.known=field.known;
+            copy.ageKnown=field.known&&now>=field.at;copy.ageMs=copy.ageKnown?now-field.at:0;
+            copy.stale=!copy.ageKnown||copy.ageMs>StaleAfterMs;
+            copy.unit=i<2?telemetry::network::PerformanceUnit::Percent:telemetry::network::PerformanceUnit::RawUnspecified;
+        }
+        return out;
+    }
     std::string diagnostics(std::uint64_t now) const {
         std::string result = "serverPerf=reported-raw freshnessMs=" + std::to_string(StaleAfterMs);
         result.reserve(MaxDiagnosticsBytes);

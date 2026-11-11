@@ -1,5 +1,6 @@
 #pragma once
 #include "core/diagnostics/thread_observation.hpp"
+#include "features/streaming/application/media_diagnostics_formatter.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -16,33 +17,14 @@ namespace fog::detail {
 // touches AVFrame/SDL/GPU objects and never tries to recover or free them.
 class VideoFlight {
 public:
-    enum class Stage { Idle, DecoderInit, DecodeSend, DecodeReceive, FrameRelease, DecoderRelease,
-        Transfer, Convert, TextureUpload, TextureRelease, Draw, Present };
-    struct Metadata {
-        int width = 0, height = 0, codec = 0, format = 0, stride = 0;
-        std::uint64_t bytes = 0, nalTypes = 0, frame = 0;
-    };
+    using Stage = media::telemetry::StallStage;
+    using Metadata = media::telemetry::StallMetadata;
     struct Snapshot { std::uint64_t sequence = 0, began = 0; Stage stage = Stage::Idle; Metadata metadata; };
     static std::uint64_t now() noexcept {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
-    static const char* name(Stage stage) noexcept {
-        switch (stage) {
-            case Stage::DecoderInit: return "decoder-init";
-            case Stage::DecodeSend: return "decode-send";
-            case Stage::DecodeReceive: return "decode-receive";
-            case Stage::FrameRelease: return "frame-release";
-            case Stage::DecoderRelease: return "decoder-release";
-            case Stage::Transfer: return "hardware-transfer";
-            case Stage::Convert: return "pixel-convert";
-            case Stage::TextureUpload: return "texture-upload";
-            case Stage::TextureRelease: return "texture-release";
-            case Stage::Draw: return "render-draw";
-            case Stage::Present: return "render-present";
-            default: return "idle";
-        }
-    }
+    static const char* name(Stage stage) noexcept { return media::telemetry::stallStageName(stage); }
     void begin(Stage stage, const Metadata& data, std::uint64_t at = now()) noexcept {
         ++revision_;
         ++sequence_; began_ = at; stage_ = stage;
@@ -88,9 +70,16 @@ private:
 class VideoWatchdog {
 public:
     using Reporter = std::function<void(const std::string&)>;
+    using NumericReporter = std::function<void(const media::telemetry::StallEvent&)>;
     VideoFlight decoder, presentation;
     ~VideoWatchdog() { stop(); }
     void start(Reporter reporter) {
+        if (!reporter) { stop(); return; }
+        startNumeric([reporter = std::move(reporter)](const media::telemetry::StallEvent& value) {
+            reporter(media::telemetry::formatStall(value));
+        });
+    }
+    void startNumeric(NumericReporter reporter) {
         stop();
         if (!reporter) return;
         reporter_ = std::move(reporter);
@@ -101,13 +90,19 @@ public:
             std::unique_lock<std::mutex> lock(mutex_);
             while (!wake_.wait_for(lock, std::chrono::milliseconds(100), [this] { return stopping_.load(); })) {
                 lock.unlock();
-                try { inspect(VideoFlight::now(), reporter_); } catch (...) { /* Diagnostics must not terminate playback. */ }
+                try { inspectNumeric(VideoFlight::now(), reporter_); } catch (...) { /* Diagnostics must not terminate playback. */ }
                 lock.lock();
             }
         }); } catch (...) {
             stopping_ = true;
             // Optional diagnostics must not prevent an otherwise usable stream.
-            try { reporter_("observer unavailable; video stall diagnostics disabled"); } catch (...) {}
+            try {
+                media::telemetry::StallEvent event;
+                event.kind = media::telemetry::StallKind::ObserverUnavailable;
+                event.error = media::telemetry::StallError::ObserverThreadStart;
+                event.monotonicMs = VideoFlight::now();
+                reporter_(event);
+            } catch (...) {}
         }
     }
     void stop() noexcept {
@@ -116,6 +111,9 @@ public:
     }
     // Observer-thread only; explicit time allows deterministic budget tests.
     void inspect(std::uint64_t now, const Reporter& report) {
+        inspectNumeric(now, [&report](const media::telemetry::StallEvent& value) { report(media::telemetry::formatStall(value)); });
+    }
+    void inspectNumeric(std::uint64_t now, const NumericReporter& report) {
         const std::array<const VideoFlight*, 2> lanes{&decoder, &presentation};
         for (std::size_t i = 0; i < lanes.size(); ++i) {
             VideoFlight::Snapshot state;
@@ -125,21 +123,18 @@ public:
             if (budget.sequence != state.sequence) budget = {state.sequence, 0, 0};
             if (total_ >= 128 || budget.count >= 4 || (budget.count && now - budget.at < 5000)) continue;
             ++budget.count; budget.at = now; ++total_;
-            const auto& m = state.metadata;
-            report(std::string("stall lane=") + (i ? "presentation" : "decoder") +
-                " stage=" + VideoFlight::name(state.stage) + " sequence=" + std::to_string(state.sequence) +
-                " monotonicMs=" + std::to_string(now) + " elapsedMs=" + std::to_string(now-state.began) +
-                " width=" + std::to_string(m.width) + " height=" + std::to_string(m.height) +
-                " codec=" + std::to_string(m.codec) + " format=" + std::to_string(m.format) +
-                " stride=" + std::to_string(m.stride) + " bytes=" + std::to_string(m.bytes) +
-                " nalTypes=" + std::to_string(m.nalTypes) + " frame=" + std::to_string(m.frame));
+            media::telemetry::StallEvent event;
+            event.lane = i ? media::telemetry::StallLane::Presentation : media::telemetry::StallLane::Decoder;
+            event.stage = state.stage; event.sequence = state.sequence;
+            event.monotonicMs = now; event.elapsedMs = now - state.began; event.metadata = state.metadata;
+            report(event);
         }
     }
 private:
     struct Budget { std::uint64_t sequence = 0, at = 0; unsigned count = 0; };
     std::array<Budget, 2> budgets_{};
     unsigned total_ = 0;
-    Reporter reporter_;
+    NumericReporter reporter_;
     std::atomic<bool> stopping_{false};
     std::mutex mutex_;
     std::condition_variable wake_;

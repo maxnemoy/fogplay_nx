@@ -54,9 +54,9 @@ void ApplicationController::beginLogin() {
     }
     const auto phone = keyboard("Phone number +7...", "+7", 20);
     if (!phone || phone->empty()) {
-        screen_ = sessionPending_ ? Screen::Recovery : Screen::Games;
+        screen_ = rentalSession_.state().pending ? Screen::Recovery : Screen::Games;
         selection_ = 0;
-        if (!sessionPending_ && catalog_.items().empty()) loadGames();
+        if (!rentalSession_.state().pending && catalog_.items().empty()) loadGames();
         return;
     }
     const auto enteredPhone = *phone;

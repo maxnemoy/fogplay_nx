@@ -1,4 +1,5 @@
 #pragma once
+#include "features/streaming/domain/network_telemetry.hpp"
 #include <array>
 #include <cstdint>
 #include <string>
@@ -7,7 +8,7 @@ namespace stream {
 // Fixed labels and numeric states only: never record remote messages or credentials.
 class TransportHistory {
 public:
-    enum class Kind { Peer, Ice, Gathering, ChannelOpen, Closed, Failure };
+    using Kind = telemetry::network::HistoryKind;
     static constexpr std::size_t Capacity = 16;
     void record(Kind kind, int state, std::uint64_t at, bool terminal = false,
                 long long videoAge = -1, long long audioAge = -1, long long controlAge = -1) noexcept {
@@ -22,6 +23,14 @@ public:
             terminalAudioAge_ = audioAge;
             terminalControlAge_ = controlAge;
         }
+    }
+    telemetry::network::HistorySnapshot numericSnapshot() const noexcept {
+        telemetry::network::HistorySnapshot out;out.count=size_;out.hasTerminal=hasTerminal_;out.terminal=terminal_;
+        for(std::size_t i=0;i<size_;++i)out.entries[i]=entries_[(next_+Capacity-size_+i)%Capacity];
+        out.terminalVideoAge={terminalVideoAge_>=0?std::uint64_t(terminalVideoAge_):0,hasTerminal_&&terminalVideoAge_>=0};
+        out.terminalAudioAge={terminalAudioAge_>=0?std::uint64_t(terminalAudioAge_):0,hasTerminal_&&terminalAudioAge_>=0};
+        out.terminalControlAge={terminalControlAge_>=0?std::uint64_t(terminalControlAge_):0,hasTerminal_&&terminalControlAge_>=0};
+        return out;
     }
     std::string diagnostics() const {
         std::string result = " firstTerminal=";
@@ -39,7 +48,7 @@ public:
         return result;
     }
 private:
-    struct Entry { Kind kind = Kind::Peer; int state = 0; std::uint64_t at = 0; };
+    using Entry = telemetry::network::HistoryEntry;
     static const char* name(Kind kind) {
         switch (kind) {
         case Kind::Peer: return "peer";

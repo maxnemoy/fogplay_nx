@@ -404,6 +404,15 @@ static void audioCounts(SDL_Renderer* renderer) {
     media.audio(bytes, packet.size());
     check(media.audioPackets() == 6 && audioBytes == 3840 && media.audioQueueResets() == 2,
         "recovered output did not accept the next packet");
+    const auto audio = media.captureTelemetry().audio;
+    check(!audio.boundedWorker, "synchronous output reported an active bounded worker");
+    check(audio.decodedPcmFrames == 6 * 960 && audio.admittedPcmFrames == 5 * 960 &&
+        audio.failedPcmFrames == 960 && audio.pcmDiscardedFrames == 0,
+        "PCM counters confused decoded samples with successful output admission");
+    check(audio.latencyClears == 1 && audio.recoveryClears == 1 &&
+        audio.lastClearReason == fog::media::telemetry::AudioClearReason::Recovery &&
+        audio.clearBeforeBytes == 3840 && audio.clearAfterBytes == 0 && audio.clearAtUs > 0,
+        "queue clear telemetry lost threshold/recovery reason or before/after boundary");
     std::cout << "PASS audio observations: no sleeps, 40 ms threshold, priming, episode/refill/reset accounting, queue cap, isolated queue failure recovery\n";
     std::cout << media.audioDiagnostics() << '\n';
     mockAudio = false;

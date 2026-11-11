@@ -37,7 +37,7 @@ void ApplicationController::loadGames() {
 }
 
 void ApplicationController::requestCatalog(bool manual) {
-    if (catalogPending_.valid() || exitAfterStop_ || (sessionPending_ && !recoveryPaused_)) return;
+    if (catalogPending_.valid() || exitAfterStop_ || (rentalSession_.state().pending && !rentalSession_.paused())) return;
     const auto request = catalog_.begin(manual);
     if (!request) return;
     try {
@@ -85,7 +85,7 @@ void ApplicationController::moveCatalog(u64 keys) {
     }
     using Direction = fog::Catalog::Direction;
     if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) {
-        if (homeCatalog_.move(catalog_,recentGames_.items().size(),Direction::Left) && (!sessionPending_ || recoveryPaused_)) sidebar_ = true;
+        if (homeCatalog_.move(catalog_,recentGames_.items().size(),Direction::Left) && (!rentalSession_.state().pending || rentalSession_.paused())) sidebar_ = true;
     }
     if (keys & (HidNpadButton_Right | HidNpadButton_StickLRight)) homeCatalog_.move(catalog_,recentGames_.items().size(),Direction::Right);
     if (keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) homeCatalog_.move(catalog_,recentGames_.items().size(),Direction::Up);

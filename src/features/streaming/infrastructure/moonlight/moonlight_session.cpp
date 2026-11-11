@@ -1,3 +1,8 @@
+#include "features/streaming/infrastructure/network_telemetry_capture.hpp"
+#include "features/streaming/infrastructure/bounded_network_events.hpp"
+#include "features/streaming/application/network_diagnostics_formatter.hpp"
+#include "features/streaming/infrastructure/telemetry_capture.hpp"
+#include "features/streaming/application/stream_diagnostics_formatter.hpp"
 #include "core/diagnostics/latency_histogram.hpp"
 #include "core/constants/stage1_options.hpp"
 #include "moonlight_session.hpp"
@@ -7,6 +12,7 @@
 #include "transport_retry.hpp"
 #include "controller_input.hpp"
 #include "video_input_gate.hpp"
+#include "encryption_policy.hpp"
 #include "features/streaming/domain/video_limits.hpp"
 #include "core/diagnostics/thread_observation.hpp"
 #include "features/streaming/application/remote_input.hpp"
@@ -32,6 +38,7 @@
 #include <mutex>
 #include <thread>
 #include <type_traits>
+#include <string_view>
 #include <utility>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -40,6 +47,10 @@ namespace moonlight {
 namespace {
 using Clock = std::chrono::steady_clock;
 std::atomic<bool> protocolClaimed{false};
+// The core event namespace outlives a Client. Serialize its cursor and legacy /
+// typed consumer handoff; receive threads never acquire this adapter mutex.
+std::mutex coreEventsMutex;
+std::uint64_t coreEventsCursor=0;
 std::uint64_t nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
 }
@@ -70,6 +81,12 @@ struct State {
     std::atomic<bool> terminated{false}, failed{false}, decoderWaiting{true}, assemblyWaiting{true};
     std::atomic<bool> fatalFailure{false}, retryableFailure{false};
     std::atomic<bool> coreDiagnosticsReady{false};
+    std::atomic<bool> typedNetworkEvents{false};
+    bool coreEventsReadable=false; // coreEventsMutex; excludes core initialization.
+    std::atomic<std::uint64_t> coreSourceMissed{0}; // diagnostic State lifetime, not per-video generation
+    stream::telemetry::network::EventJournal<stream::telemetry::network::NetworkEvent> networkEvents;
+    std::uint64_t telemetryCoreClockUs=0,telemetryCoreSteadyUs=0; // mutex; numeric final source time
+    FogMoonlightDiagnostics encryptionResult{}; // mutex; retained across stop, cleared on start.
     std::atomic<int> code{0};
     std::atomic<int> terminationCode{0};
     std::atomic<int> terminationOrigin{FOG_TERMINATION_TRANSPORT};
@@ -99,6 +116,8 @@ struct State {
     std::deque<stream::Packet> audio;
     std::string message = "Moonlight ready for pairing", error;
     std::uint64_t generation = 1;
+    const std::uint64_t telemetryStreamEpoch = stream::telemetry::nextStreamEpoch();
+    std::uint64_t telemetryEpoch = 0; // State::mutex, transport starts only (not video resync).
     moonlight_diagnostics::CommandSnapshot command;
     moonlight_diagnostics::CommandSnapshot firstCommandFailure;
     unsigned commandAttempt = 0;
@@ -108,7 +127,13 @@ struct State {
     State() { LiInitializeServerInformation(&host.serverInfo); LiInitializeStreamConfiguration(&config); }
     ~State() { delete[] host.serverInfo.rtspSessionUrl; releaseLease(); }
     bool claimLease() { bool expected = false; ownsLease = protocolClaimed.compare_exchange_strong(expected, true); return ownsLease; }
-    void releaseLease() { if (ownsLease) { ownsLease = false; protocolClaimed = false; } }
+    void releaseLease() {
+        // Re-pairing may retain the old Client after its worker joined. Close
+        // its global-core read gate before another State can claim the lease.
+        std::lock_guard<std::mutex> consumer(coreEventsMutex);
+        coreEventsReadable=false;
+        if (ownsLease) { ownsLease = false; protocolClaimed = false; }
+    }
     void status(const char* value) { std::lock_guard<std::mutex> lock(mutex); message = value; }
     void fail(const char* value, int failure = -1, bool retryable = false) {
         { std::lock_guard<std::mutex> lock(mutex); error = value; message = value;
@@ -211,36 +236,43 @@ bool copyFrame(const DECODE_UNIT& unit, std::vector<std::byte>& target) {
     }
     return target.size() == static_cast<std::size_t>(unit.fullLength);
 }
-void drainCoreEvents() noexcept {
+stream::telemetry::network::CoreRole networkRole(std::string_view value) {
+    using Role=stream::telemetry::network::CoreRole;
+    static constexpr std::pair<std::string_view,Role> roles[]={{"VideoRecv",Role::VideoRecv},{"VideoDec",Role::VideoDecoder},{"AudioRecv",Role::AudioRecv},
+        {"AudioDec",Role::AudioDecoder},{"ControlRecv",Role::ControlRecv},{"ControlSend",Role::ControlSend},{"Input",Role::Input},{"VideoPing",Role::VideoPing},
+        {"AudioPing",Role::AudioPing},{"LossStats",Role::LossStats},{"ReqIdrFrame",Role::ReqIdrFrame},{"CtrlAsyncCb",Role::CtrlAsyncCb},{"InvRefFrames",Role::InvRefFrames}};
+    for(const auto& role:roles)if(role.first==value)return role.second;
+    return Role::Unknown;
+}
+void drainCoreEvents(State& state,bool typedConsumer=false) noexcept {
     try {
-        if (!moonlight_diagnostics::sink.load()) return;
-        // The exclusive Moonlight lease serializes all session workers. Retain
-        // the cursor across reconnects: journal IDs do not reset with counters.
-        static std::uint64_t cursor = 0;
-        std::uint64_t missed = 0;
+        using namespace stream::telemetry::network;
+        std::lock_guard<std::mutex> consumer(coreEventsMutex);
+        const bool typed=state.typedNetworkEvents.load();
+        if(typed!=typedConsumer||!state.coreEventsReadable)return;
+        if(!typed&&!moonlight_diagnostics::sink.load())return;
+        // Demand transfer, never overwrite the adapter's unread prefix. Reserve
+        // one slot for the source-loss record that any read may discover.
+        const auto free=decltype(state.networkEvents)::Capacity-state.networkEvents.size();
+        const auto limit=typed?(free>1?free-1:0):FOG_MOONLIGHT_EVENT_CAPACITY;
+        if(!limit)return;
+        std::uint64_t missed=0;
+        NetworkEvent context;context.provider=Provider::FogHub;
+        {std::lock_guard<std::mutex> lock(state.mutex);context.streamEpoch=state.telemetryStreamEpoch;context.transportEpoch=state.telemetryEpoch;context.videoGeneration=state.generation;}
+        // Core connectionId is the authoritative event namespace. The adapter's
+        // current generation is only drain context, never a guessed source binding.
+        context.transportBindingKnown=false;
         FogMoonlightEvent event;
-        for (unsigned budget = 0; budget < 256 && FogMoonlightReadEvent(&cursor, &event, &missed); ++budget) {
-            if (event.kind == FOG_EVENT_THREAD_START) {
-                moonlight_diagnostics::emit("Moonlight thread role=" + std::string(event.role) +
-                    " connection=" + std::to_string(event.connectionId) + " core=" + std::to_string(event.threadCore) +
-                    " priority=" + std::to_string(event.threadPriority) + " mask=" + std::to_string(event.threadAffinityMask) +
-                    " ideal=" + std::to_string(event.threadIdealCore) + " queryErrors=" + std::to_string(event.threadQueryErrors) +
-                    " available=" + std::to_string(event.threadQueryErrors == 0) + " seq=" + std::to_string(event.sequence) +
-                    " core_us=" + std::to_string(event.timeUs));
-                continue;
-            }
-            static const char* names[] = {"unknown", "wait-enter", "request", "dispatch", "dispatch-result", "fec-failure",
-                "intact-frame", "idr-receive-hint", "idr-recognized", "wait-exit", "idr-assembled"};
-            const char* name = event.kind < sizeof(names) / sizeof(names[0]) ? names[event.kind] : "unknown";
-            moonlight_diagnostics::emit("Moonlight IDR event=" + std::string(name) +
-                " seq=" + std::to_string(event.sequence) + " connection=" + std::to_string(event.connectionId) +
-                " wait=" + std::to_string(event.waitId) + " core_us=" + std::to_string(event.timeUs) +
-                " frame=" + std::to_string(event.frameNumber) + " value=" + std::to_string(event.value) +
-                " totalsValid=" + std::to_string(event.totalsValid) + " requests=" + std::to_string(event.requests) + " intact=" + std::to_string(event.intactFrames) +
-                " fecFailedBlocks=" + std::to_string(event.fecFailures));
+        for(unsigned budget=0;budget<limit&&FogMoonlightReadEvent(&coreEventsCursor,&event,&missed);++budget){
+            auto value=context;value.kind=EventKind::Core;
+            std::size_t roleBytes=0;while(roleBytes<sizeof(event.role)&&event.role[roleBytes])++roleBytes;
+            value.core={event.sequence,event.connectionId,event.waitId,event.timeUs,event.kind,event.frameNumber,event.value,event.requests,event.intactFrames,event.fecFailures,event.totalsValid,
+                event.threadCore,event.threadIdealCore,event.threadPriority,event.threadQueryErrors,event.threadAffinityMask,networkRole(std::string_view(event.role,roleBytes))};
+            if(typed)state.networkEvents.push(value);else moonlight_diagnostics::emit(coreEventText(value));
         }
-        if (missed) moonlight_diagnostics::emit("Moonlight IDR journal missed=" + std::to_string(missed) + " through_seq=" + std::to_string(cursor));
-    } catch (...) { /* Optional diagnostics cannot terminate the session worker. */ }
+        if(missed){state.coreSourceMissed.fetch_add(missed);auto value=context;value.kind=EventKind::CoreMissed;value.core.sequence=coreEventsCursor;value.core.value=missed;
+            if(typed)state.networkEvents.push(value);else moonlight_diagnostics::emit(coreEventText(value));}
+    }catch(...){/* Optional numeric journal cannot terminate the session worker. */}
 }
 class CoreFrameCompletion final : public stream::VideoFrameCompletion {
 public:
@@ -504,6 +536,8 @@ public:
         state_->accelRateHz = 0; state_->gyroRateHz = 0; lastMotionMs_ = {};
         state_->videoInvalid = 0; state_->videoWaitDrops = 0; state_->videoResyncs = 0;
         state_->trace.reset();
+        {std::lock_guard<std::mutex> consumer(coreEventsMutex);
+            state_->coreEventsReadable=false;state_->networkEvents.discardPending();}
         state_->coreDiagnosticsReady = false;
         state_->selectedCodec = stream::VideoCodec::H264;
         state_->negotiatedWidth = 0; state_->negotiatedHeight = 0; state_->negotiatedFps = 0;
@@ -512,12 +546,16 @@ public:
         // No callbacks or previous pull/consumer threads remain at this point.
         state_->mediaSignals = mediaSignals();
         { std::lock_guard<std::mutex> lock(state_->mutex); state_->audio.clear(); state_->error.clear();
+            state_->encryptionResult = {};
+            state_->telemetryCoreClockUs=state_->telemetryCoreSteadyUs=0;
+            ++state_->telemetryEpoch;
             state_->command = {}; state_->firstCommandFailure = {}; state_->commandFailures = 0;
             state_->commandAttempt = 0; state_->closedToResumeMs = 0; ++state_->generation; }
         state_->config.width = 1280; state_->config.height = 720; state_->config.fps = settings_.framesPerSecond;
         state_->config.bitrate = settings_.bitrateMbps * 1000;
         state_->config.packetSize = 1024; state_->config.streamingRemotely = STREAM_CFG_REMOTE;
         state_->config.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
+        state_->config.encryptionFlags = detail::encryptionFlags();
         state_->config.supportedVideoFormats = VIDEO_FORMAT_H264;
         if (settings_.codec == stream::VideoCodec::H265) state_->config.supportedVideoFormats |= VIDEO_FORMAT_H265;
         state_->config.clientRefreshRateX100 = 6000; state_->config.colorSpace = COLORSPACE_REC_709;
@@ -546,7 +584,7 @@ public:
     stream::VideoCodec selectedVideoCodec() const override { return state_->selectedCodec.load(); }
     std::string qualityStatus() const override {
         return "FogHub 720p" + std::to_string(settings_.framesPerSecond) + " / " + std::string(stream::videoCodecName(selectedVideoCodec())) +
-            " / " + std::to_string(settings_.bitrateMbps) + " Мбит/с (запрос)";
+            " / " + std::to_string(settings_.bitrateMbps) + " Мбит/с (запрос) / " + detail::encryptionSummary(encryptionSnapshot());
     }
     void pump() override {
         // The application keeps pumping while LiStartConnection runs. Its
@@ -621,6 +659,48 @@ public:
         return eligible && retryIdentityValid() && !state_->fatalFailure &&
             ((!state_->failed && !state_->terminated) || retryableFailure());
     }
+    stream::telemetry::protocol::ProtocolSnapshot captureProtocolTelemetry()const noexcept override {
+        namespace p=stream::telemetry::protocol;p::ProtocolSnapshot out;out.provider=p::Provider::FogHub;out.capturedAtSteadyUs=fog::metrics::steadyNowUs();
+        try{auto& h=out.fh;FogMoonlightDiagnostics encryption{};
+            {std::lock_guard<std::mutex> lock(state_->mutex);out.streamEpoch=state_->telemetryStreamEpoch;out.transportEpoch=state_->telemetryEpoch;out.videoGeneration=state_->generation;out.sourceCapturedAtSteadyUs=state_->workerFinished?state_->telemetryCoreSteadyUs:out.capturedAtSteadyUs;
+                out.state=out.transportEpoch?(state_->workerFinished?p::State::FinalRetained:p::State::Live):p::State::NotPublished;
+                const auto& c=state_->command;h.command={static_cast<unsigned>(c.operation),c.curl,c.xmlStatus,c.xmlResult,c.gameSession,c.http,c.dispatched,c.cancelled,c.elapsedMs,c.httpElapsedMs};
+                const auto& first=state_->firstCommandFailure;h.firstFailure={static_cast<unsigned>(first.operation),first.curl,first.xmlStatus,first.xmlResult,first.gameSession,first.http,first.dispatched,first.cancelled,first.elapsedMs,first.httpElapsedMs};
+                h.attempt=state_->commandAttempt;h.failures=state_->commandFailures;h.closedToResumeMs=state_->closedToResumeMs;encryption=state_->encryptionResult;h.encryptionCapturedAtUs=state_->telemetryCoreSteadyUs;h.encryptionKnown=state_->telemetryCoreSteadyUs!=0;}
+            h.video=state_->frames.load(std::memory_order_relaxed);
+            h.audio=state_->audioFrames.load(std::memory_order_relaxed);
+            h.width=state_->negotiatedWidth.load(std::memory_order_relaxed);
+            h.height=state_->negotiatedHeight.load(std::memory_order_relaxed);
+            h.fps=state_->negotiatedFps.load(std::memory_order_relaxed);
+            h.code=state_->code.load(std::memory_order_relaxed);
+            h.terminationCode=state_->terminationCode.load(std::memory_order_relaxed);
+            h.assemblyWaiting=state_->assemblyWaiting.load(std::memory_order_relaxed);
+            h.decoderWaiting=state_->decoderWaiting.load(std::memory_order_relaxed);
+            h.retryableFailure=state_->retryableFailure.load(std::memory_order_relaxed);
+            h.fatalFailure=state_->fatalFailure.load(std::memory_order_relaxed);
+            h.inputAccepted=state_->inputAccepted.load(std::memory_order_relaxed);
+            h.inputRejected=state_->inputRejected.load(std::memory_order_relaxed);
+            h.inputIgnored=state_->inputIgnored.load(std::memory_order_relaxed);
+            h.accelRateHz=state_->accelRateHz.load(std::memory_order_relaxed);
+            h.gyroRateHz=state_->gyroRateHz.load(std::memory_order_relaxed);
+            h.codecH265=selectedVideoCodec()==stream::VideoCodec::H265;h.requestedH265=settings_.codec==stream::VideoCodec::H265;h.requestedFps=settings_.framesPerSecond;h.requestedMbps=settings_.bitrateMbps;
+            h.hostTermination=state_->terminationOrigin==FOG_TERMINATION_HOST;h.dualSense=profile_==stream::ControllerProfile::DualSense;
+            const auto& q=state_->trace.queueLock;h.queueLock={q.count.load(),q.totalUs.load(),q.maxUs.load(),q.over50ms.load()};
+            h.encryption.requested=detail::encryptionFlags();
+            h.encryption.encryptionClientFlags=encryption.encryptionClientFlags;
+            h.encryption.encryptionState=encryption.encryptionState;
+            h.encryption.encryptionFailure=encryption.encryptionFailure;
+            h.encryption.encryptionHostSupported=encryption.encryptionHostSupported;
+            h.encryption.encryptionHostRequired=encryption.encryptionHostRequired;
+            h.encryption.encryptionSelected=encryption.encryptionSelected;
+            h.encryption.encryptionAudio=encryption.encryptionAudio;
+            h.encryption.encryptionControl=encryption.encryptionControl;
+            h.encryption.encryptionRtsp=encryption.encryptionRtsp;
+            h.encryption.videoDecryptSuccesses=encryption.videoDecryptSuccesses;
+            h.encryption.audioDecryptSuccesses=encryption.audioDecryptSuccesses;
+            h.encryption.audioDecryptFailures=encryption.audioDecryptFailures;
+        }catch(...){out.state=p::State::CaptureFailed;}out.completedAtSteadyUs=fog::metrics::steadyNowUs();return out;
+    }
     std::string diagnostics() const override {
         moonlight_diagnostics::CommandSnapshot command;
         moonlight_diagnostics::CommandSnapshot firstFailure;
@@ -657,31 +737,128 @@ public:
             " terminationCode=" + std::to_string(state_->terminationCode.load()) +
             " terminationOrigin=" + (state_->terminationOrigin == FOG_TERMINATION_HOST ? "host" : "transport") +
             " retryableFailure=" + std::to_string(state_->retryableFailure.load()) +
-            " fatalFailure=" + std::to_string(state_->fatalFailure.load());
+            " fatalFailure=" + std::to_string(state_->fatalFailure.load()) + detail::encryptionDiagnostics(encryptionSnapshot());
+    }
+    stream::telemetry::Snapshot captureTelemetry(stream::telemetry::Capture mask) const noexcept override {
+        using namespace stream::telemetry;
+        Snapshot out;out.provider=Provider::FogHub;out.capturedAtSteadyUs=fog::metrics::steadyNowUs();
+        out.input.scope=Scope::ClientRolling5s;
+        try {
+            {std::lock_guard<std::mutex> lock(state_->mutex);
+                out.streamEpoch=state_->telemetryStreamEpoch;out.transportEpoch=state_->telemetryEpoch;out.videoGeneration=state_->generation;
+                if(includes(mask,Capture::Control)){
+                    const auto& c=state_->command;auto& f=out.fhControl;
+                    f.accepted=state_->inputAccepted.load();f.rejected=state_->inputRejected.load();f.ignored=state_->inputIgnored.load();
+                    f.operation=static_cast<int>(c.operation);f.curl=c.curl;f.http=c.http;f.xmlStatus=c.xmlStatus;
+                    f.xmlResult=c.xmlResult;f.ack=c.gameSession;f.result=c.result;f.elapsedMs=c.elapsedMs;f.httpElapsedMs=c.httpElapsedMs;
+                    f.dispatched=c.dispatched;f.cancelled=c.cancelled;f.attempt=state_->commandAttempt;
+                    f.failures=state_->commandFailures;f.closedToResumeMs=state_->closedToResumeMs;
+                    f.command={state_->commandAttempt?Availability::Available:Availability::NotStarted,
+                        state_->commandAttempt?Reason::None:Reason::NotYetPublished,Scope::TransportLifetime};
+                }
+                if(includes(mask,Capture::Transport)&&!state_->running&&state_->workerFinished&&state_->coreDiagnosticsReady){
+                    captureFhCore(out.fh,state_->encryptionResult);
+                    out.fh.core={Availability::FinalRetained,Reason::None,Scope::TransportLifetime};
+                }
+            }
+            out.sequence=++telemetrySequence_;
+            const Status status{out.transportEpoch?(state_->workerFinished?Availability::FinalRetained:Availability::Available):Availability::NotStarted,
+                out.transportEpoch?Reason::None:Reason::NotYetPublished,Scope::TransportLifetime};
+            if(includes(mask,Capture::Control))out.control=status;
+            if(includes(mask,Capture::Transport)){
+                out.transport=status;
+                const auto& t=state_->trace;
+                out.fh.adapter={captureAtomicTiming(t.workerGap),captureAtomicTiming(t.drain),captureAtomicTiming(t.copy),captureAtomicTiming(t.completion)};
+                out.fh.emptyPolls=t.emptyPolls.load(std::memory_order_relaxed);
+                if(state_->running&&state_->coreDiagnosticsReady){
+                    // Atomics-only diagnostic API for this State's retained core lease.
+                    // No SDK network/decoder query and no provider pointer leaves capture.
+                    captureFhCore(out.fh,coreSnapshot());out.fh.core={Availability::Available,Reason::None,Scope::TransportLifetime};
+                }else if(!available(out.fh.core))out.fh.core={Availability::TemporarilyUnavailable,Reason::NotYetPublished,Scope::TransportLifetime};
+            }
+            if(includes(mask,Capture::Input)){
+                out.input={Availability::Available,Reason::None,Scope::ClientRolling5s};
+                out.inputLatency=capturePercentiles(inputLatency_.snapshot(out.capturedAtSteadyUs));
+            }
+        }catch(...){
+            const Status failed{Availability::TemporarilyUnavailable,Reason::CaptureFailed,Scope::TransportLifetime};
+            if(includes(mask,Capture::Transport))out.transport=failed;
+            if(includes(mask,Capture::Control))out.control=failed;
+            if(includes(mask,Capture::Input)){out.input=failed;out.input.scope=Scope::ClientRolling5s;}
+        }
+        out.captureCompletedAtSteadyUs=fog::metrics::steadyNowUs();return out;
+    }
+    stream::telemetry::network::NetworkSnapshot captureNetworkTelemetry() const noexcept override {
+        namespace net=stream::telemetry::network;
+        net::NetworkSnapshot out;out.provider=net::Provider::FogHub;out.capturedAtSteadyUs=fog::metrics::steadyNowUs();
+        try{
+            FogMoonlightDiagnostics core{};
+            {std::lock_guard<std::mutex> lock(state_->mutex);
+                out.streamEpoch=state_->telemetryStreamEpoch;out.transportEpoch=state_->telemetryEpoch;out.videoGeneration=state_->generation;
+                if(state_->workerFinished&&state_->coreDiagnosticsReady){core=state_->encryptionResult;out.core.state=net::State::FinalRetained;out.core.hasValue=true;
+                    out.core.capturedAtUs=state_->telemetryCoreSteadyUs;out.fh.coreNowUs=state_->telemetryCoreClockUs;}
+            }
+            if(state_->running&&state_->coreDiagnosticsReady){core=coreSnapshot();out.core.state=net::State::Live;out.core.hasValue=true;
+                out.core.capturedAtUs=fog::metrics::steadyNowUs();out.fh.coreNowUs=LiGetMicroseconds();}
+            out.core.epoch=out.transportEpoch;out.core.generation=out.videoGeneration;out.core.ageKnown=out.core.hasValue&&out.capturedAtSteadyUs>=out.core.capturedAtUs;
+            out.core.ageUs=out.core.ageKnown?out.capturedAtSteadyUs-out.core.capturedAtUs:0;out.core.stale=!out.core.hasValue||!out.core.ageKnown||out.core.ageUs>1000000;
+            if(out.core.hasValue){out.fh.core=net::captureCore(core);out.fh.coreClockKnown=out.fh.coreNowUs!=0;
+                const std::uint64_t stamps[]={core.lastVideoPacketUs,core.idrWaitStartedUs,core.lastIdrRequestUs,core.lastIdrDispatchUs};
+                for(unsigned i=0;i<4;++i)if(stamps[i]&&out.fh.coreClockKnown&&out.fh.coreNowUs>=stamps[i])out.fh.coreAgeKnownMask|=1u<<i;}
+            out.fh.codecKnown=out.core.hasValue;out.fh.codecH265=state_->selectedCodec.load()==stream::VideoCodec::H265;
+            const auto stage=[](const detail::TimingSamples& t){return net::StageTiming{t.count.load(),t.totalUs.load(),t.maxUs.load(),t.over50ms.load()};};
+            const auto& t=state_->trace;out.fh.videoTimings={stage(t.assembly),stage(t.coreAge),stage(t.arrivalGap),stage(t.hostProcessing)};
+            out.fh.units=t.units.load();out.fh.payloadBytes=t.payloadBytes.load();out.fh.idrs=t.idrs.load();out.fh.skippedFrameNumbers=t.skippedFrameNumbers.load();
+            out.fh.repeatedOrReordered=t.repeatedOrReordered.load();out.fh.invalidTimes=t.invalidTimes.load();const auto last=t.lastUnitUs.load();
+            out.fh.lastUnitAgeKnown=last&&out.fh.coreClockKnown&&out.fh.coreNowUs>=last;out.fh.lastUnitAgeUs=out.fh.lastUnitAgeKnown?out.fh.coreNowUs-last:0;
+            out.fh.videoDrops=state_->videoDrops.load();out.fh.audioDrops=state_->audioDrops.load();out.fh.audioOverflowDrops=state_->audioOverflowDrops.load();out.fh.audioInvalidDrops=state_->audioInvalidDrops.load();
+            out.fh.audioDropsVideoWaiting=state_->audioDropsVideoWaiting.load();out.fh.audioDropsVideoStalled=state_->audioDropsVideoStalled.load();out.fh.audioDropLastMs=state_->audioDropLastMs.load();
+            out.fh.audioDropLastQueueAgeMs=state_->audioDropLastQueueAgeMs.load();out.fh.audioDropLastVideoAgeMs=state_->audioDropLastVideoAgeMs.load();
+            out.fh.videoInvalid=state_->videoInvalid.load();out.fh.videoWaitDrops=state_->videoWaitDrops.load();out.fh.videoResyncs=state_->videoResyncs.load();
+            out.rtcp.state=out.control.state=out.history.state=net::State::NotSupported;
+            out.eventMissed=state_->networkEvents.lost();out.eventCursor=state_->networkEvents.cursor();out.coreSourceMissed=state_->coreSourceMissed.load();
+        }catch(...){out.core.state=net::State::CaptureFailed;out.core.hasValue=false;}
+        out.completedAtSteadyUs=fog::metrics::steadyNowUs();
+        out.core.ageKnown=out.core.hasValue&&out.completedAtSteadyUs>=out.core.capturedAtUs;
+        out.core.ageUs=out.core.ageKnown?out.completedAtSteadyUs-out.core.capturedAtUs:0;
+        out.core.stale=!out.core.ageKnown||out.core.ageUs>1000000||out.core.state==net::State::CaptureFailed;return out;
+    }
+    void enableNetworkEvents(bool enabled) noexcept override {
+        try{std::lock_guard<std::mutex> consumer(coreEventsMutex);
+            state_->typedNetworkEvents=enabled;if(!enabled)state_->networkEvents.discardPending();
+        }catch(...){}
+    }
+    bool peekNetworkEvent(stream::telemetry::network::NetworkEvent& out)const noexcept override {
+        try{drainCoreEvents(*state_,true);
+            stream::telemetry::network::EventJournal<stream::telemetry::network::NetworkEvent>::Entry entry;
+            if(!state_->networkEvents.peek(entry))return false;
+        out=entry.value;out.journalSequence=entry.sequence;out.journalMissed=entry.missed;return true;
+        }catch(...){return false;}
+    }
+    std::size_t peekNetworkEvents(stream::telemetry::network::NetworkEvent* out,std::size_t capacity)const noexcept override {
+        if(!out||!capacity)return 0;
+        try{
+            drainCoreEvents(*state_,true);
+            using Journal=stream::telemetry::network::EventJournal<stream::telemetry::network::NetworkEvent>;
+            std::array<Journal::Entry,Journal::Capacity> entries{};
+            const auto count=state_->networkEvents.peekBatch(entries.data(),std::min(capacity,entries.size()));
+            for(std::size_t i=0;i<count;++i){out[i]=entries[i].value;out[i].journalSequence=entries[i].sequence;out[i].journalMissed=entries[i].missed;}
+            return count;
+        }catch(...){return 0;}
+    }
+    bool retireNetworkEvent(std::uint64_t sequence,bool admitted)noexcept override {
+        try{return state_->networkEvents.retire(sequence,admitted);}catch(...){return false;}
+    }
+    unsigned networkEventFinalDiscardBudget()const noexcept override {
+        constexpr auto capacity=decltype(state_->networkEvents)::Capacity;
+        static_assert(capacity>1);
+        // Retained adapter prefix + core ring + at most one loss marker for
+        // each refill of the core ring (one adapter slot is reserved for it).
+        return capacity+FOG_MOONLIGHT_EVENT_CAPACITY+
+            (FOG_MOONLIGHT_EVENT_CAPACITY+capacity-2)/(capacity-1);
     }
     std::string transportTimings() const override {
-        const auto& t = state_->trace;
-        const auto core = coreSnapshot();
-        const auto timing = [](const char* name, std::uint64_t count, std::uint64_t totalUs, std::uint64_t maxUs) {
-            return std::string(name) + "(n,avg_us,max_us)=" + std::to_string(count) + "," +
-                std::to_string(count ? totalUs / count : 0) + "," + std::to_string(maxUs);
-        };
-        return "Moonlight cumulative " + t.workerGap.text("worker_gap") + " | " + t.drain.text("drain") +
-            " | " + t.copy.text("copy") + " | " + t.completion.text("complete") +
-            " empty_polls=" + std::to_string(t.emptyPolls.load()) +
-            " | " + timing("rx_cycle", core.videoReceiveCycleCount, core.videoReceiveCycleTotalUs, core.videoReceiveCycleMaxUs) +
-            " " + timing("rx_wait", core.videoReceiveCycleCount, core.videoReceiveWaitTotalUs, core.videoReceiveWaitMaxUs) +
-            " " + timing("rx_work", core.videoReceiveCycleCount, core.videoReceiveWorkTotalUs, core.videoReceiveWorkMaxUs) +
-            " " + timing("rx_loop_gap", core.videoReceiveLoopGapCount, core.videoReceiveLoopGapTotalUs, core.videoReceiveLoopGapMaxUs) +
-            " " + timing("rx_alloc", core.videoReceiveAllocationCount, core.videoReceiveAllocationTotalUs, core.videoReceiveAllocationMaxUs) +
-            " " + timing("rx_decrypt", core.videoReceiveDecryptCount, core.videoReceiveDecryptTotalUs, core.videoReceiveDecryptMaxUs) +
-            " rx_invalid_times=" + std::to_string(core.videoReceiveTimingInvalidTimes) +
-            " | rcvbuf(requested,selected,actual)=" + std::to_string(core.videoReceiveBufferRequestedBytes) + "," +
-            std::to_string(core.videoReceiveBufferSelectedBytes) + "," + std::to_string(core.videoReceiveBufferActualBytes) +
-            " set_failures=" + std::to_string(core.videoReceiveBufferSetFailures) +
-            " last_set_error=" + std::to_string(core.videoReceiveBufferSetLastError) +
-            " query_ok=" + std::to_string(core.videoReceiveBufferQuerySucceeded) +
-            " query_error=" + std::to_string(core.videoReceiveBufferQueryError);
+        return stream::telemetry::transportText(captureTelemetry(stream::telemetry::Capture::Transport));
     }
     std::string videoDiagnostics() const override {
         const auto& t = state_->trace;
@@ -790,6 +967,7 @@ public:
     bool waitingForVideoKeyframe() const override {
         return state_->assemblyWaiting || state_->decoderWaiting;
     }
+    bool supportsInputSuspension() const noexcept override { return true; }
     stream::InputSuspension inputSuspension() const override {
         const auto core = coreSnapshot();
         const auto last = state_->lastVideoMs.load();
@@ -811,8 +989,7 @@ public:
     }
     void setDecoderWaitingForKeyframe(bool waiting) override { state_->decoderWaiting = waiting; }
     std::string inputLatencyDiagnostics() const override {
-        return "provider=FH scope=rolling-5s boundary=pad-to-send-return accepted-only=1 " +
-            inputLatency_.text(fog::metrics::steadyNowUs());
+        return stream::telemetry::inputText(captureTelemetry(stream::telemetry::Capture::Input));
     }
     bool sendGamepad(const stream::Gamepad& gamepad) override {
         std::lock_guard<std::mutex> lock(state_->apiMutex);
@@ -862,6 +1039,7 @@ private:
     stream::ControllerProfile profile_ = stream::ControllerProfile::Xbox;
     std::array<std::uint64_t, 2> lastMotionMs_{};
     fog::metrics::LatencyHistogram inputLatency_; // Application thread only.
+    mutable std::uint64_t telemetrySequence_ = 0; // Application-owner capture only.
     bool resumeOnly_ = false;
     std::thread worker_;
     bool retryIdentityValid() const {
@@ -876,6 +1054,18 @@ private:
         FogMoonlightDiagnostics result{};
         if (state_->coreDiagnosticsReady) FogMoonlightGetDiagnostics(&result);
         return result;
+    }
+    FogMoonlightDiagnostics encryptionSnapshot() const {
+        if (state_->running && state_->coreDiagnosticsReady) return coreSnapshot();
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        return state_->encryptionResult;
+    }
+    void captureEncryption() {
+        FogMoonlightDiagnostics result{};
+        FogMoonlightGetDiagnostics(&result);
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->encryptionResult = result;
+        state_->telemetryCoreClockUs=LiGetMicroseconds();state_->telemetryCoreSteadyUs=fog::metrics::steadyNowUs();
     }
     bool accepted(int result) { if (result == 0) { ++state_->inputAccepted; return true; } return rejected(); }
     bool rejected() { ++state_->inputRejected; return false; }
@@ -960,7 +1150,11 @@ private:
                     }
                 }
                 int result = -1;
-                if (state_->starting) result = LiStartConnection(&state_->host.serverInfo, &state_->config, &listeners, &video, &audio, nullptr, 0, nullptr, 0);
+                if (state_->starting) {
+                    result = LiStartConnection(&state_->host.serverInfo, &state_->config, &listeners, &video, &audio, nullptr, 0, nullptr, 0);
+                    captureEncryption();
+                    {std::lock_guard<std::mutex> consumer(coreEventsMutex);state_->coreEventsReadable=true;}
+                }
                 { std::lock_guard<std::mutex> lock(state_->apiMutex); state_->starting = false; }
                 if (result != 0) {
                     if (!state_->stop) state_->fail("Moonlight connection failed", result,
@@ -977,7 +1171,8 @@ private:
                     state_->mediaSignals->notifyAll();
                     state_->status(("Moonlight stream active: 720p" + std::to_string(settings_.framesPerSecond)).c_str());
                     while (!state_->stop && !state_->failed && !state_->terminated) {
-                        drainCoreEvents();
+                        captureEncryption();
+                        drainCoreEvents(*state_);
                         // Journaling remains live even during an indefinite core
                         // frame wait. This is a sparse diagnostic deadline, not
                         // a video/audio readiness poll.
@@ -1011,11 +1206,12 @@ private:
             LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MOUSE_RIGHT);
             for (short key : {short(0x0d), short(0x08), short(0x09), short(0x1b)}) LiSendKeyboardEvent(key, KEY_ACTION_UP, 0);
             LiStopConnection();
+            captureEncryption();
             state_->transportClosedMs = nowMs();
         }
         active = nullptr;
         state_->rumble.clear();
-        drainCoreEvents();
+        drainCoreEvents(*state_);
         { std::lock_guard<std::mutex> lock(state_->mutex); state_->workerFinished = true; }
         state_->changed.notify_all();
     }

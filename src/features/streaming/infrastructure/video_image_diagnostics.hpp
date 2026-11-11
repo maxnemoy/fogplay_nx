@@ -13,7 +13,7 @@ struct VideoImageSample {
     std::uint64_t fingerprint = 14695981039346656037ULL;
     bool nearBlack() const { return points && darkPoints == points && chromaDeviation <= 8; }
 
-    static VideoImageSample inspect(const unsigned char* pixels, std::size_t size, int w, int h) {
+    static VideoImageSample inspect(const unsigned char* pixels, std::size_t size, int w, int h, bool nv12 = false) {
         VideoImageSample sample;
         if (!pixels || w <= 0 || h <= 0 || w > 1920 || h > 1080) return sample;
         const auto lumaSize = static_cast<std::size_t>(w) * h;
@@ -35,12 +35,14 @@ struct VideoImageSample {
                 sum += value;
                 ++sample.points;
                 if (value <= 24) ++sample.darkPoints;
-                for (const unsigned component : {value, unsigned(u[uv]), unsigned(v[uv])}) {
+                const unsigned uc = nv12 ? u[2 * uv] : u[uv];
+                const unsigned vc = nv12 ? u[2 * uv + 1] : v[uv];
+                for (const unsigned component : {value, uc, vc}) {
                     sample.fingerprint ^= component;
                     sample.fingerprint *= 1099511628211ULL;
                 }
-                const unsigned ud = u[uv] > 128 ? u[uv] - 128 : 128 - u[uv];
-                const unsigned vd = v[uv] > 128 ? v[uv] - 128 : 128 - v[uv];
+                const unsigned ud = uc > 128 ? uc - 128 : 128 - uc;
+                const unsigned vd = vc > 128 ? vc - 128 : 128 - vc;
                 sample.chromaDeviation = std::max(sample.chromaDeviation, std::max(ud, vd));
             }
         }

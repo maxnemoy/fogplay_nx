@@ -1,6 +1,8 @@
 #include "core/constants/error_text.hpp"
 #include "core/constants/stage1_options.hpp"
 #include "features/streaming/infrastructure/media.hpp"
+#include "features/streaming/application/media_diagnostics_formatter.hpp"
+#include "features/streaming/infrastructure/media_telemetry_cache.hpp"
 #include "features/streaming/domain/media_annexb.hpp"
 #include "features/streaming/domain/video_limits.hpp"
 #include "features/streaming/domain/audio_queue_metrics.hpp"
@@ -9,9 +11,11 @@
 #include "features/streaming/domain/frame_cadence.hpp"
 #include "features/streaming/infrastructure/media_decoder_diagnostics.hpp"
 #include "features/streaming/infrastructure/media_frame_queue.hpp"
+#include "features/streaming/infrastructure/media_experiments.hpp"
 #include "features/streaming/infrastructure/video_image_diagnostics.hpp"
 #include "features/streaming/infrastructure/video_watchdog.hpp"
 #include "core/diagnostics/thread_observation.hpp"
+#include "core/diagnostics/stage_distribution.hpp"
 #include <SDL.h>
 #include <opus/opus.h>
 extern "C" {
@@ -37,7 +41,23 @@ extern "C" {
 #include <thread>
 
 namespace fog {
+namespace mt = media::telemetry;
 namespace {
+mt::FormatNames mediaFormatNames(false);
+std::once_flag mediaFormatNamesOnce;
+std::atomic<std::uint64_t> mediaDiagnosticInstances{0};
+void initializeMediaFormatNames() {
+    static_assert(static_cast<std::size_t>(AV_PIX_FMT_NB) <= mt::FormatNames::PixelCapacity);
+    std::call_once(mediaFormatNamesOnce, [] {
+        for (int format = 0; format < AV_PIX_FMT_NB; ++format)
+            if (const auto* name = av_get_pix_fmt_name(static_cast<AVPixelFormat>(format)))
+                mediaFormatNames.setPixel(static_cast<std::size_t>(format),name);
+        mediaFormatNames.publish();
+    });
+}
+std::uint64_t telemetryTimeUs(std::chrono::steady_clock::time_point value = std::chrono::steady_clock::now()) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(value.time_since_epoch()).count());
+}
 detail::DecoderDiagnosticCapture hardwareDiagnostics;
 std::mutex callbackLifecycleMutex;
 unsigned callbackUsers = 0;
@@ -67,6 +87,28 @@ struct StageTiming {
         while (previous < us && !maximum.compare_exchange_weak(previous, us)) {}
     }
     std::uint64_t average() const { const auto count = calls.load(); return count ? total.load() / count : 0; }
+    mt::Timing snapshot() const { return {calls.load(),total.load(),maximum.load()}; }
+};
+mt::StageDistributionValue distributionValue(const metrics::StageDistributionSnapshot& source) noexcept {
+    auto availability=mt::StageAvailability::NotCollected;
+    switch(source.availability) {
+        case metrics::DistributionAvailability::NotCollected:break;
+        case metrics::DistributionAvailability::InstrumentationDisabled:availability=mt::StageAvailability::InstrumentationDisabled;break;
+        case metrics::DistributionAvailability::Available:availability=mt::StageAvailability::Available;break;
+    }
+    return {availability,source.capturedAtSteadyUs,source.samples,source.p50Us,source.p95Us,source.p99Us,source.overflowLifetime};
+}
+// Each instance has one serialized owner: decoder/UI sync or UI upload.
+// Worker readers receive only its published scalar distribution snapshot.
+struct ProfileStageTiming : StageTiming {
+    metrics::StageDistribution<> distribution;
+    void record(DecoderClock::time_point start) {
+        const auto end = DecoderClock::now();
+        const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+        recordValue(elapsed);
+        if constexpr (metrics::collects(metrics::DiagnosticClass::StageDistribution))
+            distribution.record(elapsed, telemetryTimeUs(end));
+    }
 };
 struct WorkScope {
     StageTiming& timing;
@@ -79,6 +121,7 @@ struct FrameCompletionScope {
     ~FrameCompletionScope() { if (completion) completion->complete(decoded); }
 };
 }
+const mt::FormatNames& media::telemetry::processFormatNames() noexcept { return mediaFormatNames; }
 struct Media::Impl {
     SDL_Renderer* renderer;
     detail::VideoWatchdog watchdog;
@@ -89,9 +132,18 @@ struct Media::Impl {
     }
     Flight::Metadata presentationMetadata() const {
         return {textureWidth.load(), textureHeight.load(), static_cast<int>(videoCodec.load()),
-            AV_PIX_FMT_YUV420P, textureWidth.load(), 0, 0, uploadedFrames.load()};
+            textureFormat == SDL_PIXELFORMAT_NV12 ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P,
+            textureWidth.load(), 0, 0, uploadedFrames.load()};
     }
     SDL_Texture* texture = nullptr;
+    SDL_Texture* spareTexture = nullptr;
+    int spareWidth = 0, spareHeight = 0;
+    Uint32 textureFormat = SDL_PIXELFORMAT_IYUV, spareFormat = SDL_PIXELFORMAT_IYUV;
+    bool nv12UploadAvailable = FOGPLAY_MEDIA_NV12 != 0 && SDL_VERSION_ATLEAST(2, 0, 16);
+    std::uint64_t nv12Fallbacks = 0;
+    std::vector<unsigned char> fallbackPixels;
+    std::shared_ptr<detail::MediaCpuBufferPool> cpuPool = FOGPLAY_MEDIA_CPU_POOL
+        ? std::make_shared<detail::MediaCpuBufferPool>() : nullptr;
     SDL_AudioDeviceID audioDevice = 0;
     AVCodecContext* decoder = nullptr;
     AVFrame* frame = nullptr;
@@ -116,6 +168,7 @@ struct Media::Impl {
     std::int64_t nextFrameToken = 0;
     std::atomic<std::uint64_t> originMisses{0};
     detail::VideoImageDiagnostics image;
+    detail::MediaPixelFormat imagePixelFormat = detail::MediaPixelFormat::Iyuv;
     StageTiming imageTiming;
     DecoderClock::time_point imageUploadedAt{}, imageDrawnAt{}, imagePresentedAt{};
     std::uint64_t imageDraws = 0, imageEmptyDraws = 0;
@@ -125,6 +178,12 @@ struct Media::Impl {
     std::atomic<std::uint64_t> frames{0}, packets{0};
     detail::AudioQueueMetrics audioMetrics;
     std::uint64_t audioDiscardedPackets = 0, audioDiscardedFrames = 0;
+    std::uint64_t audioDecodedFrames = 0, audioAdmittedFrames = 0, audioFailedFrames = 0;
+    std::uint64_t audioFirstPcmAtUs = 0, audioLastPcmAtUs = 0;
+    std::uint64_t audioLatencyClears = 0, audioRecoveryClears = 0;
+    std::uint64_t audioClearBeforeBytes = 0, audioClearAfterBytes = 0, audioClearAtUs = 0;
+    mt::AudioClearReason audioLastClearReason = mt::AudioClearReason::None;
+    std::uint32_t audioOutputRate = 0, audioOutputChannels = 0, audioOutputBytesPerFrame = 0;
     std::uint64_t audioStalePackets = 0, audioOverflowPackets = 0, audioCatchups = 0;
     bool audioCatchingUp = false;
     // Experimental opt-in only until external A/V comparison is recorded.
@@ -146,7 +205,7 @@ struct Media::Impl {
     std::uint64_t packetNalTypes = 0;
     std::atomic<::stream::VideoCodec> videoCodec;
     detail::VideoParameters parameters;
-    StageTiming sendTiming, receiveTiming, transferTiming, scaleTiming, uploadTiming;
+    ProfileStageTiming sendTiming, receiveTiming, transferTiming, scaleTiming, uploadTiming;
     StageTiming videoQueueWait, audioQueueWait;
     StageTiming workerDecodeTiming, workerConvertTiming;
     std::atomic<std::uint64_t> loadGeneration{0};
@@ -162,13 +221,21 @@ struct Media::Impl {
     std::atomic<std::uint64_t> epoch{0}, transportGeneration{0};
     std::atomic<std::uint64_t> underruns{0}, audioResets{0};
     std::thread videoWorker, audioWorker;
-    std::mutex readyMutex, errorMutex, snapshotMutex;
+    std::mutex readyMutex, errorMutex;
     std::shared_ptr<::stream::MediaSignals> signals;
-    ::stream::StreamingClient* workerClient = nullptr; // Joined before client teardown.
+    ::stream::CompressedMediaSource* workerClient = nullptr; // Joined before client teardown.
     bool boundedWorkerAudio = true;
-    detail::MediaFrameQueue readyFrames;
+    detail::MediaFrameQueue readyFrames{FOGPLAY_MEDIA_READY_DEPTH == 1
+        ? detail::MediaFrameQueue::Mode::Latest : detail::MediaFrameQueue::Mode::Smooth};
     std::deque<Media::WorkerError> errors;
-    std::string videoSnapshot, audioSnapshot;
+    detail::MediaTelemetryCache diagnosticCache;
+    std::uint64_t diagnosticInstance=0;
+    std::uint64_t videoDiagnosticRevision=0,audioDiagnosticRevision=0,diagnosticEpoch=0;
+    std::uint64_t diagnosticLoadGeneration=0,diagnosticWorkerRun=0,diagnosticSourceGeneration=0;
+    std::atomic<std::uint64_t> workerRun{0};
+    bool diagnosticSourceGenerationKnown=false;
+    std::uint32_t observedAudioBytes=0;
+    std::uint64_t audioObservedAtUs=0;
     int workerFps = 30;
     // Switch's display is 60 Hz. Enable only for its active GLES VSYNC path;
     // software/unpaced renderers and 30 FPS retain the timed queue policy.
@@ -184,23 +251,83 @@ struct Media::Impl {
             throw std::logic_error("Media presentation/lifecycle requires application thread");
     }
     DecoderClock::time_point nextVideoSnapshot{}, nextAudioSnapshot{};
-    void publishVideo(bool force = false) {
+    mt::VideoOwner videoOwnerSnapshot(mt::Availability availability = mt::Availability::Available) const {
+        mt::VideoOwner value;
+        value.source.capturedAtUs=telemetryTimeUs();
+        value.source.revision=videoDiagnosticRevision; value.source.epoch=diagnosticEpoch;
+        value.source.epochKnown=true;
+        value.source.sourceGeneration=diagnosticSourceGeneration; value.source.loadGeneration=diagnosticLoadGeneration;
+        value.source.workerRun=diagnosticWorkerRun; value.source.availability=availability;
+        value.source.sourceGenerationKnown=diagnosticSourceGenerationKnown;
+        value.source.loadGenerationKnown=diagnosticWorkerRun!=0;
+        value.workerOwned=workers.load();
+        value.codec=decoder&&decoder->codec ? (videoCodec==::stream::VideoCodec::H265?mt::Codec::Hevc:mt::Codec::H264) : mt::Codec::None;
+        value.codecId=decoder?decoder->codec_id:0;
+        value.pixelFormat=decoder?decoder->pix_fmt:AV_PIX_FMT_NONE;
+        value.framePixelFormat=lastFrameFormat;value.cpuPixelFormat=lastCpuFormat;
+        value.colorspace=lastColorspace;value.range=lastRange;value.trc=lastTrc;value.primaries=lastPrimaries;
+        value.threads=decoder?decoder->thread_count:0;value.threadRequested=decoder?decoder->thread_type:0;
+        value.threadActive=decoder?decoder->active_thread_type:0;
+        value.stages={sendTiming.snapshot(),receiveTiming.snapshot(),transferTiming.snapshot(),scaleTiming.snapshot()};
+        value.distributions={distributionValue(sendTiming.distribution.snapshot(value.source.capturedAtUs)), distributionValue(receiveTiming.distribution.snapshot(value.source.capturedAtUs)),
+            distributionValue(transferTiming.distribution.snapshot(value.source.capturedAtUs)), distributionValue(scaleTiming.distribution.snapshot(value.source.capturedAtUs))};
+        const auto hardware=hardwareDiagnostics.snapshot(decoder);
+        value.hardware={hardware.events,hardware.error,hardware.badBlocks,hardware.goodBlocks,hardware.cycles,hardware.headerError,
+            hardware.waitCode,hardware.hasStatus,hardware.events>hardwareEventsBeforePacket};
+        value.pending=pending;
+        value.awaitingIdr=awaitingIdr;
+        value.pendingSinceUs=pending?telemetryTimeUs(pendingSince):0;
+        value.pendingAgeUs=pending?telemetryTimeUs()-value.pendingSinceUs:0;
+        value.source.publishedAtUs=telemetryTimeUs();
+        return value;
+    }
+    mt::AudioOwner audioOwnerSnapshot(mt::Availability availability = mt::Availability::Available) const {
+        mt::AudioOwner value;
+        value.source.capturedAtUs=telemetryTimeUs();value.source.revision=audioDiagnosticRevision;
+        value.source.workerRun=workerRun.load();value.source.availability=availability;
+        value.packets=packets.load();value.queuedBytes=observedAudioBytes;value.maximumBytes=audioMetrics.maximumBytes;
+        value.emptyObservations=audioMetrics.emptyObservations;value.prolongedEmptyObservations=audioMetrics.prolongedEmptyObservations;
+        value.resets=audioMetrics.resets;value.discardedBytes=audioMetrics.discardedBytes;
+        value.queueWait=audioQueueWait.snapshot();
+        value.pcmDiscardedPackets=audioDiscardedPackets;value.pcmDiscardedFrames=audioDiscardedFrames;
+        value.stalePackets=audioStalePackets;value.overflowPackets=audioOverflowPackets;value.catchups=audioCatchups;
+        value.badPackets=audioBadPackets;value.decoderErrors=audioDecoderErrors;value.outputErrors=audioOutputErrors;
+        value.recoveryAttempts=audioRecoveryAttempts;value.recoveryFailures=audioRecoveryFailures;
+        value.recoveryDiscardedPackets=audioRecoveryDiscardedPackets;value.recoveryPending=audioResetNeeded;
+        value.boundedSync=boundedSyncAudio;value.lastFloorBytes=audioMetrics.lastFloorBytes;
+        value.maximumFloorBytes=audioMetrics.maximumFloorBytes;value.floorWindows=audioMetrics.floorWindows;
+        value.elevatedFloorWindows=audioMetrics.elevatedFloorWindows;
+        value.decodedPcmFrames=audioDecodedFrames;value.admittedPcmFrames=audioAdmittedFrames;value.failedPcmFrames=audioFailedFrames;
+        value.firstPcmAtUs=audioFirstPcmAtUs;value.lastPcmAtUs=audioLastPcmAtUs;
+        value.latencyClears=audioLatencyClears;value.recoveryClears=audioRecoveryClears;
+        value.clearBeforeBytes=audioClearBeforeBytes;value.clearAfterBytes=audioClearAfterBytes;value.clearAtUs=audioClearAtUs;
+        value.lastClearReason=audioLastClearReason;value.outputSampleRate=audioOutputRate;
+        value.outputChannels=audioOutputChannels;value.outputBytesPerFrame=audioOutputBytesPerFrame;
+        value.boundedWorker=workers.load() && boundedWorkerAudio;
+        value.queueObservedAtUs=audioObservedAtUs;value.queueKnown=audioObservedAtUs!=0;
+        value.source.publishedAtUs=telemetryTimeUs();
+        return value;
+    }
+    void publishVideo(bool force = false,mt::Availability availability = mt::Availability::Available) {
         const auto now = DecoderClock::now();
         if (fog::stage1::sparseDiagnostics && !force && now < nextVideoSnapshot) return;
         nextVideoSnapshot = now + std::chrono::seconds(1);
-        auto text = diagnostics();
-        std::lock_guard<std::mutex> lock(snapshotMutex);
-        videoSnapshot = std::move(text);
+        ++videoDiagnosticRevision;
+        diagnosticCache.publish(videoOwnerSnapshot(availability));
     }
-    void publishAudio(bool force = false) {
+    void publishAudio(bool force = false,bool observe = true,mt::Availability availability = mt::Availability::Available) {
         const auto now = DecoderClock::now();
         if (fog::stage1::sparseDiagnostics && !force && now < nextAudioSnapshot) return;
         nextAudioSnapshot = now + std::chrono::seconds(1);
-        auto text = audioDiagnostics();
+        if(observe)observeAudioQueue();
+        ++audioDiagnosticRevision;
+        diagnosticCache.publish(audioOwnerSnapshot(availability));
         underruns = audioMetrics.prolongedEmptyObservations;
         audioResets = audioMetrics.resets;
-        std::lock_guard<std::mutex> lock(snapshotMutex);
-        audioSnapshot = std::move(text);
+    }
+    void syncDiagnosticOperation() {
+        diagnosticEpoch=epoch.load();diagnosticLoadGeneration=diagnosticWorkerRun=diagnosticSourceGeneration=0;
+        diagnosticSourceGenerationKnown=false;
     }
     void discardReady() {
         std::lock_guard<std::mutex> lock(readyMutex);
@@ -218,6 +345,12 @@ struct Media::Impl {
         try {
             Media::WorkerError event;
             event.error = std::current_exception();
+            try { if (event.error) std::rethrow_exception(event.error); }
+            catch (const VideoDecodeError& error) { event.category=mt::ErrorCategory::VideoDecode; event.code=error.code(); event.recoverable=error.recoverable(); }
+            catch (const AudioPlaybackError&) { event.category=mt::ErrorCategory::AudioPlayback; }
+            catch (const std::bad_alloc&) { event.category=mt::ErrorCategory::Allocation; }
+            catch (const std::logic_error&) { event.category=mt::ErrorCategory::Logic; }
+            catch (...) {}
             if (failed) { event.packet = *failed; event.hasPacket = true; }
             std::lock_guard<std::mutex> lock(errorMutex);
             errors.push_back(std::move(event));
@@ -232,10 +365,11 @@ struct Media::Impl {
         std::uint64_t firstPacketMs = 0, std::uint64_t enqueueMs = 0);
     void decodeAudio(const std::byte* data, std::size_t size, std::uint64_t enqueueMs = 0);
     bool recoverAudio(DecoderClock::time_point now);
+    void clearAudioQueue(mt::AudioClearReason reason);
     void resetVideo();
     void changeCodec(::stream::VideoCodec codec);
-    void runVideo(::stream::StreamingClient& client) noexcept;
-    void runAudio(::stream::StreamingClient& client) noexcept;
+    void runVideo(::stream::CompressedMediaSource& client) noexcept;
+    void runAudio(::stream::CompressedMediaSource& client) noexcept;
     explicit Impl(SDL_Renderer* value, ::stream::VideoCodec codec = ::stream::VideoCodec::H264,
         bool deferred = false)
         : renderer(value), deferredPresentation(deferred), videoCodec(codec), parameters(codec) {}
@@ -261,6 +395,7 @@ struct Media::Impl {
             Flight::Scope scope(watchdog.presentation, Flight::Stage::TextureRelease, presentationMetadata());
             SDL_DestroyTexture(texture);
         }
+        if (spareTexture) SDL_DestroyTexture(spareTexture);
         if (opus) opus_decoder_destroy(opus);
         releaseVideo();
         if (ownsCallback) releaseDecoderLogging();
@@ -296,82 +431,18 @@ struct Media::Impl {
         throw VideoDecodeError(code, recoverable, message.data());
     }
     std::string diagnostics() const {
-        const auto status = hardwareDiagnostics.snapshot(decoder);
-        const char* pixel = decoder ? av_get_pix_fmt_name(decoder->pix_fmt) : nullptr;
-        const char* actual = av_get_pix_fmt_name(static_cast<AVPixelFormat>(lastFrameFormat));
-        const char* cpu = av_get_pix_fmt_name(static_cast<AVPixelFormat>(lastCpuFormat));
-        std::array<char, 1792> text{};
-        std::snprintf(text.data(), text.size(),
-            "decoder codec=%s codec_id=%d pixfmt=%s frame_pixfmt=%s cpu_pixfmt=%s frame_colorspace=%d frame_color_range=%d frame_color_trc=%d frame_color_primaries=%d threads=%d thread_requested=%d thread_active=%d "
-            "send_calls=%llu send_avg_us=%llu send_max_us=%llu receive_calls=%llu receive_avg_us=%llu receive_max_us=%llu "
-            "transfer_calls=%llu transfer_avg_us=%llu transfer_max_us=%llu scale_calls=%llu scale_avg_us=%llu scale_max_us=%llu "
-            "upload_calls=%llu upload_avg_us=%llu upload_max_us=%llu "
-            "decoded_frames=%llu uploaded_frames=%llu presented_frames=%llu superseded_frames=%llu pending_frames=%d pending_frame_age_us=%llu "
-            "nv_events=%llu nv_status=%d nv_fresh=%d nv_error=0x%08x nv_mbs_error=%u nv_mbs_ok=%u nv_cycles_raw=%u nv_header_error=0x%08x nv_wait_code=%d",
-            decoder && decoder->codec ? decoder->codec->name : "none", decoder ? decoder->codec_id : 0,
-            pixel ? pixel : "none", actual ? actual : "none", cpu ? cpu : "none",
-            lastColorspace, lastRange, lastTrc, lastPrimaries,
-            decoder ? decoder->thread_count : 0, decoder ? decoder->thread_type : 0, decoder ? decoder->active_thread_type : 0,
-            static_cast<unsigned long long>(sendTiming.calls), static_cast<unsigned long long>(sendTiming.average()), static_cast<unsigned long long>(sendTiming.maximum),
-            static_cast<unsigned long long>(receiveTiming.calls), static_cast<unsigned long long>(receiveTiming.average()), static_cast<unsigned long long>(receiveTiming.maximum),
-            static_cast<unsigned long long>(transferTiming.calls), static_cast<unsigned long long>(transferTiming.average()), static_cast<unsigned long long>(transferTiming.maximum),
-            static_cast<unsigned long long>(scaleTiming.calls), static_cast<unsigned long long>(scaleTiming.average()), static_cast<unsigned long long>(scaleTiming.maximum),
-            static_cast<unsigned long long>(uploadTiming.calls), static_cast<unsigned long long>(uploadTiming.average()), static_cast<unsigned long long>(uploadTiming.maximum),
-            static_cast<unsigned long long>(frames), static_cast<unsigned long long>(uploadedFrames),
-            static_cast<unsigned long long>(presentedFrames), static_cast<unsigned long long>(supersededFrames), pending ? 1 : 0,
-            pending ? static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::microseconds>(
-                DecoderClock::now() - pendingSince).count()) : 0ULL,
-            static_cast<unsigned long long>(status.events), status.hasStatus ? 1 : 0,
-            status.events > hardwareEventsBeforePacket ? 1 : 0, status.error, status.badBlocks, status.goodBlocks,
-            status.cycles, status.headerError, status.waitCode);
-        return text.data();
+        mt::Snapshot value;value.captured=mt::Capture::Video;value.capturedAtUs=telemetryTimeUs();
+        value.video=videoOwnerSnapshot();
+        value.presentation.decoded=frames.load();value.presentation.uploaded=uploadedFrames.load();
+        value.presentation.presented=presentedFrames.load();value.presentation.superseded=supersededFrames.load();
+        value.presentation.upload=uploadTiming.snapshot();value.presentation.workers=workers.load();
+        return mt::formatDecoder(value,mediaFormatNames);
     }
     std::uint32_t observeAudioQueue() {
         const auto bytes = audioDevice ? SDL_GetQueuedAudioSize(audioDevice) : 0;
-        audioMetrics.observe(bytes, DecoderClock::now());
+        const auto now=DecoderClock::now();
+        audioMetrics.observe(bytes,now);observedAudioBytes=bytes;audioObservedAtUs=telemetryTimeUs(now);
         return bytes;
-    }
-    std::string audioDiagnostics() {
-        const auto bytes = observeAudioQueue();
-        std::array<char, 1792> text{};
-        std::snprintf(text.data(), text.size(),
-            "audio_packets=%llu audio_queued_ms=%llu audio_max_queued_ms=%llu "
-            "audio_empty_observations=%llu audio_prolonged_empty_observations=%llu audio_empty_threshold_ms=40 "
-            "audio_queue_resets=%llu audio_reset_discarded_ms=%llu "
-            "audio_worker_queue_samples=%llu audio_worker_queue_wait_avg_us=%llu audio_worker_queue_wait_max_us=%llu "
-            "audio_pcm_discarded_packets=%llu audio_pcm_discarded_ms=%llu audio_stale_packets=%llu "
-            "audio_overflow_packets=%llu audio_catchups=%llu audio_worker_refill_ms=40 audio_worker_max_ms=80 audio_worker_stale_ms=60 "
-            "audio_bad_packets=%llu audio_decoder_errors=%llu audio_output_errors=%llu audio_recovery_attempts=%llu "
-            "audio_recovery_failures=%llu audio_recovery_discarded_packets=%llu audio_recovery_pending=%d audio_recovery_limit=3/60s audio_recovery_deadline_ms=10000 audio_sync_bounded=%d "
-            "audio_floor_last_ms=%llu audio_floor_max_ms=%llu audio_floor_windows=%llu audio_floor_elevated_windows=%llu "
-            "audio_floor_window_ms=10000 audio_floor_elevated_ms=100",
-            static_cast<unsigned long long>(packets),
-            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(bytes)),
-            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.maximumBytes)),
-            static_cast<unsigned long long>(audioMetrics.emptyObservations),
-            static_cast<unsigned long long>(audioMetrics.prolongedEmptyObservations),
-            static_cast<unsigned long long>(audioMetrics.resets),
-            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.discardedBytes)),
-            static_cast<unsigned long long>(audioQueueWait.calls),
-            static_cast<unsigned long long>(audioQueueWait.average()),
-            static_cast<unsigned long long>(audioQueueWait.maximum),
-            static_cast<unsigned long long>(audioDiscardedPackets),
-            static_cast<unsigned long long>(audioDiscardedFrames * 1000 / detail::AudioLatencyPolicy::sampleRate),
-            static_cast<unsigned long long>(audioStalePackets),
-            static_cast<unsigned long long>(audioOverflowPackets),
-            static_cast<unsigned long long>(audioCatchups),
-            static_cast<unsigned long long>(audioBadPackets),
-            static_cast<unsigned long long>(audioDecoderErrors),
-            static_cast<unsigned long long>(audioOutputErrors),
-            static_cast<unsigned long long>(audioRecoveryAttempts),
-            static_cast<unsigned long long>(audioRecoveryFailures),
-            static_cast<unsigned long long>(audioRecoveryDiscardedPackets), audioResetNeeded ? 1 : 0,
-            boundedSyncAudio ? 1 : 0,
-            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.lastFloorBytes)),
-            static_cast<unsigned long long>(detail::AudioQueueMetrics::milliseconds(audioMetrics.maximumFloorBytes)),
-            static_cast<unsigned long long>(audioMetrics.floorWindows),
-            static_cast<unsigned long long>(audioMetrics.elevatedFloorWindows));
-        return text.data();
     }
     int sendPacket() {
         const auto start = DecoderClock::now();
@@ -433,6 +504,9 @@ struct Media::Impl {
         wanted.freq = 48000; wanted.format = AUDIO_S16SYS; wanted.channels = 2; wanted.samples = 960;
         audioDevice = SDL_OpenAudioDevice(nullptr, 0, &wanted, &obtained, 0);
         if (!audioDevice) throw std::runtime_error(fog::constants::error::Stream::CannotOpenAudioOutput);
+        audioOutputRate = static_cast<std::uint32_t>(obtained.freq);
+        audioOutputChannels = obtained.channels;
+        audioOutputBytesPerFrame = obtained.channels * SDL_AUDIO_BITSIZE(obtained.format) / 8;
         SDL_PauseAudioDevice(audioDevice, 0);
     }
     void receive() {
@@ -474,7 +548,10 @@ struct Media::Impl {
         requireVideo();
         detail::MediaFrameQueue::Frame output;
         output.origin = pendingOrigin;
-        output.pixels.swap(pixels);
+        if (workers && cpuPool) {
+            output.pool = cpuPool;
+            output.pixels = cpuPool->acquire();
+        } else output.pixels.swap(pixels);
         AVFrame* decoded = pendingFrame;
         if (pendingFrame->hw_frames_ctx) {
             Flight::Scope releaseFlight(watchdog.decoder, Flight::Stage::FrameRelease, decoderMetadata());
@@ -492,7 +569,25 @@ struct Media::Impl {
         const int w = decoded->width, h = decoded->height;
         if (w < 1 || h < 1 || w > 1920 || h > 1080)
             throw std::runtime_error(fog::constants::error::Stream::VideoExceedsPrototypeLimit1920x1080);
-        output.pixels.resize(static_cast<std::size_t>(w) * h + 2 * ((w+1)/2) * ((h+1)/2));
+        const auto layout = detail::MediaPixelLayout::make(w, h);
+        // Prevent vector growth doubling from retaining an oversized pooled
+        // allocation after a resolution increase. Each pooled frame stays at
+        // most one prototype-sized image; only two released spares are cached.
+        if (output.pool && output.pixels.capacity() < layout.size)
+            std::vector<unsigned char>(layout.size).swap(output.pixels);
+        else output.pixels.resize(layout.size);
+        output.width = w; output.height = h;
+#if FOGPLAY_MEDIA_NV12
+        if (decoded->format == AV_PIX_FMT_NV12) {
+            // CPU storage owns both planes before the decoder/transfer frame is
+            // released. Never enqueue AVFrame pointers or hardware surfaces.
+            detail::copyMediaPlane(output.pixels.data(), w, decoded->data[0], decoded->linesize[0], w, h);
+            detail::copyMediaPlane(output.pixels.data() + layout.ySize, 2 * layout.chromaWidth,
+                decoded->data[1], decoded->linesize[1], 2 * layout.chromaWidth, layout.chromaHeight);
+            output.format = detail::MediaPixelFormat::Nv12;
+            return output;
+        }
+#endif
         scaler = sws_getCachedContext(scaler, w, h, static_cast<AVPixelFormat>(decoded->format),
             w, h, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
         if (!scaler) throw std::runtime_error(fog::constants::error::Stream::CannotConvertVideoPixelFormat);
@@ -505,7 +600,6 @@ struct Media::Impl {
         scaleFlight.finish();
         scaleTiming.record(scaleStart);
         if (scaled != h) throw std::runtime_error(fog::constants::error::Stream::VideoConversionFailed);
-        output.width = w; output.height = h;
         return output;
     }
     void clearPending() {
@@ -520,39 +614,77 @@ struct Media::Impl {
         metadata.width = output.width; metadata.height = output.height; metadata.stride = output.width;
         Flight::Scope flight(watchdog.presentation, Flight::Stage::TextureUpload, metadata);
         const auto w = output.width, h = output.height;
-        const auto* y = output.pixels.data();
-        const auto* u = y + w*h;
-        const auto* v = u + ((w+1)/2)*((h+1)/2);
+        const auto layout = detail::MediaPixelLayout::make(w, h);
+        if (output.pixels.size() < layout.size) throw std::invalid_argument("Incomplete media CPU pixels");
+        bool useNv12 = output.format == detail::MediaPixelFormat::Nv12 && nv12UploadAvailable;
+#if !SDL_VERSION_ATLEAST(2, 0, 16)
+        useNv12 = false;
+#endif
+        if (useNv12 && uploadPixels(output, layout, true)) return uploaded(output);
+        if (useNv12) { nv12UploadAvailable = false; ++nv12Fallbacks; }
+        if (!uploadPixels(output, layout, false))
+            throw std::runtime_error(fog::constants::error::Stream::CannotUpdateVideoTexture);
+        return uploaded(output);
+    }
+    bool uploadPixels(const detail::MediaFrameQueue::Frame& output, const detail::MediaPixelLayout& layout, bool nv12) {
+        const int w = output.width, h = output.height;
+        const unsigned char* y = output.pixels.data();
+        if (!nv12 && output.format == detail::MediaPixelFormat::Nv12) {
+            fallbackPixels.resize(layout.size);
+            detail::mediaNv12ToIyuv(y, fallbackPixels.data(), layout);
+            y = fallbackPixels.data();
+        }
+        const Uint32 format = nv12 ? SDL_PIXELFORMAT_NV12 : SDL_PIXELFORMAT_IYUV;
+        SDL_Texture* previous = FOGPLAY_MEDIA_TEXTURES == 2 ? spareTexture : texture;
+        const int previousWidth = FOGPLAY_MEDIA_TEXTURES == 2 ? spareWidth : textureWidth.load();
+        const int previousHeight = FOGPLAY_MEDIA_TEXTURES == 2 ? spareHeight : textureHeight.load();
+        const Uint32 previousFormat = FOGPLAY_MEDIA_TEXTURES == 2 ? spareFormat : textureFormat;
         // Keep the last good texture until its replacement has been uploaded.
-        const bool replace = !texture || w != textureWidth || h != textureHeight;
+        const bool replace = !previous || w != previousWidth || h != previousHeight || format != previousFormat;
         std::unique_ptr<SDL_Texture, decltype(&SDL_DestroyTexture)> candidate(nullptr, SDL_DestroyTexture);
         if (replace) {
-            candidate.reset(SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, w, h));
+            candidate.reset(SDL_CreateTexture(renderer, format, SDL_TEXTUREACCESS_STREAMING, w, h));
             if (!candidate) {
                 ++imageCreateErrors;
+                if (nv12) return false;
                 throw std::runtime_error(fog::constants::error::Stream::CannotAllocateVideoTexture);
             }
         }
-        SDL_Texture* target = replace ? candidate.get() : texture;
+        SDL_Texture* target = replace ? candidate.get() : previous;
         const auto uploadStart = DecoderClock::now();
-        const int uploaded = SDL_UpdateYUVTexture(target, nullptr, y, w, u, (w+1)/2, v, (w+1)/2);
+        int result = -1;
+#if SDL_VERSION_ATLEAST(2, 0, 16)
+        if (nv12) result = SDL_UpdateNVTexture(target, nullptr, y, w, y + layout.ySize, 2 * layout.chromaWidth);
+        else
+#endif
+        result = SDL_UpdateYUVTexture(target, nullptr, y, w, y + layout.ySize, layout.chromaWidth,
+            y + layout.ySize + layout.chromaSize, layout.chromaWidth);
         uploadTiming.record(uploadStart);
-        if (uploaded != 0) {
+        if (result != 0) {
             ++imageUploadErrors;
-            throw std::runtime_error(fog::constants::error::Stream::CannotUpdateVideoTexture);
+            return false;
         }
         if (replace) {
-            if (texture) SDL_DestroyTexture(texture);
-            texture = candidate.release();
-            textureWidth = w; textureHeight = h;
+            if (previous) SDL_DestroyTexture(previous);
+            target = candidate.release();
         }
+        if (FOGPLAY_MEDIA_TEXTURES == 2) {
+            spareTexture = texture; spareWidth = textureWidth; spareHeight = textureHeight; spareFormat = textureFormat;
+        }
+        texture = target; textureWidth = w; textureHeight = h; textureFormat = format;
+        return true;
+    }
+    bool uploaded(const detail::MediaFrameQueue::Frame& output) {
+        const int w = output.width, h = output.height;
+        imagePixelFormat = output.format;
         // A draw of the preceding texture cannot acknowledge this upload.
         drawnGeneration = 0;
         ++uploadedFrames;
         uploadedOrigin = output.origin;
         imageUploadedAt = DecoderClock::now();
         const auto sampleStart = imageUploadedAt;
-        image.uploaded(detail::VideoImageSample::inspect(output.pixels.data(), output.pixels.size(), w, h), w, h);
+        image.uploaded(detail::VideoImageSample::inspect(output.pixels.data(), output.pixels.size(), w, h,
+            output.format == detail::MediaPixelFormat::Nv12), w, h);
         imageTiming.record(sampleStart);
         return true;
     }
@@ -572,17 +704,25 @@ struct Media::Impl {
 };
 Media::Media(SDL_Renderer* renderer, ::stream::VideoCodec codec, bool deferredPresentation)
     : impl_(std::make_unique<Impl>(renderer, codec, deferredPresentation)) {
+    impl_->diagnosticInstance=++mediaDiagnosticInstances;
     if (codec == ::stream::VideoCodec::H265 && !supportsH265()) throw std::runtime_error(fog::constants::error::Stream::H265HardwareDecoderUnavailable);
     impl_->waiting = impl_->awaitingIdr = codec == ::stream::VideoCodec::H265;
     acquireDecoderLogging();
     impl_->ownsCallback = true;
+    initializeMediaFormatNames();
     impl_->init();
+    impl_->publishVideo(true);impl_->publishAudio(true,false);
 }
 Media::~Media() { stopWorkers(); }
 void Media::setVideoStallReporter(std::function<void(const std::string&)> reporter) {
     impl_->requireApplicationThread();
     if (impl_->workers) throw std::logic_error("Configure video observer before starting workers");
     impl_->watchdog.start(std::move(reporter));
+}
+void Media::setVideoStallObserver(std::function<void(const mt::StallEvent&)> observer) {
+    impl_->requireApplicationThread();
+    if (impl_->workers) throw std::logic_error("Configure video observer before starting workers");
+    impl_->watchdog.startNumeric(std::move(observer));
 }
 void Media::Impl::decodeVideo(const std::byte* data, std::size_t size,
     std::uint64_t firstPacketMs, std::uint64_t enqueueMs) {
@@ -623,9 +763,12 @@ void Media::video(const std::byte* data, std::size_t size,
     std::uint64_t firstPacketMs, std::uint64_t enqueueMs) {
     impl_->requireApplicationThread();
     if (impl_->workers) throw std::logic_error("Media video is owned by worker");
-    impl_->decodeVideo(data, size, firstPacketMs, enqueueMs);
+    impl_->syncDiagnosticOperation();
+    try { impl_->decodeVideo(data, size, firstPacketMs, enqueueMs); }
+    catch (...) { impl_->publishVideo(true);throw; }
+    impl_->publishVideo(true);
 }
-void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
+void Media::Impl::runVideo(::stream::CompressedMediaSource& client) noexcept {
     diagnostics::observeThread("media-video");
     bool paused = false, haveGeneration = false;
     std::uint64_t lastGeneration = 0;
@@ -635,7 +778,10 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
         bool hasPacket = false;
         try {
             if (resetRequested.load()) {
+                diagnosticEpoch=epoch.load();
                 ++loadGeneration;
+                diagnosticLoadGeneration=loadGeneration.load();diagnosticWorkerRun=workerRun.load();
+                diagnosticSourceGenerationKnown=haveGeneration;diagnosticSourceGeneration=haveGeneration?lastGeneration:0;
                 WorkScope work{workerDecodeTiming};
                 resetInProgress = true;
                 resetRequested.exchange(false);
@@ -665,6 +811,7 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
                 throw std::logic_error("Video consumer received non-video packet");
             recordQueueWait(incoming, videoQueueWait);
             const auto decodeEpoch = epoch.load();
+            diagnosticEpoch=decodeEpoch;
             const auto sourceGeneration = client.currentVideoGeneration();
             if (!client.mediaAdmissionAllowed() || (sourceGeneration && incoming.videoGeneration != sourceGeneration)) {
                 discardReady();
@@ -675,6 +822,8 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
             {
                 WorkScope work{workerDecodeTiming};
                 if (!haveGeneration || codecChanged || incoming.videoGeneration != lastGeneration) ++loadGeneration;
+                diagnosticLoadGeneration=loadGeneration.load();diagnosticWorkerRun=workerRun.load();
+                diagnosticSourceGeneration=incoming.videoGeneration;diagnosticSourceGenerationKnown=true;
                 if (codecChanged) { changeCodec(selected); discardReady(); }
                 if (haveGeneration && incoming.videoGeneration != lastGeneration) {
                     if (!codecChanged) resetVideo();
@@ -682,6 +831,7 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
                 }
                 lastGeneration = incoming.videoGeneration;
                 haveGeneration = true;
+                diagnosticSourceGenerationKnown=true;
                 transportGeneration = lastGeneration;
                 decodeVideo(incoming.data.data(), incoming.data.size(), incoming.firstPacketMs, incoming.enqueueMs);
             }
@@ -709,8 +859,9 @@ void Media::Impl::runVideo(::stream::StreamingClient& client) noexcept {
             try { publishVideo(true); } catch (...) {}
         }
     }
+    try { publishVideo(true,mt::Availability::FinalRetained); } catch (...) {}
 }
-void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
+void Media::Impl::runAudio(::stream::CompressedMediaSource& client) noexcept {
     diagnostics::observeThread("media-audio");
     bool paused = false;
     auto nextQueueObservation = DecoderClock::now();
@@ -755,16 +906,20 @@ void Media::Impl::runAudio(::stream::StreamingClient& client) noexcept {
             try { publishAudio(true); } catch (...) {}
         }
     }
+    try { publishAudio(true,false,mt::Availability::FinalRetained); } catch (...) {}
 }
-void Media::startWorkers(::stream::StreamingClient& client, int fps, WorkerPolicy policy) {
+void Media::startWorkers(::stream::CompressedMediaSource& client, int fps, WorkerPolicy policy) {
     auto& m = *impl_;
     m.requireApplicationThread();
     if (m.workers) throw std::logic_error("Media workers already running");
     if (fps < 1 || fps > 120) throw std::invalid_argument("Invalid media worker frame rate");
     m.workerFps = fps;
+    ++m.workerRun;
     m.signals = client.mediaSignals();
     m.workerClient = &client;
-    m.boundedWorkerAudio = policy == WorkerPolicy::FogHub || m.boundedSyncAudio;
+    // Both transports drain compressed audio promptly and shed obsolete PCM
+    // using the same bounded output policy. Synchronous callers retain opt-in.
+    m.boundedWorkerAudio = policy == WorkerPolicy::FogHub || policy == WorkerPolicy::Mts || m.boundedSyncAudio;
     ++m.loadGeneration;
     m.displayPaced = false;
 #ifdef __SWITCH__
@@ -796,14 +951,35 @@ void Media::startWorkers(::stream::StreamingClient& client, int fps, WorkerPolic
 void Media::stopWorkers() noexcept {
     auto& m = *impl_;
     assert(std::this_thread::get_id() == m.applicationThread);
+    const bool hadWorkers=m.workers.load();
     m.stopping = true;
     if (m.workerClient) m.workerClient->wakeMediaWaiters();
     if (m.videoWorker.joinable()) m.videoWorker.join();
     if (m.audioWorker.joinable()) m.audioWorker.join();
+    if(hadWorkers) {
+        const auto last=m.diagnosticCache.snapshot();
+        // Thread creation may have failed before one producer ran. Join before
+        // filling only the missing final cache from the now-exclusive owner.
+        if(last.video.source.availability!=mt::Availability::FinalRetained)m.publishVideo(true,mt::Availability::FinalRetained);
+        if(last.audio.source.availability!=mt::Availability::FinalRetained)m.publishAudio(true,false,mt::Availability::FinalRetained);
+    }
     m.workers = false;
     m.signals.reset();
     m.workerClient = nullptr;
     m.discardReady();
+    if (m.cpuPool) m.cpuPool->clear();
+    // Retain the visible texture as before; only the experimental back texture
+    // can be retired at worker stop. Destruction always stays on the UI thread.
+    if (m.spareTexture) SDL_DestroyTexture(m.spareTexture);
+    m.spareTexture = nullptr; m.spareWidth = m.spareHeight = 0;
+    if(hadWorkers) {
+        try {
+            auto final=captureTelemetry();
+            final.presentation.retainedWorkerHistory=true;
+            final.presentation.configuredFps=m.workerFps;
+            m.diagnosticCache.retainFinal(final);
+        } catch (...) {}
+    }
 }
 bool Media::workersRunning() const { return impl_->workers; }
 bool Media::takeWorkerError(WorkerError& output) {
@@ -879,7 +1055,12 @@ void Media::setPresentationFrameRate(int fps) {
 void Media::setVideoCodec(::stream::VideoCodec codec) {
     auto& m = *impl_;
     m.requireApplicationThread();
-    if (!m.workers) { m.changeCodec(codec); return; }
+    if (!m.workers) {
+        if(codec==m.videoCodec.load())return;
+        m.syncDiagnosticOperation();
+        try {m.changeCodec(codec);}catch(...){m.publishVideo(true);throw;}
+        m.publishVideo(true);return;
+    }
     if (!m.codecRequested && !m.resetRequested && !m.resetInProgress && codec == m.videoCodec.load()) return;
     m.requestedCodec = codec;
     m.codecRequested = true;
@@ -888,10 +1069,28 @@ void Media::setVideoCodec(::stream::VideoCodec codec) {
 void Media::resetVideoDecoder() {
     impl_->requireApplicationThread();
     if (impl_->workers) impl_->requestReset();
-    else impl_->resetVideo();
+    else {
+        impl_->syncDiagnosticOperation();
+        try {impl_->resetVideo();}catch(...){impl_->publishVideo(true);throw;}
+        impl_->publishVideo(true);
+    }
 }
 bool Media::waitingForVideoKeyframe() const {
     return impl_->waiting || (impl_->workers && (impl_->resetRequested || impl_->resetInProgress));
+}
+void Media::Impl::clearAudioQueue(mt::AudioClearReason reason) {
+    const auto before = observeAudioQueue();
+    if (audioDevice) SDL_ClearQueuedAudio(audioDevice);
+    const auto after = audioDevice ? SDL_GetQueuedAudioSize(audioDevice) : 0;
+    const auto observedAt = DecoderClock::now();
+    audioMetrics.cleared(before);
+    audioClearBeforeBytes = before; audioClearAfterBytes = after;
+    audioClearAtUs = telemetryTimeUs(observedAt); audioLastClearReason = reason;
+    if (reason == mt::AudioClearReason::Latency) ++audioLatencyClears;
+    else if (reason == mt::AudioClearReason::Recovery) ++audioRecoveryClears;
+    observedAudioBytes = after; audioObservedAtUs = audioClearAtUs;
+    // before/after are SDL software queue observations around clear, not an
+    // exact played-sample count: the device may drain concurrently.
 }
 bool Media::Impl::recoverAudio(DecoderClock::time_point now) {
     if (audioRecovery.expired(now))
@@ -903,9 +1102,7 @@ bool Media::Impl::recoverAudio(DecoderClock::time_point now) {
     if (decision == AudioRecovery::Attempt::Wait) return false;
     ++audioRecoveryAttempts;
     // Clear queued PCM before reopening output or changing predictive state.
-    const auto queued = observeAudioQueue();
-    if (audioDevice) SDL_ClearQueuedAudio(audioDevice);
-    audioMetrics.cleared(queued);
+    clearAudioQueue(mt::AudioClearReason::Recovery);
     audioCatchingUp = false;
     audioResetAtMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
     int error = 0;
@@ -952,12 +1149,15 @@ void Media::Impl::decodeAudio(const std::byte* data, std::size_t size, std::uint
         if (audioResetNeeded) recoverAudio(now);
         return;
     }
+    const auto decodedAtUs = telemetryTimeUs(DecoderClock::now());
+    if (!audioDecodedFrames) audioFirstPcmAtUs = decodedAtUs;
+    audioLastPcmAtUs = decodedAtUs;
+    audioDecodedFrames += static_cast<std::uint32_t>(count);
     // Drop stale queued audio after a scheduling stall instead of increasing latency.
     const auto queued = observeAudioQueue();
     const bool boundedAudio = workers ? boundedWorkerAudio : boundedSyncAudio;
     if (!boundedAudio && queued > detail::AudioQueueMetrics::bytesPerSecond / 5) {
-        SDL_ClearQueuedAudio(audioDevice);
-        audioMetrics.cleared(queued);
+        clearAudioQueue(mt::AudioClearReason::Latency);
     }
     auto selected = detail::AudioLatencyPolicy::Selection{0, static_cast<std::uint32_t>(count), false, false};
     if (boundedAudio) {
@@ -980,17 +1180,22 @@ void Media::Impl::decodeAudio(const std::byte* data, std::size_t size, std::uint
     if (SDL_QueueAudio(audioDevice, pcm.data() + selected.skip * 2,
         static_cast<Uint32>(selected.frames * 2 * sizeof(opus_int16))) != 0) {
         ++audioOutputErrors;
+        audioFailedFrames += selected.frames;
         audioRecovery.failed(now); audioResetNeeded = audioOutputResetNeeded = true;
         recoverAudio(now);
         return;
     }
-    audioMetrics.queued(SDL_GetQueuedAudioSize(audioDevice), DecoderClock::now());
+    audioAdmittedFrames += selected.frames;
+    observedAudioBytes=SDL_GetQueuedAudioSize(audioDevice);
+    const auto queuedAt=DecoderClock::now();audioObservedAtUs=telemetryTimeUs(queuedAt);
+    audioMetrics.queued(observedAudioBytes,queuedAt);
     audioRecovery.queued();
 }
 void Media::audio(const std::byte* data, std::size_t size, std::uint64_t enqueueMs) {
     impl_->requireApplicationThread();
     if (impl_->workers) throw std::logic_error("Media audio is owned by worker");
-    impl_->decodeAudio(data, size, enqueueMs);
+    try {impl_->decodeAudio(data, size, enqueueMs);}catch(...){impl_->publishAudio(true,false);throw;}
+    impl_->publishAudio(true,false);
 }
 void Media::checkAudioRecovery() const {
     impl_->requireApplicationThread();
@@ -1003,7 +1208,12 @@ bool Media::preparePresentation() {
 bool Media::preparePresentation(DecoderClock::time_point presentationSlot) {
     auto& m = *impl_;
     m.requireApplicationThread();
-    if (!m.workers) return m.preparePresentation(presentationSlot);
+    if (!m.workers) {
+        try {
+            const bool prepared=m.preparePresentation(presentationSlot);
+            m.publishVideo(true);return prepared;
+        } catch (...) {m.publishVideo(true);throw;}
+    }
     // At most one replacement texture per completed display cycle, even when
     // a caller probes twice. SDL_RenderPresent supplies the active 60 Hz pace.
     if (m.displayPaced && m.refreshPrepared) return false;
@@ -1077,94 +1287,83 @@ std::uint64_t Media::audioPackets() const { return impl_->packets; }
 std::uint64_t Media::audioUnderruns() const {
     if (impl_->workers) return impl_->underruns;
     impl_->observeAudioQueue();
+    impl_->publishAudio(true,false);
     return impl_->audioMetrics.prolongedEmptyObservations;
 }
 std::uint64_t Media::audioQueueResets() const { return impl_->workers ? impl_->audioResets.load() : impl_->audioMetrics.resets; }
 std::string Media::audioDiagnostics() const {
-    if (!impl_->workers) return impl_->audioDiagnostics();
-    std::lock_guard<std::mutex> lock(impl_->snapshotMutex);
-    return impl_->audioSnapshot;
+    if(impl_->workers) {
+        mt::Snapshot value;value.captured=mt::Capture::Audio;value.audio=impl_->diagnosticCache.snapshot().audio;
+        return mt::formatAudio(value);
+    }
+    impl_->requireApplicationThread();
+    impl_->observeAudioQueue();impl_->publishAudio(true,false);
+    return mt::formatAudio(captureTelemetry(mt::Capture::Audio));
 }
 bool Media::hardwareVideo() const { return impl_->hw; }
 int Media::videoWidth() const { return impl_->width; }
 int Media::videoHeight() const { return impl_->height; }
 std::string Media::diagnostics() const {
-    impl_->requireApplicationThread();
-    if (!impl_->workers) return impl_->diagnostics() + " async_workers=0 presentation_queue_limit=1 presentation_fps=" +
-        std::to_string(impl_->presentationCadence.configured() ? impl_->workerFps : 0) + " " + imageDiagnostics();
-    std::string snapshot;
-    {
-        std::lock_guard<std::mutex> lock(impl_->snapshotMutex);
-        snapshot = impl_->videoSnapshot;
-    }
-    // Decoder fields describe the last completed worker operation. Presentation
-    // counters belong to UI and can advance after the worker's latest snapshot.
-    for (const auto& entry : std::array<std::pair<const char*, std::uint64_t>, 7>{{
-        {"decoded_frames=", impl_->frames.load()},
-        {"uploaded_frames=", impl_->uploadedFrames.load()},
-        {"presented_frames=", impl_->presentedFrames.load()},
-        {"superseded_frames=", impl_->supersededFrames.load()},
-        {"upload_calls=", impl_->uploadTiming.calls.load()},
-        {"upload_avg_us=", impl_->uploadTiming.average()},
-        {"upload_max_us=", impl_->uploadTiming.maximum.load()}}}) {
-        const auto start = snapshot.find(entry.first);
-        if (start == std::string::npos) continue;
-        const auto value = start + std::strlen(entry.first);
-        const auto end = snapshot.find(' ', value);
-        snapshot.replace(value, end == std::string::npos ? snapshot.size() - value : end - value,
-            std::to_string(entry.second));
-    }
-    std::size_t depth;
-    detail::MediaFrameQueue::Stats queueStats;
-    {
-        std::lock_guard<std::mutex> lock(impl_->readyMutex);
-        depth = impl_->readyFrames.size();
-        queueStats = impl_->readyFrames.stats();
-    }
-    return snapshot + " async_workers=1 presentation_queue=" + std::to_string(depth) +
-        " presentation_queue_limit=3 presentation_fps=" + std::to_string(impl_->workerFps) +
-        " video_worker_queue_samples=" + std::to_string(impl_->videoQueueWait.calls.load()) +
-        " video_worker_queue_wait_avg_us=" + std::to_string(impl_->videoQueueWait.average()) +
-        " video_worker_queue_wait_max_us=" + std::to_string(impl_->videoQueueWait.maximum.load()) +
-        " " + queueStats.diagnostics() + " " + imageDiagnostics();
+    return mt::formatVideo(captureTelemetry(mt::Capture::Video|mt::Capture::Image),mediaFormatNames);
 }
 std::string Media::imageDiagnostics() const {
-    impl_->requireApplicationThread();
-    const auto& m = *impl_;
-    const auto& image = m.image;
-    const auto now = DecoderClock::now();
-    std::array<char, 1536> text{};
-    std::snprintf(text.data(), text.size(),
-        "image_source=cpu_iyuv_grid image_grid_max=576 image_samples=%llu image_points=%u "
-        "image_y_min=%u image_y_max=%u image_y_mean=%u image_dark_points=%u image_chroma_deviation=%u "
-        "image_near_black=%d image_black_frames=%llu image_black_runs=%llu image_black_streak=%llu image_black_streak_max=%llu "
-        "image_unchanged_streak=%llu image_unchanged_streak_max=%llu "
-        "image_texture=%d image_width=%d image_height=%d image_uploaded_generation=%llu image_drawn_generation=%llu image_presented_generation=%llu "
-        "image_upload_age_ms=%lld image_draw_age_ms=%lld image_new_present_age_ms=%lld "
-        "image_draws=%llu image_empty_draws=%llu image_create_errors=%llu image_upload_errors=%llu image_clear_errors=%llu image_copy_errors=%llu "
-        "image_presented_black=%d image_presented_black_frames=%llu image_sample_avg_us=%llu image_sample_max_us=%llu",
-        static_cast<unsigned long long>(image.samples), image.last.points,
-        image.last.yMin, image.last.yMax, image.last.yMean, image.last.darkPoints, image.last.chromaDeviation,
-        image.last.nearBlack() ? 1 : 0,
-        static_cast<unsigned long long>(image.blackFrames), static_cast<unsigned long long>(image.blackRuns),
-        static_cast<unsigned long long>(image.blackStreak), static_cast<unsigned long long>(image.blackStreakMax),
-        static_cast<unsigned long long>(image.unchangedStreak), static_cast<unsigned long long>(image.unchangedStreakMax),
-        m.texture ? 1 : 0, m.textureWidth.load(), m.textureHeight.load(),
-        static_cast<unsigned long long>(m.uploadedFrames.load()), static_cast<unsigned long long>(m.imageLastDrawnGeneration),
-        static_cast<unsigned long long>(m.presentedGeneration),
-        image.samples ? static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - m.imageUploadedAt).count()) : -1LL,
-        m.imageDraws ? static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - m.imageDrawnAt).count()) : -1LL,
-        m.presentedGeneration ? static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - m.imagePresentedAt).count()) : -1LL,
-        static_cast<unsigned long long>(m.imageDraws), static_cast<unsigned long long>(m.imageEmptyDraws),
-        static_cast<unsigned long long>(m.imageCreateErrors), static_cast<unsigned long long>(m.imageUploadErrors),
-        static_cast<unsigned long long>(m.imageClearErrors), static_cast<unsigned long long>(m.imageCopyErrors),
-        m.imagePresentedBlack ? 1 : 0, static_cast<unsigned long long>(m.imagePresentedBlackFrames),
-        static_cast<unsigned long long>(m.imageTiming.average()), static_cast<unsigned long long>(m.imageTiming.maximum.load()));
-    return text.data();
+    return mt::formatImage(captureTelemetry(mt::Capture::Image));
 }
 std::string Media::latencyDiagnostics() const {
-    impl_->requireApplicationThread();
-    return impl_->latency.diagnostics(metrics::steadyNowUs(), impl_->workerFps) +
-        " originMapCapacity=64 originMissesLifetime=" + std::to_string(impl_->originMisses.load());
+    return mt::formatLatency(captureTelemetry(mt::Capture::Latency));
 }
+mt::Snapshot Media::captureTelemetry(mt::Capture mask) const {
+    impl_->requireApplicationThread();
+    const auto& m=*impl_;
+    mt::Snapshot value;value.captured=mask;value.capturedAtUs=telemetryTimeUs();value.mediaInstance=m.diagnosticInstance;
+    const auto owners=m.diagnosticCache.snapshot();value.video=owners.video;value.audio=owners.audio;
+    auto& p=value.presentation;
+    p.decoded=m.frames.load();p.uploaded=m.uploadedFrames.load();p.presented=m.presentedFrames.load();p.superseded=m.supersededFrames.load();
+    p.upload=m.uploadTiming.snapshot();p.videoQueueWait=m.videoQueueWait.snapshot();
+    p.uploadDistribution=distributionValue(m.uploadTiming.distribution.snapshot(value.capturedAtUs));
+    p.workerDecode=m.workerDecodeTiming.snapshot();p.workerConvert=m.workerConvertTiming.snapshot();
+    p.currentEpoch=m.epoch.load();p.observedSourceGeneration=m.transportGeneration.load();p.currentLoadGeneration=m.loadGeneration.load();
+    p.workerRun=m.workerRun.load();p.workers=m.workers.load();
+    p.waitingForKeyframe=m.waiting.load();p.resetRequested=m.resetRequested.load();p.resetInProgress=m.resetInProgress.load();
+    p.configuredFps=p.workers||m.presentationCadence.configured()?m.workerFps:0;
+    if(mt::includes(mask,mt::Capture::Video)) {
+        detail::MediaFrameQueue::Stats stats;
+        {
+            std::lock_guard<std::mutex> lock(impl_->readyMutex);
+            p.queue.depth=m.readyFrames.size();p.queue.limit=m.readyFrames.limit();stats=m.readyFrames.stats();
+        }
+        p.queue.readyEmpty=stats.readyEmpty;p.queue.cadenceBlocked=stats.timingCadenceBlocked;p.queue.rtpBlocked=stats.timingRtpBlocked;
+        p.queue.capacityDrop=stats.pushCapacityDrop;p.queue.staleDrop=stats.takeStaleDrop;p.queue.lateCoalesce=stats.timedLateCoalesce;
+        p.queue.taken=stats.taken;p.queue.resets=stats.resets;p.queue.framesPerSecond=stats.framesPerSecond;p.queue.displayPaced=stats.displayPaced;
+    }
+    if(mt::includes(mask,mt::Capture::Image)) {
+        auto& i=value.image;const auto& image=m.image;const auto now=DecoderClock::now();
+        i.samples=image.samples;i.points=image.last.points;i.yMin=image.last.yMin;i.yMax=image.last.yMax;i.yMean=image.last.yMean;
+        i.darkPoints=image.last.darkPoints;i.chromaDeviation=image.last.chromaDeviation;i.nearBlack=image.last.nearBlack();
+        i.blackFrames=image.blackFrames;i.blackRuns=image.blackRuns;i.blackStreak=image.blackStreak;i.blackStreakMax=image.blackStreakMax;
+        i.unchangedStreak=image.unchangedStreak;i.unchangedStreakMax=image.unchangedStreakMax;
+        i.texture=m.texture!=nullptr;i.width=m.textureWidth.load();i.height=m.textureHeight.load();
+        i.uploadedGeneration=m.uploadedFrames.load();i.drawnGeneration=m.imageLastDrawnGeneration;i.presentedGeneration=m.presentedGeneration;
+        i.uploadAgeMs=image.samples?std::chrono::duration_cast<std::chrono::milliseconds>(now-m.imageUploadedAt).count():-1;
+        i.drawAgeMs=m.imageDraws?std::chrono::duration_cast<std::chrono::milliseconds>(now-m.imageDrawnAt).count():-1;
+        i.newPresentAgeMs=m.presentedGeneration?std::chrono::duration_cast<std::chrono::milliseconds>(now-m.imagePresentedAt).count():-1;
+        i.draws=m.imageDraws;i.emptyDraws=m.imageEmptyDraws;i.createErrors=m.imageCreateErrors;i.uploadErrors=m.imageUploadErrors;
+        i.clearErrors=m.imageClearErrors;i.copyErrors=m.imageCopyErrors;i.presentedBlack=m.imagePresentedBlack;i.presentedBlackFrames=m.imagePresentedBlackFrames;
+        i.sample=m.imageTiming.snapshot();i.layout=m.imagePixelFormat==detail::MediaPixelFormat::Nv12?mt::ImageLayout::Nv12:mt::ImageLayout::Iyuv;
+        i.nv12=FOGPLAY_MEDIA_NV12;i.nv12Available=m.nv12UploadAvailable;i.nv12Fallbacks=m.nv12Fallbacks;i.cpuPool=FOGPLAY_MEDIA_CPU_POOL;
+        i.textureCount=FOGPLAY_MEDIA_TEXTURES;i.readyDepth=FOGPLAY_MEDIA_READY_DEPTH;
+    }
+    if(mt::includes(mask,mt::Capture::Latency)) {
+        const auto last=m.latency.snapshot(value.capturedAtUs,m.workerFps);auto& l=value.latency;
+        for(std::size_t stage=0;stage<l.stages.size();++stage) {
+            const auto& sample=last.stages[stage];l.stages[stage]={sample.samples,sample.p50Us,sample.p95Us,sample.p99Us,sample.overflow};
+        }
+        l.lateThresholdUs=last.lateThresholdUs;l.lateCount=last.lateCount;l.latePpm=last.latePpm;
+        l.unavailableAge=last.unavailableAge;l.unavailableWait=last.unavailableWait;l.originMisses=m.originMisses.load();
+    }
+    value.captureCompletedAtUs=telemetryTimeUs();
+    mt::sourceAge(value.video.source,value.captureCompletedAtUs);mt::sourceAge(value.audio.source,value.captureCompletedAtUs);
+    return value;
+}
+std::optional<mt::Snapshot> Media::retainedTelemetry() const {return impl_->diagnosticCache.retainedFinal();}
 }

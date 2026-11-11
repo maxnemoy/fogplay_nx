@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "series_sha256": "57ad9716d1670afcb58145690c3bab712f13673c8da455bfba995041e9d247da",
+  "overlay_sha256": "39e7cf656017b633e10cb5e62a78a229d6d4fd825b877ea69a36835253d2968b",
+  "files": {
+    "CMakeLists.txt": {
+      "approved_sha256": "7d71d3e472a0559b899322becb1c7bb67a0a708468f2b86b2c10eb95cb0db0ff",
+      "candidate_sha256": "7c3e3acae932caf8f877c20a14ca66ac793d1e1fd50a93795c04dedf2366963d"
+    },
+    "deps/libjuice/include/juice/juice.h": {
+      "approved_sha256": "45915bd76092bbe809255c0b473ebd637cfee88d984de71a4a672bb97e965a6a",
+      "candidate_sha256": "ca4c4139b7a9f4c518ea66a2e945958f2e070dd82c79193f50927473be008070"
+    },
+    "deps/libjuice/src/agent.h": {
+      "approved_sha256": "02574bb2b4855381b2883e5de8d7d7677b394c4bc1f7d4aad7d79ed77400e8a6",
+      "candidate_sha256": "3ee6a8654d3a2433e6fa1f444a28b2928a50ac9b8d71cc25a95ac154e7bb6ed0"
+    },
+    "deps/libjuice/src/conn_poll.c": {
+      "approved_sha256": "e2bc18ee7428038cb1add1dfd1750e091026dec0149bb993df6c3ed2ef01dc69",
+      "candidate_sha256": "a94479c06394887788c4d5cb831feb6a250a57351da5ba3df23b29907474e164"
+    },
+    "deps/libjuice/src/juice.c": {
+      "approved_sha256": "b57ae39460af6d2b0e153f63f9dc419ca124da665bf9166e8b02adebed515cd1",
+      "candidate_sha256": "a1fabd7328bc474b37052139c9b00fff7df068fda44189db1296c660cdbfb0ce"
+    },
+    "deps/libjuice/src/udp_poll_clock.h": {
+      "approved_sha256": null,
+      "candidate_sha256": "bd52c6fa2028b5e8cdcd875b7c2824061b202d960e45266a07a08a6b09bc5b20"
+    },
+    "include/rtc/icediagnostics.hpp": {
+      "approved_sha256": null,
+      "candidate_sha256": "47f8fa6fc2c7bea6dc3a4eb0a8bfb17672bb28a8cd6b934653cdfa6acd77fb0a"
+    },
+    "include/rtc/peerconnection.hpp": {
+      "approved_sha256": "d0211452b3132d1827aeb086ef944e1d9e1cdadf2ba18db623d63be53c91b7ab",
+      "candidate_sha256": "00373eb3245f524a928d3aab62b892f1f0cfda79035260cd7c43c574654aecf8"
+    },
+    "src/impl/icetransport.cpp": {
+      "approved_sha256": "c61bead3ec9bad14aa6f6b92bc80f7a8026dc255a27c1be98580bca41071d6f1",
+      "candidate_sha256": "8445bdf5242b7aff1565b87d2eb2a4504a0d80215a9d7b926984d5465be103b3"
+    },
+    "src/impl/icetransport.hpp": {
+      "approved_sha256": "39bf44e924c6ba9c706c66f87abbbad925010a747b15eee933c9473a821c1db3",
+      "candidate_sha256": "82b002425b8e8a7ceae36d9f24b31d0c6fac490f2f713132053ac4c938a2dc6f"
+    },
+    "src/impl/peerconnection.cpp": {
+      "approved_sha256": "2765b182f709f29f9b05b1dd914a336433a609cab65bfc9655e7996f0e280a86",
+      "candidate_sha256": "475a2d252319b0a50e71fe006475ad6317084910555435cadd03afd0fa7522f6"
+    },
+    "src/impl/peerconnection.hpp": {
+      "approved_sha256": "b55af926e4d96a49c396931b0279c50674b0507c737875bf3fea42e56b3860ac",
+      "candidate_sha256": "3a835a72bdbd8c4eb6c8a18bbfec1ffeeb85f417cc12a233f983d2f02ff3ff54"
+    },
+    "src/peerconnection.cpp": {
+      "approved_sha256": "1ea57721df9628651b39850be8e3e8b99abd3f9a6c18a4f12e4a8a1907250cdc",
+      "candidate_sha256": "b37f66b1bafb91efc6057b94aec9ca2a0ba17e88fb9ad72ebb5dcc83e92a93d3"
+    }
+  }
+}

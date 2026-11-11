@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Check fail-closed patches, repeatable preparation, and native diagnostics."""
-import hashlib
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -9,53 +9,15 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[3]
 TOOLS = ROOT / "tools/moonlight"
 CORE = ROOT / "third_party/moonlight/moonlight-switch/extern/moonlight-common-c/src"
-NAMES = ("Connection.c", "VideoStream.c", "RtpVideoQueue.c", "VideoDepacketizer.c",
-         "ControlStream.c", "LinkedBlockingQueue.c", "PlatformSockets.c", "PlatformStuff.c", "RtspConnection.c")
 sys.path.insert(0, str(TOOLS))
-from diagnostics import apply
-from idr_diagnostics import apply as apply_idr_diagnostics, validate_frame_header_policy
+from prepare import apply as prepare_series
 
-
-def digests(directory):
-    return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in NAMES}
-
-
-original = digests(CORE)
-header_source = (CORE / "VideoDepacketizer.c").read_text()
-validate_frame_header_policy(header_source)
-with tempfile.TemporaryDirectory(prefix="moonlight-header-contract-") as directory:
-    destination = Path(directory)
-    (destination / "core").mkdir()
-    # Change a pinned branch's size without touching any replacement anchor:
-    # preparation must reject it before making even its first source edit.
-    modified = header_source.replace("frameHeaderSize = 44;", "frameHeaderSize = 45;", 1)
-    assert modified != header_source
-    target = destination / "core/VideoDepacketizer.c"
-    target.write_text(modified)
-    try:
-        apply_idr_diagnostics(destination)
-    except RuntimeError as error:
-        assert "Pinned frame-header policy changed" in str(error)
-        assert target.read_text() == modified
-    else:
-        raise AssertionError("Changed pinned header policy must reject IDR instrumentation")
-subprocess.run([sys.executable, str(TOOLS / "prepare.py")], check=True)
+# Standalone driver validates the same final tree; test.sh preflights it once.
+if os.environ.get('FOG_MOONLIGHT_PRECHECKED') != '1':
+    prepare_series(ROOT, check=True)
 prepared = ROOT / "third_party/moonlight/prepared/core"
-first = digests(prepared)
-subprocess.run([sys.executable, str(TOOLS / "prepare.py")], check=True)
-assert first == digests(prepared), "Preparation is not repeatable"
-assert original == digests(CORE), "Pinned source was modified"
 with tempfile.TemporaryDirectory(prefix="moonlight-diagnostics-") as directory:
     destination = Path(directory)
-    (destination / "core").mkdir()
-    for name in NAMES:
-        (destination / "core" / name).write_bytes((prepared / name).read_bytes())
-    try:
-        apply(destination)
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("Patch must reject already transformed/unexpected source")
     binary = destination / "core-diagnostics-test"
     subprocess.run([
         "cc", "-std=c11", "-DLC_DEBUG", "-DFOG_DIAG_TEST_HOOK", "-Wall", "-Wextra", "-Werror", "-pthread",
@@ -90,7 +52,7 @@ with tempfile.TemporaryDirectory(prefix="moonlight-diagnostics-") as directory:
     source.write_text(template.replace("CONTROL_API", control[api_start:api_end])
                      .replace("CONTROL_DISPATCH", control[dispatch_start:dispatch_end]))
     binary = destination / "idr-recovery"
-    subprocess.run([
+    idr_compile = [
         "cc", "-std=c11", "-DLC_DEBUG", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
         "-pthread", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
         "-DFOG_IDR_RECOVERY_TEST_CLOCK",
@@ -98,7 +60,12 @@ with tempfile.TemporaryDirectory(prefix="moonlight-diagnostics-") as directory:
         str(TOOLS / "FogMoonlightDiagnostics.c"), str(TOOLS / "FogMoonlightRecovery.c"),
         str(prepared / "LinkedBlockingQueue.c"), str(CORE / "ByteBuffer.c"),
         str(source), "-o", str(binary),
-    ], check=True)
+    ]
+    subprocess.run(idr_compile, check=True)
+    subprocess.run([str(binary)], check=True)
+    # Exercise the invalid-payload fallback with only host-input assertions
+    # disabled via the pinned core's fuzzing mode; harness asserts stay active.
+    subprocess.run(idr_compile + ["-DLC_FUZZING", "-Wno-unused-function"], check=True)
     subprocess.run([str(binary)], check=True)
     video = (prepared / "VideoStream.c").read_text()
     start = video.index("    uint64_t previousCycleEndUs = 0;")

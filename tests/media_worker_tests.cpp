@@ -1,5 +1,6 @@
 #include "core/constants/stage1_options.hpp"
 #include "features/streaming/infrastructure/media.hpp"
+#include "features/streaming/domain/streaming_client.hpp"
 #include "features/streaming/infrastructure/media_frame_queue.hpp"
 #include "features/streaming/domain/audio_latency_policy.hpp"
 #include "features/streaming/domain/audio_recovery.hpp"
@@ -8,6 +9,7 @@
 #include <opus/opus.h>
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
 #include <array>
@@ -138,6 +140,11 @@ public:
     void close() override {}
 };
 static std::atomic<bool> captureAudio{false};
+static std::thread::id applicationThread;
+static std::atomic<unsigned> applicationQueueObservations{0},pixelNameQueries{0};
+static std::atomic<bool> blockAudioObservation{false},enteredAudioObservation{false};
+static std::mutex gateMutex;
+static std::condition_variable gate;
 static std::atomic<unsigned> videoPublications{0}, audioPublications{0}, audioQueueObservations{0};
 static std::mutex publicationMutex;
 static std::vector<std::chrono::steady_clock::time_point> audioPublicationTimes;
@@ -170,7 +177,16 @@ extern "C" int __wrap___snprintf_chk(char* destination, std::size_t size, int, s
 extern "C" Uint32 __real_SDL_GetQueuedAudioSize(SDL_AudioDeviceID);
 extern "C" Uint32 __wrap_SDL_GetQueuedAudioSize(SDL_AudioDeviceID device) {
     ++audioQueueObservations;
+    if(std::this_thread::get_id()==applicationThread)++applicationQueueObservations;
+    else if(blockAudioObservation) {
+        enteredAudioObservation=true;gate.notify_all();
+        std::unique_lock<std::mutex> lock(gateMutex);gate.wait(lock,[]{return !blockAudioObservation.load();});
+    }
     return __real_SDL_GetQueuedAudioSize(device);
+}
+extern "C" const char* __real_av_get_pix_fmt_name(AVPixelFormat);
+extern "C" const char* __wrap_av_get_pix_fmt_name(AVPixelFormat format) {
+    ++pixelNameQueries;return __real_av_get_pix_fmt_name(format);
 }
 static std::atomic<int> failAudioQueue{0}, failAudioOpen{0}, failAudioDecode{0};
 static std::atomic<bool> holdAudioDevice{false};
@@ -209,12 +225,9 @@ extern "C" int __wrap_opus_decode(OpusDecoder* decoder, const unsigned char* dat
     }
     return result;
 }
-static std::thread::id applicationThread;
 static std::atomic<bool> wrongThread{false}, failSend{false}, blockSend{false}, enteredSend{false};
 static std::atomic<unsigned> hevcOpens{0};
 static std::atomic<unsigned> scaleDelayUs{0};
-static std::mutex gateMutex;
-static std::condition_variable gate;
 extern "C" int __real_avcodec_open2(AVCodecContext*, const AVCodec*, AVDictionary**);
 extern "C" int __wrap_avcodec_open2(AVCodecContext* context, const AVCodec* codec, AVDictionary** options) {
     if (codec->id == AV_CODEC_ID_HEVC) ++hevcOpens;
@@ -521,7 +534,7 @@ static void synchronousAudioPolicy(SDL_Renderer* renderer) {
     check(diagnostics.find("audio_sync_bounded=0") != std::string::npos, "unmeasured audio policy enabled by default");
 #endif
 }
-static void audioCatchup(SDL_Renderer* renderer) {
+static void audioCatchup(SDL_Renderer* renderer, fog::Media::WorkerPolicy policy) {
     constexpr unsigned burst = 12, episodes = 3, stride = burst + 1;
     const auto sequence = audioSequence(episodes * stride + burst);
     int error = 0;
@@ -539,7 +552,7 @@ static void audioCatchup(SDL_Renderer* renderer) {
     fog::Media media(renderer, stream::VideoCodec::H264, true);
     { std::lock_guard<std::mutex> lock(audioCaptureMutex); audioHashes.clear(); }
     captureAudio = true;
-    media.startWorkers(client, 30);
+    media.startWorkers(client, 30, policy);
     for (unsigned episode = 0; episode < episodes; ++episode) {
         client.pushAudioBatch(sequence, episode * stride, burst, 400);
         until([&] { return media.audioPackets() == episode * stride + burst; });
@@ -562,6 +575,17 @@ static void audioCatchup(SDL_Renderer* renderer) {
     check(metric(text, "audio_overflow_packets") >= 6, "fresh burst backed up compressed input at full SDL output");
     check(metric(text, "audio_catchups") == episodes + 1, "repeated catchup episodes were lost or never ended");
     check(media.audioQueueResets() == 0, "catchup cleared already queued sound");
+    const auto audio = media.captureTelemetry().audio;
+    const auto retained = media.retainedTelemetry();
+    check(retained && retained->audio.boundedWorker && !audio.boundedWorker,
+        "retained worker policy lost or stopped output still reported an active worker");
+    check(audio.decodedPcmFrames == sequence.size() * 960 &&
+        audio.decodedPcmFrames == audio.admittedPcmFrames + audio.pcmDiscardedFrames + audio.failedPcmFrames &&
+        audio.failedPcmFrames == 0 && audio.latencyClears == 0 && audio.recoveryClears == 0,
+        "bounded worker PCM accounting lost decoded/admitted/suppressed conservation");
+    check(audio.outputSampleRate == 48000 && audio.outputChannels == 2 && audio.outputBytesPerFrame == 4 &&
+        audio.firstPcmAtUs > 0 && audio.lastPcmAtUs >= audio.firstPcmAtUs,
+        "PCM cadence/device format metadata missing");
     { std::lock_guard<std::mutex> lock(audioCaptureMutex);
         check(audioHashes == expected, "catchup skipped Opus state or altered decode order/output"); }
     fog::Media::WorkerError event;
@@ -573,17 +597,24 @@ static void idlePublications(SDL_Renderer* renderer) {
     Client client;
     fog::Media media(renderer, stream::VideoCodec::H264, true);
     videoPublications = 0; audioPublications = 0; audioQueueObservations = 0;
+    const auto initial=media.captureTelemetry();
     media.startWorkers(client, 30);
     // Keep transports empty long enough for several legacy 20-ms snapshots.
-    // The counters instrument actual formatting/SDL calls, not source layout.
+    // Numeric owner revisions instrument publication, while wrapped formatting
+    // and SDL calls independently prove the hot producers do not format.
     const auto started = std::chrono::steady_clock::now();
     std::this_thread::sleep_for(130ms);
+    const auto published=media.captureTelemetry();
     media.stopWorkers();
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started).count();
-    const auto video = videoPublications.load();
-    const auto audio = audioPublications.load();
+    const auto video = static_cast<std::int64_t>(published.video.source.revision-initial.video.source.revision);
+    const auto audio = static_cast<std::int64_t>(published.audio.source.revision-initial.audio.source.revision);
     const auto observations = audioQueueObservations.load();
+    check(videoPublications==0&&audioPublications==0,"idle media producers formatted telemetry strings");
+    const auto final=media.captureTelemetry();
+    check(final.video.source.availability==fog::media::telemetry::Availability::FinalRetained&&
+        final.audio.source.availability==fog::media::telemetry::Availability::FinalRetained,"joined workers did not retain final numeric snapshots");
     std::cout << "Idle publications sparse=" << fog::stage1::sparseDiagnostics << " duration_ms=" << elapsedMs
         << " polls=" << client.polls << " video=" << video << " audio=" << audio
         << " queue_observations=" << observations << '\n';
@@ -593,13 +624,13 @@ static void idlePublications(SDL_Renderer* renderer) {
         client.polls <= 6 + elapsedMs / 20, "empty media workers exceeded maintenance wake cadence");
     if (fog::stage1::sparseDiagnostics) {
         check(video <= 2 + elapsedMs / 1000 && audio <= 2 + elapsedMs / 1000,
-            "sparse idle diagnostic formatting exceeded one-second cadence");
+            "sparse idle numeric publication exceeded one-second cadence");
         check(observations <= 3 + elapsedMs / 20,
             "sparse idle audio queue observations exceeded 20-ms cadence");
     } else {
-        check(video == 1, "control profile formatted video on an empty transport poll");
+        check(video == 1, "control profile published video on an empty transport poll");
         check(audio >= 3 && audio <= 3 + elapsedMs / 20,
-            "control profile idle audio formatting lost original 20-ms cadence");
+            "control profile idle numeric audio publication lost original 20-ms cadence");
         check(observations >= audio,
             "control profile lost original audio queue observations");
     }
@@ -660,6 +691,8 @@ static void wrongKindIsolation(SDL_Renderer* renderer, const std::vector<Bytes>&
         fog::Media::WorkerError error;
         while (media.takeWorkerError(error)) {
             check(error.hasPacket, "wrong-kind error lost offending packet metadata");
+            check(error.category==fog::media::telemetry::ErrorCategory::Logic&&error.code==0&&!error.recoverable,
+                "numeric worker logic failure category did not match the raised exception");
             try { std::rethrow_exception(error.error); }
             catch (const std::logic_error& failure) {
                 videoRejected |= std::string(failure.what()).find("non-video") != std::string::npos;
@@ -686,48 +719,40 @@ static void mtsWorkerAudioPolicy(SDL_Renderer* renderer) {
         until([&] { return media.audioPackets() == packets.size(); });
         media.stopWorkers();
         const auto diagnostics = media.audioDiagnostics();
-        const bool bounded = policy == fog::Media::WorkerPolicy::FogHub || fog::stage1::boundedSyncAudio;
-        if (bounded) {
-            check(metric(diagnostics,"audio_max_queued_ms") <= 80 && media.audioQueueResets() == 0,
-                "FH/S16 worker audio lost bounded output policy");
-            check(metric(diagnostics,"audio_pcm_discarded_packets") > 0,
-                "bounded worker admitted all stale PCM");
-        } else {
-            check(metric(diagnostics,"audio_pcm_discarded_packets") == 0,
-                "MTS worker silently enabled the unmeasured S16 PCM policy");
-            check(metric(diagnostics,"audio_max_queued_ms") > 200 && media.audioQueueResets() > 0,
-                "MTS worker failed to retain legacy greater-than-200ms queue clear");
-        }
+        check(metric(diagnostics,"audio_max_queued_ms") <= 80 && media.audioQueueResets() == 0,
+            "MTS/FH worker audio lost bounded output policy");
+        check(metric(diagnostics,"audio_pcm_discarded_packets") > 0,
+            "bounded worker admitted all stale PCM");
+        const auto telemetry = media.captureTelemetry().audio;
+        const auto retained = media.retainedTelemetry();
+        check(retained && retained->audio.boundedWorker && !telemetry.boundedWorker,
+            "bounded MTS/FH active-versus-retained policy lost");
+        check(telemetry.decodedPcmFrames == packets.size() * 960 &&
+            telemetry.decodedPcmFrames == telemetry.admittedPcmFrames + telemetry.pcmDiscardedFrames,
+            "bounded MTS/FH worker PCM accounting missing");
+
     }
-    std::cout << "MTS worker audio: legacy 200ms clear retained, FH/S16 bounded policy separate, every Opus packet decoded PASS\n";
+    std::cout << "MTS/FH worker audio: 80ms bound, stale PCM suppressed, no queue clears, every Opus packet decoded PASS\n";
 }
 static void packetPublicationCadence(SDL_Renderer* renderer) {
     if (fog::stage1::sparseDiagnostics) return;
     Client client;
     fog::Media media(renderer, stream::VideoCodec::H264, true);
     const auto packet = sound();
-    {
-        std::lock_guard<std::mutex> lock(publicationMutex);
-        audioPublicationTimes.clear(); audioPublications = 0;
-    }
+    const auto initial=media.captureTelemetry().audio.source.revision;
     media.startWorkers(client, 30);
-    until([] { return audioPublications >= 3; });
-    std::chrono::steady_clock::time_point lastIdle;
-    {
-        std::lock_guard<std::mutex> lock(publicationMutex);
-        lastIdle = audioPublicationTimes.back();
-    }
+    until([&] { return media.captureTelemetry().audio.source.revision >= initial+3; });
+    const auto lastIdle=media.captureTelemetry().audio.source.publishedAtUs;
     // A packet between idle ticks must restart the legacy idle deadline.
-    std::this_thread::sleep_until(lastIdle + 8ms);
-    const auto before = audioPublications.load();
+    std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::microseconds(lastIdle))+8ms);
+    const auto before = media.captureTelemetry().audio.source.revision;
     client.push(packet, true);
-    until([&] { return media.audioPackets() == 1 && audioPublications > before; });
-    const auto packetPublication = audioPublications.load() - 1;
-    until([&] { return audioPublications > packetPublication + 1; });
+    until([&] { return media.audioPackets() == 1 && media.captureTelemetry().audio.source.revision > before; });
+    const auto packetPublication = media.captureTelemetry().audio.source;
+    until([&] { return media.captureTelemetry().audio.source.revision > packetPublication.revision; });
+    const auto idlePublication=media.captureTelemetry().audio.source.publishedAtUs;
     media.stopWorkers();
-    std::lock_guard<std::mutex> lock(publicationMutex);
-    const auto gap = std::chrono::duration_cast<std::chrono::microseconds>(
-        audioPublicationTimes.at(packetPublication + 1) - audioPublicationTimes.at(packetPublication)).count();
+    const auto gap=idlePublication-packetPublication.publishedAtUs;
     check(gap >= 19000, "control audio idle deadline was not restarted after packet publication");
     std::cout << "Control packet-to-next-idle-publication gap_us=" << gap << '\n';
 }
@@ -778,7 +803,7 @@ static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units, int
     check(hevcOpens == previousHevcOpens, "latest codec command was ignored during blocked decode");
     check(media.diagnostics().find("presentation_fps=" + std::to_string(fps)) != std::string::npos,
         "configured worker frame rate missing from diagnostics");
-    // Owner-published diagnostic strings refresh at most once per second;
+    // Owner-published numeric snapshots refresh at most once per second;
     // decoding counters remain immediate and must not force per-frame formatting.
     until([&] { return media.diagnostics().find("video_worker_queue_samples=0") == std::string::npos &&
         media.audioDiagnostics().find("audio_worker_queue_samples=0") == std::string::npos; });
@@ -796,6 +821,8 @@ static void workers(SDL_Renderer* renderer, const std::vector<Bytes>& units, int
     try { std::rethrow_exception(event.error); }
     catch (const fog::VideoDecodeError& error) { recoverable = error.recoverable() && error.code() == AVERROR_INVALIDDATA; }
     check(recoverable && event.hasPacket && event.packet.timestamp == 9000 && media.draw(), "decoder error was lost or detached from packet/recovery");
+    check(event.category==fog::media::telemetry::ErrorCategory::VideoDecode&&event.code==AVERROR_INVALIDDATA&&event.recoverable,
+        "numeric decoder failure category/code diverged from recovery exception");
     const auto beforeRecovery = media.videoFrames();
     client.push(units[0], false, 2, 12000);
     client.push(audio, true);
@@ -972,8 +999,9 @@ static void decoderCompletion(SDL_Renderer* renderer, const std::vector<Bytes>& 
     media.stopWorkers();
     check(rejected->calls == 1, "retained diagnostic packet acknowledged the frame twice");
 }
+#include "media_telemetry_worker_checks.hpp"
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    if (argc != 2 && argc != 3) return 2;
     applicationThread = std::this_thread::get_id();
     SDL_setenv("SDL_VIDEODRIVER", "dummy", 1); SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) return 3;
@@ -981,12 +1009,16 @@ int main(int argc, char** argv) {
     auto* renderer = surface ? SDL_CreateSoftwareRenderer(surface) : nullptr;
     if (!renderer) return 4;
     int result = 0;
-    try { idlePublications(renderer); packetPublicationCadence(renderer); pacing(); audioPolicy(); synchronousAudioPolicy(renderer); audioRecoveryPolicy(); audioRecoverySync(renderer); audioCatchup(renderer);
+    try {
+        if(argc==3&&std::string(argv[2])=="telemetry-only")numericMediaTelemetry(renderer,load(argv[1]));
+        else { idlePublications(renderer); packetPublicationCadence(renderer); pacing(); audioPolicy(); synchronousAudioPolicy(renderer); audioRecoveryPolicy(); audioRecoverySync(renderer); audioCatchup(renderer, fog::Media::WorkerPolicy::FogHub); audioCatchup(renderer, fog::Media::WorkerPolicy::Mts);
         const auto units = load(argv[1]); workerReadinessAndLoad(renderer,units); wrongKindIsolation(renderer,units); mtsWorkerAudioPolicy(renderer);
         decoderCompletion(renderer, units); workers(renderer, units, 30); workers(renderer, units, 60);
         audioRecoveryWorkerBacklog(renderer); audioRecoveryWorker(renderer, units); }
-    catch (const std::exception& error) { blockSend = false; gate.notify_all(); std::cerr << error.what() << '\n'; result = 1; }
+    }
+    catch (const std::exception& error) { blockSend = false;blockAudioObservation=false; gate.notify_all(); std::cerr << error.what() << '\n'; result = 1; }
     SDL_DestroyRenderer(renderer); SDL_FreeSurface(surface); SDL_Quit();
-    if (!result) std::cout << "Media workers PASS: real 720p30 H264/Opus, blocked-codec UI/audio independence, affinity, H264 negotiation fallback, reset/codec commands and generations, isolated/persistent audio recovery, decoder/output fault injection, dequeue timings, bounded RTP pacing, repeated joined shutdown\n";
+    if (!result && argc==3) std::cout << "Media telemetry focused worker path PASS\n";
+    else if (!result) std::cout << "Media workers PASS: real 720p30 H264/Opus, blocked-codec UI/audio independence, affinity, H264 negotiation fallback, reset/codec commands and generations, isolated/persistent audio recovery, decoder/output fault injection, dequeue timings, bounded RTP pacing, repeated joined shutdown\n";
     return result;
 }

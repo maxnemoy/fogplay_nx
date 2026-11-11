@@ -52,7 +52,7 @@ void ApplicationController::inputImageSettings(u64 keys) {
         fog::video::Field::Codec, fog::video::Field::Quality, fog::video::Field::Bitrate,
         fog::video::Field::Keyframes, fog::video::Field::FramesPerSecond};
     auto value = videoSettings_;
-    if (fog::video::adjust(value, fields[selection_], direction, fog::Media::supportsH265()))
+    if (fog::video::adjust(value, fields[selection_], direction, playerMediaFactory_.supportsH265()))
         changeVideoSettings(value, false);
     else if (selection_ == 0) videoSaveStatus_ = uiText::Settings::H265Fallback;
 }
@@ -66,7 +66,7 @@ void ApplicationController::drawImageSettings() {
         uiText::Settings::KeyframesPrefix + fog::ui::videoKeyframeLabel(videoSettings_),
         uiText::Settings::FrameRatePrefix + fog::ui::videoFrameRateLabel(videoSettings_)};
     const std::array<std::string, 5> hints{
-        fog::Media::supportsH265() ? uiText::Settings::H265ExperimentalNotice : uiText::Settings::H265Unavailable,
+        playerMediaFactory_.supportsH265() ? uiText::Settings::H265ExperimentalNotice : uiText::Settings::H265Unavailable,
         uiText::Settings::QualityDescription,
         uiText::Settings::BitrateDescription,
         uiText::Settings::KeyframeDescription,

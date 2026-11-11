@@ -2,6 +2,8 @@
 // H.264 packetization-mode 1 / HEVC RFC 7798 receiver (base layer, no DONL). No RTC, platform or decoder dependencies.
 // All methods must be serialized by the owner. Time is monotonic milliseconds.
 #include "features/streaming/domain/media_annexb.hpp"
+#include "features/streaming/domain/network_telemetry.hpp"
+#include "features/streaming/domain/rtp_event.hpp"
 #include "features/streaming/domain/video_limits.hpp"
 #include <algorithm>
 #include <array>
@@ -23,12 +25,7 @@ public:
         std::int64_t firstSequence = 0, lastSequence = 0;
         std::uint64_t firstPacketMs = 0;
     };
-    struct Stats {
-        std::uint64_t received = 0, candidates = 0, reordered = 0, duplicate = 0, late = 0;
-        std::uint64_t gaps = 0, missing = 0, malformed = 0, dropped = 0, emitted = 0;
-        std::uint64_t resyncs = 0, recovered = 0, pressure = 0, timeout = 0, eventOverflow = 0;
-        std::uint64_t faultSerial = 0, foreignSsrc = 0, padding = 0;
-    };
+    using Stats = telemetry::network::RtpCounters;
     static constexpr std::uint64_t ReorderMs = 20, RepairMs = 180, AssemblyMs = 150;
     static constexpr std::uint64_t MinRepairMs = 100, MaxRepairMs = 220, RepairAssemblyMs = 300;
     void enableNack(bool enabled) { nackEnabled_ = enabled; }
@@ -169,9 +166,35 @@ public:
     }
     // Latest transport round trip (SCTP) for classifying NACK arrivals; 0 = unknown.
     void observeRoundTrip(std::uint64_t ms) { roundTripMs_ = ms; }
+    bool pollNumericEvent(telemetry::network::RtpEvent& event) noexcept {
+        if(!eventSize_)return false;
+        event=events_[eventHead_];eventHead_=(eventHead_+1)%events_.size();--eventSize_;return true;
+    }
     bool pollEvent(std::string& event) {
-        if (events_.empty()) return false;
-        event = std::move(events_.front()); events_.pop_front(); return true;
+        if(!eventSize_)return false;
+        event=telemetry::network::rtpEventText(events_[eventHead_]);
+        eventHead_=(eventHead_+1)%events_.size();--eventSize_;return true;
+    }
+    telemetry::network::RtpSnapshot numericSnapshot() const noexcept {
+        telemetry::network::RtpSnapshot out;
+        out.counters=stats_;out.initialized=initialized_;out.waiting=waiting_;out.nackEnabled=nackEnabled_;out.gapActive=gapActive_;
+        out.pendingPackets=pending_.size();out.pendingBytes=pendingBytes_;out.assemblyBytes=au_.size();
+        out.readyFrames=frames_.size();out.readyBytes=frameBytes_;out.pendingEvents=eventSize_;
+        out.expectedSequence=expected_;out.lastFirstSequence=lastFirst_;out.lastLastSequence=lastLast_;
+        out.lastTimestamp=lastTimestamp_;out.lastTimestampKnown=haveTimestamp_;
+        out.nackPackets=nackPackets_;out.repairedPackets=repairPackets_;
+        out.repairWindowMs=nackEnabled_?repairMs_:ReorderMs;out.gapRepairWindowMs=gapActive_?gapRepairMs_:0;out.nackRetryMs=retryMs();
+        out.arrivalSamples=arrivalSamples_;out.lateSamples=lateSamples_;out.retrySamples=retrySamples_;
+        out.arrivalLastMs=arrivalLastMs_;out.arrivalMeanMs=arrivalMeanMs_;out.arrivalMaxMs=arrivalMaxMs_;out.arrivalDeviationMs=arrivalDeviationMs_;
+        out.arrivalP50Ms=arrivalPercentile(50);out.arrivalP95Ms=arrivalPercentile(95);out.arrivalBucketMs=ArrivalBucketMs;
+        out.arrivalHistogram=arrivalHistogram_;out.roundTripMs=roundTripMs_;out.roundTripKnown=roundTripMs_!=0;
+        out.arrivalBeforeRtt=arrivalBeforeRtt_;out.arrivalAfterRtt=arrivalAfterRtt_;out.arrivalRttUnknown=arrivalRttUnknown_;
+        out.activeRequests=requests_.size();out.history=history_.size();out.historyEvicted=historyEvicted_;out.catchupYields=catchupYields_;
+        out.expiredGaps=expiredGaps_;out.expiredPackets=expiredPackets_;out.expiredNoNackGaps=expiredNoNackGaps_;
+        out.expiredUnrequestedPackets=expiredUnrequestedPackets_;out.expiredNackAttempts=expiredNackAttempts_;
+        out.maxExpiryOvershootMs=maxExpiryOvershootMs_;out.matchedLatePackets=matchedLatePackets_;
+        out.lastExpiry=lastExpiry_;out.lastLate=lastLate_;out.lastExpiryKnown=expiredGaps_!=0;out.lastLateKnown=matchedLatePackets_!=0;
+        return out;
     }
     std::string diagnostics() const {
         return "nackEnabled=" + std::to_string(nackEnabled_) + " nackPackets=" + std::to_string(nackPackets_) +
@@ -242,15 +265,8 @@ public:
             " lateNackAttempts=" + std::to_string(lastLate_.nackAttempts);
     }
 private:
-    struct GapExpiry {
-        std::int64_t first = 0, last = 0, pendingFirst = 0, pendingLast = 0;
-        std::uint64_t detectedMs = 0, oldestMs = 0, budgetMs = 0, deadlineMs = 0, expiredMs = 0, overshootMs = 0;
-        std::uint64_t firstNackMs = 0, lastNackMs = 0, nackAttempts = 0, requestedPackets = 0, pendingDepth = 0;
-    };
-    struct LateExpiry {
-        std::int64_t sequence = 0, first = 0, last = 0;
-        std::uint64_t arrivedMs = 0, deadlineMs = 0, lateByMs = 0, firstNackMs = 0, lastNackMs = 0, nackAttempts = 0;
-    };
+    using GapExpiry = telemetry::network::GapExpiry;
+    using LateExpiry = telemetry::network::LateExpiry;
     struct Rtp {
         std::uint16_t sequence = 0;
         std::uint32_t timestamp = 0, ssrc = 0;
@@ -289,19 +305,10 @@ private:
         return true;
     }
     void event(unsigned reason, std::int64_t seq, std::uint32_t timestamp, std::uint64_t now) {
-        if (events_.size() >= 32) { events_.pop_front(); ++stats_.eventOverflow; }
-        // Fixed keys + numeric values. Never payloads, remote text or credentials.
-        events_.push_back("reason=" + std::to_string(reason) + " ms=" + std::to_string(now) +
-            " seq=" + std::to_string(seq) + " ts=" + std::to_string(timestamp) +
-            " missing=" + std::to_string(stats_.missing) + " waitIdr=" + std::to_string(waiting_));
-        if (reason == 1) events_.back() += " gapLast=" + std::to_string(lastExpiry_.last) +
-            " detectedMs=" + std::to_string(lastExpiry_.detectedMs) + " oldestMs=" + std::to_string(lastExpiry_.oldestMs) +
-            " budgetMs=" + std::to_string(lastExpiry_.budgetMs) + " deadlineMs=" + std::to_string(lastExpiry_.deadlineMs) +
-            " overshootMs=" + std::to_string(lastExpiry_.overshootMs) +
-            " firstNackMs=" + std::to_string(lastExpiry_.firstNackMs) + " lastNackMs=" + std::to_string(lastExpiry_.lastNackMs) +
-            " nackAttempts=" + std::to_string(lastExpiry_.nackAttempts) +
-            " pendingFirst=" + std::to_string(lastExpiry_.pendingFirst) + " pendingLast=" + std::to_string(lastExpiry_.pendingLast) +
-            " pendingDepth=" + std::to_string(lastExpiry_.pendingDepth);
+        if(eventSize_==events_.size()){eventHead_=(eventHead_+1)%events_.size();--eventSize_;++stats_.eventOverflow;}
+        auto& value=events_[(eventHead_+eventSize_)%events_.size()];
+        value={reason,now,seq,timestamp,stats_.missing,waiting_,reason==1?lastExpiry_:GapExpiry{}};
+        ++eventSize_;
     }
     void damage(unsigned reason, std::int64_t seq, std::uint32_t ts, std::uint64_t now) {
         retireRequests(now);
@@ -737,6 +744,7 @@ private:
     std::vector<std::byte> au_;
     fog::detail::VideoParameters parameters_;
     std::deque<Frame> frames_;
-    std::deque<std::string> events_;
+    std::array<telemetry::network::RtpEvent,32> events_{};
+    std::size_t eventHead_=0,eventSize_=0;
 };
 }

@@ -1,22 +1,10 @@
-"""Actual FH journal coordinator plus UI recovery methods; no network/mutations."""
+"""Real FH guard/journal/coordinator recovery; UI blocked-close adapter is tested separately."""
 from pathlib import Path
 import subprocess
 import tempfile
-
-root = Path(__file__).resolve().parents[1]
-
-
-def method(source, name):
-    start = source.index('void ApplicationController::' + name + '(')
-    brace = source.index('{', start)
-    depth, end = 1, brace + 1
-    while depth:
-        depth += (source[end] == '{') - (source[end] == '}')
-        end += 1
-    return source[start:end]
-
-
-harness = r'''
+root=Path(__file__).resolve().parents[1]
+harness=r'''
+#include "rental_session_fakes.hpp"
 #include "core/constants/ui_text.hpp"
 #include "core/diagnostics/thread_observation.hpp"
 #include "features/session/application/paired_checkout.hpp"
@@ -75,92 +63,47 @@ struct Repo final : fog::RentalRepository {
     fog::CreationReceipt createOrder(const fog::StartRentalRequest&) override {++creates;return {};}
     fog::RentalPreparation orderStatus(const fog::CreationId&) override {return {};}
 };
-struct RecoveryResult {bool matched=false;};
-using TaskResult=std::variant<std::monostate,fog::FinishResult,RecoveryResult>;
+
+using Owner=fog::RentalSessionCoordinator;
 struct ApplicationController {
-    enum class Task {None,Finish,CheckoutStop,PairedStop,PairedPoll,CheckoutPoll,RestoreAuth,Recovery};
-    enum class Screen {Streaming,Stopping,Checkout,Recovery,PlayStation};
-    Disk disk;
-    Repo repo;
-    Pair pair;
-    Pins pins;
-    std::unique_ptr<fog::PairedCheckoutGuard> paired_=std::make_unique<fog::PairedCheckoutGuard>(
-        repo,pair,pins,std::make_unique<Journal>(disk));
-    struct Checkout {
-        bool pending=false;
-        fog::CheckoutResult snapshot;
-        bool unresolved() const {return pending;}
-        const fog::CheckoutResult& result() const {return snapshot;}
-        void stop(bool=false) {assert(false);}
-        void poll(bool=false) {assert(false);}
-    } checkout_;
-    struct Guard {
-        bool persistent() const {return false;}
-        std::string pendingRental() const {return {};}
-        std::string journalError() const {return {};}
-        bool ownsSession() const {return false;}
-        bool recoverMatchingSession() {assert(false);return false;}
-        fog::FinishResult finishAttempt() {assert(false);return {};}
-    } guard_;
-    struct Auth {bool authenticated() const {return true;}} auth_;
-    struct PairedServices {
-        Repo* repo;
-        struct Auth {Repo* repo; bool authenticated() const {return repo->owner.authenticated();}};
-        Auth auth() const {return {repo};}
-        fog::PairingClient* pairing() {return nullptr;}
-        bool bindRental(const fog::RentalId&) {assert(false);return false;}
-    } pairedServicesOwner_{&repo};
-    PairedServices* pairedServices_=&pairedServicesOwner_;
-    bool sessionPending_=true,pairedPending_=true,stopAfterTask_=false,checkoutAutoPoll_=false;
-    bool recoveryPaused_=false,resetStopChecks_=false,exitAfterStop_=false,shutdownDone_=false;
-    bool exitUnlocked=false;
-    int closeStreams=0;
-    Screen screen_=Screen::Recovery;
-    fog::ProviderId loginProvider_=fog::ProviderId::FogHub;
-    Task task_=Task::None;
-    std::future<TaskResult> pending_;
-    fog::StopRetryBudget stopRetry_;
-    std::chrono::steady_clock::time_point retryAt_{},checkoutAt_{};
-    std::string status_,checkoutStatus_;
-    void armExitHandling() {exitUnlocked=false;}
-    void disarmExitHandling() {exitUnlocked=true;}
-    void closeStream() {++closeStreams;}
-    void diagnostic(const std::string&) {}
-    std::string safeText(const std::string& value) {return value;}
-    bool completePairedTransportReconnect() {return false;}
-    bool completePairedVideoReconnect() {return false;}
-    bool offerSessionRating(const fog::PairedCheckoutResult&) {return false;}
-    std::monostate restoreProviders() {return {};}
-    void startStream(const fog::RentalId&,bool) {assert(false);}
-    void start(Task,std::function<TaskResult()>);
-    void beginFinish(const char* reason="rental-guard");
-    void pauseSessionRecovery();
-    void retrySessionRecovery();
-    void syncPending();
-    void recoverSession();
-    void handlePairedCheckout();
-    void pollCheckout(bool);
-    void joinStop() {
-        assert(pending_.valid());pending_.get();handlePairedCheckout();
+    Disk disk; Repo repo; Pair pair; Pins pins;
+    rental_test::Disk mtsDisk;
+    rental_test::Repo mts{fog::ProviderId::Mts,mtsDisk};
+    std::unique_ptr<Owner> rental;
+    std::future<Owner::WorkerResult> pending_;
+    bool checkoutAutoPoll_=false,exitUnlocked=false;
+    ApplicationController(){reset();}
+    void reset(){
+        rental=std::make_unique<Owner>(Owner::MtsDependencies{mts,std::make_unique<rental_test::SessionJournal>(mtsDisk),std::make_unique<rental_test::CheckoutJournal>(mtsDisk)},
+            Owner::PairedDependencies{repo,pair,pins,std::make_unique<Journal>(disk)});
     }
-    void exhaust() {
+    void syncPending(){rental->externalServiceTaskJoined();}
+    void submit(Owner::Request request){
+        const auto plan=rental->plan(std::move(request),{pending_.valid(),false,true},Owner::Time{});
+        if(plan.status==Owner::PlanStatus::Paused){checkoutAutoPoll_=false;exitUnlocked=true;}
+        if(plan.work){const auto work=*plan.work;pending_=std::async(std::launch::async,[this,work]{return rental->execute(work);});}
+    }
+    void recoverSession(){submit(Owner::Recover{});}
+    void pollCheckout(bool){submit(rental->requested()?Owner::Request{Owner::Stop{}}:Owner::Request{Owner::PairedPoll{}});}
+    void retrySessionRecovery(){assert(rental->manualRetry());recoverSession();}
+    void joinStop(){
+        assert(pending_.valid());
+        Owner::Effects effects;
+        try{auto result=pending_.get();effects=rental->completeJoined(std::move(result),{},Owner::Time{});}
+        catch(...){effects=rental->completeJoined(std::current_exception(),{},Owner::Time{});}
+        checkoutAutoPoll_=rental->state().pending&&!rental->paused();exitUnlocked=rental->paused()||!rental->state().pending;
+        assert(!effects.start);
+    }
+    void exhaust(){
         syncPending();recoverSession();joinStop();
-        for(unsigned attempt=1;attempt<3;++attempt) {pollCheckout(false);joinStop();}
-        assert(recoveryPaused_ && stopRetry_.attempts()==3 && !checkoutAutoPoll_ && exitUnlocked);
-        assert(sessionPending_ && pairedPending_ && disk.saved.pending && paired_->unresolved());
-        assert(screen_==Screen::Recovery);
+        for(unsigned attempt=1;attempt<3;++attempt){pollCheckout(false);joinStop();}
+        assert(rental->paused()&&rental->attempts()==3&&!checkoutAutoPoll_&&exitUnlocked);
+        assert(rental->state().pending&&rental->state().pairedPending&&disk.saved.pending);
         const auto reads=repo.inspections,stops=repo.closes;
-        for(unsigned tick=0;tick<100;++tick) pollCheckout(false);
-        assert(!pending_.valid() && repo.inspections==reads && repo.closes==stops);
+        for(unsigned tick=0;tick<100;++tick)pollCheckout(false);
+        assert(!pending_.valid()&&repo.inspections==reads&&repo.closes==stops);
     }
 };
-'''
-harness += method((root / 'src/app/application.cpp').read_text(), 'start')
-source = (root / 'src/features/session/presentation/rental_controller.cpp').read_text()
-for name in ('beginFinish', 'pauseSessionRecovery', 'retrySessionRecovery', 'syncPending',
-             'recoverSession', 'handlePairedCheckout', 'pollCheckout'):
-    harness += '\n' + method(source, name)
-harness += r'''
 int main() {
     // Unknown/lost history after failed launch pauses after three bounded checks.
     // The user finishes on the site; explicit A rechecks the exact ended row.
@@ -169,9 +112,9 @@ int main() {
         assert(app.repo.closes==0 && app.repo.creates==0 && app.pair.pairs==0);
         app.repo.evidence.state=fog::RentalInspectionState::Terminal;
         app.retrySessionRecovery();app.joinStop();
-        assert(!app.sessionPending_ && !app.pairedPending_ && !app.recoveryPaused_ && !app.stopAfterTask_);
-        assert(!app.disk.saved.pending && app.disk.clears==1 && !app.paired_->unresolved());
-        assert(app.stopRetry_.attempts()==0 && app.repo.closes==0 && app.repo.creates==0 && app.pair.pairs==0);
+        assert(!app.rental->state().pending && !app.rental->state().pairedPending && !app.rental->paused() && !app.rental->requested());
+        assert(!app.disk.saved.pending && app.disk.clears==1 && !app.rental->state().pairedPending);
+        assert(app.rental->attempts()==0 && app.repo.closes==0 && app.repo.creates==0 && app.pair.pairs==0);
     }
     // Site-end observed after restart needs no close replay, even if old stop
     // dispatch was persisted and authentication was restored with a new epoch.
@@ -179,7 +122,7 @@ int main() {
         ApplicationController app;app.repo.owner.generation=5;
         app.repo.evidence.state=fog::RentalInspectionState::Terminal;
         app.syncPending();app.recoverSession();app.joinStop();
-        assert(!app.sessionPending_ && !app.disk.saved.pending && app.repo.closes==0 && app.pair.pairs==0);
+        assert(!app.rental->state().pending && !app.disk.saved.pending && app.repo.closes==0 && app.pair.pairs==0);
     }
     for(unsigned failure=0;failure<5;++failure) {
         ApplicationController app;
@@ -197,28 +140,26 @@ int main() {
     for(bool lostReply:{false,true}) {
         ApplicationController app;
         app.disk.saved.record.stopAttempted=false;
-        app.paired_=std::make_unique<fog::PairedCheckoutGuard>(app.repo,app.pair,app.pins,std::make_unique<Journal>(app.disk));
+        app.reset();
         app.repo.evidence.state=fog::RentalInspectionState::Preparing;
         app.repo.closeFails=lostReply;app.exhaust();
         assert(app.repo.closes==1 && app.disk.saved.record.stopAttempted);
         app.repo.evidence.state=fog::RentalInspectionState::Terminal;
         app.retrySessionRecovery();app.joinStop();
-        assert(!app.sessionPending_ && !app.disk.saved.pending && app.repo.closes==1);
+        assert(!app.rental->state().pending && !app.disk.saved.pending && app.repo.closes==1);
     }
     {
         ApplicationController app;app.disk.failClear=true;
         app.repo.evidence.state=fog::RentalInspectionState::Terminal;app.exhaust();
         assert(app.repo.closes==0 && app.disk.saved.pending);
         app.disk.failClear=false;app.retrySessionRecovery();app.joinStop();
-        assert(!app.sessionPending_ && !app.disk.saved.pending && app.repo.closes==0);
+        assert(!app.rental->state().pending && !app.disk.saved.pending && app.repo.closes==0);
     }
-    std::cout<<"FogHub stop/recovery production glue PASS: three-attempt pause, no background retry, external end/restart reconciliation clears admission gate, network/missing/wrong-owner retention, close ACK/lost-reply no replay, SD cleanup retry\n";
+    std::cout<<"FogHub REAL coordinator stop/recovery PASS: three-attempt pause, no background retry, external end/restart reconciliation clears admission gate, network/missing/wrong-owner retention, close ACK/lost-reply no replay, SD cleanup retry\n";
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fog-fh-stop-recovery-') as directory:
-    target = Path(directory)
-    (target / 'test.cpp').write_text(harness)
-    subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-pthread',
-                    '-I' + str(root / 'src'), str(root / 'src/features/session/application/paired_checkout.cpp'),
-                    str(target / 'test.cpp'), '-o', str(target / 'test')], check=True)
-    subprocess.run([str(target / 'test')], check=True, timeout=15)
+    target=Path(directory);(target/'test.cpp').write_text(harness)
+    sources=['session.cpp','checkout.cpp','paired_checkout.cpp','rental_session_coordinator.cpp']
+    subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-pthread','-I'+str(root/'src'),'-I'+str(root/'tests'),*[str(root/'src/features/session/application'/file) for file in sources],str(target/'test.cpp'),'-o',str(target/'test')],check=True)
+    subprocess.run([str(target/'test')],check=True,timeout=20)

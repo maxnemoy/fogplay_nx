@@ -421,13 +421,15 @@ void queueBoundsAndNoIoOnCaller() {
     // I/O is intentionally blocked: completing these enqueues proves the caller
     // never performs write/fsync/commit and is independent of SD completion.
     log.requestFlush(); // A watchdog flush request must also return while storage is blocked.
-    for (std::size_t i = 0; i < fog::RunLog::maxQueuedLines; ++i)
+    for (std::size_t i = 0; i < fog::RunLog::maxQueuedLines - 1; ++i)
         require(log.append("pending " + std::to_string(i)), "caller enqueues while worker I/O blocked");
     require(!log.append("over capacity"), "line bound rejects excess");
     require(!log.append(std::string(fog::RunLog::maxLineBytes + 1, 'x')), "oversize line rejected");
     const auto before = log.stats();
-    require(before.queuedLines == fog::RunLog::maxQueuedLines && before.queuedBytes <= fog::RunLog::maxQueuedBytes,
+    require(before.queuedLines == fog::RunLog::maxQueuedLines - 1 && before.queuedBytes <= fog::RunLog::maxQueuedBytes,
         "queue memory bounded");
+    require(before.acceptedLines == before.queuedLines + 1 && before.acceptedLines == fog::RunLog::maxQueuedLines,
+        "resident line budget includes the blocked writer line");
     require(before.droppedLines == 2 && log.error().find("dropped 2") != std::string::npos, "drops observable without filesystem access");
     {
         std::lock_guard<std::mutex> lock(gateMutex); blockedWrite = false;
@@ -436,9 +438,11 @@ void queueBoundsAndNoIoOnCaller() {
     require(!log.flush(), "barrier reports previously lost lines");
     log.close();
     const auto contents = readFile(log.archivePath());
-    require(contents.find("[RunLog] dropped 2 diagnostic lines (queue capacity)\n") != std::string::npos, "drop summary persisted");
+    require(contents.find("[RunLog] dropped 2 diagnostic lines (enqueue rejection)") != std::string::npos, "drop summary persisted");
     require(contents == readFile(fixture.path("last-run.log")), "drop summaries mirror consistently");
-    require(log.stats().writtenLines == fog::RunLog::maxQueuedLines + 1, "accepted lines survive saturation");
+    require(contents.find("first batch\npending 0\n") == 0 &&
+        contents.find("pending 510\n") != std::string::npos, "blocked prefix and saturated queue retain FIFO");
+    require(log.stats().writtenLines == fog::RunLog::maxQueuedLines, "accepted lines survive saturation");
 }
 void byteBoundAndShutdownFailure() {
     Fixture fixture;

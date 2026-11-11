@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run prepared RTSP/socket code against local sockets and exact host parsing."""
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 
@@ -8,7 +9,8 @@ ROOT = Path(__file__).resolve().parents[3]
 TOOLS = ROOT / "tools/moonlight"
 CORE = ROOT / "third_party/moonlight/moonlight-switch/extern/moonlight-common-c/src"
 PREPARED = ROOT / "third_party/moonlight/prepared/core"
-subprocess.run(["python3", str(TOOLS / "prepare.py")], check=True)
+if os.environ.get("FOG_MOONLIGHT_PRECHECKED") != "1":
+    subprocess.run(["python3", "-B", str(TOOLS / "prepare.py"), "--check"], check=True)
 flags = ["cc", "-std=gnu11", "-DLC_DEBUG", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
          "-Wno-unused-function", "-pthread", "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
          "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
@@ -18,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix="moonlight-transport-") as directory:
     binary = destination / "rtsp-test"
     subprocess.run(flags + [str(TOOLS / "tests/rtsp_transport_test.c"),
         str(PREPARED / "PlatformSockets.c"), str(CORE / "RtspParser.c"),
-        str(CORE / "PlatformCrypto.c"), str(CORE / "Misc.c"), "-lcrypto", "-o", str(binary)], check=True)
+        str(CORE / "PlatformCrypto.c"), str(CORE / "Misc.c"), str(TOOLS / "FogMoonlightDiagnostics.c"), "-lcrypto", "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 
     control = (PREPARED / "ControlStream.c").read_text()

@@ -150,6 +150,111 @@ static void lossGatingAndReferenceSafety(void) {
     frame(3, false, true); assert(events == 1 && presented == 1);
     done();
 }
+static void repeatedHolesRequestAtRecovery(void) {
+    clockUs += 1000000; init(false); frame(1, true, true);
+    // A recent API request must not delay recovery from a new frame loss.
+    LiRequestIdrFrame();
+    clockUs += 10000; frame(3, false, true);
+    assert(events == 2 && presented == 1 && waitingForIdrFrame);
+    const uint64_t waitEntries = snapshot().idrWaitEntries;
+    // New holes in the same wait each regain an immediate request when the
+    // first complete frame shows that packets are flowing again.
+    for (unsigned i = 5; i <= 45; i += 2) {
+        clockUs += 20000; frame(i, false, true);
+        assert(events == 2 + (i - 3) / 2 && presented == 1);
+        assert(snapshot().idrWaitEntries == waitEntries);
+    }
+    const unsigned requests = events;
+    const uint64_t latestRequestUs = clockUs;
+    // Consecutive complete P frames without another hole retain the existing
+    // 500 ms fallback; restoring loss recovery does not remove that bound.
+    clockUs = latestRequestUs + 499999; frame(46, false, true);
+    assert(events == requests);
+    clockUs++; frame(47, false, true);
+    assert(events == requests + 1 && snapshot().idrWaitRetryRequests == 1);
+    clockUs++; frame(48, true, true);
+    clockUs++; frame(50, false, true);
+    assert(events == requests + 2 && presented == 2);
+    assert(snapshot().idrWaitEntries == waitEntries + 1);
+    done();
+}
+static void lostRequestedIdrRetriesOnNextCompleteFrame(void) {
+    clockUs += 1000000; init(false); frame(1, true, true);
+    notifyFrameLost(2, false);
+    clockUs += 10000; frame(3, false, true);
+    assert(events == 1 && waitingForIdrFrame && presented == 1);
+    const uint64_t waitEntries = snapshot().idrWaitEntries;
+    // The requested IDR is lost before depacketizer recognition. The FEC
+    // queue reports that loss through its real depacketizer entry point.
+    clockUs += 20000; notifyFrameLost(4, false);
+    assert(events == 1 && waitingForIdrFrame);
+    clockUs += 10000; frame(5, false, true);
+    assert(events == 2 && waitingForIdrFrame && presented == 1);
+    assert(snapshot().idrWaitEntries == waitEntries);
+    assert(snapshot().idrWaitRetryRequests == 0);
+    clockUs += 1000; frame(6, true, true);
+    assert(!waitingForIdrFrame && presented == 2);
+    done();
+}
+static void* decoderThreadRefresh(void* context) {
+    (void)context;
+    requestDecoderRefresh();
+    return NULL;
+}
+static void decoderRefreshAndNetworkRecovery(void) {
+    clockUs += 1000000; init(false); frame(1, true, true);
+    pthread_t decoder;
+    assert(pthread_create(&decoder, NULL, decoderThreadRefresh, NULL) == 0);
+    assert(pthread_join(decoder, NULL) == 0);
+    assert(events == 1 && waitingForIdrFrame);
+    // A network hole after a decoder request gets an immediate recovery
+    // request. Without a new hole, complete frames share the normal deadline.
+    clockUs += 10000; frame(3, false, true);
+    assert(events == 2 && presented == 1);
+    clockUs += 499999; frame(4, false, true); assert(events == 2);
+    clockUs++; frame(5, false, true); assert(events == 3);
+    clockUs++; FogIdrRecoveryRequestDecoderRefresh(); FogIdrRecoveryPollDecoder();
+    assert(events == 4 && localDecoderRecovery);
+    clockUs += 10000; frame(6, false, true); assert(events == 4);
+    clockUs += 489999; FogIdrRecoveryPollDecoder(); assert(events == 4);
+    clockUs++; FogIdrRecoveryPollDecoder(); assert(events == 5);
+    done();
+}
+static void exceptionalDirectRequestsRemainImmediate(void) {
+    clockUs += 1000000; init(false); frame(1, true, true);
+    for (unsigned index = 2; index <= 3; index++) {
+        unsigned char packet[sizeof(NV_VIDEO_PACKET) + 8] = {0};
+        PNV_VIDEO_PACKET nv = (PNV_VIDEO_PACKET)packet;
+        nv->frameIndex = index; nv->streamPacketIndex = (index + 3) << 8;
+        nv->flags = FLAG_EOF; // corrupt non-SOF sequence, before frame parsing
+        PLENTRY_INTERNAL entry = NULL;
+        processRtpPayload(nv, sizeof(packet), clockUs, 1, 1, &entry);
+        assert(entry == NULL && events == index - 1 && waitingForIdrFrame);
+        clockUs++;
+    }
+    frame(5, false, true); assert(events == 3 && presented == 1);
+    done();
+#ifdef LC_FUZZING
+    // Disable host-input assertions only; all harness assertions stay active.
+    clockUs += 1000000; init(false); frame(1, true, true);
+    NegotiatedVideoFormat = VIDEO_FORMAT_AV1_MAIN8;
+    for (unsigned index = 2; index <= 3; index++) {
+        unsigned char packet[sizeof(NV_VIDEO_PACKET) + 9] = {0};
+        PNV_VIDEO_PACKET nv = (PNV_VIDEO_PACKET)packet;
+        nv->frameIndex = index; nv->streamPacketIndex = index << 8;
+        nv->flags = FLAG_SOF | FLAG_EOF;
+        unsigned char* data = packet + sizeof(*nv);
+        data[0] = 1; data[3] = 1; // encoded payload length stays zero (invalid)
+        PLENTRY_INTERNAL entry = NULL;
+        processRtpPayload(nv, sizeof(packet), clockUs, 1, 1, &entry);
+        assert(entry == NULL && events == index - 1 && waitingForIdrFrame);
+        clockUs++;
+    }
+    NegotiatedVideoFormat = VIDEO_FORMAT_H264;
+    frame(5, false, true); assert(events == 3 && presented == 1);
+    done();
+#endif
+}
 static void controlOutcomesAndReset(void) {
     clockUs += 1000000; init(false);
     LiRequestIdrFrame(); sendOk = false; requestIdrFrame();
@@ -267,6 +372,9 @@ static void pullRendererAdmissionAndRefresh(void) {
     done();
 }
 int main(void) {
+    repeatedHolesRequestAtRecovery(); lostRequestedIdrRetriesOnNextCompleteFrame();
+    decoderRefreshAndNetworkRecovery();
+    exceptionalDirectRequestsRemainImmediate();
     timedRetriesAndRelease(); lossGatingAndReferenceSafety(); controlOutcomesAndReset(); staleSamples(); localDecoderRecoveryScenarios(); ordinaryWaitDoesNotGainTimeoutRetry();
     pullRendererAdmissionAndRefresh();
     puts("Prepared IDR wait/retry, reference safety, dispatch, reset and actual pull/wake/completion tests passed");

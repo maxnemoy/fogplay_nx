@@ -244,7 +244,9 @@ bool RunLog::start(const std::string& dataDir, std::time_t timestamp, bool (*com
         errorOperation_ = nullptr;
         errorCode_ = 0;
         stats_ = {};
+        pendingRejections_ = {};
         queue_.clear();
+        residentLines_ = 0;
         pendingDrops_ = requestedBarrier_ = completedBarrier_ = 0;
         stopping_ = false;
         commit_ = commit;
@@ -301,7 +303,7 @@ bool RunLog::start(const std::string& dataDir, std::time_t timestamp, bool (*com
         std::chrono::steady_clock::now() - startupBegan).count());
     return !errorOperation_;
 }
-bool RunLog::writeSink(int& fd, const std::string& batch, const char* operation, bool sync) noexcept {
+bool RunLog::writeSink(int& fd, std::string_view batch, const char* operation, bool sync) noexcept {
     if (fd < 0) return false;
     if ((!batch.empty() && !writeBytes(fd, batch.data(), batch.size())) || (sync && fsync(fd) != 0)) {
         fail(operation, errno);
@@ -310,26 +312,86 @@ bool RunLog::writeSink(int& fd, const std::string& batch, const char* operation,
     }
     return true;
 }
+void RunLog::reject(RejectionReason reason, std::size_t lines, bool deferred) noexcept {
+    stats_.droppedLines += lines; pendingDrops_ += lines;
+    if (deferred) ++stats_.droppedDeferred;
+    for (auto* counts : {&stats_.rejected, &pendingRejections_}) {
+        switch (reason) {
+        case RejectionReason::Records: ++counts->records; break;
+        case RejectionReason::Bytes: ++counts->bytes; break;
+        case RejectionReason::Lines: ++counts->lines; break;
+        case RejectionReason::Raw: ++counts->raw; break;
+        case RejectionReason::Rendered: ++counts->rendered; break;
+        case RejectionReason::Invalid: ++counts->invalidOrProducerLoss; break;
+        case RejectionReason::Allocation: ++counts->allocation; break;
+        }
+    }
+}
 bool RunLog::append(const std::string& preparedLine) noexcept {
     bool accepted = false;
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!running_ || stopping_) return false;
-        if (preparedLine.size() > maxLineBytes || queue_.size() >= maxQueuedLines ||
-            preparedLine.size() + 1 > maxQueuedBytes - stats_.queuedBytes) {
-            ++stats_.droppedLines; ++pendingDrops_;
-        } else {
-            queue_.push_back(preparedLine);
+        if (preparedLine.size() > maxLineBytes) reject(RejectionReason::Rendered, 1, false);
+        else if (residentLines_ >= maxQueuedLines) reject(RejectionReason::Lines, 1, false);
+        else if (stats_.residentBytes >= maxQueuedBytes ||
+            preparedLine.size() + 1 > maxQueuedBytes - stats_.residentBytes) reject(RejectionReason::Bytes, 1, false);
+        else {
+            queue_.push_back({preparedLine, {}, preparedLine.size() + 1, 0});
+            stats_.residentBytes += preparedLine.size() + 1;
             ++stats_.acceptedLines;
-            stats_.queuedLines = queue_.size();
+            ++stats_.queuedLines; ++residentLines_;
             stats_.queuedBytes += preparedLine.size() + 1;
-            stats_.highWaterBytes = std::max(stats_.highWaterBytes, stats_.queuedBytes);
+            stats_.highWaterBytes = std::max(stats_.highWaterBytes, stats_.residentBytes);
             accepted = true;
         }
     } catch (...) {
         fail("enqueue", ENOMEM);
         std::lock_guard<std::mutex> lock(mutex_);
-        ++stats_.droppedLines; ++pendingDrops_;
+        reject(RejectionReason::Allocation, 1, false);
+    }
+    ready_.notify_one();
+    return accepted && archiveHealthy() && mirrorHealthy();
+}
+bool RunLog::appendDeferred(std::unique_ptr<const DeferredRecord> record, Admission admission) noexcept {
+    bool accepted = false;
+    std::size_t declaredLines = 1;
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!running_ || stopping_) return false;
+        const auto raw = record ? record->rawBytes() : 0;
+        const auto rendered = record ? record->maxOutputBytes() : 0;
+        const auto requestedLines = record ? record->lineCount() : 0;
+        const bool validLines = requestedLines && requestedLines <= maxDeferredLines;
+        if (validLines) declaredLines = requestedLines;
+        const bool terminal = admission == Admission::Terminal;
+        const auto maximumRecords = terminal ? maxTerminalDeferredRecords : maxDeferredRecords;
+        const auto maximumBytes = terminal ? maxTerminalQueuedBytes : maxQueuedBytes;
+        const auto charge = raw + std::max<std::size_t>(rendered, 64) + 1;
+        // First-failing reason: invalid declaration, raw/rendered declaration,
+        // then total outstanding records/lines/bytes (including in-flight).
+        if (!record || !validLines || (admission != Admission::Ordinary && !terminal))
+            reject(RejectionReason::Invalid, declaredLines, true);
+        else if (!raw || raw > maxDeferredRawBytes) reject(RejectionReason::Raw, declaredLines, true);
+        else if (!rendered || rendered > (declaredLines == 1 ? maxLineBytes : maxDeferredOutputBytes))
+            reject(RejectionReason::Rendered, declaredLines, true);
+        else if (stats_.deferredRecords >= maximumRecords) reject(RejectionReason::Records, declaredLines, true);
+        else if (declaredLines > maxQueuedLines - residentLines_) reject(RejectionReason::Lines, declaredLines, true);
+        else if (stats_.residentBytes >= maximumBytes || charge > maximumBytes - stats_.residentBytes)
+            reject(RejectionReason::Bytes, declaredLines, true);
+        else {
+            const auto nowUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            queue_.push_back({{}, std::move(record), charge, nowUs, declaredLines, rendered});
+            stats_.acceptedLines += declaredLines; ++stats_.acceptedDeferred; ++stats_.deferredRecords;
+            stats_.queuedLines += declaredLines; residentLines_ += declaredLines;
+            stats_.queuedBytes += charge; stats_.residentBytes += charge;
+            stats_.highWaterBytes = std::max(stats_.highWaterBytes, stats_.residentBytes);
+            accepted = true;
+        }
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        reject(RejectionReason::Allocation, declaredLines, true);
     }
     ready_.notify_one();
     return accepted && archiveHealthy() && mirrorHealthy();
@@ -354,8 +416,9 @@ void RunLog::writer() noexcept {
     auto nextSync = Clock::now() + std::chrono::seconds(5);
     try {
         for (;;) {
-            std::deque<std::string> lines;
+            std::deque<Entry> lines;
             std::uint64_t barrier = 0, dropped = 0;
+            RejectionCounts rejected;
             bool sync = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
@@ -369,17 +432,62 @@ void RunLog::writer() noexcept {
                 }
                 if (stopping_ && !dirty && queue_.empty() && !pendingDrops_ && requestedBarrier_ == completedBarrier_) break;
                 lines.swap(queue_);
-                inFlightLines = lines.size();
+                inFlightLines = stats_.queuedLines;
                 stats_.queuedLines = stats_.queuedBytes = 0;
                 dropped = pendingDrops_; pendingDrops_ = 0;
+                rejected = pendingRejections_; pendingRejections_ = {};
                 barrier = requestedBarrier_;
                 sync = !fog::stage1::sparseDiagnostics || stopping_ ||
                     barrier > completedBarrier_ || Clock::now() >= nextSync;
             }
             const auto began = Clock::now();
             std::string batch;
-            for (const auto& line : lines) { batch += line; batch += '\n'; }
-            if (dropped) batch += "[RunLog] dropped " + std::to_string(dropped) + " diagnostic lines (queue capacity)\n";
+            std::size_t formattedLines = 0, writtenEarlier = 0, failedRecords = 0, failedLines = 0;
+            std::size_t releasedBytes = 0, releasedRecords = 0, releasedLines = 0;
+            std::uint64_t formatMaxUs = 0, residenceMaxUs = 0;
+            for (const auto& entry : lines) {
+                releasedBytes += entry.charge;
+                releasedLines += entry.declaredLines;
+                if (entry.record) {
+                    ++releasedRecords;
+                    const auto formatBegan = Clock::now();
+                    const auto nowUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(formatBegan.time_since_epoch()).count());
+                    residenceMaxUs = std::max(residenceMaxUs, nowUs >= entry.enqueuedAtUs ? nowUs-entry.enqueuedAtUs : 0);
+                    const auto beforeRecord = batch.size();
+                    try {
+                        DeferredSink sink(entry.maximumOutput, entry.declaredLines);
+                        entry.record->format(sink);
+                        sink.finish();
+                        batch += sink.text(); batch += '\n'; formattedLines += entry.declaredLines;
+                    } catch (...) {
+                        // Formatting and batch growth can both allocate. If text
+                        // appended but its newline failed, discard the whole
+                        // record before adding the bounded failure notice.
+                        batch.resize(beforeRecord);
+                        ++failedRecords; failedLines += entry.declaredLines;
+                        constexpr std::string_view notice = "[RunLog] deferred-format failure\n";
+                        try { batch += notice; }
+                        catch (...) {
+                            // Persistent OOM must not lose the earlier complete
+                            // FIFO prefix or make the failed record partially
+                            // visible. Both writes below allocate no memory;
+                            // the eventual sync still belongs to this barrier.
+                            const bool archive = writeSink(archiveFd_, batch, "write-archive", false);
+                            const bool mirror = writeSink(mirrorFd_, batch, "write-mirror", false);
+                            if (archive || mirror) writtenEarlier += formattedLines;
+                            batch.clear(); formattedLines = 0;
+                            writeSink(archiveFd_, notice, "write-archive", false);
+                            writeSink(mirrorFd_, notice, "write-mirror", false);
+                        }
+                    }
+                    formatMaxUs = std::max(formatMaxUs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-formatBegan).count()));
+                } else { batch += entry.line; batch += '\n'; ++formattedLines; }
+            }
+            if (dropped) batch += "[RunLog] dropped " + std::to_string(dropped) +
+                " diagnostic lines (enqueue rejection) rejectedRequestsRecords=" + std::to_string(rejected.records) +
+                " rejectedRequestsBytes=" + std::to_string(rejected.bytes) + " rejectedRequestsLines=" + std::to_string(rejected.lines) +
+                " rejectedRequestsRaw=" + std::to_string(rejected.raw) + " rejectedRequestsRendered=" + std::to_string(rejected.rendered) +
+                " rejectedRequestsInvalidOrProducerLoss=" + std::to_string(rejected.invalidOrProducerLoss) + " rejectedRequestsAllocation=" + std::to_string(rejected.allocation) + "\n";
             const bool archive = writeSink(archiveFd_, batch, "write-archive", sync);
             const bool mirror = writeSink(mirrorFd_, batch, "write-mirror", sync);
             dirty = !sync;
@@ -389,9 +497,16 @@ void RunLog::writer() noexcept {
                 catch (...) { fail("commit-device", EIO); }
             }
             const auto duration = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-began).count());
+            lines.clear(); // Destroy owned raw copies before releasing their admission charge.
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (archive || mirror) stats_.writtenLines += lines.size();
+                stats_.writtenLines += writtenEarlier + ((archive || mirror) ? formattedLines : 0);
+                stats_.droppedLines += failedLines; stats_.droppedDeferred += failedRecords;
+                stats_.formatFailures += failedRecords;
+                stats_.residentBytes -= releasedBytes; stats_.deferredRecords -= releasedRecords;
+                residentLines_ -= releasedLines;
+                stats_.formatMaxUs = std::max(stats_.formatMaxUs, formatMaxUs);
+                stats_.residenceMaxUs = std::max(stats_.residenceMaxUs, residenceMaxUs);
                 ++stats_.batches;
                 stats_.lastBatchUs = duration;
                 stats_.maxBatchUs = std::max(stats_.maxBatchUs, duration);
@@ -403,9 +518,11 @@ void RunLog::writer() noexcept {
     } catch (...) { fail("writer", ENOMEM); }
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        stats_.droppedLines += queue_.size() + inFlightLines;
+        stats_.droppedLines += stats_.queuedLines + inFlightLines;
+        stats_.droppedDeferred += stats_.deferredRecords;
         queue_.clear();
-        stats_.queuedLines = stats_.queuedBytes = 0;
+        stats_.queuedLines = stats_.queuedBytes = stats_.residentBytes = stats_.deferredRecords = 0;
+        residentLines_ = 0;
         running_ = false;
     }
     drained_.notify_all();

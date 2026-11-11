@@ -358,7 +358,7 @@ void curatedComputers() {
     s.web.responses.push_back({"/pc/preview?id=1836",html(second)});
     const std::vector<std::pair<std::string,std::string>> added{
         {"1233","10623X9"},{"1232","10623X2"},{"1231","10623X3"},
-        {"1235","10623X7"},{"1237","10623X10"},{"1230","10623X4"}};
+        {"1235","10623X7"},{"1237","10623X10"},{"1230","10623X4"},{"193","fixture193"}};
     for (const auto& [id,name] : added) {
         auto page=fixture("computer-preview-card-excerpt.html");
         page=std::regex_replace(page,std::regex("1838"),id);
@@ -369,7 +369,7 @@ void curatedComputers() {
     const auto cards=s.catalog.playStationComputers([&](const std::vector<Computer>& rows) {
         ++updates; assert(rows.size()==updates);
     });
-    assert(cards.size()==8 && cards[0].id.value=="1838" && cards[1].id.value=="1836" && updates==8);
+    assert(cards.size()==9 && cards[0].id.value=="1838" && cards[1].id.value=="1836" && updates==9);
     for (std::size_t i=0;i<added.size();++i)
         assert(cards[i+2].id.value==added[i].first && cards[i+2].name==added[i].second);
     for(const auto& card:cards) assert(card.launchable && card.hourlyPrice && card.hourlyPrice->minorUnits==2500);
@@ -400,34 +400,34 @@ void publicCatalogWithoutAccountStorage() {
     second->cancel();
 }
 void isolatedFeaturedCardFailures() {
-    const std::vector<std::string> ids{"1838","1836","1233","1232","1231","1235","1237","1230"};
-    for (const auto invalid : {0U,3U,8U}) {
+    const std::vector<std::string> ids{"1838","1836","1233","1232","1231","1235","1237","1230","193"};
+    for (const auto invalid : {0U,3U,9U}) {
         Setup s;
         std::vector<std::size_t> sizes;
         for (std::size_t i=0;i<ids.size();++i) {
             auto page=std::regex_replace(fixture("computer-preview-card-excerpt.html"),std::regex("1838"),ids[i]);
             // A mismatched action must reject the entire card, even when
             // other cards remain usable. The bad card is never launchable.
-            if (invalid==8 || i==invalid) replace(page,"/pc/play?id="+ids[i],"/pc/play?id=999999");
+            if (invalid==9 || i==invalid) replace(page,"/pc/play?id="+ids[i],"/pc/play?id=999999");
             sizes.push_back(page.size());
             s.web.responses.push_back({"/pc/preview?id="+ids[i],html(page)});
         }
         unsigned updates=0;
         const auto progress=[&](const std::vector<Computer>& rows) {
             ++updates; assert(rows.size()==updates);
-            for (const auto& card:rows) assert(invalid==8 || card.id.value!=ids[invalid]);
+            for (const auto& card:rows) assert(invalid==9 || card.id.value!=ids[invalid]);
         };
-        if (invalid==8) error(RepositoryErrorKind::InvalidResponse,[&]{s.catalog.playStationComputers(progress);});
+        if (invalid==9) error(RepositoryErrorKind::InvalidResponse,[&]{s.catalog.playStationComputers(progress);});
         else {
             const auto cards=s.catalog.playStationComputers(progress);
-            assert(cards.size()==7 && updates==7);
+            assert(cards.size()==8 && updates==8);
             for (const auto& card:cards) assert(card.launchable && card.id.value!=ids[invalid] && card.hourlyPrice->minorUnits==2500);
             assert(cards.front().id.value==(invalid==0 ? ids[1] : ids[0]) && cards.back().id.value==ids.back());
         }
-        assert(s.web.gets==8 && s.web.responses.empty() && s.web.posts==0);
-        assert(s.diagnostics.size()==(invalid==8 ? 8U : 1U));
+        assert(s.web.gets==9 && s.web.responses.empty() && s.web.posts==0);
+        assert(s.diagnostics.size()==(invalid==9 ? 9U : 1U));
         for (std::size_t i=0;i<s.diagnostics.size();++i) {
-            const auto card=invalid==8 ? i : invalid;
+            const auto card=invalid==9 ? i : invalid;
             assert(s.diagnostics[i]=="FogHub featured catalog: card-skipped id="+ids[card]+
                 " reason=invalid-response stage=play bytes="+std::to_string(sizes[card]));
         }
@@ -440,7 +440,7 @@ void isolatedFeaturedCardFailures() {
         s.web.responses.push_back({"/pc/preview?id=1838",html(challenge)});
         for (std::size_t i=1;i<ids.size();++i)
             s.web.responses.push_back({"/pc/preview?id="+ids[i],html(std::regex_replace(fixture("computer-preview-card-excerpt.html"),std::regex("1838"),ids[i]))});
-        assert(s.catalog.playStationComputers().size()==7 && s.diagnostics.size()==1);
+        assert(s.catalog.playStationComputers().size()==8 && s.diagnostics.size()==1);
         const auto& line=s.diagnostics.front();
         assert(line.rfind("FogHub featured catalog: card-skipped id=1838 reason=invalid-response stage=",0)==0);
         assert(line.find("stage=play")==std::string::npos && line.find("stage=value")==std::string::npos);

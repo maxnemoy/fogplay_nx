@@ -569,9 +569,14 @@ static void controlDiagnosticsLifecycle() {
         const std::string unknown = R"({"id":"controller_effect","payload":{"left":25,"right":10,"token":"secret-feedback-token"},"session":"secret-feedback-session"})";
         client.receiveControlForTesting(unknown);
         assert(client.pollControlDiagnostic(event));
-        assert(event.find("provider=mts") != std::string::npos && event.find("controller_effect") != std::string::npos);
-        assert(event.find("parsed=ignored") != std::string::npos && event.find("left") != std::string::npos);
-        assert(event.find("secret-feedback") == std::string::npos);
+        // Schema2 deliberately replaces unknown remote ids and field names;
+        // a type-only shape remains useful without retaining identifiers.
+        assert(event.find("provider=mts mtsControl id=unknown") == 0);
+        assert(event.find("fields={id:string,unknown:{unknown:integer,unknown:integer,unknown:<redacted>},session:<redacted>}") != std::string::npos);
+        assert(event.find("parsed=ignored count=1 pending=1") != std::string::npos);
+        assert(event.find("discoverySchema=2 unknownNames=5 tokensTruncated=0 formatterTruncated=0") != std::string::npos);
+        for (const auto* forbidden : {"controller_effect", "payload:", "left:", "right:", "token:", "secret-feedback-token", "secret-feedback-session"})
+            assert(event.find(forbidden) == std::string::npos);
         assert(!client.pollControlDiagnostic(event));
         for (unsigned i = 0; i < 1000; ++i) client.receiveControlForTesting(unknown);
         client.receiveControlForTesting(R"({"id":"gamepad_notification","index":0,"large_motor":255,"small_motor":128})");
@@ -582,9 +587,25 @@ static void controlDiagnosticsLifecycle() {
         unsigned count = 0;
         while (client.pollControlDiagnostic(event, true)) {
             assert(++count <= 33 && event.find("secret-feedback") == std::string::npos);
-            ignored |= event.find("parsed=ignored") != std::string::npos;
-            rumble |= event.find("parsed=rumble") != std::string::npos;
-            invalidRumble |= event.find("parsed=invalid-rumble") != std::string::npos;
+            if (event.find("parsed=ignored") != std::string::npos) {
+                ignored = true;
+                assert(event.find("count=1001 pending=1000") != std::string::npos);
+                assert(event.find("discoverySchema=2 unknownNames=5") != std::string::npos);
+                for (const auto* forbidden : {"controller_effect", "payload:", "left:", "right:", "token:"})
+                    assert(event.find(forbidden) == std::string::npos);
+            }
+            if (event.find("parsed=rumble") != std::string::npos) {
+                rumble = true;
+                assert(event.find("id=gamepad_notification") != std::string::npos);
+                assert(event.find("large_motor:255,small_motor:128") != std::string::npos);
+                assert(event.find("count=1 pending=1") != std::string::npos);
+            }
+            if (event.find("parsed=invalid-rumble") != std::string::npos) {
+                invalidRumble = true;
+                assert(event.find("id=gamepad_notification") != std::string::npos);
+                assert(event.find("large_motor:256,small_motor:128") != std::string::npos);
+                assert(event.find("count=1 pending=1") != std::string::npos);
+            }
         }
         assert(ignored && rumble && invalidRumble);
         assert(client.startForTesting("fixture", "abcdf", endpoint));

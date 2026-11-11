@@ -1,6 +1,8 @@
 #pragma once
-#include "features/streaming/domain/streaming_client.hpp"
+#include "features/streaming/domain/gamepad.hpp"
+#include "features/streaming/domain/input_experiments.hpp"
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -12,12 +14,21 @@ public:
     using Clock = std::chrono::steady_clock;
     using Time = Clock::time_point;
     static constexpr auto AnalogInterval = std::chrono::milliseconds(16);
+    static constexpr auto KeepaliveInterval = std::chrono::milliseconds(200);
+    static constexpr float AxisChangeThreshold = 0.005f;
     void reset() { initialized_ = releasePending_ = false; }
     bool due(const ::stream::Gamepad& value, Time now) const {
         if (releasePending_) return false;
-        return !initialized_ || value.buttons != accepted_.buttons ||
+        if (!initialized_ || value.buttons != accepted_.buttons ||
             value.leftTrigger != accepted_.leftTrigger || value.rightTrigger != accepted_.rightTrigger ||
-            now < acceptedAt_ || now - acceptedAt_ >= AnalogInterval;
+            now < acceptedAt_) return true;
+        if constexpr (!fog::input_options::changeOnly) return now - acceptedAt_ >= AnalogInterval;
+        for (std::size_t i = 0; i < value.axes.size(); ++i) {
+            // Never retain a tiny deflection when the stick returns to centre.
+            if ((value.axes[i] == 0 && accepted_.axes[i] != 0) ||
+                std::fabs(value.axes[i] - accepted_.axes[i]) >= AxisChangeThreshold) return true;
+        }
+        return now - acceptedAt_ >= KeepaliveInterval;
     }
     void accepted(const ::stream::Gamepad& value, Time now) {
         for (std::size_t i = 0; i < value.buttons.size(); ++i)

@@ -1,10 +1,12 @@
 #pragma once
 #include "features/streaming/domain/frame_cadence.hpp"
 #include "features/streaming/infrastructure/video_latency.hpp"
+#include "features/streaming/infrastructure/media_cpu_buffer.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,11 +19,27 @@ public:
     using Clock = std::chrono::steady_clock;
     struct Frame {
         std::vector<unsigned char> pixels;
+        std::shared_ptr<MediaCpuBufferPool> pool;
+        MediaPixelFormat format = MediaPixelFormat::Iyuv;
         int width = 0, height = 0;
         Clock::time_point due{};
         Clock::time_point readyAt{};
         VideoFrameOrigin origin;
         std::uint64_t transportGeneration = 0;
+        Frame() = default;
+        Frame(const Frame&) = delete;
+        Frame& operator=(const Frame&) = delete;
+        Frame(Frame&& other) noexcept { *this = std::move(other); }
+        Frame& operator=(Frame&& other) noexcept {
+            if (this == &other) return *this;
+            if (pool) pool->recycle(pixels);
+            pixels = std::move(other.pixels); pool = std::move(other.pool);
+            format = other.format; width = other.width; height = other.height;
+            due = other.due; readyAt = other.readyAt; origin = other.origin;
+            transportGeneration = other.transportGeneration;
+            return *this;
+        }
+        ~Frame() { if (pool) pool->recycle(pixels); }
     };
     struct Stats {
         std::uint64_t readyEmpty = 0, timingCadenceBlocked = 0, timingRtpBlocked = 0;
@@ -43,6 +61,9 @@ public:
         }
     };
     static constexpr std::size_t capacity = 3;
+    enum class Mode { Smooth, Latest };
+    explicit MediaFrameQueue(Mode mode = Mode::Smooth) : mode_(mode) {}
+    std::size_t limit() const { return mode_ == Mode::Latest ? 1 : capacity; }
     // displayPaced is valid only for 60 fps and a caller that takes at most once
     // per VSYNC-backed render cycle. Other modes retain RTP/cadence scheduling.
     // Reset drops buffered pixels and timing state, retaining lifetime counters.
@@ -57,6 +78,14 @@ public:
     }
     std::uint64_t push(Frame frame, std::uint32_t timestamp, Clock::time_point now) {
         frame.readyAt = now;
+        if (mode_ == Mode::Latest) {
+            const auto dropped = frames_.size();
+            stats_.pushCapacityDrop += dropped;
+            frames_.clear();
+            frame.due = now;
+            frames_.push_back(std::move(frame));
+            return dropped;
+        }
         if (stats_.displayPaced) {
             std::uint64_t dropped = 0;
             if (frames_.size() == capacity) {
@@ -97,6 +126,13 @@ public:
     }
     bool take(Frame& output, Clock::time_point now, std::uint64_t& dropped) {
         if (frames_.empty()) { ++stats_.readyEmpty; return false; }
+        if (mode_ == Mode::Latest) {
+            if (!stats_.displayPaced && !cadence_.due(now)) { ++stats_.timingCadenceBlocked; return false; }
+            output = std::move(frames_.front()); frames_.pop_front();
+            if (!stats_.displayPaced) cadence_.uploaded(now);
+            ++stats_.taken;
+            return true;
+        }
         if (stats_.displayPaced) {
             // Ready pixels already crossed the decoder boundary. The display
             // supplies cadence; an additional RTP gate would discard good frames
@@ -126,6 +162,7 @@ public:
     std::size_t size() const { return frames_.size(); }
     Stats stats() const { return stats_; }
 private:
+    Mode mode_;
     std::deque<Frame> frames_;
     bool initialized_ = false;
     FrameCadence cadence_;

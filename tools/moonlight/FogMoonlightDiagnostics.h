@@ -12,7 +12,25 @@ extern "C" {
 // slightly different instants. Read during the owner's current connection.
 // Times share LiGetMicroseconds()' clock; zero means no packet yet. This core
 // may use wall time on Switch, so consumers must validate timestamp ordering.
+// Fixed safe result code: required known encryption is unsupported or not selected/active.
+#define FOG_MOONLIGHT_ENCRYPTION_CONFLICT (-5501)
+enum FogMoonlightEncryptionState {
+    FOG_ENCRYPTION_UNKNOWN = 0, FOG_ENCRYPTION_CAPABILITIES = 1,
+    FOG_ENCRYPTION_SELECTED = 2, FOG_ENCRYPTION_ACCEPTED = 3,
+    FOG_ENCRYPTION_FAILED = 4
+};
+enum FogMoonlightEncryptionFailure {
+    FOG_ENCRYPTION_FAILURE_NONE = 0, FOG_ENCRYPTION_FAILURE_CONFLICT = 1,
+    FOG_ENCRYPTION_FAILURE_HANDSHAKE = 2
+};
 typedef struct FogMoonlightDiagnostics {
+    // Request, host claims, selected mode and accepted handshake are distinct.
+    // ENCFLG client bits differ from SS_ENC host/selected bits. No secrets.
+    uint64_t encryptionState, encryptionFailure, encryptionClientFlags;
+    uint64_t encryptionHostSupported, encryptionHostRequired, encryptionSelected;
+    uint64_t encryptionAudio, encryptionControl, encryptionRtsp;
+    // Successful local decrypt calls, independent of timing clock validity.
+    uint64_t videoDecryptSuccesses, audioDecryptSuccesses, audioDecryptFailures;
     uint64_t videoPacketsReceived;
     uint64_t videoBytesReceived;
     uint64_t videoReceiveErrors;
@@ -138,11 +156,14 @@ typedef struct FogMoonlightDiagnostics {
 // No locks, allocation, logging, or internal queue reads are performed here.
 void FogMoonlightGetDiagnostics(FogMoonlightDiagnostics* snapshot);
 
+// Retained core journal size, shared with bounded adapter final-drain accounting.
+#define FOG_MOONLIGHT_EVENT_CAPACITY 256
+
 enum FogMoonlightEventKind {
     FOG_EVENT_WAIT_ENTER = 1, FOG_EVENT_IDR_REQUEST, FOG_EVENT_IDR_DISPATCH,
     FOG_EVENT_IDR_DISPATCH_RESULT, FOG_EVENT_FEC_FAILURE, FOG_EVENT_INTACT_FRAME,
     FOG_EVENT_IDR_HEADER, FOG_EVENT_IDR_RECOGNIZED, FOG_EVENT_WAIT_EXIT,
-    FOG_EVENT_IDR_ASSEMBLED, FOG_EVENT_THREAD_START
+    FOG_EVENT_IDR_ASSEMBLED, FOG_EVENT_THREAD_START, FOG_EVENT_VIDEO_PACKET_GAP
 };
 typedef struct FogMoonlightEvent {
     uint64_t sequence, connectionId, waitId, timeUs;
@@ -161,6 +182,9 @@ typedef struct FogMoonlightEvent {
 // Best-effort bounded journal. The cursor is process-local, monotonic across
 // connections. Each event has a connection/wait ID; frameNumber is valid only
 // for frame events. value: reason / block count / dispatch success by kind.
+// VIDEO_PACKET_GAP reports only an observed inter-arrival gap >50000us:
+// timeUs is this packet's receipt, value is the gap in core-clock microseconds.
+// It does not measure host latency, prove packet loss, or identify a frame.
 // Returns one stable event, or zero if empty/busy. missed includes overwritten
 // entries and producer contention; callers must report it, not infer no loss.
 // A short nonblocking atomic gate protects copies; never waits or allocates.

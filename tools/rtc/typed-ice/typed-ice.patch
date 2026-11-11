@@ -1,0 +1,792 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -118,6 +118,7 @@
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/frameinfo.hpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/peerconnection.hpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/dtlsdiagnostics.hpp
++	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/icediagnostics.hpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/reliability.hpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/rtc.h
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/rtc.hpp
+diff --git a/deps/libjuice/include/juice/juice.h b/deps/libjuice/include/juice/juice.h
+--- a/deps/libjuice/include/juice/juice.h
++++ b/deps/libjuice/include/juice/juice.h
+@@ -73,6 +73,34 @@
+ 	JUICE_FAILURE_STUN_RESPONSE,
+ 	JUICE_FAILURE_CONNECTIVITY_TIMEOUT
+ } juice_failure_reason_t;
++
++typedef struct juice_udp_poll_event {
++	uint64_t sequence, start_mono_us, elapsed_us, bytes, service_gap_us, ready_delay_us;
++	unsigned int datagrams, flags, exit_reason;
++	uint64_t phase_recv_us, phase_callback_us;
++} juice_udp_poll_event_t;
++
++typedef struct juice_udp_poll_diagnostics {
++	bool clock_available, sample_clock_available, last_clock_available, pending_yield;
++	bool rcvbuf_checked, rcvbuf_available;
++	int rcvbuf_bytes, rcvbuf_errno;
++	uint64_t sample_mono_us, clock_invalid;
++	uint64_t batches, bytes, timed_batches, elapsed_total_us, elapsed_max_us;
++	uint64_t last_start_mono_us, last_end_mono_us;
++	uint64_t service_gaps, service_gap_max_us;
++	uint64_t ready_delays, ready_delay_max_us;
++	// Legacy >=5ms ORlarge/budget eligible count; detail now>=50ms ORlarge/budget/error.
++	uint64_t legacy_eligible_batches;
++	unsigned int phase_sample_every;
++	uint64_t phase_sampled_batches, phase_timed_batches, phase_invalid_batches;
++	uint64_t phase_sampled_datagrams, phase_timed_datagrams;
++	uint64_t phase_sampled_receive_calls, phase_timed_receive_calls;
++	uint64_t phase_recv_total_us, phase_recv_batch_max_us;
++	uint64_t phase_callback_total_us, phase_callback_batch_max_us;
++	uint64_t events_total, events_overwritten;
++	unsigned int event_count;
++	juice_udp_poll_event_t events[16]; // circular storage; getter sorts oldest first
++} juice_udp_poll_diagnostics_t;
+ 
+ typedef struct juice_diagnostics {
+ 	juice_state_t state;
+@@ -96,6 +124,10 @@
+ // Coherent per-agent snapshot under the connection lock; retained until destruction.
+ JUICE_EXPORT int juice_get_diagnostics(juice_agent_t *agent, juice_diagnostics_t *out);
+ 
++// One connection-lock acquisition, coherent summary and cold poll history.
++JUICE_EXPORT int juice_get_udp_poll_diagnostics(juice_agent_t *agent,
++    juice_diagnostics_t *summary, juice_udp_poll_diagnostics_t *out);
++
+ typedef void (*juice_cb_state_changed_t)(juice_agent_t *agent, juice_state_t state, void *user_ptr);
+ typedef void (*juice_cb_candidate_t)(juice_agent_t *agent, const char *sdp, void *user_ptr);
+ typedef void (*juice_cb_gathering_done_t)(juice_agent_t *agent, void *user_ptr);
+diff --git a/deps/libjuice/src/agent.h b/deps/libjuice/src/agent.h
+--- a/deps/libjuice/src/agent.h
++++ b/deps/libjuice/src/agent.h
+@@ -129,6 +129,7 @@
+ 	juice_config_t config;
+ 	juice_state_t state;
+ 	juice_diagnostics_t diagnostics; // guarded by conn_lock
++	juice_udp_poll_diagnostics_t udp_poll_diagnostics; // same lock
+ 	agent_mode_t mode;
+ 	juice_ice_tcp_mode_t ice_tcp_mode;
+ 
+diff --git a/deps/libjuice/src/conn_poll.c b/deps/libjuice/src/conn_poll.c
+--- a/deps/libjuice/src/conn_poll.c
++++ b/deps/libjuice/src/conn_poll.c
+@@ -13,6 +13,8 @@
+ #include "tcp.h"
+ #include "thread.h"
+ #include "udp.h"
++
++#include "udp_poll_clock.h"
+ 
+ #include <assert.h>
+ #include <string.h>
+@@ -43,6 +45,8 @@
+ 	uint16_t ice_tcp_len;
+ 	mutex_t send_mutex;
+ 	int send_ds;
++	uint64_t poll_ready_mono_us;
++	bool poll_ready_valid;
+ 	timestamp_t next_timestamp;
+ } conn_impl_t;
+ 
+@@ -225,6 +229,113 @@
+ error:
+ 	mutex_unlock(&registry->mutex);
+ 	return -1;
++}
++
++// Only connection initialization and poll processing write these fields.
++// Initialization precedes publication; poll processing holds registry->mutex.
++static void conn_poll_sample_rcvbuf(juice_agent_t *agent, socket_t sock) {
++	juice_udp_poll_diagnostics_t *d = &agent->udp_poll_diagnostics;
++	if (d->rcvbuf_checked)
++		return;
++	d->rcvbuf_checked = true;
++	sockopt_t size = 0;
++	socklen_t len = sizeof(size);
++	const int saved_errno = sockerrno;
++	d->rcvbuf_available = getsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&size, &len) == 0;
++	d->rcvbuf_errno = d->rcvbuf_available ? 0 : sockerrno;
++	d->rcvbuf_bytes = d->rcvbuf_available ? (int)size : 0;
++#ifdef _WIN32
++	WSASetLastError(saved_errno);
++#else
++	errno = saved_errno;
++#endif
++}
++
++typedef struct udp_poll_phase {
++	bool sampled, valid;
++	uint64_t last, recv_us, callback_us, receive_calls;
++} udp_poll_phase_t;
++
++// Only selected complete batches use packet clocks: 3 per positive receive,
++// 2 for a terminal receive. At most3000 extra reads for the1000-receive budget.
++static uint64_t conn_poll_phase_clock(udp_poll_phase_t *phase) {
++	uint64_t now = 0;
++	if (!juice_udp_poll_clock_preserving_errno(&now) || now < phase->last)
++		phase->valid = false;
++	phase->last = now;
++	return now;
++}
++
++static void conn_poll_record_udp(juice_agent_t *agent, uint64_t start, bool start_valid,
++    uint64_t gap, bool gap_valid, uint64_t ready_delay, bool ready_valid,
++    unsigned int received, uint64_t bytes,
++    unsigned int exit_reason, udp_poll_phase_t *phase) {
++	juice_udp_poll_diagnostics_t *d = &agent->udp_poll_diagnostics;
++	uint64_t end = 0;
++	const bool valid = juice_udp_poll_clock_preserving_errno(&end) && start_valid && end >= start;
++	const uint64_t elapsed = valid ? end - start : 0;
++	++d->batches;
++	d->bytes += bytes;
++	d->clock_available = valid;
++	d->last_clock_available = valid;
++	d->last_start_mono_us = start_valid ? start : 0;
++	d->last_end_mono_us = valid ? end : 0;
++	if (valid) {
++		++d->timed_batches;
++		d->elapsed_total_us += elapsed;
++		if (elapsed > d->elapsed_max_us) d->elapsed_max_us = elapsed;
++	} else {
++		++d->clock_invalid;
++	}
++	if (gap_valid) {
++		++d->service_gaps;
++		if (gap > d->service_gap_max_us) d->service_gap_max_us = gap;
++	}
++	if (ready_valid) {
++		++d->ready_delays;
++		if (ready_delay > d->ready_delay_max_us) d->ready_delay_max_us = ready_delay;
++	}
++	d->phase_sample_every = 16;
++	if (phase->sampled) {
++		++d->phase_sampled_batches;
++		d->phase_sampled_datagrams += received;
++		d->phase_sampled_receive_calls += phase->receive_calls;
++		// A phase failure does not invalidate overall timing. Valid phases require
++		// valid whole-batch boundaries and monotonic intermediate clocks.
++		phase->valid = phase->valid && valid && phase->last <= end &&
++		    phase->recv_us <= elapsed && phase->callback_us <= elapsed - phase->recv_us;
++		if (phase->valid) {
++			++d->phase_timed_batches;
++			d->phase_timed_datagrams += received;
++			d->phase_timed_receive_calls += phase->receive_calls;
++			d->phase_recv_total_us += phase->recv_us;
++			d->phase_callback_total_us += phase->callback_us;
++			if (phase->recv_us > d->phase_recv_batch_max_us)
++				d->phase_recv_batch_max_us = phase->recv_us;
++			if (phase->callback_us > d->phase_callback_batch_max_us)
++				d->phase_callback_batch_max_us = phase->callback_us;
++		} else ++d->phase_invalid_batches;
++	}
++	d->pending_yield = exit_reason == 1 && valid;
++	unsigned int flags = (received >= 256 ? 1u : 0u) | (valid && elapsed >= 5000 ? 2u : 0u) |
++	    (exit_reason == 1 ? 4u : 0u);
++	if (flags) ++d->legacy_eligible_batches;
++	if (received >= 256 || (valid && elapsed >= 50000) ||
++	    exit_reason == 1 || exit_reason == 3 || exit_reason == 4) {
++		if (phase->sampled) flags |= 64;
++		if (phase->sampled && phase->valid) flags |= 128;
++		if (valid) flags |= 8;
++		if (gap_valid) flags |= 16;
++		if (ready_valid) flags |= 32;
++		juice_udp_poll_event_t *event = &d->events[d->events_total % 16];
++		*event = (juice_udp_poll_event_t){++d->events_total, start_valid ? start : 0,
++		    elapsed, bytes, gap_valid ? gap : 0, ready_valid ? ready_delay : 0,
++		    received, flags, exit_reason,
++		    phase->sampled && phase->valid ? phase->recv_us : 0,
++		    phase->sampled && phase->valid ? phase->callback_us : 0};
++		if (d->event_count < 16) ++d->event_count;
++		else ++d->events_overwritten;
++	}
+ }
+ 
+ void conn_poll_process_udp(juice_agent_t *agent, struct pollfd *pfd) {
+@@ -247,23 +358,58 @@
+ 		return;
+ 	}
+ 
++	if (!(pfd->revents & POLLIN)) agent->udp_poll_diagnostics.pending_yield = false;
+ 	if (pfd->revents & POLLIN) {
+ 		char buffer[BUFFER_SIZE];
+ 		addr_record_t src;
+ 		int ret = 0;
+ 		unsigned int received = 0;
++		uint64_t bytes = 0, start = 0, gap = 0;
++		juice_udp_poll_diagnostics_t *poll_diag = &agent->udp_poll_diagnostics;
++		const bool start_valid = juice_udp_poll_clock_preserving_errno(&start);
++		const bool ready_valid = start_valid && conn_impl->poll_ready_valid &&
++		    start >= conn_impl->poll_ready_mono_us;
++		const uint64_t ready_delay = ready_valid ? start - conn_impl->poll_ready_mono_us : 0;
++		conn_impl->poll_ready_valid = false;
++		const bool gap_valid = poll_diag->pending_yield && poll_diag->last_clock_available &&
++		    start_valid && start >= poll_diag->last_end_mono_us;
++		if (gap_valid) gap = start - poll_diag->last_end_mono_us;
++		unsigned int exit_reason = 0;
++		udp_poll_phase_t phase = {.sampled = poll_diag->batches % 16 == 0,
++		    .valid = start_valid, .last = start};
+ 		// Remaining datagrams stay readable for the next level-triggered poll.
+ 		for (unsigned int attempts = 0; attempts < 1000; ++attempts) {
++			uint64_t phase_before = 0, phase_received = 0;
++			if (phase.sampled) {
++				++phase.receive_calls;
++				phase_before = conn_poll_phase_clock(&phase);
++			}
+ 			ret = conn_poll_recv_udp(conn_impl->udp_sock, buffer, BUFFER_SIZE, &src);
++			if (phase.sampled) {
++				phase_received = conn_poll_phase_clock(&phase);
++				if (phase.valid) phase.recv_us += phase_received - phase_before;
++			}
+ 			if (ret <= 0)
+ 				break;
+ 			++received;
+-			if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
++			bytes += (unsigned int)ret;
++			const int callback_result = agent_conn_recv(agent, buffer, (size_t)ret, &src);
++			if (phase.sampled) {
++				const uint64_t phase_done = conn_poll_phase_clock(&phase);
++				if (phase.valid) phase.callback_us += phase_done - phase_received;
++			}
++			if (callback_result != 0) {
++				exit_reason = 4;
+ 				JLOG_WARN("Agent receive failed");
+ 				conn_impl->state = CONN_STATE_FINISHED;
+ 				break;
+ 			}
+ 		}
++		if (exit_reason != 4)
++			exit_reason = ret > 0 ? 1 : ret == -SEINTR ? 2 :
++			    (ret == -SEAGAIN || ret == -SEWOULDBLOCK) ? 0 : 3;
++		conn_poll_record_udp(agent, start, start_valid, gap, gap_valid,
++		    ready_delay, ready_valid, received, bytes, exit_reason, &phase);
+ 		diag->udp_datagrams += received;
+ 		if (received > diag->udp_max_batch)
+ 			diag->udp_max_batch = received;
+@@ -443,6 +589,8 @@
+ }
+ 
+ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
++	uint64_t poll_ready_mono_us = 0;
++	const bool poll_ready_valid = juice_udp_poll_clock_preserving_errno(&poll_ready_mono_us);
+ 	struct pollfd *interrupt_pfd = pfds->pfds;
+ 	if (interrupt_pfd->revents & POLLIN) {
+ #ifdef _WIN32
+@@ -482,6 +630,8 @@
+ 		if (udp_pfd->fd != conn_impl->udp_sock)
+ 			break;
+ 
++		conn_impl->poll_ready_mono_us = poll_ready_mono_us;
++		conn_impl->poll_ready_valid = poll_ready_valid;
+ 		conn_poll_process_udp(agent, udp_pfd);
+ 		i++;
+ 
+@@ -551,6 +701,7 @@
+ 		return -1;
+ 	}
+ 
++	conn_poll_sample_rcvbuf(agent, conn_impl->udp_sock);
+ 	mutex_init(&conn_impl->send_mutex, 0);
+ 	conn_impl->registry = registry;
+ 	conn_impl->tcp_sock = INVALID_SOCKET;
+diff --git a/deps/libjuice/src/juice.c b/deps/libjuice/src/juice.c
+--- a/deps/libjuice/src/juice.c
++++ b/deps/libjuice/src/juice.c
+@@ -9,6 +9,7 @@
+ #include "juice.h"
+ #include "addr.h"
+ #include "agent.h"
++#include "udp_poll_clock.h"
+ #include "ice.h"
+ 
+ #ifndef NO_SERVER
+@@ -103,6 +104,25 @@
+ }
+ 
+ JUICE_EXPORT juice_state_t juice_get_state(juice_agent_t *agent) { return agent_get_state(agent); }
++
++JUICE_EXPORT int juice_get_udp_poll_diagnostics(juice_agent_t *agent,
++    juice_diagnostics_t *summary, juice_udp_poll_diagnostics_t *out) {
++	if (!agent || !summary || !out)
++		return JUICE_ERR_INVALID;
++	conn_lock(agent);
++	*summary = agent->diagnostics;
++	summary->state = agent->state;
++	*out = agent->udp_poll_diagnostics;
++	// Normalize only on this cold query; writes remain O(1).
++	const unsigned int count = out->event_count;
++	const unsigned int first = (unsigned int)((out->events_total - count) % 16);
++	for (unsigned int i = 0; i < count; ++i)
++		out->events[i] = agent->udp_poll_diagnostics.events[(first + i) % 16];
++	// Filled by the clock helper shared with conn_poll.c.
++	out->sample_clock_available = juice_udp_poll_clock_preserving_errno(&out->sample_mono_us);
++	conn_unlock(agent);
++	return JUICE_ERR_SUCCESS;
++}
+ 
+ JUICE_EXPORT int juice_get_diagnostics(juice_agent_t *agent, juice_diagnostics_t *out) {
+ 	if (!agent || !out)
+diff --git a/deps/libjuice/src/udp_poll_clock.h b/deps/libjuice/src/udp_poll_clock.h
+new file mode 100644
+--- /dev/null
++++ b/deps/libjuice/src/udp_poll_clock.h
+@@ -0,0 +1,45 @@
++#ifndef JUICE_UDP_POLL_CLOCK_H
++#define JUICE_UDP_POLL_CLOCK_H
++#include <stdbool.h>
++#include <stdint.h>
++#include <errno.h>
++#ifdef _WIN32
++#include <winsock2.h>
++#endif
++#if (defined(__linux__) || defined(__SWITCH__)) && !defined(JUICE_UDP_POLL_TEST_CLOCK)
++#include <time.h>
++#endif
++#ifdef JUICE_UDP_POLL_TEST_CLOCK
++bool juice_udp_poll_clock(uint64_t *out);
++#else
++static inline bool juice_udp_poll_clock(uint64_t *out) {
++	*out = 0;
++#if defined(__linux__) || defined(__SWITCH__)
++	struct timespec ts;
++	if (clock_gettime(CLOCK_MONOTONIC, &ts) || ts.tv_sec < 0 ||
++	    ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
++		return false;
++	*out = (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
++	return true;
++#else
++	return false; // no wall-clock fallback or unsupported CPU-time claim
++#endif
++}
++#endif
++// Diagnostics must not modify the caller's receive/socket error, including
++// failed test clocks or platforms where clock_gettime can set errno.
++static inline bool juice_udp_poll_clock_preserving_errno(uint64_t *out) {
++#ifdef _WIN32
++	const int saved = WSAGetLastError();
++#else
++	const int saved = errno;
++#endif
++	const bool valid = juice_udp_poll_clock(out);
++#ifdef _WIN32
++	WSASetLastError(saved);
++#else
++	errno = saved;
++#endif
++	return valid;
++}
++#endif
+diff --git a/include/rtc/icediagnostics.hpp b/include/rtc/icediagnostics.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/rtc/icediagnostics.hpp
+@@ -0,0 +1,96 @@
++#ifndef RTC_ICE_DIAGNOSTICS_H
++#define RTC_ICE_DIAGNOSTICS_H
++
++#include <cstdint>
++#include <array>
++#include <type_traits>
++
++namespace rtc {
++
++// Fork extension. Fixed numeric copy; no endpoints, credentials or SDK handles.
++// Counters are cumulative for one ICE transport, not reset by clearStats().
++struct IceDiagnostics {
++    enum class Availability : uint8_t {
++        Available, NotStarted, NotSupported, ReadFailed, ClosedWithoutSample
++    };
++    enum class Provenance : uint8_t { None, Live, FinalRetained };
++    enum class Backend : uint8_t { Unknown, LibJuice, LibNice };
++    enum class FailureReason : uint8_t {
++        None, UdpRecv, UdpPoll, Connection, ConsentExpired, StunTimeout,
++        StunSend, StunResponse, ConnectivityTimeout, Unknown = 255
++    };
++
++    Availability availability = Availability::NotStarted;
++    Provenance provenance = Provenance::None;
++    Backend backend = Backend::Unknown;
++    FailureReason failureReason = FailureReason::Unknown;
++    // Numeric juice_state_t. Meaningful only when availability == Available.
++    unsigned int state = 0;
++    uint64_t udpBudgetYields = 0, udpDatagrams = 0;
++    unsigned int udpMaxBatch = 0; // datagrams, maximum in one receive batch
++    int recvErrno = 0; // signed backend error; preserve negative values
++    unsigned int pollFlags = 0; // native poll bit mask
++    int socketError = 0; // signed SO_ERROR; valid only if socketErrorAvailable
++    bool socketErrorAvailable = false;
++    uint64_t consentExpired = 0, stunTimeouts = 0, stunSendFailures = 0;
++    uint64_t stunErrorResponses = 0;
++    unsigned int stunErrorCode = 0; // STUN response code, not a duration
++    int stunSendErrno = 0; // signed backend error; preserve negative values
++    uint64_t connectivityTimeouts = 0;
++};
++
++static_assert(std::is_trivially_copyable<IceDiagnostics>::value);
++static_assert(std::is_standard_layout<IceDiagnostics>::value);
++static_assert(sizeof(IceDiagnostics) <= 128, "ICE snapshot must stay bounded");
++
++// Cold-path poll evidence. Never place this history in a packet/frame record.
++// Monotonic timestamps use the backend clock epoch, not the application epoch.
++// Map sampleMonoUs to an application before/after query bracket. CPU time is
++// unsupported: elapsed wall time does not establish CPU saturation.
++struct IceUdpPollDiagnostics {
++    struct Event {
++        uint64_t sequence = 0, startMonoUs = 0, elapsedUs = 0;
++        uint64_t bytes = 0, serviceGapUs = 0, readyDelayUs = 0;
++        unsigned int datagrams = 0, flags = 0, exitReason = 0;
++        uint64_t phaseRecvUs = 0, phaseCallbackUs = 0;
++    };
++    // flags: 1=large (>=256 datagrams), 2=slow (>=5000us), 4=budget yield,
++    // 8=valid start+elapsed clock, 16=valid gap after a preceding budget yield,
++    // 32=valid poll-ready-to-batch-start delay (excludes time sleeping in poll).
++    // 64=phase sampled (every16th batch, starting withbatch0),
++    // 128=all sampled phase clocks valid. Phase sections include preemption
++    // and clock-boundary overhead; their sum need not equal batch elapsed.
++    // Detail eligibility is >=50ms ORlarge/budget/error; flag2 remains>=5ms.
++    // exitReason: 0=drained, 1=budget, 2=interrupted, 3=recv error, 4=callback error.
++    IceDiagnostics ice;
++    bool clockAvailable = false, sampleClockAvailable = false;
++    bool lastClockAvailable = false, pendingYield = false;
++    bool rcvbufChecked = false, rcvbufAvailable = false;
++    int rcvbufBytes = 0, rcvbufErrno = 0;
++    uint64_t sampleMonoUs = 0, clockInvalid = 0;
++    uint64_t batches = 0, bytes = 0, timedBatches = 0;
++    uint64_t elapsedTotalUs = 0, elapsedMaxUs = 0;
++    uint64_t lastStartMonoUs = 0, lastEndMonoUs = 0;
++    // Gap after a yield can include socket idle: packet 1001 is not proven.
++    // pendingYield means only that the preceding batch hit the budget.
++    uint64_t serviceGaps = 0, serviceGapMaxUs = 0;
++    uint64_t readyDelays = 0, readyDelayMaxUs = 0;
++    // Original >=5ms ORlarge/budget criterion, independent of filtered detail.
++    uint64_t legacyEligibleBatches = 0;
++    unsigned int phaseSampleEvery = 0; // 16 after the first poll batch
++    uint64_t phaseSampledBatches = 0, phaseTimedBatches = 0, phaseInvalidBatches = 0;
++    uint64_t phaseSampledDatagrams = 0, phaseTimedDatagrams = 0;
++    // Receive calls include terminal EAGAIN/EINTR/error; sampled includes invalid.
++    uint64_t phaseSampledReceiveCalls = 0, phaseTimedReceiveCalls = 0;
++    // Totals/maxima cover complete valid sampled batches only. No extrapolation.
++    uint64_t phaseRecvTotalUs = 0, phaseRecvBatchMaxUs = 0;
++    uint64_t phaseCallbackTotalUs = 0, phaseCallbackBatchMaxUs = 0;
++    uint64_t eventsTotal = 0, eventsOverwritten = 0; // filtered detail, not legacy criterion
++    unsigned int eventCount = 0;
++    std::array<Event, 16> events{}; // chronological, oldest first
++};
++static_assert(std::is_trivially_copyable<IceUdpPollDiagnostics>::value);
++static_assert(sizeof(IceUdpPollDiagnostics) <= 2048, "cold UDP history must stay bounded");
++
++} // namespace rtc
++#endif
+diff --git a/include/rtc/peerconnection.hpp b/include/rtc/peerconnection.hpp
+--- a/include/rtc/peerconnection.hpp
++++ b/include/rtc/peerconnection.hpp
+@@ -15,6 +15,7 @@
+ #include "datachannel.hpp"
+ #include "description.hpp"
+ #include "dtlsdiagnostics.hpp"
++#include "icediagnostics.hpp"
+ #include "reliability.hpp"
+ #include "track.hpp"
+ 
+@@ -98,6 +99,12 @@
+ 	bool getSelectedCandidatePair(Candidate *local, Candidate *remote);
+ 	// Fork extension: sanitized per-transport counters; empty before ICE exists.
+ 	string iceDiagnostics() const;
++	// Explicit potentially blocking query: call on a background diagnostics owner.
++	// After close, returns only the last successful typed observation (if any),
++	// marked FinalRetained. This is not a fresh observation of the closed transport.
++	IceDiagnostics getIceDiagnostics() const;
++	// Cold query: coherent summary plus bounded UDP batch history, one ICE lock.
++	IceUdpPollDiagnostics getIceUdpPollDiagnostics() const;
+ 	// Live transport snapshot; close retains a last pre-teardown snapshot.
+ 	DtlsDiagnostics getDtlsDiagnostics() const;
+ 
+diff --git a/src/impl/icetransport.cpp b/src/impl/icetransport.cpp
+--- a/src/impl/icetransport.cpp
++++ b/src/impl/icetransport.cpp
+@@ -33,6 +33,141 @@
+ using std::chrono::system_clock;
+ 
+ namespace rtc::impl {
++
++IceDiagnostics IceTransport::getIceDiagnostics() const {
++	IceDiagnostics snapshot;
++#if !USE_NICE
++	snapshot.backend = IceDiagnostics::Backend::LibJuice;
++	juice_diagnostics_t d{};
++	if (juice_get_diagnostics(mAgent.get(), &d) != JUICE_ERR_SUCCESS) {
++		snapshot.availability = IceDiagnostics::Availability::ReadFailed;
++		return snapshot;
++	}
++	snapshot.availability = IceDiagnostics::Availability::Available;
++	snapshot.provenance = IceDiagnostics::Provenance::Live;
++	snapshot.state = static_cast<unsigned int>(d.state);
++	snapshot.udpBudgetYields = d.udp_budget_yields;
++	snapshot.udpDatagrams = d.udp_datagrams;
++	snapshot.udpMaxBatch = d.udp_max_batch;
++	snapshot.recvErrno = d.recv_errno;
++	snapshot.pollFlags = d.poll_flags;
++	snapshot.socketError = d.socket_error;
++	snapshot.socketErrorAvailable = d.socket_error_available;
++	snapshot.consentExpired = d.consent_expired;
++	snapshot.stunTimeouts = d.stun_timeouts;
++	snapshot.stunSendFailures = d.stun_send_failures;
++	snapshot.stunErrorResponses = d.stun_error_responses;
++	snapshot.stunErrorCode = d.stun_error_code;
++	snapshot.stunSendErrno = d.stun_send_errno;
++	snapshot.connectivityTimeouts = d.connectivity_timeouts;
++	switch (d.failure_reason) {
++	case JUICE_FAILURE_NONE: snapshot.failureReason = IceDiagnostics::FailureReason::None; break;
++	case JUICE_FAILURE_UDP_RECV: snapshot.failureReason = IceDiagnostics::FailureReason::UdpRecv; break;
++	case JUICE_FAILURE_UDP_POLL: snapshot.failureReason = IceDiagnostics::FailureReason::UdpPoll; break;
++	case JUICE_FAILURE_CONNECTION: snapshot.failureReason = IceDiagnostics::FailureReason::Connection; break;
++	case JUICE_FAILURE_CONSENT_EXPIRED: snapshot.failureReason = IceDiagnostics::FailureReason::ConsentExpired; break;
++	case JUICE_FAILURE_STUN_TIMEOUT: snapshot.failureReason = IceDiagnostics::FailureReason::StunTimeout; break;
++	case JUICE_FAILURE_STUN_SEND: snapshot.failureReason = IceDiagnostics::FailureReason::StunSend; break;
++	case JUICE_FAILURE_STUN_RESPONSE: snapshot.failureReason = IceDiagnostics::FailureReason::StunResponse; break;
++	case JUICE_FAILURE_CONNECTIVITY_TIMEOUT: snapshot.failureReason = IceDiagnostics::FailureReason::ConnectivityTimeout; break;
++	default: snapshot.failureReason = IceDiagnostics::FailureReason::Unknown; break;
++	}
++#else
++	snapshot.backend = IceDiagnostics::Backend::LibNice;
++	snapshot.availability = IceDiagnostics::Availability::NotSupported;
++#endif
++	return snapshot;
++}
++
++IceUdpPollDiagnostics IceTransport::getIceUdpPollDiagnostics() const {
++	IceUdpPollDiagnostics result;
++	auto &snapshot = result.ice;
++#if !USE_NICE
++	snapshot.backend = IceDiagnostics::Backend::LibJuice;
++	juice_diagnostics_t d{};
++	juice_udp_poll_diagnostics_t p{};
++	if (juice_get_udp_poll_diagnostics(mAgent.get(), &d, &p) != JUICE_ERR_SUCCESS) {
++		snapshot.availability = IceDiagnostics::Availability::ReadFailed;
++		return result;
++	}
++	snapshot.availability = IceDiagnostics::Availability::Available;
++	snapshot.provenance = IceDiagnostics::Provenance::Live;
++	snapshot.state = static_cast<unsigned int>(d.state);
++	snapshot.udpBudgetYields = d.udp_budget_yields;
++	snapshot.udpDatagrams = d.udp_datagrams;
++	snapshot.udpMaxBatch = d.udp_max_batch;
++	snapshot.recvErrno = d.recv_errno;
++	snapshot.pollFlags = d.poll_flags;
++	snapshot.socketError = d.socket_error;
++	snapshot.socketErrorAvailable = d.socket_error_available;
++	snapshot.consentExpired = d.consent_expired;
++	snapshot.stunTimeouts = d.stun_timeouts;
++	snapshot.stunSendFailures = d.stun_send_failures;
++	snapshot.stunErrorResponses = d.stun_error_responses;
++	snapshot.stunErrorCode = d.stun_error_code;
++	snapshot.stunSendErrno = d.stun_send_errno;
++	snapshot.connectivityTimeouts = d.connectivity_timeouts;
++	result.clockAvailable = p.clock_available;
++	result.sampleClockAvailable = p.sample_clock_available;
++	result.lastClockAvailable = p.last_clock_available;
++	result.pendingYield = p.pending_yield;
++	result.rcvbufChecked = p.rcvbuf_checked;
++	result.rcvbufAvailable = p.rcvbuf_available;
++	result.rcvbufBytes = p.rcvbuf_bytes;
++	result.rcvbufErrno = p.rcvbuf_errno;
++	result.sampleMonoUs = p.sample_mono_us;
++	result.clockInvalid = p.clock_invalid;
++	result.batches = p.batches;
++	result.bytes = p.bytes;
++	result.timedBatches = p.timed_batches;
++	result.elapsedTotalUs = p.elapsed_total_us;
++	result.elapsedMaxUs = p.elapsed_max_us;
++	result.lastStartMonoUs = p.last_start_mono_us;
++	result.lastEndMonoUs = p.last_end_mono_us;
++	result.serviceGaps = p.service_gaps;
++	result.serviceGapMaxUs = p.service_gap_max_us;
++	result.readyDelays = p.ready_delays;
++	result.readyDelayMaxUs = p.ready_delay_max_us;
++	result.eventsTotal = p.events_total;
++	result.eventsOverwritten = p.events_overwritten;
++	result.eventCount = p.event_count;
++	result.legacyEligibleBatches = p.legacy_eligible_batches;
++	result.phaseSampleEvery = p.phase_sample_every;
++	result.phaseSampledBatches = p.phase_sampled_batches;
++	result.phaseTimedBatches = p.phase_timed_batches;
++	result.phaseInvalidBatches = p.phase_invalid_batches;
++	result.phaseSampledDatagrams = p.phase_sampled_datagrams;
++	result.phaseTimedDatagrams = p.phase_timed_datagrams;
++	result.phaseSampledReceiveCalls = p.phase_sampled_receive_calls;
++	result.phaseTimedReceiveCalls = p.phase_timed_receive_calls;
++	result.phaseRecvTotalUs = p.phase_recv_total_us;
++	result.phaseRecvBatchMaxUs = p.phase_recv_batch_max_us;
++	result.phaseCallbackTotalUs = p.phase_callback_total_us;
++	result.phaseCallbackBatchMaxUs = p.phase_callback_batch_max_us;
++	for (unsigned int i = 0; i < result.eventCount && i < result.events.size(); ++i) {
++		const auto &e = p.events[i];
++		result.events[i] = {e.sequence, e.start_mono_us, e.elapsed_us, e.bytes,
++		    e.service_gap_us, e.ready_delay_us, e.datagrams, e.flags, e.exit_reason,
++		    e.phase_recv_us, e.phase_callback_us};
++	}
++	switch (d.failure_reason) {
++	case JUICE_FAILURE_NONE: snapshot.failureReason = IceDiagnostics::FailureReason::None; break;
++	case JUICE_FAILURE_UDP_RECV: snapshot.failureReason = IceDiagnostics::FailureReason::UdpRecv; break;
++	case JUICE_FAILURE_UDP_POLL: snapshot.failureReason = IceDiagnostics::FailureReason::UdpPoll; break;
++	case JUICE_FAILURE_CONNECTION: snapshot.failureReason = IceDiagnostics::FailureReason::Connection; break;
++	case JUICE_FAILURE_CONSENT_EXPIRED: snapshot.failureReason = IceDiagnostics::FailureReason::ConsentExpired; break;
++	case JUICE_FAILURE_STUN_TIMEOUT: snapshot.failureReason = IceDiagnostics::FailureReason::StunTimeout; break;
++	case JUICE_FAILURE_STUN_SEND: snapshot.failureReason = IceDiagnostics::FailureReason::StunSend; break;
++	case JUICE_FAILURE_STUN_RESPONSE: snapshot.failureReason = IceDiagnostics::FailureReason::StunResponse; break;
++	case JUICE_FAILURE_CONNECTIVITY_TIMEOUT: snapshot.failureReason = IceDiagnostics::FailureReason::ConnectivityTimeout; break;
++	default: snapshot.failureReason = IceDiagnostics::FailureReason::Unknown; break;
++	}
++#else
++	snapshot.backend = IceDiagnostics::Backend::LibNice;
++	snapshot.availability = IceDiagnostics::Availability::NotSupported;
++#endif
++	return result;
++}
+ 
+ string IceTransport::iceDiagnostics() const {
+ #if !USE_NICE
+diff --git a/src/impl/icetransport.hpp b/src/impl/icetransport.hpp
+--- a/src/impl/icetransport.hpp
++++ b/src/impl/icetransport.hpp
+@@ -14,6 +14,7 @@
+ #include "configuration.hpp"
+ #include "description.hpp"
+ #include "global.hpp"
++#include "rtc/icediagnostics.hpp"
+ #include "peerconnection.hpp"
+ #include "transport.hpp"
+ 
+@@ -60,6 +61,8 @@
+ 
+ 	bool getSelectedCandidatePair(Candidate *local, Candidate *remote);
+ 	string iceDiagnostics() const;
++	IceDiagnostics getIceDiagnostics() const;
++	IceUdpPollDiagnostics getIceUdpPollDiagnostics() const;
+ 
+ private:
+ 	bool outgoing(message_ptr message) override;
+diff --git a/src/impl/peerconnection.cpp b/src/impl/peerconnection.cpp
+--- a/src/impl/peerconnection.cpp
++++ b/src/impl/peerconnection.cpp
+@@ -372,6 +372,76 @@
+ 	return mFinalDtlsDiagnostics;
+ }
+ 
++IceDiagnostics PeerConnection::getIceDiagnostics() const {
++	// Closed reads bypass a possibly blocked live query. The shared transport
++	// reference below keeps the agent alive if close races with that query.
++	std::unique_lock queryLock(mTypedIceQueryMutex, std::defer_lock);
++	if (state.load() != State::Closed)
++		queryLock.lock();
++	if (state.load() != State::Closed) {
++		if (auto ice = getIceTransport()) {
++			auto snapshot = ice->getIceDiagnostics();
++			std::lock_guard cacheLock(mTypedIceCacheMutex);
++			if (snapshot.availability == IceDiagnostics::Availability::Available) {
++				mFinalTypedIceDiagnostics = snapshot;
++				if (state.load() == State::Closed)
++					snapshot.provenance = IceDiagnostics::Provenance::FinalRetained;
++			}
++			return snapshot;
++		}
++	}
++	std::lock_guard cacheLock(mTypedIceCacheMutex);
++	auto snapshot = mFinalTypedIceDiagnostics;
++	if (snapshot.availability == IceDiagnostics::Availability::Available) {
++		snapshot.provenance = IceDiagnostics::Provenance::FinalRetained;
++	} else {
++#if !USE_NICE
++		snapshot.backend = IceDiagnostics::Backend::LibJuice;
++		snapshot.availability = state.load() == State::Closed
++		    ? IceDiagnostics::Availability::ClosedWithoutSample
++		    : IceDiagnostics::Availability::NotStarted;
++#else
++		snapshot.backend = IceDiagnostics::Backend::LibNice;
++		snapshot.availability = IceDiagnostics::Availability::NotSupported;
++#endif
++	}
++	return snapshot;
++}
++
++IceUdpPollDiagnostics PeerConnection::getIceUdpPollDiagnostics() const {
++	std::unique_lock queryLock(mTypedIceQueryMutex, std::defer_lock);
++	if (state.load() != State::Closed) queryLock.lock();
++	if (state.load() != State::Closed) {
++		if (auto ice = getIceTransport()) {
++			auto snapshot = ice->getIceUdpPollDiagnostics();
++			std::lock_guard cacheLock(mTypedIceCacheMutex);
++			if (snapshot.ice.availability == IceDiagnostics::Availability::Available) {
++				mFinalUdpPollDiagnostics = snapshot;
++				mFinalTypedIceDiagnostics = snapshot.ice;
++				if (state.load() == State::Closed)
++					snapshot.ice.provenance = IceDiagnostics::Provenance::FinalRetained;
++			}
++			return snapshot;
++		}
++	}
++	std::lock_guard cacheLock(mTypedIceCacheMutex);
++	auto snapshot = mFinalUdpPollDiagnostics;
++	if (snapshot.ice.availability == IceDiagnostics::Availability::Available) {
++		snapshot.ice.provenance = IceDiagnostics::Provenance::FinalRetained;
++	} else {
++#if !USE_NICE
++		snapshot.ice.backend = IceDiagnostics::Backend::LibJuice;
++		snapshot.ice.availability = state.load() == State::Closed
++		    ? IceDiagnostics::Availability::ClosedWithoutSample
++		    : IceDiagnostics::Availability::NotStarted;
++#else
++		snapshot.ice.backend = IceDiagnostics::Backend::LibNice;
++		snapshot.ice.availability = IceDiagnostics::Availability::NotSupported;
++#endif
++	}
++	return snapshot;
++}
++
+ string PeerConnection::iceDiagnostics() const {
+ 	if (auto ice = getIceTransport()) {
+ 		// The caller chooses where this potentially blocking ICE read runs.
+diff --git a/src/impl/peerconnection.hpp b/src/impl/peerconnection.hpp
+--- a/src/impl/peerconnection.hpp
++++ b/src/impl/peerconnection.hpp
+@@ -48,6 +48,8 @@
+ 	shared_ptr<SctpTransport> initSctpTransport();
+ 	shared_ptr<IceTransport> getIceTransport() const;
+ 	string iceDiagnostics() const;
++	IceDiagnostics getIceDiagnostics() const;
++	IceUdpPollDiagnostics getIceUdpPollDiagnostics() const;
+ 	DtlsDiagnostics getDtlsDiagnostics() const;
+ 	shared_ptr<DtlsTransport> getDtlsTransport() const;
+ 	shared_ptr<SctpTransport> getSctpTransport() const;
+@@ -156,6 +158,12 @@
+ 	shared_ptr<IceTransport> mIceTransport;
+ 	mutable std::mutex mIceDiagnosticsMutex;
+ 	mutable string mFinalIceDiagnostics;
++	// Only explicit typed queries use these locks; teardown never takes them.
++	// Serialize live sampling, but never hold the cache lock across a juice call.
++	mutable std::mutex mTypedIceQueryMutex;
++	mutable std::mutex mTypedIceCacheMutex;
++	mutable IceDiagnostics mFinalTypedIceDiagnostics;
++	mutable IceUdpPollDiagnostics mFinalUdpPollDiagnostics;
+ 	shared_ptr<DtlsTransport> mDtlsTransport;
+ 	mutable std::mutex mDtlsDiagnosticsMutex;
+ 	DtlsDiagnostics mFinalDtlsDiagnostics;
+diff --git a/src/peerconnection.cpp b/src/peerconnection.cpp
+--- a/src/peerconnection.cpp
++++ b/src/peerconnection.cpp
+@@ -387,6 +387,14 @@
+ 	return impl()->getDtlsDiagnostics();
+ }
+ 
++IceDiagnostics PeerConnection::getIceDiagnostics() const {
++	return impl()->getIceDiagnostics();
++}
++
++IceUdpPollDiagnostics PeerConnection::getIceUdpPollDiagnostics() const {
++	return impl()->getIceUdpPollDiagnostics();
++}
++
+ string PeerConnection::iceDiagnostics() const {
+ 	return impl()->iceDiagnostics();
+ }

@@ -1,0 +1,2683 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -117,6 +117,8 @@
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/message.hpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/frameinfo.hpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/peerconnection.hpp
++	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/dtlsdiagnostics.hpp
++	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/icediagnostics.hpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/reliability.hpp
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/rtc.h
+ 	${CMAKE_CURRENT_SOURCE_DIR}/include/rtc/rtc.hpp
+diff --git a/include/rtc/dtlsdiagnostics.hpp b/include/rtc/dtlsdiagnostics.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/rtc/dtlsdiagnostics.hpp
+@@ -0,0 +1,77 @@
++#ifndef RTC_DTLS_DIAGNOSTICS_H
++#define RTC_DTLS_DIAGNOSTICS_H
++
++#include <cstdint>
++
++namespace rtc {
++
++// Fork extension. Numeric aggregates for the lifetime of the DTLS transport;
++// not reset by clearStats(). No packet contents, endpoints or credentials.
++// All durations are integer microseconds on a steady clock, rounded per sample.
++// Queue and receiver groups are each coherent, but sampled independently.
++struct DtlsDiagnostics {
++    bool available = false; // false before DTLS exists
++    uint64_t queueDepth = 0, queueHighWater = 0, queueOldestAgeUs = 0;
++    uint64_t enqueued = 0, dequeued = 0;
++    // Enqueue acceptance to pop, excluding a producer's full-queue wait.
++    // Average = residenceTotalUs / dequeued (zero if dequeued == 0).
++    uint64_t residenceTotalUs = 0, residenceMaxUs = 0;
++    // Completed push calls that waited on a full queue (including stop wakeups).
++    // In-progress waits are not included. Average = total / count.
++    uint64_t fullPushWaitCount = 0, fullPushWaitTotalUs = 0, fullPushWaitMaxUs = 0;
++    uint64_t recvRuns = 0, recvScheduleCount = 0;
++    // Immediate enqueueRecv tasks only: submission to receiver lock acquisition.
++    // Includes thread-pool and receiver-lock contention. For mbedTLS, timer
++    // wakeups also submit coalesced receive tasks and are included.
++    uint64_t recvScheduleWaitTotalUs = 0, recvScheduleWaitMaxUs = 0;
++    // Completed doRecv calls: after receiver lock acquisition to return, including
++    // synchronous demux/application callbacks. Average = total / recvRuns.
++    uint64_t recvProcessingTotalUs = 0, recvProcessingMaxUs = 0;
++    // mbedTLS only: completed lock acquisitions around application writes and
++    // receiver TLS calls/staging (handshake key derivation included). Callback
++    // delivery and SRTP decryption are excluded. Average = total / lock count.
++    uint64_t sendSslLockCount = 0, sendSslLockWaitTotalUs = 0, sendSslLockWaitMaxUs = 0;
++    uint64_t sendSslLockHoldTotalUs = 0, sendSslLockHoldMaxUs = 0;
++    uint64_t recvSslLockCount = 0, recvSslLockWaitTotalUs = 0, recvSslLockWaitMaxUs = 0;
++    uint64_t recvSslLockHoldTotalUs = 0, recvSslLockHoldMaxUs = 0;
++    // Completed receive batches: datagrams popped, maximum per batch, and
++    // explicit fairness continuations (64 work units or 2 ms; one callback
++    // itself can overrun the time budget). TLS buffered records also continue.
++    uint64_t recvBatchPacketsTotal = 0, recvBatchPacketsMax = 0, recvBatchYields = 0;
++    // DTLS ingress only: capacity 1024, at most 960 RTP datagrams; FIFO among
++    // survivors. Critical = DTLS/SRTCP. New RTP is shed; critical admission at
++    // capacity evicts oldest RTP. All-critical overflow asynchronously fails.
++    uint64_t admissionMediaAccepted = 0, admissionControlAccepted = 0;
++    uint64_t admissionMediaDropped = 0, admissionMediaEvicted = 0;
++    uint64_t admissionInvalid = 0, admissionStopped = 0, admissionCriticalOverflow = 0;
++    // Completed per-packet stages; total/max in microseconds, including waits
++    // and preemption. Demux includes unprotect and media callback; nested
++    // stages must not be added together. Unprotect includes failed attempts.
++    uint64_t recvDemuxCount = 0, recvDemuxTotalUs = 0, recvDemuxMaxUs = 0;
++    uint64_t recvUnprotectCount = 0, recvUnprotectTotalUs = 0, recvUnprotectMaxUs = 0;
++    uint64_t recvMediaCallbackCount = 0, recvMediaCallbackTotalUs = 0, recvMediaCallbackMaxUs = 0;
++    uint64_t recvDataCallbackCount = 0, recvDataCallbackTotalUs = 0, recvDataCallbackMaxUs = 0;
++    uint64_t recvBatchTimeYields = 0, recvBatchWorkYields = 0, recvBatchEmpty = 0;
++
++    // Completed callbacks split by successfully decrypted datagram type.
++    // Their sum equals recvMediaCallback*; totals include waits/preemption.
++    uint64_t recvRtpCallbackCount = 0, recvRtpCallbackTotalUs = 0, recvRtpCallbackMaxUs = 0;
++    uint64_t recvRtcpCallbackCount = 0, recvRtcpCallbackTotalUs = 0, recvRtcpCallbackMaxUs = 0;
++    // sendMedia's distinct SRTP serialization lock, not mSslMutex. All calls,
++    // including pre-key/null rejections; hold includes protect and lower send.
++    uint64_t sendSrtpLockCount = 0, sendSrtpLockWaitTotalUs = 0, sendSrtpLockWaitMaxUs = 0;
++    uint64_t sendSrtpLockHoldTotalUs = 0, sendSrtpLockHoldMaxUs = 0;
++    uint64_t sendSrtpRejected = 0, sendSrtpFailed = 0;
++    // Valid post-key send attempts, including crypto/transport failures.
++    uint64_t sendRtpCount = 0, sendRtcpCount = 0;
++    uint64_t sendRtpProtectCount = 0, sendRtpProtectTotalUs = 0, sendRtpProtectMaxUs = 0;
++    uint64_t sendRtcpProtectCount = 0, sendRtcpProtectTotalUs = 0, sendRtcpProtectMaxUs = 0;
++    // Lower send includes ICE serialization, DSCP/socket work and UDP. Does
++    // not split them or include SRTP protect/serialization-lock wait.
++    uint64_t sendRtpLowerCount = 0, sendRtpLowerTotalUs = 0, sendRtpLowerMaxUs = 0;
++    uint64_t sendRtcpLowerCount = 0, sendRtcpLowerTotalUs = 0, sendRtcpLowerMaxUs = 0;
++
++};
++
++} // namespace rtc
++#endif
+diff --git a/include/rtc/global.hpp b/include/rtc/global.hpp
+--- a/include/rtc/global.hpp
++++ b/include/rtc/global.hpp
+@@ -54,6 +54,10 @@
+ // Optional global preload and cleanup
+ RTC_CPP_EXPORT void Preload();
+ RTC_CPP_EXPORT std::shared_future<void> Cleanup();
++// Fork extension: call after the Cleanup future is ready, before get() or platform teardown.
++// Joins owned cleanup threads on Switch (or the host test configuration).
++// Do not create new RTC objects concurrently with this final barrier.
++RTC_CPP_EXPORT void JoinCleanupThreads();
+ 
+ RTC_CPP_EXPORT std::ostream &operator<<(std::ostream &out, LogLevel level);
+ 
+diff --git a/include/rtc/icediagnostics.hpp b/include/rtc/icediagnostics.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/rtc/icediagnostics.hpp
+@@ -0,0 +1,96 @@
++#ifndef RTC_ICE_DIAGNOSTICS_H
++#define RTC_ICE_DIAGNOSTICS_H
++
++#include <cstdint>
++#include <array>
++#include <type_traits>
++
++namespace rtc {
++
++// Fork extension. Fixed numeric copy; no endpoints, credentials or SDK handles.
++// Counters are cumulative for one ICE transport, not reset by clearStats().
++struct IceDiagnostics {
++    enum class Availability : uint8_t {
++        Available, NotStarted, NotSupported, ReadFailed, ClosedWithoutSample
++    };
++    enum class Provenance : uint8_t { None, Live, FinalRetained };
++    enum class Backend : uint8_t { Unknown, LibJuice, LibNice };
++    enum class FailureReason : uint8_t {
++        None, UdpRecv, UdpPoll, Connection, ConsentExpired, StunTimeout,
++        StunSend, StunResponse, ConnectivityTimeout, Unknown = 255
++    };
++
++    Availability availability = Availability::NotStarted;
++    Provenance provenance = Provenance::None;
++    Backend backend = Backend::Unknown;
++    FailureReason failureReason = FailureReason::Unknown;
++    // Numeric juice_state_t. Meaningful only when availability == Available.
++    unsigned int state = 0;
++    uint64_t udpBudgetYields = 0, udpDatagrams = 0;
++    unsigned int udpMaxBatch = 0; // datagrams, maximum in one receive batch
++    int recvErrno = 0; // signed backend error; preserve negative values
++    unsigned int pollFlags = 0; // native poll bit mask
++    int socketError = 0; // signed SO_ERROR; valid only if socketErrorAvailable
++    bool socketErrorAvailable = false;
++    uint64_t consentExpired = 0, stunTimeouts = 0, stunSendFailures = 0;
++    uint64_t stunErrorResponses = 0;
++    unsigned int stunErrorCode = 0; // STUN response code, not a duration
++    int stunSendErrno = 0; // signed backend error; preserve negative values
++    uint64_t connectivityTimeouts = 0;
++};
++
++static_assert(std::is_trivially_copyable<IceDiagnostics>::value);
++static_assert(std::is_standard_layout<IceDiagnostics>::value);
++static_assert(sizeof(IceDiagnostics) <= 128, "ICE snapshot must stay bounded");
++
++// Cold-path poll evidence. Never place this history in a packet/frame record.
++// Monotonic timestamps use the backend clock epoch, not the application epoch.
++// Map sampleMonoUs to an application before/after query bracket. CPU time is
++// unsupported: elapsed wall time does not establish CPU saturation.
++struct IceUdpPollDiagnostics {
++    struct Event {
++        uint64_t sequence = 0, startMonoUs = 0, elapsedUs = 0;
++        uint64_t bytes = 0, serviceGapUs = 0, readyDelayUs = 0;
++        unsigned int datagrams = 0, flags = 0, exitReason = 0;
++        uint64_t phaseRecvUs = 0, phaseCallbackUs = 0;
++    };
++    // flags: 1=large (>=256 datagrams), 2=slow (>=5000us), 4=budget yield,
++    // 8=valid start+elapsed clock, 16=valid gap after a preceding budget yield,
++    // 32=valid poll-ready-to-batch-start delay (excludes time sleeping in poll).
++    // 64=phase sampled (every16th batch, starting withbatch0),
++    // 128=all sampled phase clocks valid. Phase sections include preemption
++    // and clock-boundary overhead; their sum need not equal batch elapsed.
++    // Detail eligibility is >=50ms ORlarge/budget/error; flag2 remains>=5ms.
++    // exitReason: 0=drained, 1=budget, 2=interrupted, 3=recv error, 4=callback error.
++    IceDiagnostics ice;
++    bool clockAvailable = false, sampleClockAvailable = false;
++    bool lastClockAvailable = false, pendingYield = false;
++    bool rcvbufChecked = false, rcvbufAvailable = false;
++    int rcvbufBytes = 0, rcvbufErrno = 0;
++    uint64_t sampleMonoUs = 0, clockInvalid = 0;
++    uint64_t batches = 0, bytes = 0, timedBatches = 0;
++    uint64_t elapsedTotalUs = 0, elapsedMaxUs = 0;
++    uint64_t lastStartMonoUs = 0, lastEndMonoUs = 0;
++    // Gap after a yield can include socket idle: packet 1001 is not proven.
++    // pendingYield means only that the preceding batch hit the budget.
++    uint64_t serviceGaps = 0, serviceGapMaxUs = 0;
++    uint64_t readyDelays = 0, readyDelayMaxUs = 0;
++    // Original >=5ms ORlarge/budget criterion, independent of filtered detail.
++    uint64_t legacyEligibleBatches = 0;
++    unsigned int phaseSampleEvery = 0; // 16 after the first poll batch
++    uint64_t phaseSampledBatches = 0, phaseTimedBatches = 0, phaseInvalidBatches = 0;
++    uint64_t phaseSampledDatagrams = 0, phaseTimedDatagrams = 0;
++    // Receive calls include terminal EAGAIN/EINTR/error; sampled includes invalid.
++    uint64_t phaseSampledReceiveCalls = 0, phaseTimedReceiveCalls = 0;
++    // Totals/maxima cover complete valid sampled batches only. No extrapolation.
++    uint64_t phaseRecvTotalUs = 0, phaseRecvBatchMaxUs = 0;
++    uint64_t phaseCallbackTotalUs = 0, phaseCallbackBatchMaxUs = 0;
++    uint64_t eventsTotal = 0, eventsOverwritten = 0; // filtered detail, not legacy criterion
++    unsigned int eventCount = 0;
++    std::array<Event, 16> events{}; // chronological, oldest first
++};
++static_assert(std::is_trivially_copyable<IceUdpPollDiagnostics>::value);
++static_assert(sizeof(IceUdpPollDiagnostics) <= 2048, "cold UDP history must stay bounded");
++
++} // namespace rtc
++#endif
+diff --git a/include/rtc/peerconnection.hpp b/include/rtc/peerconnection.hpp
+--- a/include/rtc/peerconnection.hpp
++++ b/include/rtc/peerconnection.hpp
+@@ -14,6 +14,8 @@
+ #include "configuration.hpp"
+ #include "datachannel.hpp"
+ #include "description.hpp"
++#include "dtlsdiagnostics.hpp"
++#include "icediagnostics.hpp"
+ #include "reliability.hpp"
+ #include "track.hpp"
+ 
+@@ -95,6 +97,16 @@
+ 	optional<string> remoteAddress() const;
+ 	uint16_t maxDataChannelId() const;
+ 	bool getSelectedCandidatePair(Candidate *local, Candidate *remote);
++	// Fork extension: sanitized per-transport counters; empty before ICE exists.
++	string iceDiagnostics() const;
++	// Explicit potentially blocking query: call on a background diagnostics owner.
++	// After close, returns only the last successful typed observation (if any),
++	// marked FinalRetained. This is not a fresh observation of the closed transport.
++	IceDiagnostics getIceDiagnostics() const;
++	// Cold query: coherent summary plus bounded UDP batch history, one ICE lock.
++	IceUdpPollDiagnostics getIceUdpPollDiagnostics() const;
++	// Live transport snapshot; close retains a last pre-teardown snapshot.
++	DtlsDiagnostics getDtlsDiagnostics() const;
+ 
+ 	void setLocalDescription(Description::Type type = Description::Type::Unspec, LocalDescriptionInit init = {});
+ 	void gatherLocalCandidates(std::vector<IceServer> additionalIceServers = {});
+diff --git a/include/rtc/rtcpreceivingsession.hpp b/include/rtc/rtcpreceivingsession.hpp
+--- a/include/rtc/rtcpreceivingsession.hpp
++++ b/include/rtc/rtcpreceivingsession.hpp
+@@ -6,74 +6,79 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  */
+-
+ #ifndef RTC_RTCP_RECEIVING_SESSION_H
+ #define RTC_RTCP_RECEIVING_SESSION_H
+-
+ #if RTC_ENABLE_MEDIA
+-
+ #include "common.hpp"
+ #include "mediahandler.hpp"
+ #include "message.hpp"
+ #include "rtp.hpp"
+-
+ #include <atomic>
++#include <chrono>
+ #include <mutex>
+ 
+ #define RTP_SEQ_MOD (1<<16)
+-
+ namespace rtc {
+-
+-// An RtcpSession can be plugged into a Track to handle the whole RTCP session
+ class RTC_CPP_EXPORT RtcpReceivingSession : public MediaHandler {
+ public:
+ 	RtcpReceivingSession() = default;
+ 	virtual ~RtcpReceivingSession() = default;
+-
+ 	void incoming(message_vector &messages, const message_callback &send) override;
+ 	bool requestKeyframe(const message_callback &send) override;
+ 	bool requestBitrate(unsigned int bitrate, const message_callback &send) override;
+-
+-	// For backward compatibility
+ 	[[deprecated("Use Track::requestKeyframe()")]] inline bool requestKeyframe() { return false; };
+ 	[[deprecated("Use Track::requestBitrate()")]] inline void requestBitrate(unsigned int) {};
+-
+-	struct SyncTimestamps {
+-		uint64_t rtpTimestamp;
+-		uint64_t ntpTimestamp;
+-	};
+-
++	struct SyncTimestamps { uint64_t rtpTimestamp; uint64_t ntpTimestamp; };
+ 	SyncTimestamps getSyncTimestamps();
+ 
++	// Opt-in: an application-owned worker flushes latest regular feedback.
++	// The captured callback is Track's original weak-transport callback.
++	// PLI (and other handlers' NACK) bypass regular report pacing.
++	void setDeferredReports(bool enabled);
++	bool flushPendingReports(std::chrono::milliseconds interval = std::chrono::milliseconds(250));
++	// Terminal for the deferred queue until explicitly enabled again. Never waits on send().
++	void discardPendingReports();
++	struct FeedbackDiagnostics {
++		uint64_t rtpPackets = 0, rtcpPackets = 0, senderReports = 0, malformedControl = 0;
++		uint64_t regularRequests = 0, coalescedRequests = 0, discardedReports = 0;
++		// sentPackets means the void send callback completed; UDP delivery is not acknowledged.
++		uint64_t sendAttempts = 0, sentPackets = 0, sendFailures = 0;
++		uint64_t rrPackets = 0, rembPackets = 0, compoundPackets = 0;
++		uint64_t pendingAgeMaxUs = 0, sendTotalUs = 0, sendMaxUs = 0;
++		bool pending = false, stopped = false, inFlight = false;
++	};
++	FeedbackDiagnostics getFeedbackDiagnostics() const;
+ protected:
+ 	void pushREMB(const message_callback &send, unsigned int bitrate);
+-	void pushRR(const message_callback &send,unsigned int lastSrDelay);
++	void pushRR(const message_callback &send, unsigned int lastSrDelay);
+ 	void pushPLI(const message_callback &send);
+-
+ 	void initSeq(uint16_t seq);
+ 	bool updateSeq(uint16_t seq);
+-	
+ 	SSRC mSsrc = 0;
+ 	uint32_t mGreatestSeqNo = 0;
+-    uint16_t mMaxSeq = 0;			// highest seq. number seen
+-    uint32_t mCycles = 0;			// shifted count of seq. number cycles
+-	uint32_t mBaseSeq = 0;			// base seq number
+-    uint32_t mBadSeq = 0;			// last 'bad' seq number + 1
+-	uint32_t mProbation = 0;		// sequ. packets till source is valid
+-    uint32_t mReceived = 0;			// packets received
+-    uint32_t mExpectedPrior = 0;	// packet expected at last interval
+-    uint32_t mReceivedPrior = 0;	// packet received at last interval
+-	uint32_t mTransit = 0;			// relative trans time for prev pkt
+-	uint32_t mJitter = 0;	
+-	
++	uint16_t mMaxSeq = 0;
++	uint32_t mCycles = 0, mBaseSeq = 0, mBadSeq = 0, mProbation = 0;
++	uint32_t mReceived = 0, mExpectedPrior = 0, mReceivedPrior = 0;
++	uint32_t mTransit = 0, mJitter = 0;
+ 	SyncTimestamps mSyncTimestamps{0,0};
+-
+ 	std::atomic<unsigned int> mRequestedBitrate = 0;
+ 	std::mutex mSyncMutex;
++private:
++	using Clock = std::chrono::steady_clock;
++	void selectSourceLocked(SSRC ssrc);
++	void queueReportsLocked(bool rr, bool remb, const message_callback &send);
++	message_ptr makeReceiverReportLocked(unsigned int lastSrDelay, uint32_t &expected, uint32_t &received);
++	message_ptr makeRembLocked(unsigned int bitrate);
++	uint32_t senderReportDelayLocked(Clock::time_point now) const;
++	mutable std::mutex mStateMutex;
++	bool mSourceKnown = false, mSequenceInitialized = false;
++	bool mDeferredReports = false, mReportsStopped = false, mFlushInFlight = false;
++	bool mPendingRR = false, mPendingREMB = false;
++	uint64_t mSourceGeneration = 0;
++	Clock::time_point mLastSrAt{}, mPendingSince{}, mNextReportAt{};
++	message_callback mReportSend;
++	FeedbackDiagnostics mFeedback;
+ };
+-
+ } // namespace rtc
+-
+ #endif // RTC_ENABLE_MEDIA
+-
+ #endif // RTC_RTCP_RECEIVING_SESSION_H
+diff --git a/src/global.cpp b/src/global.cpp
+--- a/src/global.cpp
++++ b/src/global.cpp
+@@ -88,6 +88,11 @@
+ 
+ void Preload() { impl::Init::Instance().preload(); }
+ std::shared_future<void> Cleanup() { return impl::Init::Instance().cleanup(); }
++void JoinCleanupThreads() {
++#if defined(__SWITCH__) || defined(RTC_TEST_JOINABLE_CLEANUP)
++	impl::Init::Instance().joinCleanupThreads();
++#endif
++}
+ 
+ std::ostream &operator<<(std::ostream &out, LogLevel level) {
+ 	switch (level) {
+diff --git a/src/impl/dtlsingressqueue.hpp b/src/impl/dtlsingressqueue.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/impl/dtlsingressqueue.hpp
+@@ -0,0 +1,98 @@
++// FogPlay DTLS ingress: bounded FIFO admission. Never waits for queue capacity.
++#ifndef RTC_IMPL_DTLS_INGRESS_QUEUE_H
++#define RTC_IMPL_DTLS_INGRESS_QUEUE_H
++#include "message.hpp"
++#include "rtc/dtlsdiagnostics.hpp"
++#include <algorithm>
++#include <chrono>
++#include <deque>
++#include <functional>
++#include <mutex>
++
++namespace rtc::impl {
++class DtlsIngressQueue {
++public:
++    static constexpr size_t Capacity = 1024;
++    static constexpr size_t ControlReserve = 64;
++    enum class Kind { Rtp, Control, Invalid };
++    static Kind classify(const message_ptr &message) {
++        if (!message || message->empty()) return Kind::Invalid;
++        const auto first = std::to_integer<unsigned char>((*message)[0]);
++        if (first >= 20 && first <= 63)
++            return message->size() >= 13 ? Kind::Control : Kind::Invalid; // DTLS header
++        if (first >= 128 && first <= 191 && message->size() >= 2) {
++            const auto type = std::to_integer<unsigned char>((*message)[1]);
++            // RFC5761: the full second byte, including RTP marker bit.
++            if (type >= 192 && type <= 223)
++                return message->size() >= 8 ? Kind::Control : Kind::Invalid; // SRTCP header
++            return message->size() >= 12 ? Kind::Rtp : Kind::Invalid;
++        }
++        return Kind::Invalid;
++    }
++    // Signature mirrors Queue only to keep backend constructors uniform.
++    DtlsIngressQueue(size_t, std::function<size_t(const message_ptr &)>, bool) {}
++    void push(message_ptr message) {
++        const auto kind = classify(message);
++        std::lock_guard lock(mMutex);
++        if (mStopping || mOverflow) { ++mDiagnostics.admissionStopped; return; }
++        if (kind == Kind::Invalid) { ++mDiagnostics.admissionInvalid; return; }
++        if (kind == Kind::Rtp && (mMedia >= Capacity - ControlReserve || mQueue.size() >= Capacity)) {
++            ++mDiagnostics.admissionMediaDropped;
++            return;
++        }
++        if (mQueue.size() >= Capacity) {
++            const auto media = std::find_if(mQueue.begin(), mQueue.end(),
++                [](const Entry &entry) { return entry.kind == Kind::Rtp; });
++            if (media == mQueue.end()) {
++                ++mDiagnostics.admissionCriticalOverflow;
++                mOverflow = true; // receiver publishes terminal failure, never the producer
++                return;
++            }
++            mQueue.erase(media);
++            --mMedia;
++            ++mDiagnostics.admissionMediaEvicted;
++        }
++        mQueue.push_back({std::move(message), Clock::now(), kind});
++        if (kind == Kind::Rtp) { ++mMedia; ++mDiagnostics.admissionMediaAccepted; }
++        else ++mDiagnostics.admissionControlAccepted;
++        ++mDiagnostics.enqueued;
++        mDiagnostics.queueHighWater = std::max(mDiagnostics.queueHighWater, uint64_t(mQueue.size()));
++    }
++    optional<message_ptr> pop() {
++        std::lock_guard lock(mMutex);
++        if (mQueue.empty() || mOverflow) return nullopt;
++        auto &entry = mQueue.front();
++        const auto age = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - entry.at).count());
++        ++mDiagnostics.dequeued;
++        mDiagnostics.residenceTotalUs += age;
++        mDiagnostics.residenceMaxUs = std::max(mDiagnostics.residenceMaxUs, age);
++        if (entry.kind == Kind::Rtp) --mMedia;
++        auto message = std::move(entry.message);
++        mQueue.pop_front();
++        return message;
++    }
++    void stop() { std::lock_guard lock(mMutex); mStopping = true; }
++    bool empty() const { std::lock_guard lock(mMutex); return mQueue.empty(); }
++    bool running() const { std::lock_guard lock(mMutex); return !mOverflow && (!mStopping || !mQueue.empty()); }
++    bool overflowed() const { std::lock_guard lock(mMutex); return mOverflow; }
++    // Called on receiver only, after overflow is observed; promptly frees payloads.
++    void discard() { std::lock_guard lock(mMutex); mQueue.clear(); mMedia = 0; }
++    DtlsDiagnostics diagnostics() const {
++        std::lock_guard lock(mMutex);
++        auto d = mDiagnostics;
++        d.available = true;
++        d.queueDepth = mQueue.size();
++        if (!mQueue.empty()) d.queueOldestAgeUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - mQueue.front().at).count());
++        return d;
++    }
++private:
++    using Clock = std::chrono::steady_clock;
++    struct Entry { message_ptr message; Clock::time_point at; Kind kind; };
++    mutable std::mutex mMutex;
++    std::deque<Entry> mQueue;
++    size_t mMedia = 0;
++    bool mStopping = false, mOverflow = false;
++    DtlsDiagnostics mDiagnostics;
++};
++} // namespace rtc::impl
++#endif
+diff --git a/src/impl/dtlssrtptransport.cpp b/src/impl/dtlssrtptransport.cpp
+--- a/src/impl/dtlssrtptransport.cpp
++++ b/src/impl/dtlssrtptransport.cpp
+@@ -84,8 +84,68 @@
+ 	srtp_dealloc(mSrtpOut);
+ }
+ 
++
++DtlsSrtpTransport::MediaCallbackDiagnosticScope::~MediaCallbackDiagnosticScope() {
++	const auto us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++	    std::chrono::steady_clock::now() - at).count());
++	std::lock_guard lock(t.mDiagnosticsMutex);
++	auto &d = t.mRecvDiagnostics;
++	++d.recvMediaCallbackCount;
++	d.recvMediaCallbackTotalUs += us;
++	d.recvMediaCallbackMaxUs = std::max(d.recvMediaCallbackMaxUs, us);
++	if (rtcp) {
++		++d.recvRtcpCallbackCount;
++		d.recvRtcpCallbackTotalUs += us;
++		d.recvRtcpCallbackMaxUs = std::max(d.recvRtcpCallbackMaxUs, us);
++	} else {
++		++d.recvRtpCallbackCount;
++		d.recvRtpCallbackTotalUs += us;
++		d.recvRtpCallbackMaxUs = std::max(d.recvRtpCallbackMaxUs, us);
++	}
++}
++
++DtlsSrtpTransport::MediaSendDiagnosticScope::MediaSendDiagnosticScope(DtlsSrtpTransport &transport)
++    : t(transport), lock(t.sendMutex), acquiredAt(std::chrono::steady_clock::now()) {}
++
++DtlsSrtpTransport::MediaSendDiagnosticScope::~MediaSendDiagnosticScope() {
++	const auto releasedAt = std::chrono::steady_clock::now();
++	lock.unlock();
++	const auto waitUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(acquiredAt - waitingAt).count());
++	const auto holdUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(releasedAt - acquiredAt).count());
++	std::lock_guard diagnosticLock(t.mDiagnosticsMutex);
++	auto &d = t.mRecvDiagnostics;
++	++d.sendSrtpLockCount;
++	d.sendSrtpLockWaitTotalUs += waitUs;
++	d.sendSrtpLockWaitMaxUs = std::max(d.sendSrtpLockWaitMaxUs, waitUs);
++	d.sendSrtpLockHoldTotalUs += holdUs;
++	d.sendSrtpLockHoldMaxUs = std::max(d.sendSrtpLockHoldMaxUs, holdUs);
++	if (!valid) { ++d.sendSrtpRejected; return; }
++	if (!sent) ++d.sendSrtpFailed;
++	if (rtcp) {
++		++d.sendRtcpCount;
++		if (protectedPacket) {
++			++d.sendRtcpProtectCount; d.sendRtcpProtectTotalUs += protectUs;
++			d.sendRtcpProtectMaxUs = std::max(d.sendRtcpProtectMaxUs, protectUs);
++		}
++		if (lowerAttempted) {
++			++d.sendRtcpLowerCount; d.sendRtcpLowerTotalUs += lowerUs;
++			d.sendRtcpLowerMaxUs = std::max(d.sendRtcpLowerMaxUs, lowerUs);
++		}
++	} else {
++		++d.sendRtpCount;
++		if (protectedPacket) {
++			++d.sendRtpProtectCount; d.sendRtpProtectTotalUs += protectUs;
++			d.sendRtpProtectMaxUs = std::max(d.sendRtpProtectMaxUs, protectUs);
++		}
++		if (lowerAttempted) {
++			++d.sendRtpLowerCount; d.sendRtpLowerTotalUs += lowerUs;
++			d.sendRtpLowerMaxUs = std::max(d.sendRtpLowerMaxUs, lowerUs);
++		}
++	}
++}
++
+ bool DtlsSrtpTransport::sendMedia(message_ptr message) {
+-	std::lock_guard lock(sendMutex);
++	MediaSendDiagnosticScope diagnostic{*this};
+ 	if (!message)
+ 		return false;
+ 
+@@ -94,6 +154,8 @@
+ 		return false;
+ 	}
+ 
++	diagnostic.valid = true;
++	diagnostic.rtcp = IsRtcp(*message);
+ 	int size = int(message->size());
+ 	PLOG_VERBOSE << "Send size=" << size;
+ 
+@@ -103,7 +165,12 @@
+ 	message = make_message(size + SRTP_MAX_TRAILER_LEN, message);
+ 
+ 	if (IsRtcp(*message)) { // Demultiplex RTCP and RTP using payload type
+-		if (srtp_err_status_t err = srtp_protect_rtcp(mSrtpOut, message->data(), &size)) {
++		srtp_err_status_t err;
++		const auto protectAt = std::chrono::steady_clock::now();
++		err = srtp_protect_rtcp(mSrtpOut, message->data(), &size);
++		diagnostic.protectedPacket = true;
++		diagnostic.protectUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - protectAt).count());
++		if (err) {
+ 			if (err == srtp_err_status_replay_fail)
+ 				throw std::runtime_error("Outgoing SRTCP packet is a replay");
+ 			else
+@@ -113,7 +180,12 @@
+ 		PLOG_VERBOSE << "Protected SRTCP packet, size=" << size;
+ 
+ 	} else {
+-		if (srtp_err_status_t err = srtp_protect(mSrtpOut, message->data(), &size)) {
++		srtp_err_status_t err;
++		const auto protectAt = std::chrono::steady_clock::now();
++		err = srtp_protect(mSrtpOut, message->data(), &size);
++		diagnostic.protectedPacket = true;
++		diagnostic.protectUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - protectAt).count());
++		if (err) {
+ 			if (err == srtp_err_status_replay_fail)
+ 				throw std::runtime_error("Outgoing SRTP packet is a replay");
+ 			else
+@@ -131,7 +203,17 @@
+ 		message->dscp = 36; // AF42: Assured Forwarding class 4, medium drop probability
+ 	}
+ 
+-	return Transport::outgoing(message); // bypass DTLS DSCP marking
++	const auto lowerAt = std::chrono::steady_clock::now();
++	try {
++		diagnostic.sent = Transport::outgoing(message); // bypass DTLS DSCP marking
++	} catch (...) {
++		diagnostic.lowerAttempted = true;
++		diagnostic.lowerUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - lowerAt).count());
++		throw;
++	}
++	diagnostic.lowerAttempted = true;
++	diagnostic.lowerUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - lowerAt).count());
++	return diagnostic.sent;
+ }
+ 
+ void DtlsSrtpTransport::recvMedia(message_ptr message) {
+@@ -150,7 +232,12 @@
+ 
+ 	if (IsRtcp(*message)) { // Demultiplex RTCP and RTP using payload type
+ 		PLOG_VERBOSE << "Incoming SRTCP packet, size=" << size;
+-		if (srtp_err_status_t err = srtp_unprotect_rtcp(mSrtpIn, message->data(), &size)) {
++		srtp_err_status_t err;
++		{
++			PacketDiagnosticScope cryptoScope{*this, PacketStage::Unprotect};
++			err = srtp_unprotect_rtcp(mSrtpIn, message->data(), &size);
++		}
++		if (err) {
+ 			if (err == srtp_err_status_replay_fail) {
+ 				PLOG_VERBOSE << "Incoming SRTCP packet is a replay";
+ 				COUNTER_SRTCP_REPLAY++;
+@@ -170,7 +257,12 @@
+ 
+ 	} else {
+ 		PLOG_VERBOSE << "Incoming SRTP packet, size=" << size;
+-		if (srtp_err_status_t err = srtp_unprotect(mSrtpIn, message->data(), &size)) {
++		srtp_err_status_t err;
++		{
++			PacketDiagnosticScope cryptoScope{*this, PacketStage::Unprotect};
++			err = srtp_unprotect(mSrtpIn, message->data(), &size);
++		}
++		if (err) {
+ 			if (err == srtp_err_status_replay_fail) {
+ 				PLOG_VERBOSE << "Incoming SRTP packet is a replay";
+ 				COUNTER_SRTP_REPLAY++;
+@@ -189,6 +281,7 @@
+ 	}
+ 
+ 	message->resize(size);
++	MediaCallbackDiagnosticScope callbackScope{*this, message->type == Message::Control};
+ 	mSrtpRecvCallback(message);
+ }
+ 
+diff --git a/src/impl/dtlssrtptransport.hpp b/src/impl/dtlssrtptransport.hpp
+--- a/src/impl/dtlssrtptransport.hpp
++++ b/src/impl/dtlssrtptransport.hpp
+@@ -58,6 +58,26 @@
+ 	std::atomic<bool> mInitDone = false;
+ 	std::vector<unsigned char> mClientSessionKey;
+ 	std::vector<unsigned char> mServerSessionKey;
++
++	// Aggregate only after releasing the SRTP send mutex. A snapshot never
++	// acquires media/TLS/ICE locks and is safe from an inline send callback.
++	struct MediaCallbackDiagnosticScope {
++		DtlsSrtpTransport &t;
++		bool rtcp;
++		std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
++		~MediaCallbackDiagnosticScope();
++	};
++	struct MediaSendDiagnosticScope {
++		DtlsSrtpTransport &t;
++		std::chrono::steady_clock::time_point waitingAt = std::chrono::steady_clock::now();
++		std::unique_lock<std::mutex> lock;
++		std::chrono::steady_clock::time_point acquiredAt;
++		bool valid = false, rtcp = false, sent = false;
++		bool protectedPacket = false, lowerAttempted = false;
++		uint64_t protectUs = 0, lowerUs = 0;
++		explicit MediaSendDiagnosticScope(DtlsSrtpTransport &transport);
++		~MediaSendDiagnosticScope();
++	};
+ 	std::mutex sendMutex;
+ };
+ 
+diff --git a/src/impl/dtlstransport.cpp b/src/impl/dtlstransport.cpp
+--- a/src/impl/dtlstransport.cpp
++++ b/src/impl/dtlstransport.cpp
+@@ -29,15 +29,116 @@
+ 
+ namespace rtc::impl {
+ 
++DtlsDiagnostics DtlsTransport::getDtlsDiagnostics() const {
++	auto result = mIncomingQueue.diagnostics();
++	std::lock_guard lock(mDiagnosticsMutex);
++	result.recvRtpCallbackCount = mRecvDiagnostics.recvRtpCallbackCount;
++	result.recvRtpCallbackTotalUs = mRecvDiagnostics.recvRtpCallbackTotalUs;
++	result.recvRtpCallbackMaxUs = mRecvDiagnostics.recvRtpCallbackMaxUs;
++	result.recvRtcpCallbackCount = mRecvDiagnostics.recvRtcpCallbackCount;
++	result.recvRtcpCallbackTotalUs = mRecvDiagnostics.recvRtcpCallbackTotalUs;
++	result.recvRtcpCallbackMaxUs = mRecvDiagnostics.recvRtcpCallbackMaxUs;
++	result.sendSrtpLockCount = mRecvDiagnostics.sendSrtpLockCount;
++	result.sendSrtpLockWaitTotalUs = mRecvDiagnostics.sendSrtpLockWaitTotalUs;
++	result.sendSrtpLockWaitMaxUs = mRecvDiagnostics.sendSrtpLockWaitMaxUs;
++	result.sendSrtpLockHoldTotalUs = mRecvDiagnostics.sendSrtpLockHoldTotalUs;
++	result.sendSrtpLockHoldMaxUs = mRecvDiagnostics.sendSrtpLockHoldMaxUs;
++	result.sendSrtpRejected = mRecvDiagnostics.sendSrtpRejected;
++	result.sendSrtpFailed = mRecvDiagnostics.sendSrtpFailed;
++	result.sendRtpCount = mRecvDiagnostics.sendRtpCount;
++	result.sendRtcpCount = mRecvDiagnostics.sendRtcpCount;
++	result.sendRtpProtectCount = mRecvDiagnostics.sendRtpProtectCount;
++	result.sendRtpProtectTotalUs = mRecvDiagnostics.sendRtpProtectTotalUs;
++	result.sendRtpProtectMaxUs = mRecvDiagnostics.sendRtpProtectMaxUs;
++	result.sendRtcpProtectCount = mRecvDiagnostics.sendRtcpProtectCount;
++	result.sendRtcpProtectTotalUs = mRecvDiagnostics.sendRtcpProtectTotalUs;
++	result.sendRtcpProtectMaxUs = mRecvDiagnostics.sendRtcpProtectMaxUs;
++	result.sendRtpLowerCount = mRecvDiagnostics.sendRtpLowerCount;
++	result.sendRtpLowerTotalUs = mRecvDiagnostics.sendRtpLowerTotalUs;
++	result.sendRtpLowerMaxUs = mRecvDiagnostics.sendRtpLowerMaxUs;
++	result.sendRtcpLowerCount = mRecvDiagnostics.sendRtcpLowerCount;
++	result.sendRtcpLowerTotalUs = mRecvDiagnostics.sendRtcpLowerTotalUs;
++	result.sendRtcpLowerMaxUs = mRecvDiagnostics.sendRtcpLowerMaxUs;
++	result.recvDemuxCount = mRecvDiagnostics.recvDemuxCount;
++	result.recvDemuxTotalUs = mRecvDiagnostics.recvDemuxTotalUs;
++	result.recvDemuxMaxUs = mRecvDiagnostics.recvDemuxMaxUs;
++	result.recvUnprotectCount = mRecvDiagnostics.recvUnprotectCount;
++	result.recvUnprotectTotalUs = mRecvDiagnostics.recvUnprotectTotalUs;
++	result.recvUnprotectMaxUs = mRecvDiagnostics.recvUnprotectMaxUs;
++	result.recvMediaCallbackCount = mRecvDiagnostics.recvMediaCallbackCount;
++	result.recvMediaCallbackTotalUs = mRecvDiagnostics.recvMediaCallbackTotalUs;
++	result.recvMediaCallbackMaxUs = mRecvDiagnostics.recvMediaCallbackMaxUs;
++	result.recvDataCallbackCount = mRecvDiagnostics.recvDataCallbackCount;
++	result.recvDataCallbackTotalUs = mRecvDiagnostics.recvDataCallbackTotalUs;
++	result.recvDataCallbackMaxUs = mRecvDiagnostics.recvDataCallbackMaxUs;
++	result.recvBatchTimeYields = mRecvDiagnostics.recvBatchTimeYields;
++	result.recvBatchWorkYields = mRecvDiagnostics.recvBatchWorkYields;
++	result.recvBatchEmpty = mRecvDiagnostics.recvBatchEmpty;
++	result.recvRuns = mRecvDiagnostics.recvRuns;
++	result.recvScheduleCount = mRecvDiagnostics.recvScheduleCount;
++	result.recvScheduleWaitTotalUs = mRecvDiagnostics.recvScheduleWaitTotalUs;
++	result.recvScheduleWaitMaxUs = mRecvDiagnostics.recvScheduleWaitMaxUs;
++	result.recvProcessingTotalUs = mRecvDiagnostics.recvProcessingTotalUs;
++	result.recvProcessingMaxUs = mRecvDiagnostics.recvProcessingMaxUs;
++	result.sendSslLockCount = mRecvDiagnostics.sendSslLockCount;
++	result.sendSslLockWaitTotalUs = mRecvDiagnostics.sendSslLockWaitTotalUs;
++	result.sendSslLockWaitMaxUs = mRecvDiagnostics.sendSslLockWaitMaxUs;
++	result.sendSslLockHoldTotalUs = mRecvDiagnostics.sendSslLockHoldTotalUs;
++	result.sendSslLockHoldMaxUs = mRecvDiagnostics.sendSslLockHoldMaxUs;
++	result.recvSslLockCount = mRecvDiagnostics.recvSslLockCount;
++	result.recvSslLockWaitTotalUs = mRecvDiagnostics.recvSslLockWaitTotalUs;
++	result.recvSslLockWaitMaxUs = mRecvDiagnostics.recvSslLockWaitMaxUs;
++	result.recvSslLockHoldTotalUs = mRecvDiagnostics.recvSslLockHoldTotalUs;
++	result.recvSslLockHoldMaxUs = mRecvDiagnostics.recvSslLockHoldMaxUs;
++	result.recvBatchPacketsTotal = mRecvDiagnostics.recvBatchPacketsTotal;
++	result.recvBatchPacketsMax = mRecvDiagnostics.recvBatchPacketsMax;
++	result.recvBatchYields = mRecvDiagnostics.recvBatchYields;
++	return result;
++}
++
++DtlsTransport::RecvDiagnosticScope::~RecvDiagnosticScope() {
++	const auto us = uint64_t(duration_cast<microseconds>(steady_clock::now() - startedAt).count());
++	std::lock_guard lock(transport.mDiagnosticsMutex);
++	++transport.mRecvDiagnostics.recvRuns;
++	transport.mRecvDiagnostics.recvProcessingTotalUs += us;
++	transport.mRecvDiagnostics.recvProcessingMaxUs = std::max(transport.mRecvDiagnostics.recvProcessingMaxUs, us);
++}
++
++DtlsTransport::PacketDiagnosticScope::~PacketDiagnosticScope() {
++	const auto us = uint64_t(duration_cast<microseconds>(steady_clock::now() - at).count());
++	// Clock and work execute without the diagnostics lock, including crypto.
++	std::lock_guard lock(t.mDiagnosticsMutex);
++	uint64_t *count = nullptr, *total = nullptr, *maximum = nullptr;
++	switch (stage) {
++	case PacketStage::Demux: count = &t.mRecvDiagnostics.recvDemuxCount; total = &t.mRecvDiagnostics.recvDemuxTotalUs; maximum = &t.mRecvDiagnostics.recvDemuxMaxUs; break;
++	case PacketStage::Unprotect: count = &t.mRecvDiagnostics.recvUnprotectCount; total = &t.mRecvDiagnostics.recvUnprotectTotalUs; maximum = &t.mRecvDiagnostics.recvUnprotectMaxUs; break;
++	case PacketStage::MediaCallback: count = &t.mRecvDiagnostics.recvMediaCallbackCount; total = &t.mRecvDiagnostics.recvMediaCallbackTotalUs; maximum = &t.mRecvDiagnostics.recvMediaCallbackMaxUs; break;
++	case PacketStage::DataCallback: count = &t.mRecvDiagnostics.recvDataCallbackCount; total = &t.mRecvDiagnostics.recvDataCallbackTotalUs; maximum = &t.mRecvDiagnostics.recvDataCallbackMaxUs; break;
++	}
++	++*count; *total += us; *maximum = std::max(*maximum, us);
++}
++
++bool DtlsTransport::failIngressOverflow() {
++	if (!mIncomingQueue.overflowed()) return false;
++	mIncomingQueue.discard();
++	if (state() == State::Connecting || state() == State::Connected) {
++		const bool connected = state() == State::Connected;
++		PLOG_ERROR << "DTLS critical ingress capacity exhausted";
++		changeState(State::Failed);
++		if (connected) recv(nullptr);
++	}
++	return true;
++}
++
+ void DtlsTransport::enqueueRecv() {
+-	if (mPendingRecvCount > 0)
++	int expected = 0;
++	if (!mPendingRecvCount.compare_exchange_strong(expected, 1))
+ 		return;
+ 
+-	++mPendingRecvCount;
+-
+-	ThreadPool::Instance().enqueue([weak_this = weak_from_this()]() {
++	const auto queuedAt = steady_clock::now();
++	ThreadPool::Instance().enqueue([weak_this = weak_from_this(), queuedAt]() {
+ 		if (auto locked = weak_this.lock())
+-			locked->doRecv();
++			locked->doRecv(queuedAt);
+ 	});
+ }
+ 
+@@ -56,7 +157,7 @@
+     : Transport(lower, std::move(stateChangeCallback)), mMtu(mtu), mCertificate(certificate),
+       mFingerprintAlgorithm(fingerprintAlgorithm), mVerifierCallback(std::move(verifierCallback)),
+       mIsClient(lower->role() == Description::Role::Active),
+-      mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
++      mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func, true) {
+ 
+ 	PLOG_DEBUG << "Initializing DTLS transport (GnuTLS)";
+ 
+@@ -158,6 +259,7 @@
+ void DtlsTransport::incoming(message_ptr message) {
+ 	if (!message) {
+ 		mIncomingQueue.stop();
++		enqueueRecv();
+ 		return;
+ 	}
+ 
+@@ -183,9 +285,20 @@
+ 	// Dummy
+ }
+ 
+-void DtlsTransport::doRecv() {
++void DtlsTransport::doRecv(steady_clock::time_point queuedAt) {
+ 	std::lock_guard lock(mRecvMutex);
+-	--mPendingRecvCount;
++	const auto startedAt = steady_clock::now();
++	if (queuedAt != steady_clock::time_point{}) {
++		const auto us = uint64_t(duration_cast<microseconds>(startedAt - queuedAt).count());
++		std::lock_guard diagnosticLock(mDiagnosticsMutex);
++		++mRecvDiagnostics.recvScheduleCount;
++		mRecvDiagnostics.recvScheduleWaitTotalUs += us;
++		mRecvDiagnostics.recvScheduleWaitMaxUs = std::max(mRecvDiagnostics.recvScheduleWaitMaxUs, us);
++	}
++	RecvDiagnosticScope diagnosticScope{*this, startedAt};
++	if (failIngressOverflow()) return;
++	if (queuedAt != steady_clock::time_point{})
++		mPendingRecvCount = 0;
+ 
+ 	if (state() != State::Connecting && state() != State::Connected)
+ 		return;
+@@ -258,6 +371,7 @@
+ 						break;
+ 					}
+ 					auto *b = reinterpret_cast<byte *>(buffer);
++					PacketDiagnosticScope callbackScope{*this, PacketStage::DataCallback};
+ 					recv(make_message(b, b + ret));
+ 				}
+ 			}
+@@ -384,7 +498,7 @@
+     : Transport(lower, std::move(stateChangeCallback)), mMtu(mtu), mCertificate(certificate),
+       mFingerprintAlgorithm(fingerprintAlgorithm), mVerifierCallback(std::move(verifierCallback)),
+       mIsClient(lower->role() == Description::Role::Active),
+-      mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
++      mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func, true) {
+ 
+ 	PLOG_DEBUG << "Initializing DTLS transport (MbedTLS)";
+ 
+@@ -452,6 +566,32 @@
+ 	// Nothing to do
+ }
+ 
++DtlsTransport::SslDiagnosticScope::SslDiagnosticScope(DtlsTransport &t, bool send)
++    : transport(t), sending(send), waitingAt(steady_clock::now()), lock(t.mSslMutex),
++      acquiredAt(steady_clock::now()) {}
++
++DtlsTransport::SslDiagnosticScope::~SslDiagnosticScope() {
++	const auto releasedAt = steady_clock::now();
++	lock.unlock();
++	const auto waitUs = uint64_t(duration_cast<microseconds>(acquiredAt - waitingAt).count());
++	const auto holdUs = uint64_t(duration_cast<microseconds>(releasedAt - acquiredAt).count());
++	std::lock_guard diagnosticLock(transport.mDiagnosticsMutex);
++	auto &d = transport.mRecvDiagnostics;
++	if (sending) {
++		++d.sendSslLockCount;
++		d.sendSslLockWaitTotalUs += waitUs;
++		d.sendSslLockWaitMaxUs = std::max(d.sendSslLockWaitMaxUs, waitUs);
++		d.sendSslLockHoldTotalUs += holdUs;
++		d.sendSslLockHoldMaxUs = std::max(d.sendSslLockHoldMaxUs, holdUs);
++	} else {
++		++d.recvSslLockCount;
++		d.recvSslLockWaitTotalUs += waitUs;
++		d.recvSslLockWaitMaxUs = std::max(d.recvSslLockWaitMaxUs, waitUs);
++		d.recvSslLockHoldTotalUs += holdUs;
++		d.recvSslLockHoldMaxUs = std::max(d.recvSslLockHoldMaxUs, holdUs);
++	}
++}
++
+ void DtlsTransport::start() {
+ 	PLOG_DEBUG << "Starting DTLS transport";
+ 	registerIncoming();
+@@ -482,7 +622,7 @@
+ 
+ 	int ret;
+ 	do {
+-		std::lock_guard lock(mSslMutex);
++		SslDiagnosticScope sslLock(*this, true);
+ 		if (message->size() > size_t(mbedtls_ssl_get_max_out_record_payload(&mSsl)))
+ 			return false;
+ 
+@@ -497,6 +637,7 @@
+ void DtlsTransport::incoming(message_ptr message) {
+ 	if (!message) {
+ 		mIncomingQueue.stop();
++		enqueueRecv();
+ 		return;
+ 	}
+ 
+@@ -522,78 +663,138 @@
+ 	// Dummy
+ }
+ 
+-void DtlsTransport::doRecv() {
++void DtlsTransport::doRecv(steady_clock::time_point queuedAt) {
+ 	std::lock_guard lock(mRecvMutex);
+-	--mPendingRecvCount;
++	const auto startedAt = steady_clock::now();
++	if (queuedAt != steady_clock::time_point{}) {
++		const auto us = uint64_t(duration_cast<microseconds>(startedAt - queuedAt).count());
++		std::lock_guard diagnosticLock(mDiagnosticsMutex);
++		++mRecvDiagnostics.recvScheduleCount;
++		mRecvDiagnostics.recvScheduleWaitTotalUs += us;
++		mRecvDiagnostics.recvScheduleWaitMaxUs = std::max(mRecvDiagnostics.recvScheduleWaitMaxUs, us);
++	}
++	RecvDiagnosticScope diagnosticScope{*this, startedAt};
++	if (failIngressOverflow()) return;
++
++	// The scheduling token covers both queued and running work: new arrivals
++	// never park another pool worker on mRecvMutex while a callback is active.
++	// Release then recheck to close the empty-queue/incoming() wakeup race.
++	bool continueRecv = false;
++	struct ScheduleScope {
++		DtlsTransport &t;
++		bool queued;
++		bool &again;
++		~ScheduleScope() {
++			if (queued) t.mPendingRecvCount = 0;
++			if ((t.state() == State::Connecting || t.state() == State::Connected) &&
++			    (again || !t.mIncomingQueue.empty() || !t.mIncomingQueue.running()))
++				t.enqueueRecv();
++		}
++	} scheduleScope{*this, queuedAt != steady_clock::time_point{}, continueRecv};
+ 
+ 	if (state() != State::Connecting && state() != State::Connected)
+ 		return;
+ 
++
++	// One datagram or TLS call is a work unit. A slow application callback may
++	// overrun the time budget, but never owns mSslMutex. mRecvMutex preserves
++	// SRTP replay-context serialization and packet/callback ordering.
++	constexpr size_t maxWork = 64;
++	constexpr auto maxTime = milliseconds(2);
++	size_t work = 0, packets = 0;
++	struct BatchScope {
++		DtlsTransport &t;
++		size_t &packets;
++		~BatchScope() {
++			std::lock_guard lock(t.mDiagnosticsMutex);
++			t.mRecvDiagnostics.recvBatchPacketsTotal += packets;
++			t.mRecvDiagnostics.recvBatchPacketsMax = std::max(
++			    t.mRecvDiagnostics.recvBatchPacketsMax, uint64_t(packets));
++		}
++	} batchScope{*this, packets};
++	bool readTls = true;
++
+ 	try {
+-		const size_t bufferSize = 4096;
+-		char buffer[bufferSize];
+-
+-		// Handle handshake if connecting
+-		if (state() == State::Connecting) {
+-			while (true) {
++		unsigned char buffer[4096];
++		while (true) {
++			if (failIngressOverflow()) return;
++			if (work >= maxWork || (work > 0 && steady_clock::now() - startedAt >= maxTime)) {
++				{
++					std::lock_guard diagnosticLock(mDiagnosticsMutex);
++					++mRecvDiagnostics.recvBatchYields;
++					if (work >= maxWork) ++mRecvDiagnostics.recvBatchWorkYields;
++					else ++mRecvDiagnostics.recvBatchTimeYields;
++				}
++				// Also continue with no queued datagrams: mbedTLS may still own
++				// plaintext records from the last datagram. Never strand those.
++				continueRecv = true;
++				return;
++			}
++
++			if (readTls) {
++				++work;
+ 				int ret;
++				const bool connecting = state() == State::Connecting;
+ 				{
+-					std::lock_guard lock(mSslMutex);
+-					ret = mbedtls_ssl_handshake(&mSsl);
+-				}
+-
+-				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+-					ThreadPool::Instance().schedule(mTimerSetAt + milliseconds(mFinMs),
+-					                                [weak_this = weak_from_this()]() {
+-						                                if (auto locked = weak_this.lock())
+-							                                locked->doRecv();
+-					                                });
+-					return;
+-				}
+-
+-				if (mbedtls::check(ret, "Handshake failed")) {
+-					// RFC 8261: DTLS MUST support sending messages larger than the current path MTU
+-					// See https://www.rfc-editor.org/rfc/rfc8261.html#section-5
+-					{
+-						std::lock_guard lock(mSslMutex);
+-						mbedtls_ssl_set_mtu(&mSsl, static_cast<unsigned int>(bufferSize + 1));
++					SslDiagnosticScope sslLock(*this, false);
++
++					ret = connecting ? mbedtls_ssl_handshake(&mSsl)
++					                 : mbedtls_ssl_read(&mSsl, buffer, sizeof(buffer));
++					if (connecting && ret == 0) {
++						mbedtls_ssl_set_mtu(&mSsl, static_cast<unsigned int>(sizeof(buffer) + 1));
++						// SRTP profile inspection uses mSsl. Publish Connected only
++						// after keys are ready, before handling following media.
++						postHandshake();
+ 					}
+-
++				}
++				if (connecting && ret == 0) {
+ 					PLOG_INFO << "DTLS handshake finished";
+ 					changeState(State::Connected);
+-					postHandshake();
++					continue;
++				}
++				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
++					readTls = false;
++				} else if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || (!connecting && ret == 0)) {
+ 					break;
++				} else if (mbedtls::check(ret, connecting ? "Handshake failed" : "DTLS read failed")) {
++					auto *b = reinterpret_cast<byte *>(buffer);
++					PacketDiagnosticScope callbackScope{*this, PacketStage::DataCallback};
++					recv(make_message(b, b + ret));
++					continue; // drain buffered TLS records before the next datagram
++				} else {
++					continue;
+ 				}
+ 			}
+-		}
+-
+-		if (state() == State::Connected) {
+-			while (true) {
+-				int ret;
+-				{
+-					std::lock_guard lock(mSslMutex);
+-					ret = mbedtls_ssl_read(&mSsl, reinterpret_cast<unsigned char *>(buffer),
+-					                       bufferSize);
+-				}
+-
+-				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+-					return;
+-				}
+-
+-				if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+-					PLOG_DEBUG << "DTLS connection cleanly closed";
++
++			auto next = mIncomingQueue.pop();
++			if (!next) {
++				if (failIngressOverflow()) return;
++				{ std::lock_guard lock(mDiagnosticsMutex); ++mRecvDiagnostics.recvBatchEmpty; }
++				if (!mIncomingQueue.running())
+ 					break;
+-				}
+-
+-				if (mbedtls::check(ret)) {
+-					if (ret == 0) {
+-						PLOG_DEBUG << "DTLS connection terminated";
+-						break;
+-					}
+-					auto *b = reinterpret_cast<byte *>(buffer);
+-					recv(make_message(b, b + ret));
+-				}
++				if (state() == State::Connecting && mFinMs != 0) {
++					ThreadPool::Instance().schedule(mTimerSetAt + milliseconds(mFinMs),
++					    [weak_this = weak_from_this()] {
++						    if (auto locked = weak_this.lock()) locked->enqueueRecv();
++					    });
++				}
++				return;
+ 			}
++			++work;
++			++packets;
++			auto message = std::move(*next);
++			bool demuxed;
++			{
++				PacketDiagnosticScope packetScope{*this, PacketStage::Demux};
++				demuxed = demuxMessage(message);
++			}
++			if (demuxed)
++				continue; // application/SRTP work is outside mSslMutex
++			{
++				SslDiagnosticScope sslLock(*this, false);
++				mReadMessage = std::move(message);
++			}
++			readTls = true;
+ 		}
+ 	} catch (const std::exception &e) {
+ 		PLOG_ERROR << "DTLS recv: " << e.what();
+@@ -647,30 +848,13 @@
+ 
+ int DtlsTransport::ReadCallback(void *ctx, unsigned char *buf, size_t len) {
+ 	auto *t = static_cast<DtlsTransport *>(ctx);
+-	try {
+-		while (t->mIncomingQueue.running()) {
+-			auto next = t->mIncomingQueue.pop();
+-			if (!next) {
+-				return MBEDTLS_ERR_SSL_WANT_READ;
+-			}
+-
+-			message_ptr message = std::move(*next);
+-			if (t->demuxMessage(message))
+-				continue;
+-
+-			auto bufMin = std::min(len, size_t(message->size()));
+-			std::memcpy(buf, message->data(), bufMin);
+-			return int(len);
+-		}
+-
+-		// Closed
+-		return 0;
+-
+-	} catch (const std::exception &e) {
+-		PLOG_WARNING << e.what();
+-		return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+-		;
+-	}
++	if (!t->mReadMessage)
++		return MBEDTLS_ERR_SSL_WANT_READ;
++	auto message = std::move(t->mReadMessage);
++	if (message->size() > len)
++		return MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL;
++	std::memcpy(buf, message->data(), message->size());
++	return int(message->size());
+ }
+ 
+ void DtlsTransport::SetTimerCallback(void *ctx, uint32_t int_ms, uint32_t fin_ms) {
+@@ -734,7 +918,7 @@
+     : Transport(lower, std::move(stateChangeCallback)), mMtu(mtu), mCertificate(certificate),
+       mFingerprintAlgorithm(fingerprintAlgorithm), mVerifierCallback(std::move(verifierCallback)),
+       mIsClient(lower->role() == Description::Role::Active),
+-      mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func) {
++      mIncomingQueue(RECV_QUEUE_LIMIT, message_size_func, true) {
+ 
+ 	PLOG_DEBUG << "Initializing DTLS transport (OpenSSL)";
+ 
+@@ -917,9 +1101,20 @@
+ 	// Dummy
+ }
+ 
+-void DtlsTransport::doRecv() {
++void DtlsTransport::doRecv(steady_clock::time_point queuedAt) {
+ 	std::lock_guard lock(mRecvMutex);
+-	--mPendingRecvCount;
++	const auto startedAt = steady_clock::now();
++	if (queuedAt != steady_clock::time_point{}) {
++		const auto us = uint64_t(duration_cast<microseconds>(startedAt - queuedAt).count());
++		std::lock_guard diagnosticLock(mDiagnosticsMutex);
++		++mRecvDiagnostics.recvScheduleCount;
++		mRecvDiagnostics.recvScheduleWaitTotalUs += us;
++		mRecvDiagnostics.recvScheduleWaitMaxUs = std::max(mRecvDiagnostics.recvScheduleWaitMaxUs, us);
++	}
++	RecvDiagnosticScope diagnosticScope{*this, startedAt};
++	if (failIngressOverflow()) return;
++	if (queuedAt != steady_clock::time_point{})
++		mPendingRecvCount = 0;
+ 
+ 	if (state() != State::Connecting && state() != State::Connected)
+ 		return;
+@@ -932,6 +1127,8 @@
+ 		while (mIncomingQueue.running()) {
+ 			auto next = mIncomingQueue.pop();
+ 			if (!next) {
++				if (failIngressOverflow()) return;
++				{ std::lock_guard lock(mDiagnosticsMutex); ++mRecvDiagnostics.recvBatchEmpty; }
+ 				// No more messages pending, handle timeout if connecting
+ 				if (state() == State::Connecting)
+ 					handleTimeout();
+diff --git a/src/impl/dtlstransport.hpp b/src/impl/dtlstransport.hpp
+--- a/src/impl/dtlstransport.hpp
++++ b/src/impl/dtlstransport.hpp
+@@ -12,6 +12,7 @@
+ #include "certificate.hpp"
+ #include "common.hpp"
+ #include "queue.hpp"
++#include "dtlsingressqueue.hpp"
+ #include "tls.hpp"
+ #include "transport.hpp"
+ 
+@@ -41,6 +42,7 @@
+ 	virtual bool send(message_ptr message) override; // false if dropped
+ 
+ 	bool isClient() const { return mIsClient; }
++	DtlsDiagnostics getDtlsDiagnostics() const;
+ 
+ protected:
+ 	virtual void incoming(message_ptr message) override;
+@@ -49,7 +51,22 @@
+ 	virtual void postHandshake();
+ 
+ 	void enqueueRecv();
+-	void doRecv();
++	bool failIngressOverflow();
++	enum class PacketStage { Demux, Unprotect, MediaCallback, DataCallback };
++	struct PacketDiagnosticScope {
++		DtlsTransport &t;
++		PacketStage stage;
++		std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
++		~PacketDiagnosticScope();
++	};
++	void doRecv(std::chrono::steady_clock::time_point queuedAt = {});
++	struct RecvDiagnosticScope {
++		DtlsTransport &transport;
++		std::chrono::steady_clock::time_point startedAt;
++		~RecvDiagnosticScope();
++	};
++	mutable std::mutex mDiagnosticsMutex;
++	DtlsDiagnostics mRecvDiagnostics;
+ 
+ 	const optional<size_t> mMtu;
+ 	const certificate_ptr mCertificate;
+@@ -57,7 +74,7 @@
+ 	const verifier_callback mVerifierCallback;
+ 	const bool mIsClient;
+ 
+-	Queue<message_ptr> mIncomingQueue;
++	DtlsIngressQueue mIncomingQueue;
+ 	std::atomic<int> mPendingRecvCount = 0;
+ 	std::mutex mRecvMutex;
+ 	std::atomic<unsigned int> mCurrentDscp = 0;
+@@ -79,6 +96,17 @@
+ 	mbedtls_ssl_context mSsl;
+ 
+ 	std::recursive_mutex mSslMutex;
++	// Accessed only under mSslMutex. BIO never demuxes or calls application code.
++	message_ptr mReadMessage;
++	struct SslDiagnosticScope {
++		DtlsTransport &transport;
++		bool sending;
++		std::chrono::steady_clock::time_point waitingAt;
++		std::unique_lock<std::recursive_mutex> lock;
++		std::chrono::steady_clock::time_point acquiredAt;
++		SslDiagnosticScope(DtlsTransport &transport, bool sending);
++		~SslDiagnosticScope();
++	};
+ 
+ 	uint32_t mFinMs = 0, mIntMs = 0;
+ 	std::chrono::time_point<std::chrono::steady_clock> mTimerSetAt;
+diff --git a/src/impl/fogthreadobservation.h b/src/impl/fogthreadobservation.h
+new file mode 100644
+--- /dev/null
++++ b/src/impl/fogthreadobservation.h
+@@ -0,0 +1,20 @@
++#ifndef FOG_RTC_THREAD_OBSERVATION_H
++#define FOG_RTC_THREAD_OBSERVATION_H
++/* Optional application observer, called by thread naming helpers at entry.
++ * The observer must copy role before returning and must never throw, change
++ * scheduling, or call back into RTC. No application symbol is required. */
++#if defined(__GNUC__) || defined(__clang__)
++#ifdef __cplusplus
++extern "C" {
++#endif
++void fogObserveThread(const char *role) __attribute__((weak));
++#ifdef __cplusplus
++}
++#endif
++static inline void fog_observe_thread_start(const char *role) {
++    if (fogObserveThread) fogObserveThread(role);
++}
++#else
++static inline void fog_observe_thread_start(const char *role) { (void)role; }
++#endif
++#endif
+diff --git a/src/impl/icetransport.cpp b/src/impl/icetransport.cpp
+--- a/src/impl/icetransport.cpp
++++ b/src/impl/icetransport.cpp
+@@ -33,6 +33,177 @@
+ using std::chrono::system_clock;
+ 
+ namespace rtc::impl {
++
++IceDiagnostics IceTransport::getIceDiagnostics() const {
++	IceDiagnostics snapshot;
++#if !USE_NICE
++	snapshot.backend = IceDiagnostics::Backend::LibJuice;
++	juice_diagnostics_t d{};
++	if (juice_get_diagnostics(mAgent.get(), &d) != JUICE_ERR_SUCCESS) {
++		snapshot.availability = IceDiagnostics::Availability::ReadFailed;
++		return snapshot;
++	}
++	snapshot.availability = IceDiagnostics::Availability::Available;
++	snapshot.provenance = IceDiagnostics::Provenance::Live;
++	snapshot.state = static_cast<unsigned int>(d.state);
++	snapshot.udpBudgetYields = d.udp_budget_yields;
++	snapshot.udpDatagrams = d.udp_datagrams;
++	snapshot.udpMaxBatch = d.udp_max_batch;
++	snapshot.recvErrno = d.recv_errno;
++	snapshot.pollFlags = d.poll_flags;
++	snapshot.socketError = d.socket_error;
++	snapshot.socketErrorAvailable = d.socket_error_available;
++	snapshot.consentExpired = d.consent_expired;
++	snapshot.stunTimeouts = d.stun_timeouts;
++	snapshot.stunSendFailures = d.stun_send_failures;
++	snapshot.stunErrorResponses = d.stun_error_responses;
++	snapshot.stunErrorCode = d.stun_error_code;
++	snapshot.stunSendErrno = d.stun_send_errno;
++	snapshot.connectivityTimeouts = d.connectivity_timeouts;
++	switch (d.failure_reason) {
++	case JUICE_FAILURE_NONE: snapshot.failureReason = IceDiagnostics::FailureReason::None; break;
++	case JUICE_FAILURE_UDP_RECV: snapshot.failureReason = IceDiagnostics::FailureReason::UdpRecv; break;
++	case JUICE_FAILURE_UDP_POLL: snapshot.failureReason = IceDiagnostics::FailureReason::UdpPoll; break;
++	case JUICE_FAILURE_CONNECTION: snapshot.failureReason = IceDiagnostics::FailureReason::Connection; break;
++	case JUICE_FAILURE_CONSENT_EXPIRED: snapshot.failureReason = IceDiagnostics::FailureReason::ConsentExpired; break;
++	case JUICE_FAILURE_STUN_TIMEOUT: snapshot.failureReason = IceDiagnostics::FailureReason::StunTimeout; break;
++	case JUICE_FAILURE_STUN_SEND: snapshot.failureReason = IceDiagnostics::FailureReason::StunSend; break;
++	case JUICE_FAILURE_STUN_RESPONSE: snapshot.failureReason = IceDiagnostics::FailureReason::StunResponse; break;
++	case JUICE_FAILURE_CONNECTIVITY_TIMEOUT: snapshot.failureReason = IceDiagnostics::FailureReason::ConnectivityTimeout; break;
++	default: snapshot.failureReason = IceDiagnostics::FailureReason::Unknown; break;
++	}
++#else
++	snapshot.backend = IceDiagnostics::Backend::LibNice;
++	snapshot.availability = IceDiagnostics::Availability::NotSupported;
++#endif
++	return snapshot;
++}
++
++IceUdpPollDiagnostics IceTransport::getIceUdpPollDiagnostics() const {
++	IceUdpPollDiagnostics result;
++	auto &snapshot = result.ice;
++#if !USE_NICE
++	snapshot.backend = IceDiagnostics::Backend::LibJuice;
++	juice_diagnostics_t d{};
++	juice_udp_poll_diagnostics_t p{};
++	if (juice_get_udp_poll_diagnostics(mAgent.get(), &d, &p) != JUICE_ERR_SUCCESS) {
++		snapshot.availability = IceDiagnostics::Availability::ReadFailed;
++		return result;
++	}
++	snapshot.availability = IceDiagnostics::Availability::Available;
++	snapshot.provenance = IceDiagnostics::Provenance::Live;
++	snapshot.state = static_cast<unsigned int>(d.state);
++	snapshot.udpBudgetYields = d.udp_budget_yields;
++	snapshot.udpDatagrams = d.udp_datagrams;
++	snapshot.udpMaxBatch = d.udp_max_batch;
++	snapshot.recvErrno = d.recv_errno;
++	snapshot.pollFlags = d.poll_flags;
++	snapshot.socketError = d.socket_error;
++	snapshot.socketErrorAvailable = d.socket_error_available;
++	snapshot.consentExpired = d.consent_expired;
++	snapshot.stunTimeouts = d.stun_timeouts;
++	snapshot.stunSendFailures = d.stun_send_failures;
++	snapshot.stunErrorResponses = d.stun_error_responses;
++	snapshot.stunErrorCode = d.stun_error_code;
++	snapshot.stunSendErrno = d.stun_send_errno;
++	snapshot.connectivityTimeouts = d.connectivity_timeouts;
++	result.clockAvailable = p.clock_available;
++	result.sampleClockAvailable = p.sample_clock_available;
++	result.lastClockAvailable = p.last_clock_available;
++	result.pendingYield = p.pending_yield;
++	result.rcvbufChecked = p.rcvbuf_checked;
++	result.rcvbufAvailable = p.rcvbuf_available;
++	result.rcvbufBytes = p.rcvbuf_bytes;
++	result.rcvbufErrno = p.rcvbuf_errno;
++	result.sampleMonoUs = p.sample_mono_us;
++	result.clockInvalid = p.clock_invalid;
++	result.batches = p.batches;
++	result.bytes = p.bytes;
++	result.timedBatches = p.timed_batches;
++	result.elapsedTotalUs = p.elapsed_total_us;
++	result.elapsedMaxUs = p.elapsed_max_us;
++	result.lastStartMonoUs = p.last_start_mono_us;
++	result.lastEndMonoUs = p.last_end_mono_us;
++	result.serviceGaps = p.service_gaps;
++	result.serviceGapMaxUs = p.service_gap_max_us;
++	result.readyDelays = p.ready_delays;
++	result.readyDelayMaxUs = p.ready_delay_max_us;
++	result.eventsTotal = p.events_total;
++	result.eventsOverwritten = p.events_overwritten;
++	result.eventCount = p.event_count;
++	result.legacyEligibleBatches = p.legacy_eligible_batches;
++	result.phaseSampleEvery = p.phase_sample_every;
++	result.phaseSampledBatches = p.phase_sampled_batches;
++	result.phaseTimedBatches = p.phase_timed_batches;
++	result.phaseInvalidBatches = p.phase_invalid_batches;
++	result.phaseSampledDatagrams = p.phase_sampled_datagrams;
++	result.phaseTimedDatagrams = p.phase_timed_datagrams;
++	result.phaseSampledReceiveCalls = p.phase_sampled_receive_calls;
++	result.phaseTimedReceiveCalls = p.phase_timed_receive_calls;
++	result.phaseRecvTotalUs = p.phase_recv_total_us;
++	result.phaseRecvBatchMaxUs = p.phase_recv_batch_max_us;
++	result.phaseCallbackTotalUs = p.phase_callback_total_us;
++	result.phaseCallbackBatchMaxUs = p.phase_callback_batch_max_us;
++	for (unsigned int i = 0; i < result.eventCount && i < result.events.size(); ++i) {
++		const auto &e = p.events[i];
++		result.events[i] = {e.sequence, e.start_mono_us, e.elapsed_us, e.bytes,
++		    e.service_gap_us, e.ready_delay_us, e.datagrams, e.flags, e.exit_reason,
++		    e.phase_recv_us, e.phase_callback_us};
++	}
++	switch (d.failure_reason) {
++	case JUICE_FAILURE_NONE: snapshot.failureReason = IceDiagnostics::FailureReason::None; break;
++	case JUICE_FAILURE_UDP_RECV: snapshot.failureReason = IceDiagnostics::FailureReason::UdpRecv; break;
++	case JUICE_FAILURE_UDP_POLL: snapshot.failureReason = IceDiagnostics::FailureReason::UdpPoll; break;
++	case JUICE_FAILURE_CONNECTION: snapshot.failureReason = IceDiagnostics::FailureReason::Connection; break;
++	case JUICE_FAILURE_CONSENT_EXPIRED: snapshot.failureReason = IceDiagnostics::FailureReason::ConsentExpired; break;
++	case JUICE_FAILURE_STUN_TIMEOUT: snapshot.failureReason = IceDiagnostics::FailureReason::StunTimeout; break;
++	case JUICE_FAILURE_STUN_SEND: snapshot.failureReason = IceDiagnostics::FailureReason::StunSend; break;
++	case JUICE_FAILURE_STUN_RESPONSE: snapshot.failureReason = IceDiagnostics::FailureReason::StunResponse; break;
++	case JUICE_FAILURE_CONNECTIVITY_TIMEOUT: snapshot.failureReason = IceDiagnostics::FailureReason::ConnectivityTimeout; break;
++	default: snapshot.failureReason = IceDiagnostics::FailureReason::Unknown; break;
++	}
++#else
++	snapshot.backend = IceDiagnostics::Backend::LibNice;
++	snapshot.availability = IceDiagnostics::Availability::NotSupported;
++#endif
++	return result;
++}
++
++string IceTransport::iceDiagnostics() const {
++#if !USE_NICE
++	juice_diagnostics_t d{};
++	if (juice_get_diagnostics(mAgent.get(), &d) != JUICE_ERR_SUCCESS)
++		return {};
++	const char *reason = "unknown";
++	switch (d.failure_reason) {
++	case JUICE_FAILURE_NONE: reason = "none"; break;
++	case JUICE_FAILURE_UDP_RECV: reason = "udp-recv"; break;
++	case JUICE_FAILURE_UDP_POLL: reason = "udp-poll"; break;
++	case JUICE_FAILURE_CONNECTION: reason = "connection"; break;
++	case JUICE_FAILURE_CONSENT_EXPIRED: reason = "consent-expired"; break;
++	case JUICE_FAILURE_STUN_TIMEOUT: reason = "stun-timeout"; break;
++	case JUICE_FAILURE_STUN_SEND: reason = "stun-send"; break;
++	case JUICE_FAILURE_STUN_RESPONSE: reason = "stun-response"; break;
++	case JUICE_FAILURE_CONNECTIVITY_TIMEOUT: reason = "connectivity-timeout"; break;
++	}
++	std::ostringstream out;
++	out.imbue(std::locale::classic());
++	out << "iceState=" << static_cast<unsigned int>(d.state) << " iceReason=" << reason
++	    << " udpBudgetYields=" << d.udp_budget_yields << " udpDatagrams=" << d.udp_datagrams
++	    << " udpMaxBatch=" << d.udp_max_batch << " recvErrno=" << d.recv_errno
++	    << " pollFlags=" << d.poll_flags << " socketError=" << d.socket_error
++	    << " socketErrorAvailable=" << unsigned(d.socket_error_available)
++	    << " consentExpired=" << d.consent_expired << " stunTimeouts=" << d.stun_timeouts
++	    << " stunSendFailures=" << d.stun_send_failures
++	    << " stunErrorResponses=" << d.stun_error_responses << " stunErrorCode=" << d.stun_error_code
++	    << " stunSendErrno=" << d.stun_send_errno
++	    << " connectivityTimeouts=" << d.connectivity_timeouts;
++	return out.str();
++#else
++	return "iceDiagnostics=unavailable";
++#endif
++}
++
+ 
+ #if !USE_NICE // libjuice
+ 
+diff --git a/src/impl/icetransport.hpp b/src/impl/icetransport.hpp
+--- a/src/impl/icetransport.hpp
++++ b/src/impl/icetransport.hpp
+@@ -14,6 +14,7 @@
+ #include "configuration.hpp"
+ #include "description.hpp"
+ #include "global.hpp"
++#include "rtc/icediagnostics.hpp"
+ #include "peerconnection.hpp"
+ #include "transport.hpp"
+ 
+@@ -59,6 +60,9 @@
+ 	bool send(message_ptr message) override; // false if dropped
+ 
+ 	bool getSelectedCandidatePair(Candidate *local, Candidate *remote);
++	string iceDiagnostics() const;
++	IceDiagnostics getIceDiagnostics() const;
++	IceUdpPollDiagnostics getIceUdpPollDiagnostics() const;
+ 
+ private:
+ 	bool outgoing(message_ptr message) override;
+diff --git a/src/impl/init.cpp b/src/impl/init.cpp
+--- a/src/impl/init.cpp
++++ b/src/impl/init.cpp
+@@ -29,18 +29,23 @@
+ #include <winsock2.h>
+ #endif
+ 
++#include <algorithm>
+ #include <thread>
+ 
+ namespace rtc::impl {
+ 
+ struct Init::TokenPayload {
+ 	TokenPayload(std::shared_future<void> *cleanupFuture) {
++		completionFuture = cleanupPromise.get_future().share();
+ 		Init::Instance().doInit();
+ 		if (cleanupFuture)
+-			*cleanupFuture = cleanupPromise.get_future().share();
++			*cleanupFuture = completionFuture;
+ 	}
+ 
+ 	~TokenPayload() {
++#if defined(__SWITCH__) || defined(RTC_TEST_JOINABLE_CLEANUP)
++		Init::Instance().scheduleCleanup(std::move(cleanupPromise), completionFuture);
++#else
+ 		std::thread t(
+ 		    [](std::promise<void> promise) {
+ 			    utils::this_thread::set_name("RTC cleanup");
+@@ -54,9 +59,11 @@
+ 		    },
+ 		    std::move(cleanupPromise));
+ 		t.detach();
++#endif
+ 	}
+ 
+ 	std::promise<void> cleanupPromise;
++	std::shared_future<void> completionFuture;
+ };
+ 
+ Init &Init::Instance() {
+@@ -73,7 +80,10 @@
+ Init::~Init() {}
+ 
+ init_token Init::token() {
+-	std::lock_guard lock(mMutex);
++#if defined(__SWITCH__) || defined(RTC_TEST_JOINABLE_CLEANUP)
++	joinCleanupThreads(false);
++#endif
++	auto lock = lockForInit();
+ 	if (auto locked = mWeak.lock())
+ 		return locked;
+ 
+@@ -83,7 +93,10 @@
+ }
+ 
+ void Init::preload() {
+-	std::lock_guard lock(mMutex);
++#if defined(__SWITCH__) || defined(RTC_TEST_JOINABLE_CLEANUP)
++	joinCleanupThreads(false);
++#endif
++	auto lock = lockForInit();
+ 	if (!mGlobal) {
+ 		mGlobal = std::make_shared<TokenPayload>(&mCleanupFuture);
+ 		mWeak = *mGlobal;
+@@ -110,47 +123,190 @@
+ 	mCurrentSctpSettings = std::move(s); // store for next init
+ }
+ 
++#if defined(__SWITCH__) || defined(RTC_TEST_JOINABLE_CLEANUP)
++void Init::scheduleCleanup(std::promise<void> promise, std::shared_future<void> future) noexcept {
++	std::shared_ptr<std::promise<void>> completion;
++	try {
++		completion = std::make_shared<std::promise<void>>(std::move(promise));
++		auto record = std::make_shared<CleanupThread>();
++		record->future = std::move(future);
++		std::lock_guard lock(mCleanupThreadsMutex);
++		// Allocate and register ownership before any joinable thread exists.
++		mCleanupThreads.push_back(record);
++		try {
++			record->thread = std::thread([completion] {
++				utils::this_thread::set_name("RTC cleanup");
++				try {
++					Init::Instance().doCleanup();
++					completion->set_value();
++				} catch (...) {
++					completion->set_exception(std::current_exception());
++				}
++			});
++		} catch (...) {
++			mCleanupThreads.pop_back();
++			throw;
++		}
++	} catch (...) {
++		try {
++			if (completion)
++				completion->set_exception(std::current_exception());
++			else
++				promise.set_exception(std::current_exception());
++		} catch (...) {
++			// Destruction still supplies broken_promise if signaling itself fails.
++		}
++	}
++}
++
++void Init::joinCleanupThreads(bool waitForAll) {
++	std::unique_lock joinLock(mCleanupJoinMutex, std::defer_lock);
++	if (waitForAll)
++		joinLock.lock();
++	else if (!joinLock.try_lock())
++		return; // A pool worker must not wait for a barrier joining that pool.
++
++	std::vector<std::shared_ptr<CleanupThread>> records;
++	{
++		std::lock_guard lock(mCleanupThreadsMutex);
++		for (const auto &record : mCleanupThreads)
++			if (waitForAll || record->future.wait_for(std::chrono::seconds(0)) ==
++			                      std::future_status::ready)
++				records.push_back(record);
++	}
++
++	std::exception_ptr failure;
++	for (const auto &record : records) {
++		try {
++			if (record->thread.joinable())
++				record->thread.join();
++			record->future.get();
++		} catch (...) {
++			if (!failure)
++				failure = std::current_exception();
++		}
++		if (!record->thread.joinable()) {
++			std::lock_guard lock(mCleanupThreadsMutex);
++			mCleanupThreads.erase(
++			    std::remove(mCleanupThreads.begin(), mCleanupThreads.end(), record),
++			    mCleanupThreads.end());
++		}
++	}
++	// A failed join keeps the record owned by Init. Attempt every other join
++	// before reporting failure; never destroy a still-joinable local thread.
++	if (failure)
++		std::rethrow_exception(failure);
++}
++#endif
++
+ void Init::doInit() {
+-	// mMutex needs to be locked
+-
+-	if (std::exchange(mInitialized, true))
++	// mMutex needs to be locked. Do not call doCleanup() from rollback:
++	// it takes the same mutex and assumes every global service was initialized.
++#if defined(__SWITCH__) || defined(RTC_TEST_JOINABLE_CLEANUP)
++	if (mCleanupFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
++		mCleanupFuture.get();
++#endif
++	if (mInitialized)
+ 		return;
+ 
+-	PLOG_DEBUG << "Global initialization";
+-
+-#ifdef _WIN32
+-	WSADATA wsaData;
+-	if (WSAStartup(MAKEWORD(2, 2), &wsaData))
+-		throw std::runtime_error("WSAStartup failed, error=" + std::to_string(WSAGetLastError()));
+-#endif
+-
+-	unsigned int count = mThreadPoolSize > 0 ? mThreadPoolSize : std::thread::hardware_concurrency();
+-	count = std::max(count, MIN_THREADPOOL_SIZE);
+-	PLOG_DEBUG << "Spawning " << count << " threads";
+-	ThreadPool::Instance().spawn(count);
+-
+-#if RTC_ENABLE_WEBSOCKET
+-	PollService::Instance().start();
++	// Refuse reuse if an earlier rollback could not finish safely.
++	mCleanupFuture.get();
++
++	bool sctpStarted = false;
++	bool dtlsStarted = false;
++#if RTC_ENABLE_WEBSOCKET
++	bool pollStarted = false;
++	bool tlsStarted = false;
++#endif
++#if RTC_ENABLE_MEDIA
++	bool mediaStarted = false;
++#endif
++	bool iceStarted = false;
++#ifdef _WIN32
++	bool winsockStarted = false;
++#endif
++
++	try {
++		PLOG_DEBUG << "Global initialization";
++
++#ifdef _WIN32
++		WSADATA wsaData;
++		if (WSAStartup(MAKEWORD(2, 2), &wsaData))
++			throw std::runtime_error("WSAStartup failed, error=" + std::to_string(WSAGetLastError()));
++		winsockStarted = true;
++#endif
++
++		unsigned int count = mThreadPoolSize > 0 ? mThreadPoolSize : std::thread::hardware_concurrency();
++		count = std::max(count, MIN_THREADPOOL_SIZE);
++		PLOG_DEBUG << "Spawning " << count << " threads";
++		ThreadPool::Instance().spawn(count);
++
++#if RTC_ENABLE_WEBSOCKET
++		PollService::Instance().start();
++		pollStarted = true;
+ #endif
+ 
+ #if USE_GNUTLS
+-	// Nothing to do
++		// Nothing to do
+ #elif USE_MBEDTLS
+-	// Nothing to do
++		// Nothing to do
+ #else
+-	openssl::init();
+-#endif
+-
+-	SctpTransport::Init();
+-	SctpTransport::SetSettings(mCurrentSctpSettings);
+-	DtlsTransport::Init();
+-#if RTC_ENABLE_WEBSOCKET
+-	TlsTransport::Init();
+-#endif
+-#if RTC_ENABLE_MEDIA
+-	DtlsSrtpTransport::Init();
+-#endif
+-	IceTransport::Init();
++		openssl::init();
++#endif
++
++		// Init starts usrsctp before allocating its Instances set, so even
++		// an allocation failure inside Init must finish the SCTP globals.
++		sctpStarted = true;
++		SctpTransport::Init();
++		SctpTransport::SetSettings(mCurrentSctpSettings);
++		DtlsTransport::Init();
++		dtlsStarted = true;
++#if RTC_ENABLE_WEBSOCKET
++		TlsTransport::Init();
++		tlsStarted = true;
++#endif
++#if RTC_ENABLE_MEDIA
++		DtlsSrtpTransport::Init();
++		mediaStarted = true;
++#endif
++		IceTransport::Init();
++		iceStarted = true;
++		mInitialized = true;
++	} catch (...) {
++		try {
++			// spawn may have created some workers before throwing.
++			ThreadPool::Instance().join();
++			ThreadPool::Instance().clear();
++#if RTC_ENABLE_WEBSOCKET
++			if (pollStarted)
++				PollService::Instance().join();
++#endif
++			if (sctpStarted)
++				SctpTransport::Cleanup();
++			if (dtlsStarted)
++				DtlsTransport::Cleanup();
++#if RTC_ENABLE_WEBSOCKET
++			if (tlsStarted)
++				TlsTransport::Cleanup();
++#endif
++#if RTC_ENABLE_MEDIA
++			if (mediaStarted)
++				DtlsSrtpTransport::Cleanup();
++#endif
++			if (iceStarted)
++				IceTransport::Cleanup();
++#ifdef _WIN32
++			if (winsockStarted)
++				WSACleanup();
++#endif
++		} catch (...) {
++			// Cleanup callers must not mistake a failed rollback for readiness.
++			std::promise<void> failedCleanup;
++			failedCleanup.set_exception(std::current_exception());
++			mCleanupFuture = failedCleanup.get_future().share();
++		}
++		throw;
++	}
+ }
+ 
+ void Init::doCleanup() {
+@@ -184,4 +340,16 @@
+ #endif
+ }
+ 
++std::unique_lock<std::mutex> Init::lockForInit() {
++	std::unique_lock lock(mMutex);
++	while (!mInitialized &&
++	       mCleanupFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
++		auto completion = mCleanupFuture;
++		lock.unlock();
++		completion.get();
++		lock.lock();
++	}
++	return lock;
++}
++
+ } // namespace rtc::impl
+diff --git a/src/impl/init.hpp b/src/impl/init.hpp
+--- a/src/impl/init.hpp
++++ b/src/impl/init.hpp
+@@ -15,6 +15,8 @@
+ #include <chrono>
+ #include <future>
+ #include <mutex>
++#include <thread>
++#include <vector>
+ 
+ namespace rtc::impl {
+ 
+@@ -32,6 +34,9 @@
+ 	init_token token();
+ 	void preload();
+ 	std::shared_future<void> cleanup();
++#if defined(__SWITCH__) || defined(RTC_TEST_JOINABLE_CLEANUP)
++	void joinCleanupThreads(bool waitForAll = true);
++#endif
+ 
+ 	void setThreadPoolSize(unsigned int count);
+ 	void setSctpSettings(SctpSettings s);
+@@ -40,8 +45,19 @@
+ 	Init();
+ 	~Init();
+ 
++	std::unique_lock<std::mutex> lockForInit();
+ 	void doInit();
+ 	void doCleanup();
++#if defined(__SWITCH__) || defined(RTC_TEST_JOINABLE_CLEANUP)
++	void scheduleCleanup(std::promise<void> promise, std::shared_future<void> future) noexcept;
++	struct CleanupThread {
++		std::shared_future<void> future;
++		std::thread thread;
++	};
++	std::mutex mCleanupThreadsMutex;
++	std::mutex mCleanupJoinMutex;
++	std::vector<std::shared_ptr<CleanupThread>> mCleanupThreads;
++#endif
+ 
+ 	std::optional<shared_ptr<void>> mGlobal;
+ 	weak_ptr<void> mWeak;
+diff --git a/src/impl/peerconnection.cpp b/src/impl/peerconnection.cpp
+--- a/src/impl/peerconnection.cpp
++++ b/src/impl/peerconnection.cpp
+@@ -365,6 +365,96 @@
+ 	return std::atomic_load(&mIceTransport);
+ }
+ 
++DtlsDiagnostics PeerConnection::getDtlsDiagnostics() const {
++	if (auto dtls = getDtlsTransport())
++		return dtls->getDtlsDiagnostics();
++	std::lock_guard lock(mDtlsDiagnosticsMutex);
++	return mFinalDtlsDiagnostics;
++}
++
++IceDiagnostics PeerConnection::getIceDiagnostics() const {
++	// Closed reads bypass a possibly blocked live query. The shared transport
++	// reference below keeps the agent alive if close races with that query.
++	std::unique_lock queryLock(mTypedIceQueryMutex, std::defer_lock);
++	if (state.load() != State::Closed)
++		queryLock.lock();
++	if (state.load() != State::Closed) {
++		if (auto ice = getIceTransport()) {
++			auto snapshot = ice->getIceDiagnostics();
++			std::lock_guard cacheLock(mTypedIceCacheMutex);
++			if (snapshot.availability == IceDiagnostics::Availability::Available) {
++				mFinalTypedIceDiagnostics = snapshot;
++				if (state.load() == State::Closed)
++					snapshot.provenance = IceDiagnostics::Provenance::FinalRetained;
++			}
++			return snapshot;
++		}
++	}
++	std::lock_guard cacheLock(mTypedIceCacheMutex);
++	auto snapshot = mFinalTypedIceDiagnostics;
++	if (snapshot.availability == IceDiagnostics::Availability::Available) {
++		snapshot.provenance = IceDiagnostics::Provenance::FinalRetained;
++	} else {
++#if !USE_NICE
++		snapshot.backend = IceDiagnostics::Backend::LibJuice;
++		snapshot.availability = state.load() == State::Closed
++		    ? IceDiagnostics::Availability::ClosedWithoutSample
++		    : IceDiagnostics::Availability::NotStarted;
++#else
++		snapshot.backend = IceDiagnostics::Backend::LibNice;
++		snapshot.availability = IceDiagnostics::Availability::NotSupported;
++#endif
++	}
++	return snapshot;
++}
++
++IceUdpPollDiagnostics PeerConnection::getIceUdpPollDiagnostics() const {
++	std::unique_lock queryLock(mTypedIceQueryMutex, std::defer_lock);
++	if (state.load() != State::Closed) queryLock.lock();
++	if (state.load() != State::Closed) {
++		if (auto ice = getIceTransport()) {
++			auto snapshot = ice->getIceUdpPollDiagnostics();
++			std::lock_guard cacheLock(mTypedIceCacheMutex);
++			if (snapshot.ice.availability == IceDiagnostics::Availability::Available) {
++				mFinalUdpPollDiagnostics = snapshot;
++				mFinalTypedIceDiagnostics = snapshot.ice;
++				if (state.load() == State::Closed)
++					snapshot.ice.provenance = IceDiagnostics::Provenance::FinalRetained;
++			}
++			return snapshot;
++		}
++	}
++	std::lock_guard cacheLock(mTypedIceCacheMutex);
++	auto snapshot = mFinalUdpPollDiagnostics;
++	if (snapshot.ice.availability == IceDiagnostics::Availability::Available) {
++		snapshot.ice.provenance = IceDiagnostics::Provenance::FinalRetained;
++	} else {
++#if !USE_NICE
++		snapshot.ice.backend = IceDiagnostics::Backend::LibJuice;
++		snapshot.ice.availability = state.load() == State::Closed
++		    ? IceDiagnostics::Availability::ClosedWithoutSample
++		    : IceDiagnostics::Availability::NotStarted;
++#else
++		snapshot.ice.backend = IceDiagnostics::Backend::LibNice;
++		snapshot.ice.availability = IceDiagnostics::Availability::NotSupported;
++#endif
++	}
++	return snapshot;
++}
++
++string PeerConnection::iceDiagnostics() const {
++	if (auto ice = getIceTransport()) {
++		// The caller chooses where this potentially blocking ICE read runs.
++		// Never hold the cache mutex while acquiring the ICE connection lock.
++		auto snapshot = ice->iceDiagnostics();
++		std::lock_guard lock(mIceDiagnosticsMutex);
++		if (!snapshot.empty()) mFinalIceDiagnostics = snapshot;
++		return snapshot;
++	}
++	std::lock_guard lock(mIceDiagnosticsMutex);
++	return mFinalIceDiagnostics;
++}
++
+ shared_ptr<DtlsTransport> PeerConnection::getDtlsTransport() const {
+ 	return std::atomic_load(&mDtlsTransport);
+ }
+@@ -386,6 +476,17 @@
+ 	// Reset interceptor and callbacks now that state is changed
+ 	setMediaHandler(nullptr);
+ 	resetCallbacks();
++
++	// Cache before exchanging away the transport; readers retain a shared
++	// pointer or see this snapshot. Do not hold the cache mutex while sampling.
++	if (auto dtls = getDtlsTransport()) {
++		auto snapshot = dtls->getDtlsDiagnostics();
++		std::lock_guard lock(mDtlsDiagnosticsMutex);
++		mFinalDtlsDiagnostics = snapshot;
++	}
++
++	// Retain the final per-peer snapshot before the ICE pointer disappears.
++	// The last explicit iceDiagnostics() sample is cached; teardown never queries ICE.
+ 
+ 	// Pass the pointers to a thread, allowing to terminate a transport from its own thread
+ 	auto sctp = std::atomic_exchange(&mSctpTransport, decltype(mSctpTransport)(nullptr));
+@@ -1171,6 +1272,9 @@
+ 	if (candidate.isResolved()) {
+ 		iceTransport->addRemoteCandidate(std::move(candidate));
+ 	} else {
++#if defined(__SWITCH__) || defined(RTC_TEST_JOINABLE_CLEANUP)
++		throw std::runtime_error("Hostname ICE candidates are not supported on this platform");
++#else
+ 		// We might need a lookup, do it asynchronously
+ 		// We don't use the thread pool because we have no control on the timeout
+ 		if ((iceTransport = std::atomic_load(&mIceTransport))) {
+@@ -1183,6 +1287,7 @@
+ 			});
+ 			t.detach();
+ 		}
++#endif
+ 	}
+ }
+ 
+diff --git a/src/impl/peerconnection.hpp b/src/impl/peerconnection.hpp
+--- a/src/impl/peerconnection.hpp
++++ b/src/impl/peerconnection.hpp
+@@ -47,6 +47,10 @@
+ 	shared_ptr<DtlsTransport> initDtlsTransport();
+ 	shared_ptr<SctpTransport> initSctpTransport();
+ 	shared_ptr<IceTransport> getIceTransport() const;
++	string iceDiagnostics() const;
++	IceDiagnostics getIceDiagnostics() const;
++	IceUdpPollDiagnostics getIceUdpPollDiagnostics() const;
++	DtlsDiagnostics getDtlsDiagnostics() const;
+ 	shared_ptr<DtlsTransport> getDtlsTransport() const;
+ 	shared_ptr<SctpTransport> getSctpTransport() const;
+ 	void closeTransports();
+@@ -152,7 +156,17 @@
+ 	mutable std::shared_mutex mMediaHandlerMutex;
+ 
+ 	shared_ptr<IceTransport> mIceTransport;
++	mutable std::mutex mIceDiagnosticsMutex;
++	mutable string mFinalIceDiagnostics;
++	// Only explicit typed queries use these locks; teardown never takes them.
++	// Serialize live sampling, but never hold the cache lock across a juice call.
++	mutable std::mutex mTypedIceQueryMutex;
++	mutable std::mutex mTypedIceCacheMutex;
++	mutable IceDiagnostics mFinalTypedIceDiagnostics;
++	mutable IceUdpPollDiagnostics mFinalUdpPollDiagnostics;
+ 	shared_ptr<DtlsTransport> mDtlsTransport;
++	mutable std::mutex mDtlsDiagnosticsMutex;
++	DtlsDiagnostics mFinalDtlsDiagnostics;
+ 	shared_ptr<SctpTransport> mSctpTransport;
+ 
+ 	std::unordered_map<uint16_t, weak_ptr<DataChannel>> mDataChannels; // by stream ID
+diff --git a/src/impl/pollinterrupter.cpp b/src/impl/pollinterrupter.cpp
+--- a/src/impl/pollinterrupter.cpp
++++ b/src/impl/pollinterrupter.cpp
+@@ -100,7 +100,11 @@
+ 		}
+ #else
+ 		char dummy;
++#ifdef __SWITCH__
++		while (::recv(pfd.fd, &dummy, 1, 0) > 0) {
++#else
+ 		while (::read(pfd.fd, &dummy, 1) > 0) {
++#endif
+ 			// Ignore
+ 		}
+ #endif
+@@ -114,7 +118,12 @@
+ 	}
+ #else
+ 	char dummy = 0;
++#ifdef __SWITCH__
++	if (::send(mPipeOut, &dummy, 1, 0) < 0 && errno != EAGAIN &&
++	    errno != EWOULDBLOCK) {
++#else
+ 	if (::write(mPipeOut, &dummy, 1) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
++#endif
+ 		PLOG_WARNING << "Writing to interrupter pipe failed, errno=" << errno;
+ 	}
+ #endif
+diff --git a/src/impl/pollservice.cpp b/src/impl/pollservice.cpp
+--- a/src/impl/pollservice.cpp
++++ b/src/impl/pollservice.cpp
+@@ -31,10 +31,17 @@
+ PollService::~PollService() {}
+ 
+ void PollService::start() {
+-	mSocks = std::make_unique<SocketMap>();
+-	mInterrupter = std::make_unique<PollInterrupter>();
+-	mStopped = false;
+-	mThread = std::thread(&PollService::runLoop, this);
++	try {
++		mSocks = std::make_unique<SocketMap>();
++		mInterrupter = std::make_unique<PollInterrupter>();
++		mStopped = false;
++		mThread = std::thread(&PollService::runLoop, this);
++	} catch (...) {
++		mStopped = true;
++		mInterrupter.reset();
++		mSocks.reset();
++		throw;
++	}
+ }
+ 
+ void PollService::join() {
+diff --git a/src/impl/queue.hpp b/src/impl/queue.hpp
+--- a/src/impl/queue.hpp
++++ b/src/impl/queue.hpp
+@@ -10,7 +10,9 @@
+ #define RTC_IMPL_QUEUE_H
+ 
+ #include "common.hpp"
++#include "rtc/dtlsdiagnostics.hpp"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+@@ -24,7 +26,7 @@
+ 	using amount_function = std::function<size_t(const T &element)>;
+ 
+ 	Queue(size_t limit = 0, // elements (0 means no limit)
+-	      amount_function func = nullptr);
++	      amount_function func = nullptr, bool diagnostics = false);
+ 	~Queue();
+ 
+ 	void stop();
+@@ -37,11 +39,16 @@
+ 	optional<T> pop();
+ 	optional<T> peek();
+ 	optional<T> exchange(T element);
++	DtlsDiagnostics diagnostics() const;
+ 
+ private:
+ 	const size_t mLimit;
+ 	size_t mAmount;
+-	std::queue<T> mQueue;
++	using clock = std::chrono::steady_clock;
++	struct Entry { T value; clock::time_point enqueuedAt; };
++	std::queue<Entry> mQueue;
++	const bool mDiagnosticsEnabled;
++	DtlsDiagnostics mDiagnostics;
+ 	std::condition_variable mPushCondition;
+ 	amount_function mAmountFunction;
+ 	bool mStopping = false;
+@@ -50,7 +57,8 @@
+ };
+ 
+ template <typename T>
+-Queue<T>::Queue(size_t limit, amount_function func) : mLimit(limit), mAmount(0) {
++Queue<T>::Queue(size_t limit, amount_function func, bool diagnostics)
++    : mLimit(limit), mAmount(0), mDiagnosticsEnabled(diagnostics) {
+ 	mAmountFunction = func ? func : []([[maybe_unused]] const T &element) -> size_t { return 1; };
+ }
+ 
+@@ -89,12 +97,24 @@
+ 
+ template <typename T> void Queue<T>::push(T element) {
+ 	std::unique_lock lock(mMutex);
++	const bool fullWait = mDiagnosticsEnabled && !mStopping && mLimit > 0 && mQueue.size() >= mLimit;
++	const auto waitStart = fullWait ? clock::now() : clock::time_point{};
+ 	mPushCondition.wait(lock, [this]() { return mLimit == 0 || mQueue.size() < mLimit || mStopping; });
++	if (fullWait) {
++		const auto us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - waitStart).count());
++		++mDiagnostics.fullPushWaitCount;
++		mDiagnostics.fullPushWaitTotalUs += us;
++		mDiagnostics.fullPushWaitMaxUs = std::max(mDiagnostics.fullPushWaitMaxUs, us);
++	}
+ 	if (mStopping)
+ 		return;
+ 
+ 	mAmount += mAmountFunction(element);
+-	mQueue.emplace(std::move(element));
++	mQueue.push(Entry{std::move(element), mDiagnosticsEnabled ? clock::now() : clock::time_point{}});
++	if (mDiagnosticsEnabled) {
++		++mDiagnostics.enqueued;
++		mDiagnostics.queueHighWater = std::max(mDiagnostics.queueHighWater, uint64_t(mQueue.size()));
++	}
+ }
+ 
+ template <typename T> optional<T> Queue<T>::pop() {
+@@ -102,8 +122,14 @@
+ 	if (mQueue.empty())
+ 		return nullopt;
+ 
+-	mAmount -= mAmountFunction(mQueue.front());
+-	optional<T> element{std::move(mQueue.front())};
++	mAmount -= mAmountFunction(mQueue.front().value);
++	optional<T> element{std::move(mQueue.front().value)};
++	if (mDiagnosticsEnabled) {
++		const auto us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - mQueue.front().enqueuedAt).count());
++		++mDiagnostics.dequeued;
++		mDiagnostics.residenceTotalUs += us;
++		mDiagnostics.residenceMaxUs = std::max(mDiagnostics.residenceMaxUs, us);
++	}
+ 	mQueue.pop();
+ 	mPushCondition.notify_one();
+ 	return element;
+@@ -111,7 +137,7 @@
+ 
+ template <typename T> optional<T> Queue<T>::peek() {
+ 	std::unique_lock lock(mMutex);
+-	return !mQueue.empty() ? std::make_optional(mQueue.front()) : nullopt;
++	return !mQueue.empty() ? std::make_optional(mQueue.front().value) : nullopt;
+ }
+ 
+ template <typename T> optional<T> Queue<T>::exchange(T element) {
+@@ -119,8 +145,22 @@
+ 	if (mQueue.empty())
+ 		return nullopt;
+ 
+-	std::swap(mQueue.front(), element);
++	std::swap(mQueue.front().value, element);
++	if (mDiagnosticsEnabled)
++		mQueue.front().enqueuedAt = clock::now();
+ 	return std::make_optional(std::move(element));
++}
++
++template <typename T> DtlsDiagnostics Queue<T>::diagnostics() const {
++	std::lock_guard lock(mMutex);
++	auto result = mDiagnostics;
++	result.available = mDiagnosticsEnabled;
++	if (mDiagnosticsEnabled) {
++		result.queueDepth = mQueue.size();
++		if (!mQueue.empty())
++			result.queueOldestAgeUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - mQueue.front().enqueuedAt).count());
++	}
++	return result;
+ }
+ 
+ } // namespace rtc::impl
+diff --git a/src/impl/tlstransport.cpp b/src/impl/tlstransport.cpp
+--- a/src/impl/tlstransport.cpp
++++ b/src/impl/tlstransport.cpp
+@@ -529,8 +529,12 @@
+ 				message = *next;
+ 				if (message->size() > 0)
+ 					break;
+-				else
+-					t->recv(message); // Pass zero-sized messages through
++				else {
++					t->recv(message); // Pass zero-sized idle notifications through
++					// An idle marker is not TLS input or EOF. Once forwarded, an
++					// empty running queue must return WANT_READ, not zero bytes.
++					message.reset();
++				}
+ 			}
+ 		}
+ 
+diff --git a/src/impl/utils.cpp b/src/impl/utils.cpp
+--- a/src/impl/utils.cpp
++++ b/src/impl/utils.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "utils.hpp"
++#include "fogthreadobservation.h"
+ 
+ #include "impl/internals.hpp"
+ 
+@@ -143,6 +144,7 @@
+ namespace {
+ 
+ void thread_set_name_self(const char *name) {
++	fog_observe_thread_start(name);
+ #if defined(_WIN32)
+ 	int name_length = (int)strlen(name);
+ 	int wname_length =
+diff --git a/src/peerconnection.cpp b/src/peerconnection.cpp
+--- a/src/peerconnection.cpp
++++ b/src/peerconnection.cpp
+@@ -383,6 +383,22 @@
+ 
+ void PeerConnection::resetCallbacks() { impl()->resetCallbacks(); }
+ 
++DtlsDiagnostics PeerConnection::getDtlsDiagnostics() const {
++	return impl()->getDtlsDiagnostics();
++}
++
++IceDiagnostics PeerConnection::getIceDiagnostics() const {
++	return impl()->getIceDiagnostics();
++}
++
++IceUdpPollDiagnostics PeerConnection::getIceUdpPollDiagnostics() const {
++	return impl()->getIceUdpPollDiagnostics();
++}
++
++string PeerConnection::iceDiagnostics() const {
++	return impl()->iceDiagnostics();
++}
++
+ bool PeerConnection::getSelectedCandidatePair(Candidate *local, Candidate *remote) {
+ 	auto iceTransport = impl()->getIceTransport();
+ 	return iceTransport ? iceTransport->getSelectedCandidatePair(local, remote) : false;
+diff --git a/src/rtcpreceivingsession.cpp b/src/rtcpreceivingsession.cpp
+--- a/src/rtcpreceivingsession.cpp
++++ b/src/rtcpreceivingsession.cpp
+@@ -6,227 +6,258 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  */
+-
+ #if RTC_ENABLE_MEDIA
+-
+ #include "rtcpreceivingsession.hpp"
+-#include "track.hpp"
+-
+-#include "impl/logcounter.hpp"
+-
+-#include <cmath>
+-#include <mutex>
++#include <algorithm>
++#include <cstring>
++#include <limits>
+ #include <utility>
+-
+-#ifdef _WIN32
+-#include <winsock2.h>
+-#else
+-#include <arpa/inet.h>
+-#endif
+-
+ namespace rtc {
+-
+-static impl::LogCounter COUNTER_BAD_RTP_HEADER(plog::warning, "Number of malformed RTP headers");
+-static impl::LogCounter COUNTER_UNKNOWN_PPID(plog::warning, "Number of Unknown PPID messages");
+-static impl::LogCounter COUNTER_BAD_NOTIF_LEN(plog::warning,
+-                                              "Number of Bad-Lengthed notifications");
+-static impl::LogCounter COUNTER_BAD_SCTP_STATUS(plog::warning,
+-                                                "Number of unknown SCTP_STATUS errors");
+-
+-RtcpReceivingSession::SyncTimestamps RtcpReceivingSession::getSyncTimestamps(){
+-	std::lock_guard lock(mSyncMutex);
++RtcpReceivingSession::SyncTimestamps RtcpReceivingSession::getSyncTimestamps() {
++	std::lock_guard lock(mStateMutex);
+ 	return mSyncTimestamps;
+ }
+-
++void RtcpReceivingSession::selectSourceLocked(SSRC ssrc) {
++	if (mSourceKnown && mSsrc == ssrc) return;
++	mSourceKnown = true;
++	mSsrc = ssrc;
++	mSequenceInitialized = false;
++	mCycles = mMaxSeq = mBaseSeq = mReceived = mExpectedPrior = mReceivedPrior = 0;
++	mBadSeq = RTP_SEQ_MOD + 1;
++	mProbation = 0;
++	mSyncTimestamps = {0,0};
++	mLastSrAt = {};
++	++mSourceGeneration;
++	if (mPendingRR) { mPendingRR = false; ++mFeedback.discardedReports; }
++}
++void RtcpReceivingSession::queueReportsLocked(bool rr, bool remb, const message_callback &send) {
++	++mFeedback.regularRequests;
++	if (mReportsStopped) { mFeedback.discardedReports += unsigned(rr) + unsigned(remb); return; }
++	if (mPendingRR || mPendingREMB) ++mFeedback.coalescedRequests;
++	else mPendingSince = Clock::now();
++	mPendingRR = mPendingRR || rr;
++	mPendingREMB = mPendingREMB || remb;
++	mReportSend = send;
++}
+ void RtcpReceivingSession::incoming(message_vector &messages, const message_callback &send) {
+ 	message_vector result;
+-	for (auto message : messages) {
+-		switch (message->type) {
+-		case Message::Binary: {
+-			if (message->size() < sizeof(RtpHeader)) {
+-				COUNTER_BAD_RTP_HEADER++;
+-				PLOG_VERBOSE << "RTP packet is too small, size=" << message->size();
+-				continue;
++	for (auto &message : messages) {
++		if (message->type == Message::Binary) {
++			if (message->size() < sizeof(RtpHeader)) continue;
++			const auto *rtp = reinterpret_cast<const RtpHeader *>(message->data());
++			if (rtp->version() != 2) continue;
++			{
++				std::lock_guard lock(mStateMutex);
++				++mFeedback.rtpPackets;
++				selectSourceLocked(rtp->ssrc());
++				if (!mSequenceInitialized) { initSeq(rtp->seqNumber()); mSequenceInitialized = true; }
++				updateSeq(rtp->seqNumber());
+ 			}
+-
+-			auto rtp = reinterpret_cast<const RtpHeader *>(message->data());
+-
+-			// https://www.rfc-editor.org/rfc/rfc3550.html#appendix-A.1
+-			if (rtp->version() != 2) {
+-				COUNTER_BAD_RTP_HEADER++;
+-				PLOG_VERBOSE << "RTP packet is not version 2";
+-				continue;
++			result.push_back(std::move(message));
++		} else if (message->type == Message::Control) {
++			{ std::lock_guard lock(mStateMutex); ++mFeedback.rtcpPackets; }
++			size_t offset = 0;
++			while (offset < message->size()) {
++				if (message->size() - offset < sizeof(RtcpHeader)) {
++					std::lock_guard lock(mStateMutex); ++mFeedback.malformedControl; break;
++				}
++				const auto *header = reinterpret_cast<const RtcpHeader *>(message->data() + offset);
++				const auto bytes = header->lengthInBytes();
++				if (header->version() != 2 || bytes < sizeof(RtcpHeader) || bytes > message->size() - offset) {
++					std::lock_guard lock(mStateMutex); ++mFeedback.malformedControl; break;
++				}
++				if (header->payloadType() == 200) {
++					if (bytes < RtcpSr::Size(header->reportCount())) {
++						std::lock_guard lock(mStateMutex); ++mFeedback.malformedControl; break;
++					}
++					const auto *sr = reinterpret_cast<const RtcpSr *>(header);
++					bool deferred;
++					unsigned int bitrate;
++					{
++						std::lock_guard lock(mStateMutex);
++						++mFeedback.senderReports;
++						// Compound RTCP may mention another source mapped to this Track.
++						if (mSequenceInitialized && sr->senderSSRC() != mSsrc) { offset += bytes; continue; }
++						selectSourceLocked(sr->senderSSRC());
++						mSyncTimestamps = {sr->rtpTimestamp(), sr->ntpTimestamp()};
++						mLastSrAt = Clock::now();
++						deferred = mDeferredReports;
++						bitrate = mRequestedBitrate.load();
++						if (deferred) queueReportsLocked(true, bitrate > 0, send);
++					}
++					if (!deferred) { pushRR(send, 0); if (bitrate > 0) pushREMB(send, bitrate); }
++				}
++				offset += bytes;
+ 			}
+-
+-			if (rtp->payloadType() == 201 || rtp->payloadType() == 200) {
+-				COUNTER_BAD_RTP_HEADER++;
+-				PLOG_VERBOSE << "RTP packet has a payload type indicating RR/SR";
+-				continue;
+-			}
+-
+-			mSsrc = rtp->ssrc();
+-
+-			updateSeq(rtp->seqNumber());
+-
+-			result.push_back(std::move(message));
+-			break;
+ 		}
+-
+-		case Message::Control: {
+-			auto rr = reinterpret_cast<const RtcpRr *>(message->data());
+-			if (rr->header.payloadType() == 201) { // RR
+-				mSsrc = rr->senderSSRC();
+-				rr->log();
+-			} else if (rr->header.payloadType() == 200) { // SR
+-				mSsrc = rr->senderSSRC();
+-				auto sr = reinterpret_cast<const RtcpSr *>(message->data());
+-				{
+-					std::lock_guard lock(mSyncMutex);
+-					mSyncTimestamps.rtpTimestamp = sr->rtpTimestamp();
+-					mSyncTimestamps.ntpTimestamp = sr->ntpTimestamp();
+-				}
+-				sr->log();
+-
+-				// TODO For the time being, we will send RR's/REMB's when we get an SR
+-				pushRR(send, 0);
+-				if (unsigned int bitrate = mRequestedBitrate.load(); bitrate > 0)
+-					pushREMB(send, bitrate);
+-			}
+-			break;
+-		}
+-
+-		default:
+-			break;
+-		}
+-	}
+-
++	}
+ 	messages.swap(result);
+ }
+-
+-bool RtcpReceivingSession::requestBitrate(unsigned int bitrate, const message_callback &send) {
+-	PLOG_DEBUG << "Requesting bitrate: " << bitrate << std::endl;
+-	mRequestedBitrate.store(bitrate);
+-	pushREMB(send, bitrate);
+-	return true;
+-}
+-
+-void RtcpReceivingSession::pushREMB(const message_callback &send, unsigned int bitrate) {
++void RtcpReceivingSession::setDeferredReports(bool enabled) {
++	std::lock_guard lock(mStateMutex);
++	mFeedback.discardedReports += unsigned(mPendingRR) + unsigned(mPendingREMB);
++	mPendingRR = mPendingREMB = false;
++	mReportSend = {};
++	mDeferredReports = enabled;
++	mReportsStopped = false;
++	mNextReportAt = {};
++}
++void RtcpReceivingSession::discardPendingReports() {
++	std::lock_guard lock(mStateMutex);
++	mReportsStopped = true;
++	mFeedback.discardedReports += unsigned(mPendingRR) + unsigned(mPendingREMB);
++	mPendingRR = mPendingREMB = false;
++	mReportSend = {};
++}
++RtcpReceivingSession::FeedbackDiagnostics RtcpReceivingSession::getFeedbackDiagnostics() const {
++	std::lock_guard lock(mStateMutex);
++	auto snapshot = mFeedback;
++	snapshot.pending = mPendingRR || mPendingREMB;
++	snapshot.stopped = mReportsStopped;
++	snapshot.inFlight = mFlushInFlight;
++	return snapshot;
++}
++uint32_t RtcpReceivingSession::senderReportDelayLocked(Clock::time_point now) const {
++	if (mLastSrAt == Clock::time_point{}) return 0;
++	const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - mLastSrAt).count();
++	return uint32_t(std::min<uint64_t>(uint64_t(std::max<int64_t>(0, us)) * 65536 / 1000000,
++	                                   std::numeric_limits<uint32_t>::max()));
++}
++message_ptr RtcpReceivingSession::makeReceiverReportLocked(unsigned int lastSrDelay, uint32_t &expected, uint32_t &received) {
++	auto message = make_message(RtcpRr::SizeWithReportBlocks(1), Message::Control);
++	auto *rr = reinterpret_cast<RtcpRr *>(message->data());
++	rr->preparePacket(mSsrc, 1);
++	const uint32_t extendedMax = mCycles + mMaxSeq;
++	expected = mSequenceInitialized ? extendedMax - mBaseSeq + 1 : 0;
++	received = mReceived;
++	const int64_t lost = std::clamp<int64_t>(int64_t(expected) - received, -0x800000, 0x7fffff);
++	const uint32_t expectedInterval = expected - mExpectedPrior;
++	const uint32_t receivedInterval = received - mReceivedPrior;
++	const int64_t lostInterval = int64_t(expectedInterval) - receivedInterval;
++	const uint8_t fraction = expectedInterval == 0 || lostInterval <= 0 ? 0 :
++	    uint8_t(std::min<int64_t>(255, (lostInterval * 256) / expectedInterval));
++	rr->getReportBlock(0)->preparePacket(mSsrc, fraction, uint32_t(lost), mMaxSeq,
++	    uint16_t(mCycles >> 16), mJitter, mSyncTimestamps.ntpTimestamp, lastSrDelay);
++	return message;
++}
++message_ptr RtcpReceivingSession::makeRembLocked(unsigned int bitrate) {
+ 	auto message = make_message(RtcpRemb::SizeWithSSRCs(1), Message::Control);
+-	auto remb = reinterpret_cast<RtcpRemb *>(message->data());
++	auto *remb = reinterpret_cast<RtcpRemb *>(message->data());
+ 	remb->preparePacket(mSsrc, 1, bitrate);
+ 	remb->setSsrc(0, mSsrc);
++	return message;
++}
++bool RtcpReceivingSession::flushPendingReports(std::chrono::milliseconds interval) {
++	message_ptr message;
++	message_callback send;
++	uint32_t expected = 0, received = 0;
++	uint64_t generation = 0;
++	bool rr = false, remb = false;
++	{
++		std::lock_guard lock(mStateMutex);
++		const auto now = Clock::now();
++		if (!mDeferredReports || mReportsStopped || mFlushInFlight || (!mPendingRR && !mPendingREMB) ||
++		    now < mNextReportAt || !mReportSend) return false;
++		rr = mPendingRR;
++		remb = mPendingREMB || (rr && mRequestedBitrate.load() > 0);
++		if (rr) message = makeReceiverReportLocked(senderReportDelayLocked(now), expected, received);
++		if (remb) {
++			auto part = makeRembLocked(mRequestedBitrate.load());
++			if (message) message->insert(message->end(), part->begin(), part->end());
++			else message = std::move(part);
++		}
++		generation = mSourceGeneration;
++		send = mReportSend;
++		mPendingRR = mPendingREMB = false;
++		mFlushInFlight = true;
++		mNextReportAt = now + std::max(interval, std::chrono::milliseconds(0));
++		const auto age = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - mPendingSince).count());
++		mFeedback.pendingAgeMaxUs = std::max(mFeedback.pendingAgeMaxUs, age);
++		++mFeedback.sendAttempts;
++	}
++	const auto started = Clock::now();
++	try {
++		send(message);
++	} catch (...) {
++		std::lock_guard lock(mStateMutex);
++		++mFeedback.sendFailures;
++		const auto us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
++		mFeedback.sendTotalUs += us;
++		mFeedback.sendMaxUs = std::max(mFeedback.sendMaxUs, us);
++		mFlushInFlight = false;
++		// Loss interval remains uncommitted. Retry latest state, never a stale packet.
++		if (!mReportsStopped && generation == mSourceGeneration) queueReportsLocked(rr, remb, send);
++		throw;
++	}
++	{
++		std::lock_guard lock(mStateMutex);
++		mFlushInFlight = false;
++		++mFeedback.sentPackets;
++		mFeedback.rrPackets += unsigned(rr);
++		mFeedback.rembPackets += unsigned(remb);
++		mFeedback.compoundPackets += unsigned(rr && remb);
++		const auto us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count());
++		mFeedback.sendTotalUs += us;
++		mFeedback.sendMaxUs = std::max(mFeedback.sendMaxUs, us);
++		if (rr && generation == mSourceGeneration) { mExpectedPrior = expected; mReceivedPrior = received; }
++	}
++	return true;
++}
++bool RtcpReceivingSession::requestBitrate(unsigned int bitrate, const message_callback &send) {
++	bool deferred;
++	{
++		std::lock_guard lock(mStateMutex);
++		mRequestedBitrate.store(bitrate);
++		deferred = mDeferredReports;
++		if (deferred) queueReportsLocked(false, true, send);
++	}
++	if (!deferred) pushREMB(send, bitrate);
++	return true;
++}
++void RtcpReceivingSession::pushREMB(const message_callback &send, unsigned int bitrate) {
++	message_ptr message;
++	{ std::lock_guard lock(mStateMutex); message = makeRembLocked(bitrate); }
+ 	send(message);
+ }
+-
+ void RtcpReceivingSession::pushRR(const message_callback &send, unsigned int lastSrDelay) {
+-	auto message = make_message(RtcpRr::SizeWithReportBlocks(1), Message::Control);
+-	auto rr = reinterpret_cast<RtcpRr *>(message->data());
+-	rr->preparePacket(mSsrc, 1);
+-
+-	// calculate packets lost, packet expected, fraction
+-	auto extended_max = mCycles + mMaxSeq;
+-    auto expected = extended_max - mBaseSeq + 1;
+-	auto lost = 0;
+-	if (mReceived > 0) {
+-		lost = expected - mReceived;
+-	} 
+-
+-	auto expected_interval = expected - mExpectedPrior;
+-    mExpectedPrior = expected;
+-    auto received_interval = mReceived - mReceivedPrior;
+-    mReceivedPrior = mReceived;
+-    auto lost_interval = expected_interval - received_interval;
+-
+-	uint8_t fraction;
+-
+-	if (expected_interval == 0 || lost_interval <= 0) {  
+-		fraction = 0;
+-	}	
+-	else { 
+-		fraction = (lost_interval << 8) / expected_interval;
+-	}
+-	auto syncTimestamps = getSyncTimestamps();
+-	rr->getReportBlock(0)->preparePacket(mSsrc, fraction, lost, uint16_t(mGreatestSeqNo), mMaxSeq, 0, syncTimestamps.ntpTimestamp,
+-	                                     lastSrDelay);
+-	rr->log();
++	message_ptr message;
++	uint32_t expected = 0, received = 0;
++	uint64_t generation;
++	{
++		std::lock_guard lock(mStateMutex);
++		message = makeReceiverReportLocked(lastSrDelay, expected, received);
++		generation = mSourceGeneration;
++	}
+ 	send(message);
+-}
+-
+-bool RtcpReceivingSession::requestKeyframe(const message_callback &send) {
+-	pushPLI(send);
+-	return true;
+-}
+-
++	{
++		std::lock_guard lock(mStateMutex);
++		if (generation == mSourceGeneration) { mExpectedPrior = expected; mReceivedPrior = received; }
++	}
++}
++bool RtcpReceivingSession::requestKeyframe(const message_callback &send) { pushPLI(send); return true; }
+ void RtcpReceivingSession::pushPLI(const message_callback &send) {
+ 	auto message = make_message(RtcpPli::Size(), Message::Control);
+-	auto *pli = reinterpret_cast<RtcpPli *>(message->data());
+-	pli->preparePacket(mSsrc);
++	{ std::lock_guard lock(mStateMutex); reinterpret_cast<RtcpPli *>(message->data())->preparePacket(mSsrc); }
+ 	send(message);
+ }
+-
+ void RtcpReceivingSession::initSeq(uint16_t seq) {
+-	mBaseSeq = seq;
+-	mMaxSeq = seq;
+-	mBadSeq = RTP_SEQ_MOD + 1;   /* so seq == bad_seq is false */
+-	mCycles = 0;
+-	mReceived = 0;
+-	mReceivedPrior = 0;
+-	mExpectedPrior = 0;
+-}
+-
++	++mSourceGeneration; // A same-SSRC restart invalidates an in-flight report snapshot.
++	mBaseSeq = mMaxSeq = seq;
++	mBadSeq = RTP_SEQ_MOD + 1;
++	mCycles = mReceived = mReceivedPrior = mExpectedPrior = 0;
++}
+ bool RtcpReceivingSession::updateSeq(uint16_t seq) {
+-	uint16_t udelta = seq - mMaxSeq;
+-	const int MAX_DROPOUT = 3000;
+-	const int MAX_MISORDER = 100;
+-	const int MIN_SEQUENTIAL = 2;
+-
+-	/*
+-	* Source is not valid until MIN_SEQUENTIAL packets with
+-	* sequential sequence numbers have been received.
+-	*/
+-	if (mProbation) {
+-		/* packet is in sequence */
+-		if (seq == mMaxSeq + 1) {
+-			mProbation--;
+-			mMaxSeq = seq;
+-			if (mProbation == 0) {
+-				initSeq(seq);
+-				mReceived++;
+-				return true;
+-			}
+-		} else {
+-			mProbation = MIN_SEQUENTIAL - 1;
+-			mMaxSeq = seq;
+-		}
+-		return false;
+-	} else if (udelta < MAX_DROPOUT) {
+-		/* in order, with permissible gap */
+-		if (seq < mMaxSeq) {
+-			/*
+-			* Sequence number wrapped - count another 64K cycle.
+-			*/
+-			mCycles += RTP_SEQ_MOD;
+-		}
++	const uint16_t delta = seq - mMaxSeq;
++	constexpr unsigned maxDropout = 3000, maxMisorder = 100;
++	if (delta < maxDropout) {
++		if (seq < mMaxSeq) mCycles += RTP_SEQ_MOD;
+ 		mMaxSeq = seq;
+-	} else if (udelta <= RTP_SEQ_MOD - MAX_MISORDER) {
+-		/* the sequence number made a very large jump */
+-		if (seq == mBadSeq) {
+-			/*
+-			* Two sequential packets -- assume that the other side
+-			* restarted without telling us so just re-sync
+-			* (i.e., pretend this was the first packet).
+-			*/
+-			initSeq(seq);
+-		}
+-		else {
+-			mBadSeq = (seq + 1) & (RTP_SEQ_MOD-1);
+-			return false;
+-		}
+-	}
+-	mReceived++;
++	} else if (delta <= RTP_SEQ_MOD - maxMisorder) {
++		if (seq == mBadSeq) initSeq(seq);
++		else { mBadSeq = (seq + 1) & (RTP_SEQ_MOD - 1); return false; }
++	}
++	++mReceived;
+ 	return true;
+ }
+-
+ } // namespace rtc
+-
+ #endif // RTC_ENABLE_MEDIA

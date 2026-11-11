@@ -1,155 +1,33 @@
 #include "features/streaming/infrastructure/incoming_control_diagnostics.hpp"
+#include "features/streaming/application/control_discovery_formatter.hpp"
 #include <cassert>
+#include <cstring>
 #include <iostream>
-
-using Json = nlohmann::json;
-using Diagnostics = stream::IncomingControlDiagnostics;
-
-static void descriptions() {
-    const auto unknown = Diagnostics::describe(Json{{"id", "new_event-v2"}, {"enabled", true},
-        {"level", 73519}, {"nested", {{"mode", "private-mode"}, {"items", Json::array({1, 2, 3})}}}}, 123);
-    assert(unknown.key.find("id=new_event-v2") != std::string::npos);
-    assert(unknown.sample.find("enabled:bool") != std::string::npos);
-    assert(unknown.sample.find("level:integer") != std::string::npos);
-    assert(unknown.sample.find("nested:{items:[integer,integer,...],mode:string}") != std::string::npos);
-    assert(unknown.sample.find("private-mode") == std::string::npos && unknown.sample.find("73519") == std::string::npos);
-    Json secrets{{"id", "mystery"}, {"outer", {{"accessToken", "secret-token"},
-        {"Cookie", "secret-cookie"}, {"password", "secret-password"},
-        {"authorization", "secret-auth"}, {"url", "https://secret.example"},
-        {"sdp", "secret-sdp"}, {"candidate", "secret-candidate"}, {"ip", "192.0.2.1"},
-        {"address", "secret-address"}, {"host", "secret-host"}}}};
-    const auto hidden = Diagnostics::describe(secrets, 456);
-    assert(hidden.sample.find("secret") == std::string::npos && hidden.sample.find("192.0.2.1") == std::string::npos);
-    assert(hidden.sample.find("accessToken:<redacted>") != std::string::npos);
-    for (const auto* field : {"session", "hash", "email", "phone", "pin", "text", "clipboard", "body"}) {
-        const auto nested = Diagnostics::describe(Json{{"id", "event"}, {"outer", {{field, {{"raw", "nested-secret"}, {"number", 123456}}}}}}, 1);
-        assert(nested.sample.find(std::string(field) + ":<redacted>") != std::string::npos);
-        assert(nested.sample.find("raw") == std::string::npos && nested.sample.find("nested-secret") == std::string::npos);
-    }
-    for (const auto& invalid : {std::string("bad\nid"), std::string("bad\rkey"), std::string("escape\x1b[31m"),
-             std::string("with spaces"), std::string(65, 'a'), std::string("nonascii\xc3\xa9")}) {
-        const auto description = Diagnostics::describe(Json{{"id", invalid}, {invalid, "secret"}}, 1);
-        assert(description.key.find("id=<invalid>") != std::string::npos);
-        assert(description.sample.find(invalid) == std::string::npos && description.sample.find("secret") == std::string::npos);
-        assert(description.sample.find('\n') == std::string::npos && description.sample.find('\r') == std::string::npos);
-    }
-    const auto malformed = Diagnostics::describe(Json::parse("{malformed", nullptr, false), 65537);
-    assert(malformed.key == "id=<missing> schema=invalid" && malformed.sample.find("bytes=65537") != std::string::npos);
-    assert(Diagnostics::describe(Json{{"id", 5}}, 1).key.find("id=<invalid>") != std::string::npos);
-    auto rumble = Json{{"id", "gamepad_notification"}, {"index", 0}, {"large_motor", 255}, {"small_motor", 128}};
-    const auto first = Diagnostics::describe(rumble, 100);
-    assert(first.sample.find("large_motor:255") != std::string::npos && first.sample.find("small_motor:128") != std::string::npos);
-    rumble["large_motor"] = 0;
-    const auto stop = Diagnostics::describe(rumble, 101);
-    assert(first.key == stop.key && first.sample != stop.sample);
-    rumble["large_motor"] = 65536; rumble["small_motor"] = -1; rumble["index"] = true;
-    const auto badRumble = Diagnostics::describe(rumble, 102);
-    assert(badRumble.sample.find("large_motor:integer") != std::string::npos);
-    assert(badRumble.sample.find("small_motor:integer") != std::string::npos && badRumble.sample.find("index:bool") != std::string::npos);
-    assert(badRumble.sample.find("65536") == std::string::npos);
-    rumble["id"] = "unknown"; rumble["large_motor"] = 255;
-    assert(Diagnostics::describe(rumble, 100).sample.find("large_motor:255") == std::string::npos);
-    Json large = Json::object(); large["id"] = "large";
-    for (unsigned n = 0; n < 1000; ++n) large["field_" + std::to_string(n) + std::string(48, 'x')] = std::string(1000, 's');
-    const auto limited = Diagnostics::describe(large, 1000000);
-    assert(limited.key.size() < 800 && limited.sample.size() < 800 && limited.sample.find("...") != std::string::npos);
-    Json deep{{"id", "deep"}, {"one", {{"two", {{"three", {{"four", "deep-secret"}}}}}}}};
-    const auto depth = Diagnostics::describe(deep, 100);
-    assert(depth.sample.find("object{...}") != std::string::npos && depth.sample.find("four") == std::string::npos);
-}
-
-static void rateAndCoalescing() {
-    Diagnostics incoming;
-    std::string event;
-    const auto description = Diagnostics::describe(Json{{"id", "event"}, {"value", 42}}, 100);
-    assert(!incoming.poll(event, 0, true));
-    for (unsigned n = 0; n < 1000; ++n) incoming.receive(description, 100 + n);
-    assert(incoming.poll(event, 1100));
-    assert(event.find("count=1000 pending=1000 firstMs=100 lastMs=1099") != std::string::npos);
-    assert(!incoming.poll(event, 1100));
-    incoming.receive(description, 1101); assert(incoming.poll(event, 1101));
-    incoming.receive(description, 1102); assert(incoming.poll(event, 1102));
-    incoming.receive(description, 1103); assert(!incoming.poll(event, 6101));
-    assert(!incoming.poll(event, 0)); // A rewound clock cannot bypass throttling.
-    assert(incoming.poll(event, 6102));
-    assert(event.find("pending=1") != std::string::npos && !incoming.poll(event, 6103));
-    incoming.receive(description, 6103); assert(!incoming.poll(event, 6103));
-    assert(incoming.poll(event, 6103, true));
-    assert(!incoming.poll(event, 6103, true));
-    assert(incoming.diagnostics().find("incomingEvents=1004 ") != std::string::npos);
-    assert(incoming.diagnostics().find("incomingSchemas=1 ") != std::string::npos);
-    assert(incoming.diagnostics().find("incomingCoalesced=999 ") != std::string::npos);
-    assert(incoming.diagnostics().find("event") == std::string::npos);
-    Diagnostics pulses;
-    for (unsigned n = 0; n < 1000; ++n)
-        pulses.receive(Diagnostics::describe(Json{{"id", "gamepad_notification"}, {"index", 0},
-            {"large_motor", n % 256}, {"small_motor", 0}}, n), n);
-    assert(pulses.poll(event, 1000) && event.find("large_motor:231") != std::string::npos);
-    assert(event.find("count=1000") != std::string::npos && !pulses.poll(event, 1001));
-    assert(event.size() <= 1024);
-}
-
-static void schemaLimit() {
-    Diagnostics incoming;
-    std::string event;
-    for (unsigned n = 0; n < 1000; ++n)
-        incoming.receive(Diagnostics::describe(Json{{"id", "event_" + std::to_string(n)}, {"field", 1}}, 100), n);
-    assert(incoming.diagnostics().find("incomingSchemas=32 ") != std::string::npos);
-    assert(incoming.diagnostics().find("incomingSchemaOverflow=968") != std::string::npos);
-    unsigned emitted = 0, overflow = 0;
-    while (incoming.poll(event, 1000, true)) {
-        ++emitted; overflow += event.find("schemaOverflow=968") != std::string::npos;
-        assert(event.size() <= 1024 && emitted <= 33);
-    }
-    assert(emitted == 33 && overflow == 1);
-    assert(!incoming.poll(event, 1001, true));
-    for (unsigned n = 0; n < 4; ++n) {
-        incoming.receive(Diagnostics::describe(Json{{"id", "overflow_new"}}, 1), 1001 + n);
-        const auto available = incoming.poll(event, 1001 + n);
-        assert(available == (n < 2)); // Forced initial summary already consumed one of its first three emissions.
-    }
-    assert(incoming.poll(event, 1005, true) && event.find("pending=2") != std::string::npos);
-    assert(!incoming.poll(event, 1005, true));
-}
-
-static void lossRecoveryValues() {
-    // MTS announces its loss-recovery/FEC configuration on the control channel.
-    // Bounded flags, numbers and identifier strings are logged; nothing else.
-    const auto features = Diagnostics::describe(Json{{"id", "network_features_state"}, {"network_features", {
-        {"flags", {{"fec_group_limit", true}, {"fresh_metrics", false}, {"packet_recovery", true}, {"repair_deadlines", true}}},
-        {"parameters", {{"metric_stale_ms", 1500}, {"metric_window_ms", 2000}, {"recovery_max_hold_ms", 120},
-            {"recovery_nack_retries", 2}, {"ratio", 0.25}, {"huge", 5000000000LL}, {"mode", "with spaces"},
-            {"session_hash", "secret-hash"}}}}}}, 393);
-    assert(features.sample.find("packet_recovery:true") != std::string::npos);
-    assert(features.sample.find("fresh_metrics:false") != std::string::npos);
-    assert(features.sample.find("recovery_max_hold_ms:120") != std::string::npos);
-    assert(features.sample.find("recovery_nack_retries:2") != std::string::npos);
-    assert(features.sample.find("metric_window_ms:2000") != std::string::npos);
-    assert(features.sample.find("ratio:number") != std::string::npos && features.sample.find("0.25") == std::string::npos);
-    assert(features.sample.find("huge:integer") != std::string::npos && features.sample.find("5000000000") == std::string::npos);
-    assert(features.sample.find("mode:string") != std::string::npos && features.sample.find("with spaces") == std::string::npos);
-    assert(features.sample.find("session_hash:<redacted>") != std::string::npos && features.sample.find("secret") == std::string::npos);
-    assert(features.key.find("true") == std::string::npos && features.key.find("120") == std::string::npos); // schema bucket stays value-free
-    const auto params = Diagnostics::describe(Json{{"id", "params"}, {"fecMaskType", "bursty"}, {"fecfactor", 30},
-        {"useUnequalProtection", false}}, 76);
-    assert(params.sample.find("fecMaskType:bursty") != std::string::npos);
-    assert(params.sample.find("fecfactor:30") != std::string::npos && params.sample.find("useUnequalProtection:false") != std::string::npos);
-    // Allowlist, not a blacklist: unknown fields in these messages keep types
-    // only (validation probe: credential/input leaked with a value blacklist).
-    const auto unknown = Diagnostics::describe(Json{{"id", "params"}, {"credential", "SYNTHETIC_SECRET"},
-        {"input", "SyntheticUserInput"}, {"account_number", 12345}, {"admin", true}, {"fecMaskType", "SYNTHETICMASK"},
-        {"fecfactor", 30}, {"network", {{"flags_extra", "SYNTHETIC_FLAG"}}}}, 100);
-    for (const auto* leaked : {"SYNTHETIC_SECRET", "SyntheticUserInput", "12345", "admin:true", "SYNTHETICMASK", "SYNTHETIC_FLAG"})
-        assert(unknown.sample.find(leaked) == std::string::npos);
-    assert(unknown.sample.find("credential:string") != std::string::npos && unknown.sample.find("input:string") != std::string::npos);
-    assert(unknown.sample.find("account_number:integer") != std::string::npos && unknown.sample.find("admin:bool") != std::string::npos);
-    assert(unknown.sample.find("fecMaskType:string") != std::string::npos && unknown.sample.find("fecfactor:30") != std::string::npos);
-    // Other messages keep type-only samples.
-    const auto stats = Diagnostics::describe(Json{{"id", "stats"}, {"fecfactor", 30}}, 10);
-    assert(stats.sample.find("fecfactor:integer") != std::string::npos && stats.sample.find("30") == std::string::npos);
-}
-
-int main() {
-    descriptions(); rateAndCoalescing(); schemaLimit(); lossRecoveryValues();
-    std::cout << "Incoming control diagnostics: redacted schema discovery, labels, bounds, coalescing, rate limits, overflow and final flush PASS\n";
+using Json=nlohmann::json;using D=stream::IncomingControlDiagnostics;
+namespace n=stream::telemetry::network;
+int main(){
+ const auto rumble=D::describe(Json{{"id","gamepad_notification"},{"index",0},{"large_motor",255},{"small_motor",128}},100);
+ const auto golden=n::discoverySampleText(rumble);assert(golden=="id=gamepad_notification bytes=100 fields={id:string,index:0,large_motor:255,small_motor:128}");
+ const auto stop=D::describe(Json{{"id","gamepad_notification"},{"index",0},{"large_motor",0},{"small_motor",0}},101);assert(n::discoverySchemaText(rumble)==n::discoverySchemaText(stop));assert(n::discoverySampleText(stop)!=golden);
+ const auto params=D::describe(Json{{"id","params"},{"fecMaskType","bursty"},{"fecfactor",30},{"useUnequalProtection",false}},76);
+ assert(n::discoverySampleText(params)=="id=params bytes=76 fields={fecMaskType:bursty,fecfactor:30,id:string,useUnequalProtection:false}");
+ const auto features=D::describe(Json{{"id","network_features_state"},{"network_features",{{"flags",{{"packet_recovery",true},{"fresh_metrics",false}}},{"parameters",{{"metric_window_ms",2000},{"recovery_max_hold_ms",120}}}}}},393);
+ const auto featureText=n::discoverySampleText(features);assert(featureText.find("packet_recovery:true")!=std::string::npos&&featureText.find("metric_window_ms:2000")!=std::string::npos&&featureText.find("recovery_max_hold_ms:120")!=std::string::npos);
+ const auto hidden=D::describe(Json{{"id","innocent_Identifier_7e2b9"},{"opaqueIdentifier918273","a-value"},{"accessToken","TOKEN-CANARY"},{"params",{{"candidate", "192.0.2.1"}}}},456);
+ const auto hiddenText=n::discoverySampleText(hidden);assert(hidden.unknownNames>=2);for(auto* secret:{"innocent_Identifier_7e2b9","opaqueIdentifier918273","a-value","TOKEN-CANARY","192.0.2.1"}){assert(hiddenText.find(secret)==std::string::npos);assert(std::string(reinterpret_cast<const char*>(&hidden),sizeof(hidden)).find(secret)==std::string::npos);}assert(hiddenText.find("unknown:string")!=std::string::npos);
+ for(const auto& bad:{std::string("bad\nid"),std::string(65,'x'),std::string("with spaces")}){const auto d=D::describe(Json{{"id",bad},{bad,"secret"}},1);assert(n::discoverySchemaText(d).find("id=<invalid>")==0);assert(n::discoverySampleText(d).find("secret")==std::string::npos);}
+ assert(n::discoverySchemaText(D::describe(Json::parse("{",nullptr,false),1))=="id=<missing> schema=invalid");
+ D source;assert(!source.retire(0,true));for(unsigned i=0;i<1000;++i)source.receive(rumble,100+i);
+ n::ControlDiscoveryEvent e,again;assert(source.peekBatch(&e,1,1100)==1&&source.peekBatch(&again,1,1101)==1);assert(e.sequence==again.sequence&&e.count==1000&&e.firstMs==100&&e.lastMs==1099);
+ // A real new arrival while an immutable record waits must survive retirement.
+ source.receive(stop,1102);assert(source.retire(e.sequence,true));assert(source.numericSnapshot().pendingEvents==1);assert(source.peekBatch(&again,1,1103)==1&&again.count==1001&&again.pending==1);assert(n::controlDiscoveryText(e).find("large_motor:255")!=std::string::npos&&n::controlDiscoveryText(again).find("large_motor:0")!=std::string::npos);assert(source.retire(again.sequence,false));
+ source.receive(rumble,1104);assert(source.peekBatch(&again,1,1104)==1&&again.discarded==1);source.retire(again.sequence,true);
+ source.receive(rumble,1105);assert(source.peekBatch(&again,1,6103)==0);assert(source.peekBatch(&again,1,0)==0);assert(source.peekBatch(&again,1,6104)==1);source.retire(again.sequence,true);
+ D retained=source;retained.receive(stop,6105);assert(retained.peekBatch(&e,1,6105,true)==1);source={};assert(n::controlDiscoveryText(e).find("discoverySchema=2")!=std::string::npos);assert(retained.retire(e.sequence,false));assert(retained.numericSnapshot().pendingEvents==0);
+ D collapsed;for(unsigned i=0;i<1000;++i)collapsed.receive(D::describe(Json{{"id","unknown"+std::to_string(i)},{"field",1}},1),i);assert(collapsed.numericSnapshot().schemas==1&&collapsed.numericSnapshot().overflow==0);
+ // Overflow still accounts truly distinct fixed-key schemas and coalesces all
+ // excess unknown names rather than keeping identifiers in a dictionary.
+ D overflow;for(unsigned i=0;i<40;++i){Json object{{"id","stats"}};for(unsigned k=1;k<=6;++k)if(i&(1u<<(k-1)))object[n::DiscoveryKeys[k]]=1;overflow.receive(D::describe(object,1),i);}assert(overflow.numericSnapshot().schemas==32&&overflow.numericSnapshot().overflow==8);
+ unsigned emitted=0;std::string text;while(overflow.poll(text,40,true)){++emitted;assert(text.size()<1400);}assert(emitted==33);
+ std::cout<<"Numeric discovery known-schema golden parity, fixed-name privacy, schema2 collapse, immutable peek/admission, concurrent newer counts, throttling, overflow/final/drop PASS; event="<<sizeof(e)<<'\n';
 }

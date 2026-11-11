@@ -1,0 +1,433 @@
+diff --git a/core/Connection.c b/core/Connection.c
+index bac9a6e..bb406ff 100644
+--- a/core/Connection.c
++++ b/core/Connection.c
+@@ -1,10 +1,9 @@
+ #include "Limelight-internal.h"
++#include <stdatomic.h>
+ 
+ static int stage = STAGE_NONE;
+ static ConnListenerConnectionTerminated originalTerminationCallback;
+-static bool alreadyTerminated;
+-static PLT_THREAD terminationCallbackThread;
+-static int terminationCallbackErrorCode;
++static atomic_bool alreadyTerminated;
+ 
+ // Common globals
+ char* RemoteAddrString;
+@@ -143,40 +142,16 @@ void LiStopConnection(void) {
+     }
+ }
+ 
+-static void terminationCallbackThreadFunc(void* context)
+-{
+-    // Invoke the client's termination callback
+-    originalTerminationCallback(terminationCallbackErrorCode);
+-}
+-
+-// This shim callback runs the client's connectionTerminated() callback on a
+-// separate thread. This is neccessary because other internal threads directly
+-// invoke this callback. That can result in a deadlock if the client
+-// calls LiStopConnection() in the callback when the cleanup code
+-// attempts to join the thread that the termination callback (and LiStopConnection)
+-// is running on.
++// Isolated probe contract: callbacks only publish state/log; they must never
++// stop the connection here. The owner's worker calls LiStopConnection(), whose
++// stream-thread joins now also wait for termination callback completion.
+ static void ClInternalConnectionTerminated(int errorCode)
+ {
+-    int err;
+-
+-    // Avoid recursion and issuing multiple callbacks
+-    if (alreadyTerminated || ConnectionInterrupted) {
++    if (ConnectionInterrupted ||
++        atomic_exchange_explicit(&alreadyTerminated, true, memory_order_relaxed)) {
+         return;
+     }
+-
+-    terminationCallbackErrorCode = errorCode;
+-    alreadyTerminated = true;
+-
+-    // Invoke the termination callback on a separate thread
+-    err = PltCreateThread("AsyncTerm", terminationCallbackThreadFunc, NULL, &terminationCallbackThread);
+-    if (err != 0) {
+-        // Nothing we can safely do here, so we'll just assert on debug builds
+-        Limelog("Failed to create termination thread: %d\n", err);
+-        LC_ASSERT(err == 0);
+-    }
+-
+-    // Detach the thread since we never wait on it
+-    PltDetachThread(&terminationCallbackThread);
++    originalTerminationCallback(errorCode);
+ }
+ 
+ static bool parseRtspPortNumberFromUrl(const char* rtspSessionUrl, uint16_t* port)
+diff --git a/crypto/Data.cpp b/crypto/Data.cpp
+index 8df3273..14351d4 100644
+--- a/crypto/Data.cpp
++++ b/crypto/Data.cpp
+@@ -1,6 +1,7 @@
+ #include "Data.hpp"
+ #include <borealis.hpp>
+ #include <cstdlib>
++#include <switch.h>
+ #include <string.h>
+ 
+ Data::Data(unsigned char* bytes, size_t size) {
+@@ -70,19 +71,8 @@ Data& Data::operator=(const Data& that) {
+ }
+ 
+ Data Data::random_bytes(size_t size) {
+-    unsigned char* bytes = (unsigned char*)malloc(sizeof(char) * size);
+-
+-#ifndef _WIN32
+-    srand(time(NULL));
+-#endif
+-
+-    for (int i = 0; i < size; i++) {
+-        bytes[i] = rand() % 255;
+-    }
+-
+     Data random_data(size);
+-    memcpy(random_data.m_bytes, bytes, size);
+-    free(bytes);
++    randomGet(random_data.bytes(), size);
+     return random_data;
+ }
+ 
+diff --git a/crypto/MbedTLSCryptoManager.cpp b/crypto/MbedTLSCryptoManager.cpp
+index 6472943..1e71337 100644
+--- a/crypto/MbedTLSCryptoManager.cpp
++++ b/crypto/MbedTLSCryptoManager.cpp
+@@ -203,8 +203,19 @@ Data MbedTLSCryptoManager::signature(Data cert) {
+ 
+ bool MbedTLSCryptoManager::verify_signature(Data data, Data signature,
+                                             Data cert) {
+-    // TODO
+-    return true;
++    mbedtls_x509_crt certificate;
++    mbedtls_x509_crt_init(&certificate);
++    unsigned char hash[32];
++    int result = mbedtls_x509_crt_parse(&certificate, cert.bytes(), cert.size() + 1);
++    if (result == 0) {
++        result = _mbedtls_sha256(data.bytes(), data.size(), hash);
++    }
++    if (result == 0) {
++        result = mbedtls_pk_verify(&certificate.pk, MBEDTLS_MD_SHA256,
++                                   hash, sizeof(hash), signature.bytes(), signature.size());
++    }
++    mbedtls_x509_crt_free(&certificate);
++    return result == 0;
+ }
+ 
+ Data MbedTLSCryptoManager::sign_data(Data data, Data key) {
+diff --git a/libgamestream/client.cpp b/libgamestream/client.cpp
+index 4078b2f..a4d4118 100644
+--- a/libgamestream/client.cpp
++++ b/libgamestream/client.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include "Settings.hpp"
+ #include "client.h"
++#include "Diagnostics.hpp"
+ #include "CryptoManager.hpp"
+ #include "errors.h"
+ #include "http.h"
+@@ -146,12 +147,7 @@ static int load_serverinfo(PSERVER_DATA server, bool https) {
+     if (!server->httpsPort)
+         server->httpsPort = 47984;
+ 
+-    if (stateText == "_SERVER_BUSY") {
+-        // After GFE 2.8, current game remains set even after streaming
+-        // has ended. We emulate the old behavior by forcing it to zero
+-        // if streaming is not active.
+-        server->currentGame = 0;
+-    }
++    // Preserve the reported app ID for the probe's ownership checks.
+     ret = GS_OK;
+ 
+ cleanup:
+@@ -224,16 +220,17 @@ static int gs_pair_validate(Data& data, std::string* result) {
+     *result = "";
+ 
+     int ret = GS_OK;
+-    if ((ret = xml_status(data) != GS_OK)) {
++    if ((ret = xml_status(data)) != GS_OK) {
+         return ret;
+     } else if ((ret = xml_search(data, "paired", result)) != GS_OK) {
+         return ret;
+     }
+ 
+-    //    if (strcmp(*result, "1") != 0) {
+-    //        gs_error = "Pairing failed";
+-    //        ret = GS_FAILED;
+-    //    }
++    if (*result != "1") {
++        moonlight_diagnostics::emit("Pairing verification failed: Pairing acknowledgement missing or rejected");
++        gs_set_error("Pairing acknowledgement missing or rejected");
++        ret = GS_FAILED;
++    }
+ 
+     return ret;
+ }
+@@ -284,7 +281,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+-    if ((ret = gs_pair_validate(data, &result) != GS_OK)) {
++    if ((ret = gs_pair_validate(data, &result)) != GS_OK) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+@@ -324,7 +321,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+-    if ((ret = gs_pair_validate(data, &result) != GS_OK)) {
++    if ((ret = gs_pair_validate(data, &result)) != GS_OK) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+@@ -373,7 +370,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+-    if ((ret = gs_pair_validate(data, &result) != GS_OK)) {
++    if ((ret = gs_pair_validate(data, &result)) != GS_OK) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+@@ -391,6 +388,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+ 
+     if (!CryptoManager::verify_signature(serverSecret, serverSignature,
+                                          plainCert.hex_to_bytes())) {
++        moonlight_diagnostics::emit("Pairing verification failed: MITM attack detected");
+         gs_set_error("MITM attack detected");
+         ret = GS_FAILED;
+         return gs_pair_cleanup(ret, server, &result);
+@@ -410,6 +408,13 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+             CryptoManager::SHA1_hash_data(serverChallengeRespHashInput);
+     }
+ 
++    if (serverChallengeRespHash.size() != serverResponse.size() ||
++        memcmp(serverChallengeRespHash.bytes(), serverResponse.bytes(), serverResponse.size()) != 0) {
++        moonlight_diagnostics::emit("Pairing verification failed: Pairing server challenge mismatch");
++        gs_set_error("Pairing server challenge mismatch");
++        return gs_pair_cleanup(GS_FAILED, server, &result);
++    }
++
+     Data clientPairingSecret = clientSecret.append(
+         CryptoManager::sign_data(clientSecret, CryptoManager::key_data()));
+ 
+@@ -425,7 +430,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+-    if ((ret = gs_pair_validate(data, &result) != GS_OK)) {
++    if ((ret = gs_pair_validate(data, &result)) != GS_OK) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+@@ -440,7 +445,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+-    if ((ret = gs_pair_validate(data, &result) != GS_OK)) {
++    if ((ret = gs_pair_validate(data, &result)) != GS_OK) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
+@@ -533,13 +538,13 @@ int gs_start_app(PSERVER_DATA server, STREAM_CONFIGURATION* config, int appId,
+         goto exit;
+     }
+ 
+-    if ((ret = xml_status(data) != GS_OK)) {
++    if ((ret = xml_status(data)) != GS_OK) {
+         goto exit;
+     } else if ((ret = xml_search(data, "gamesession", &result)) != GS_OK) {
+         goto exit;
+     }
+ 
+-    if (result == "0") {
++    if (result != "1") {
+         ret = GS_FAILED;
+         goto exit;
+     }
+@@ -567,13 +572,13 @@ int gs_quit_app(PSERVER_DATA server) {
+     if ((ret = http_request(url, &data, HTTPRequestTimeoutMedium)) != GS_OK)
+         goto exit;
+ 
+-    if ((ret = xml_status(data) != GS_OK)) {
++    if ((ret = xml_status(data)) != GS_OK) {
+         goto exit;
+     } else if ((ret = xml_search(data, "cancel", &result)) != GS_OK) {
+         goto exit;
+     }
+ 
+-    if (result == "0") {
++    if (result != "1") {
+         ret = GS_FAILED;
+         goto exit;
+     }
+@@ -607,7 +612,11 @@ int gs_init(PSERVER_DATA server, const std::string address) {
+         }
+     }
+ 
+-    http_init(Settings::instance().key_dir());
++    // Bind the stable client ID to this probe's own certificate, avoiding the
++    // upstream global ID shared by every fresh installation.
++    Data identifier = CryptoManager::SHA256_hash_data(CryptoManager::cert_data()).subdata(0, 8).hex();
++    unique_id.assign(reinterpret_cast<const char*>(identifier.bytes()), identifier.size());
++    if (http_init(Settings::instance().key_dir()) != GS_OK) return GS_FAILED;
+ 
+     LiInitializeServerInformation(&server->serverInfo);
+     server->address = seglist[0];
+diff --git a/libgamestream/http.cpp b/libgamestream/http.cpp
+index 267fa4b..0654ea9 100644
+--- a/libgamestream/http.cpp
++++ b/libgamestream/http.cpp
+@@ -18,6 +18,9 @@
+  */
+ 
+ #include "http.h"
++#include "Settings.hpp"
++#include "Diagnostics.hpp"
++#include <chrono>
+ #include "CryptoManager.hpp"
+ #include "client.h"
+ #include "errors.h"
+@@ -30,6 +33,10 @@ static bool curlGlobalInit = false;
+ static std::string certificateFilePath;
+ static std::string keyFilePath;
+ 
++static int cancel_transfer(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
++    return Settings::instance().request_cancelled() ? 1 : 0;
++}
++
+ CURL* makeCurl();
+ void freeCurl(CURL* curl);
+ 
+@@ -43,9 +50,10 @@ static size_t _write_curl(void* contents, size_t size, size_t nmemb,
+     size_t realsize = size * nmemb;
+     auto* mem = (HTTP_DATA*)userp;
+ 
+-    mem->memory = (char*)realloc(mem->memory, mem->size + realsize + 1);
+-    if (mem->memory == NULL)
++    char* resized = (char*)realloc(mem->memory, mem->size + realsize + 1);
++    if (resized == NULL)
+         return 0;
++    mem->memory = resized;
+ 
+     memcpy(&(mem->memory[mem->size]), contents, realsize);
+     mem->size += realsize;
+@@ -55,14 +63,18 @@ static size_t _write_curl(void* contents, size_t size, size_t nmemb,
+ 
+ int http_init(const std::string& key_directory) {
+     if (!curlGlobalInit) {
+-#if LIBCURL_VERSION_NUM >= 0x075600
+-#ifdef USE_OPENSSL_CRYPTO
+-        curl_global_sslset(CURLSSLBACKEND_OPENSSL, NULL, NULL);
+-#elif USE_MBEDTLS_CRYPTO
+-        curl_global_sslset(CURLSSLBACKEND_MBEDTLS, NULL, NULL);
+-#endif
+-#endif
+-        curl_global_init(CURL_GLOBAL_ALL);
++        const auto backend = curl_global_sslset(CURLSSLBACKEND_MBEDTLS, nullptr, nullptr);
++        if (backend != CURLSSLSET_OK || curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
++            moonlight_diagnostics::emit("TLS initialization failed; mbedTLS backend required");
++            return GS_FAILED;
++        }
++        const auto* version = curl_version_info(CURLVERSION_NOW);
++        if (!version || !version->ssl_version || !std::strstr(version->ssl_version, "mbedTLS")) {
++            moonlight_diagnostics::emit("TLS backend mismatch; PEM identity requires mbedTLS");
++            curl_global_cleanup();
++            return GS_FAILED;
++        }
++        moonlight_diagnostics::emit("TLS backend=mbedTLS identity=PEM");
+         brls::Logger::info("Curl: {}", curl_version());
+     } else {
+         return GS_OK;
+@@ -81,7 +93,11 @@ CURL* makeCurl() {
+     if (!curl)
+         return nullptr;
+ 
+-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
++    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
++    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
++    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
++    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
++    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, cancel_transfer);
+     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+     curl_easy_setopt(curl, CURLOPT_SSLENGINE_DEFAULT, 1L);
+     curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE, "PEM");
+@@ -102,31 +118,57 @@ void freeCurl(CURL* curl) {
+ 
+ int http_request(const std::string& url, Data* data,
+                  HTTPRequestTimeout timeout) {
+-    brls::Logger::info("Curl: Request:\n{}", url.c_str());
++    if (Settings::instance().request_cancelled()) {
++        gs_set_error("HTTP request cancelled or deadline reached");
++        return GS_FAILED;
++    }
++    brls::Logger::info("Curl: Request");
+ 
+     auto* http_data = (HTTP_DATA*)malloc(sizeof(HTTP_DATA));
+     http_data->memory = (char*)malloc(1);
+     http_data->size = 0;
+ 
+     auto curl = makeCurl();
+-    if (!curl) return GS_FAILED;
++    if (!curl) {
++        free(http_data->memory);
++        free(http_data);
++        return GS_FAILED;
++    }
+ 
+     curl_easy_setopt(curl, CURLOPT_WRITEDATA, http_data);
+     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+-
++    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
++                     Settings::instance().remaining_timeout_ms(static_cast<long>(timeout) * 1000));
++
++    const std::string operation = moonlight_diagnostics::operation(url);
++    const std::string transport = url.compare(0, 8, "https://") == 0 ? "https" : "http";
++    moonlight_diagnostics::emit("HTTP begin operation=" + operation + " transport=" + transport);
++    const auto started = std::chrono::steady_clock::now();
++    moonlight_diagnostics::httpDispatched = false;
+     CURLcode res = curl_easy_perform(curl);
++    long responseCode = 0;
++    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &responseCode);
++    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now() - started).count();
++    moonlight_diagnostics::commandHttp(static_cast<int>(res),responseCode,
++        static_cast<std::uint64_t>(elapsed),moonlight_diagnostics::httpDispatched,
++        Settings::instance().request_cancelled());
++    moonlight_diagnostics::emit("HTTP end operation=" + operation + " transport=" + transport +
++        " curl=" + std::to_string(static_cast<int>(res)) + " http=" + std::to_string(responseCode) +
++        " elapsed_ms=" + std::to_string(elapsed));
+ 
+     if (res != CURLE_OK) {
+         gs_set_error(curl_easy_strerror(res));
+         brls::Logger::error("Curl: error: {}", gs_error().c_str());
+         free(http_data->memory);
+         free(http_data);
++        freeCurl(curl);
+         return GS_FAILED;
+     } else if (http_data->memory == nullptr) {
+         brls::Logger::error("Curl: memory = NULL");
+         free(http_data->memory);
+         free(http_data);
++        freeCurl(curl);
+         return GS_OUT_OF_MEMORY;
+     }
+ 
+@@ -135,7 +177,7 @@ int http_request(const std::string& url, Data* data,
+     if (http_data->size > 3000) {
+         brls::Logger::info("Curl: Response: Ok");
+     } else {
+-        brls::Logger::info("Curl: Response:\n{}", http_data->memory);
++        brls::Logger::info("Curl: Response received (body omitted)");
+     }
+ 
+     free(http_data->memory);

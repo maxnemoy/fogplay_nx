@@ -1,0 +1,158 @@
+diff --git a/core/ControlStream.c b/core/ControlStream.c
+index 3901d79..89173ef 100644
+--- a/core/ControlStream.c
++++ b/core/ControlStream.c
+@@ -1519,6 +1519,7 @@ static void requestIdrFrame(void) {
+                                         CTRL_CHANNEL_URGENT,
+                                         ENET_PACKET_FLAG_RELIABLE,
+                                         false)) {
++            FogDiagIdrDispatchResult(0, PltGetMicroseconds());
+             FogDiagAdd(FOG_DIAG_idrDispatchFailures, 1);
+             Limelog("Request IDR Frame: Transaction failed: %d\n", (int)LastSocketError());
+             ListenerCallbacks.connectionTerminated(LastSocketFail());
+@@ -1533,6 +1534,7 @@ static void requestIdrFrame(void) {
+                                         CTRL_CHANNEL_URGENT,
+                                         ENET_PACKET_FLAG_RELIABLE,
+                                         false)) {
++            FogDiagIdrDispatchResult(0, PltGetMicroseconds());
+             FogDiagAdd(FOG_DIAG_idrDispatchFailures, 1);
+             Limelog("Request IDR Frame: Transaction failed: %d\n", (int)LastSocketError());
+             ListenerCallbacks.connectionTerminated(LastSocketFail());
+@@ -1540,6 +1542,7 @@ static void requestIdrFrame(void) {
+         }
+     }
+ 
++    FogDiagIdrDispatchResult(1, PltGetMicroseconds());
+     FogDiagAdd(FOG_DIAG_idrDispatchSuccesses, 1);
+     Limelog("IDR frame request sent\n");
+ }
+diff --git a/core/PlatformStuff.c b/core/PlatformStuff.c
+index 037ef1a..aac4207 100644
+--- a/core/PlatformStuff.c
++++ b/core/PlatformStuff.c
+@@ -1,5 +1,6 @@
+ #define _GNU_SOURCE
+ #include "Limelight-internal.h"
++#include "FogMoonlightDiagnosticsInternal.h"
+ #if defined(__vita__)
+ #include <pthread.h>
+ #include <psp2/kernel/processmgr.h>
+@@ -179,6 +180,12 @@ void* ThreadProc(void* context) {
+ 
+ #if defined(__SWITCH__)
+     applySwitchThreadHints(ctx->name);
++    s32 fogIdeal = -1, fogPriority = -1;
++    u64 fogMask = 0;
++    const Result fogAffinityResult = svcGetThreadCoreMask(&fogIdeal, &fogMask, CUR_THREAD_HANDLE);
++    const Result fogPriorityResult = svcGetThreadPriority(&fogPriority, CUR_THREAD_HANDLE);
++    FogDiagThreadStarted(ctx->name, svcGetCurrentProcessorNumber(), fogIdeal, fogMask, fogPriority,
++                         (R_FAILED(fogAffinityResult) ? 1 : 0) | (R_FAILED(fogPriorityResult) ? 2 : 0), PltGetMicroseconds());
+ #endif
+ 
+     ctx->entry(ctx->context);
+diff --git a/core/RtpVideoQueue.c b/core/RtpVideoQueue.c
+index 4d17aad..f5ce2e4 100644
+--- a/core/RtpVideoQueue.c
++++ b/core/RtpVideoQueue.c
+@@ -536,6 +536,7 @@ static void stageCompleteFecBlock(PRTP_VIDEO_QUEUE queue) {
+ }
+ 
+ static void submitCompletedFrame(PRTP_VIDEO_QUEUE queue) {
++    FogDiagIntactFrame(queue->currentFrameNumber, queue->multiFecLastBlockNumber + 1, PltGetMicroseconds());
+     while (queue->completedFecBlockList.count > 0) {
+         PRTPV_QUEUE_ENTRY entry = queue->completedFecBlockList.head;
+ 
+@@ -604,17 +605,34 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+         return RTPF_RET_REJECTED;
+     }
+ 
++    // Raw, accepted-window first data packet: may identify an IDR even
++    // when later FEC blocks never complete. Absence is inconclusive.
++    if (fecIndex == 0 && fecCurrentBlockNumber == 0 && (nvPacket->flags & FLAG_SOF)) {
++        const unsigned char* payload = (const unsigned char*)(nvPacket + 1);
++        const int payloadLength = length - dataOffset - sizeof(*nvPacket);
++        unsigned int header = 0;
++        if (APP_VERSION_AT_LEAST(7, 1, 450)) header = payloadLength > 0 && payload[0] == 1 ? 8 : 44;
++        else if (APP_VERSION_AT_LEAST(7, 1, 446)) header = payloadLength > 0 && payload[0] == 1 ? 8 : 41;
++        else if (APP_VERSION_AT_LEAST(7, 1, 415)) header = payloadLength > 0 && payload[0] == 1 ? 8 : 24;
++        else if (APP_VERSION_AT_LEAST(7, 1, 350)) header = 8;
++        else if (APP_VERSION_AT_LEAST(7, 1, 320)) header = 12;
++        else if (APP_VERSION_AT_LEAST(5, 0, 0)) header = 8;
++        const bool headerIdr = APP_VERSION_AT_LEAST(7, 1, 350) && payloadLength >= 4 && payload[3] == 2;
++        if (headerIdr || FogDiagPayloadStartsIdr(payload, payloadLength, header,
++                (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H265) != 0)) {
++            FogDiagIdrHeader(nvPacket->frameIndex, ((nvPacket->multiFecBlocks >> 6) & 3) + 1, PltGetMicroseconds());
++        }
++    }
++
+     // Reinitialize the queue if it's empty after a frame delivery or
+     // if we can't finish a frame before receiving the next one.
+     if (queue->pendingFecBlockList.count == 0 || queue->currentFrameNumber != nvPacket->frameIndex ||
+             queue->multiFecCurrentBlockNumber != fecCurrentBlockNumber) {
+         if (queue->currentFrameNumber != nvPacket->frameIndex) {
+-            FogDiagFecFrameAbandoned(queue->pendingFecBlockList.count,
+-                                     queue->completedFecBlockList.count,
+-                                     queue->multiFecCurrentBlockNumber,
+-                                     queue->multiFecLastBlockNumber);
++            FogDiagFecFrameAbandonedWithId(queue->currentFrameNumber, PltGetMicroseconds(), queue->pendingFecBlockList.count, queue->completedFecBlockList.count, queue->multiFecCurrentBlockNumber, queue->multiFecLastBlockNumber);
+         }
+         if (queue->pendingFecBlockList.count != 0) {
++            FogDiagFecFailure(queue->currentFrameNumber, 1, PltGetMicroseconds());
+             FogDiagAdd(FOG_DIAG_fecBlocksFailed, 1);
+             FogDiagFecBlockAbandoned(queue->pendingFecBlockList.count, queue->bufferDataPackets,
+                                      queue->receivedDataPackets, queue->bufferParityPackets, queue->receivedParityPackets);
+@@ -634,10 +652,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+                 // we must manually advance the queue to the next frame. Parsing this
+                 // frame further is not possible.
+                 if (queue->currentFrameNumber == nvPacket->frameIndex) {
+-                    FogDiagFecFrameAbandoned(queue->pendingFecBlockList.count,
+-                                             queue->completedFecBlockList.count,
+-                                             queue->multiFecCurrentBlockNumber,
+-                                             queue->multiFecLastBlockNumber);
++                    FogDiagFecFrameAbandonedWithId(queue->currentFrameNumber, PltGetMicroseconds(), queue->pendingFecBlockList.count, queue->completedFecBlockList.count, queue->multiFecCurrentBlockNumber, queue->multiFecLastBlockNumber);
+                     // Discard any unsubmitted buffers from the previous frame
+                     purgeListEntries(&queue->pendingFecBlockList);
+                     purgeListEntries(&queue->completedFecBlockList);
+@@ -668,12 +683,10 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+         uint8_t expectedFecBlockNumber = (queue->currentFrameNumber == nvPacket->frameIndex ? queue->multiFecCurrentBlockNumber : 0);
+         if (fecCurrentBlockNumber != expectedFecBlockNumber) {
+             if (queue->currentFrameNumber == nvPacket->frameIndex) {
+-                FogDiagFecFrameAbandoned(queue->pendingFecBlockList.count,
+-                                         queue->completedFecBlockList.count,
+-                                         queue->multiFecCurrentBlockNumber,
+-                                         queue->multiFecLastBlockNumber);
++                FogDiagFecFrameAbandonedWithId(queue->currentFrameNumber, PltGetMicroseconds(), queue->pendingFecBlockList.count, queue->completedFecBlockList.count, queue->multiFecCurrentBlockNumber, queue->multiFecLastBlockNumber);
+             }
+             else {
++                FogDiagFecFailure(nvPacket->frameIndex, fecCurrentBlockNumber - expectedFecBlockNumber, PltGetMicroseconds());
+                 FogDiagAdd(FOG_DIAG_fecBlocksFailed, fecCurrentBlockNumber - expectedFecBlockNumber);
+             }
+             // Report the final status of the FEC queue before dropping this frame
+diff --git a/core/VideoDepacketizer.c b/core/VideoDepacketizer.c
+index 6ee5501..bdab170 100644
+--- a/core/VideoDepacketizer.c
++++ b/core/VideoDepacketizer.c
+@@ -508,6 +508,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
+             // Invoke the key frame callback if needed
+             if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
+                 qdu->decodeUnit.frameType = FRAME_TYPE_IDR;
++                FogDiagIdrAssembled((uint32_t)frameNumber, PltGetMicroseconds());
+                 FogDiagAdd(FOG_DIAG_idrFramesCompleted, 1);
+                 notifyKeyFrameReceived();
+             }
+@@ -689,6 +690,7 @@ static void processAvcHevcRtpPayloadSlow(PBUFFER_DESC currentPos, PLENTRY_INTERN
+         if (isSeqReferenceFrameStart(currentPos)) {
+             // No longer waiting for an IDR frame
+             localDecoderRecovery = false;
++            FogDiagIdrRecognized(nextFrameNumber, PltGetMicroseconds());
+             waitingForIdrFrame = false; FogDiagSetWaitingForIdr(0, 0, PltGetMicroseconds());
+             waitingForRefInvalFrame = false;
+ 
+@@ -886,6 +888,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
+                 // to determine if a given frame is an IDR frame.
+                 if (!(NegotiatedVideoFormat & (VIDEO_FORMAT_MASK_H264 | VIDEO_FORMAT_MASK_H265))) {
+                     localDecoderRecovery = false;
++            FogDiagIdrRecognized(nextFrameNumber, PltGetMicroseconds());
+             waitingForIdrFrame = false; FogDiagSetWaitingForIdr(0, 0, PltGetMicroseconds());
+                     waitingForNextSuccessfulFrame = false;
+                     frameType = FRAME_TYPE_IDR;

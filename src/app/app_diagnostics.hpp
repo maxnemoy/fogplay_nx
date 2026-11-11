@@ -26,6 +26,10 @@ PlaybackTiming diagnosticTimingSnapshot();
 PlaybackTiming takeDiagnosticTiming();
 void resetDiagnosticTiming();
 void diagnostic(const std::string& text, std::size_t maximum = 512);
+// Freeze this value on the producer, before enqueue. Writer delay never changes
+// the legacy startup-relative prefix. No formatting or provider reads here.
+std::uint64_t diagnosticElapsedMs();
+bool deferredDiagnostic(std::unique_ptr<const fog::RunLog::DeferredRecord> record, fog::RunLog::Admission admission = fog::RunLog::Admission::Ordinary) noexcept;
 void firstUiFramePresented();
 class StartupStage {
 public:

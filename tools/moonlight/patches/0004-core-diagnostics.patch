@@ -1,0 +1,610 @@
+diff --git a/core/Connection.c b/core/Connection.c
+index bb406ff..b2ce1ae 100644
+--- a/core/Connection.c
++++ b/core/Connection.c
+@@ -1,4 +1,5 @@
+ #include "Limelight-internal.h"
++#include "FogMoonlightDiagnosticsInternal.h"
+ #include <stdatomic.h>
+ 
+ static int stage = STAGE_NONE;
+@@ -186,6 +187,8 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
+     void* audioContext, int arFlags) {
+     int err;
+ 
++    FogDiagReset();
++
+     if (drCallbacks != NULL && (drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && drCallbacks->submitDecodeUnit) {
+         Limelog("CAPABILITY_PULL_RENDERER cannot be set with a submitDecodeUnit callback\n");
+         LC_ASSERT(false);
+diff --git a/core/ControlStream.c b/core/ControlStream.c
+index 2b5182e..8427009 100644
+--- a/core/ControlStream.c
++++ b/core/ControlStream.c
+@@ -1,4 +1,5 @@
+ #include "Limelight-internal.h"
++#include "FogMoonlightDiagnosticsInternal.h"
+ 
+ // This is a private header, but it just contains some time macros
+ #include <enet/time.h>
+@@ -413,6 +414,9 @@ static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame)
+ 
+ // Request an IDR frame on demand by the decoder
+ void LiRequestIdrFrame(void) {
++    const uint64_t requestUs = PltGetMicroseconds();
++    FogIdrRecoveryRequested();
++    FogDiagIdrRequested(requestUs);
+     // Any reference frame invalidation requests should be dropped now.
+     // We require a full IDR frame to recover.
+     freeBasicLbqList(LbqFlushQueueItems(&referenceFrameControlQueue));
+@@ -1488,6 +1492,7 @@ static void lossStatsThreadFunc(void* context) {
+ }
+ 
+ static void requestIdrFrame(void) {
++    FogDiagIdrDispatched(PltGetMicroseconds());
+     // If this server does not have a known IDR frame request
+     // message, we'll accomplish the same thing by creating a
+     // reference frame invalidation request.
+@@ -1513,6 +1518,7 @@ static void requestIdrFrame(void) {
+                                         CTRL_CHANNEL_URGENT,
+                                         ENET_PACKET_FLAG_RELIABLE,
+                                         false)) {
++            FogDiagAdd(FOG_DIAG_idrDispatchFailures, 1);
+             Limelog("Request IDR Frame: Transaction failed: %d\n", (int)LastSocketError());
+             ListenerCallbacks.connectionTerminated(LastSocketFail());
+             return;
+@@ -1526,12 +1532,14 @@ static void requestIdrFrame(void) {
+                                         CTRL_CHANNEL_URGENT,
+                                         ENET_PACKET_FLAG_RELIABLE,
+                                         false)) {
++            FogDiagAdd(FOG_DIAG_idrDispatchFailures, 1);
+             Limelog("Request IDR Frame: Transaction failed: %d\n", (int)LastSocketError());
+             ListenerCallbacks.connectionTerminated(LastSocketFail());
+             return;
+         }
+     }
+ 
++    FogDiagAdd(FOG_DIAG_idrDispatchSuccesses, 1);
+     Limelog("IDR frame request sent\n");
+ }
+ 
+diff --git a/core/LinkedBlockingQueue.c b/core/LinkedBlockingQueue.c
+index 5d7f9a7..d7d3990 100644
+--- a/core/LinkedBlockingQueue.c
++++ b/core/LinkedBlockingQueue.c
+@@ -1,9 +1,11 @@
+ #include "LinkedBlockingQueue.h"
++#include "FogMoonlightDiagnosticsInternal.h"
+ 
+ // Destroy the linked blocking queue and associated mutex and event
+ PLINKED_BLOCKING_QUEUE_ENTRY LbqDestroyLinkedBlockingQueue(PLINKED_BLOCKING_QUEUE queueHead) {
+     LC_ASSERT(queueHead->shutdown || queueHead->draining || queueHead->lifetimeSize == 0);
+     
++    FogDiagQueueDepth(queueHead, 0);
+     PltDeleteMutex(&queueHead->mutex);
+     PltDeleteConditionVariable(&queueHead->cond);
+ 
+@@ -16,6 +18,9 @@ PLINKED_BLOCKING_QUEUE_ENTRY LbqFlushQueueItems(PLINKED_BLOCKING_QUEUE queueHead
+ 
+     PltLockMutex(&queueHead->mutex);
+ 
++    FogDiagQueueFlushed(queueHead, queueHead->currentSize);
++    FogDiagQueueDepth(queueHead, 0);
++
+     // Save the old head
+     head = queueHead->head;
+ 
+@@ -117,6 +122,7 @@ int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOC
+     }
+ 
+     queueHead->currentSize++;
++    FogDiagQueueDepth(queueHead, queueHead->currentSize);
+     queueHead->lifetimeSize++;
+ 
+     PltUnlockMutex(&queueHead->mutex);
+@@ -181,6 +187,7 @@ int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
+     entry = queueHead->head;
+     queueHead->head = entry->flink;
+     queueHead->currentSize--;
++    FogDiagQueueDepth(queueHead, queueHead->currentSize);
+     if (queueHead->head == NULL) {
+         LC_ASSERT(queueHead->currentSize == 0);
+         queueHead->tail = NULL;
+@@ -232,6 +239,7 @@ int LbqWaitForQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
+     entry = queueHead->head;
+     queueHead->head = entry->flink;
+     queueHead->currentSize--;
++    FogDiagQueueDepth(queueHead, queueHead->currentSize);
+     if (queueHead->head == NULL) {
+         LC_ASSERT(queueHead->currentSize == 0);
+         queueHead->tail = NULL;
+diff --git a/core/PlatformSockets.c b/core/PlatformSockets.c
+index cec96f3..4a024c3 100644
+--- a/core/PlatformSockets.c
++++ b/core/PlatformSockets.c
+@@ -1,4 +1,5 @@
+ #include "Limelight-internal.h"
++#include "FogMoonlightDiagnosticsInternal.h"
+ 
+ #define TEST_PORT_TIMEOUT_SEC 3
+ 
+@@ -362,11 +363,17 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
+     if (bufferSize == 0 || bufferSize > n3ds_max_buf_size)
+         bufferSize = n3ds_max_buf_size;
+ #endif
++    if (socketQosType == SOCK_QOS_TYPE_VIDEO) {
++        FogDiagVideoReceiveBufferRequested(bufferSize);
++    }
+     if (bufferSize != 0) {
+         // We start at the requested recv buffer value and step down until we find
+         // a value that the OS will accept.
+         for (;;) {
+             err = setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufferSize, sizeof(bufferSize));
++            if (socketQosType == SOCK_QOS_TYPE_VIDEO) {
++                FogDiagVideoReceiveBufferSetResult(bufferSize, err == 0 ? 0 : (unsigned int)LastSocketError());
++            }
+             if (err == 0) {
+                 // Successfully set a buffer size
+                 break;
+@@ -403,6 +410,13 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
+ #endif
+     }
+ 
++    if (socketQosType == SOCK_QOS_TYPE_VIDEO) {
++        int actualBufferSize = 0;
++        SOCKADDR_LEN actualLength = sizeof(actualBufferSize);
++        const int queryResult = getsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&actualBufferSize, &actualLength);
++        FogDiagVideoReceiveBufferActual(actualBufferSize > 0 ? (uint64_t)actualBufferSize : 0,
++                                        queryResult == 0 ? 0 : (unsigned int)LastSocketError());
++    }
+     return s;
+ }
+ 
+diff --git a/core/RtpVideoQueue.c b/core/RtpVideoQueue.c
+index adbcd18..4d17aad 100644
+--- a/core/RtpVideoQueue.c
++++ b/core/RtpVideoQueue.c
+@@ -1,4 +1,5 @@
+ #include "Limelight-internal.h"
++#include "FogMoonlightDiagnosticsInternal.h"
+ 
+ #include <rs.h>
+ 
+@@ -135,6 +136,7 @@ static bool queuePacket(PRTP_VIDEO_QUEUE queue, PRTPV_QUEUE_ENTRY newEntry, PRTP
+         entry = queue->pendingFecBlockList.head;
+         while (entry != NULL) {
+             if (packet->sequenceNumber == entry->packet->sequenceNumber) {
++                if (!isFecRecovery) FogDiagAdd(FOG_DIAG_videoPacketsRejectedDuplicate, 1);
+                 return false;
+             }
+             else if (isBefore16(packet->sequenceNumber, entry->packet->sequenceNumber)) {
+@@ -161,19 +163,21 @@ static bool queuePacket(PRTP_VIDEO_QUEUE queue, PRTPV_QUEUE_ENTRY newEntry, PRTP
+     // FEC recovery packets are synthesized by us, so don't use them to determine OOS data
+     if (!isFecRecovery) {
+         if (outOfSequence) {
++            FogDiagAdd(FOG_DIAG_videoPacketsOutOfOrder, 1);
+             // This packet was received after a higher sequence number packet, so note that we
+             // received an out of order packet to disable our speculative RFI recovery logic.
+             queue->lastOosFramePresentationTimestamp = newEntry->presentationTimeUs;
+             if (!queue->receivedOosData) {
+                 Limelog("Leaving speculative RFI mode after OOS video data at frame %u\n",
+                         queue->currentFrameNumber);
+-                queue->receivedOosData = true;
++                queue->receivedOosData = true; FogDiagFecOosMode(1);
+             }
+         }
+         else if (queue->receivedOosData && newEntry->presentationTimeUs > queue->lastOosFramePresentationTimestamp + SPECULATIVE_RFI_COOLDOWN_PERIOD_US) {
+             Limelog("Entering speculative RFI mode after sequenced video data at frame %u\n",
+                     queue->currentFrameNumber);
+-            queue->receivedOosData = false;
++            queue->receivedOosData = false; FogDiagFecOosMode(0);
++            FogDiagAdd(FOG_DIAG_fecSpeculativeModeResumes, 1);
+         }
+     }
+ 
+@@ -216,6 +220,7 @@ static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
+             // NB: We use totalPackets - neededPackets instead of just bufferParityPackets here because we require
+             // one extra parity shard for recovery if we're in FEC validation mode.
+             if (queue->missingPackets > totalPackets - neededPackets) {
++                FogDiagAdd(FOG_DIAG_fecSpeculativeLossPredictions, 1);
+                 notifyFrameLost(queue->currentFrameNumber, true);
+                 queue->reportedLostFrame = true;
+             }
+@@ -234,8 +239,9 @@ static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
+     LC_ASSERT(queue->missingPackets <= queue->bufferParityPackets);
+     LC_ASSERT(!queue->reportedLostFrame || queue->receivedOosData);
+     if (queue->reportedLostFrame && !queue->receivedOosData) {
++        FogDiagAdd(FOG_DIAG_fecSpeculativeLossMispredictions, 1);
+         // If it turns out that we lied to the host, stop further speculative RFI requests for a while.
+-        queue->receivedOosData = true;
++        queue->receivedOosData = true; FogDiagFecOosMode(1);
+         queue->lastOosFramePresentationTimestamp = queue->pendingFecBlockList.head->presentationTimeUs;
+         Limelog("Leaving speculative RFI mode due to incorrect loss prediction of frame %u\n", queue->currentFrameNumber);
+     }
+@@ -444,7 +450,9 @@ cleanup_packets:
+                 // it may be a legitimate part of the H.264 bytestream.
+ 
+                 LC_ASSERT(isBefore16(rtpPacket->sequenceNumber, queue->bufferFirstParitySequenceNumber));
+-                queuePacket(queue, queueEntry, rtpPacket, StreamConfig.packetSize + dataOffset, false, true);
++                if (queuePacket(queue, queueEntry, rtpPacket, StreamConfig.packetSize + dataOffset, false, true)) {
++                    FogDiagAdd(FOG_DIAG_fecPacketsRecovered, 1);
++                }
+             } else if (packets[i] != NULL) {
+                 free(packets[i]);
+             }
+@@ -460,6 +468,9 @@ cleanup:
+     if (marks != NULL)
+         free(marks);
+ 
++    if (ret != 0) {
++        FogDiagAdd(FOG_DIAG_fecReconstructionFailures, 1);
++    }
+     return ret;
+ }
+ 
+@@ -544,6 +555,7 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
+ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
+     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
+         // Reject packets behind our current buffer window
++        FogDiagAdd(FOG_DIAG_videoPacketsRejectedSequence, 1);
+         return RTPF_RET_REJECTED;
+     }
+ 
+@@ -557,6 +569,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+ 
+     if (length < dataOffset + (int)sizeof(NV_VIDEO_PACKET)) {
+         // Reject packets that are too small to fit a NV_VIDEO_PACKET header
++        FogDiagAdd(FOG_DIAG_videoPacketsRejectedHeader, 1);
+         return RTPF_RET_REJECTED;
+     }
+ 
+@@ -577,6 +590,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+ #ifndef LC_FUZZING
+     if (isBefore16(nvPacket->frameIndex, queue->currentFrameNumber)) {
+         // Reject frames behind our current frame number
++        FogDiagAdd(FOG_DIAG_videoPacketsRejectedFrame, 1);
+         return RTPF_RET_REJECTED;
+     }
+ #endif
+@@ -586,6 +600,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+ 
+     if (nvPacket->frameIndex == queue->currentFrameNumber && fecCurrentBlockNumber < queue->multiFecCurrentBlockNumber) {
+         // Reject FEC blocks behind our current block number
++        FogDiagAdd(FOG_DIAG_videoPacketsRejectedBlock, 1);
+         return RTPF_RET_REJECTED;
+     }
+ 
+@@ -593,7 +608,16 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+     // if we can't finish a frame before receiving the next one.
+     if (queue->pendingFecBlockList.count == 0 || queue->currentFrameNumber != nvPacket->frameIndex ||
+             queue->multiFecCurrentBlockNumber != fecCurrentBlockNumber) {
++        if (queue->currentFrameNumber != nvPacket->frameIndex) {
++            FogDiagFecFrameAbandoned(queue->pendingFecBlockList.count,
++                                     queue->completedFecBlockList.count,
++                                     queue->multiFecCurrentBlockNumber,
++                                     queue->multiFecLastBlockNumber);
++        }
+         if (queue->pendingFecBlockList.count != 0) {
++            FogDiagAdd(FOG_DIAG_fecBlocksFailed, 1);
++            FogDiagFecBlockAbandoned(queue->pendingFecBlockList.count, queue->bufferDataPackets,
++                                     queue->receivedDataPackets, queue->bufferParityPackets, queue->receivedParityPackets);
+             // Report the final status of the FEC queue before dropping this frame
+             reportFinalFrameFecStatus(queue);
+ 
+@@ -610,6 +634,10 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+                 // we must manually advance the queue to the next frame. Parsing this
+                 // frame further is not possible.
+                 if (queue->currentFrameNumber == nvPacket->frameIndex) {
++                    FogDiagFecFrameAbandoned(queue->pendingFecBlockList.count,
++                                             queue->completedFecBlockList.count,
++                                             queue->multiFecCurrentBlockNumber,
++                                             queue->multiFecLastBlockNumber);
+                     // Discard any unsubmitted buffers from the previous frame
+                     purgeListEntries(&queue->pendingFecBlockList);
+                     purgeListEntries(&queue->completedFecBlockList);
+@@ -622,6 +650,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+ 
+                     queue->currentFrameNumber++;
+                     queue->multiFecCurrentBlockNumber = 0;
++                    FogDiagAdd(FOG_DIAG_videoPacketsRejectedTransition, 1);
+                     return RTPF_RET_REJECTED;
+                 }
+             }
+@@ -638,6 +667,15 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+         // or block 0 of a new frame.
+         uint8_t expectedFecBlockNumber = (queue->currentFrameNumber == nvPacket->frameIndex ? queue->multiFecCurrentBlockNumber : 0);
+         if (fecCurrentBlockNumber != expectedFecBlockNumber) {
++            if (queue->currentFrameNumber == nvPacket->frameIndex) {
++                FogDiagFecFrameAbandoned(queue->pendingFecBlockList.count,
++                                         queue->completedFecBlockList.count,
++                                         queue->multiFecCurrentBlockNumber,
++                                         queue->multiFecLastBlockNumber);
++            }
++            else {
++                FogDiagAdd(FOG_DIAG_fecBlocksFailed, fecCurrentBlockNumber - expectedFecBlockNumber);
++            }
+             // Report the final status of the FEC queue before dropping this frame
+             reportFinalFrameFecStatus(queue);
+ 
+@@ -659,6 +697,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+             // We dropped a block of this frame, so we must skip to the next one.
+             queue->currentFrameNumber = nvPacket->frameIndex + 1;
+             queue->multiFecCurrentBlockNumber = 0;
++            FogDiagAdd(FOG_DIAG_videoPacketsRejectedTransition, 1);
+             return RTPF_RET_REJECTED;
+         }
+ 
+@@ -715,6 +754,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+ 
+     // Reject packets above our FEC queue valid sequence number range
+     if (isBefore16(queue->bufferHighestSequenceNumber, packet->sequenceNumber)) {
++        FogDiagAdd(FOG_DIAG_videoPacketsRejectedRange, 1);
+         return RTPF_RET_REJECTED;
+     }
+ 
+@@ -740,12 +780,16 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+             // Initialize counts and highest seqnum on the first packet
+             LC_ASSERT(queue->missingPackets == 0);
+             LC_ASSERT(queue->receivedHighestSequenceNumber == 0);
++            const unsigned int observedGap = U16(packet->sequenceNumber - queue->bufferLowestSequenceNumber);
++            if (observedGap) FogDiagAdd(FOG_DIAG_videoSequenceGapPackets, observedGap);
+             queue->missingPackets += U16(packet->sequenceNumber - queue->bufferLowestSequenceNumber);
+             queue->receivedHighestSequenceNumber = packet->sequenceNumber;
+         }
+         else if (isBefore16(queue->receivedHighestSequenceNumber, packet->sequenceNumber)) {
+             // If we receive a packet above the highest sequence number,
+             // adjust our missing packets count based on that new sequence number.
++            const unsigned int observedGap = U16(packet->sequenceNumber - queue->receivedHighestSequenceNumber - 1);
++            if (observedGap) FogDiagAdd(FOG_DIAG_videoSequenceGapPackets, observedGap);
+             queue->missingPackets += U16(packet->sequenceNumber - queue->receivedHighestSequenceNumber - 1);
+             queue->receivedHighestSequenceNumber = packet->sequenceNumber;
+         }
+@@ -753,6 +797,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+             // If we receive a packet behind the highest sequence number, but
+             // queuePacket() accepted it, we must have received a missing packet.
+             LC_ASSERT(queue->missingPackets > 0);
++            FogDiagAdd(FOG_DIAG_videoPacketsGapFill, 1);
+             queue->missingPackets--;
+         }
+ 
+@@ -771,6 +816,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
+         // Try to submit this frame. If we haven't received enough packets,
+         // this will fail and we'll keep waiting.
+         if (reconstructFrame(queue) == 0) {
++            FogDiagAdd(FOG_DIAG_fecBlocksCompleted, 1);
+             // Stage the complete FEC block for use once reassembly is complete
+             stageCompleteFecBlock(queue);
+ 
+diff --git a/core/VideoDepacketizer.c b/core/VideoDepacketizer.c
+index 43f2df9..7e980b9 100644
+--- a/core/VideoDepacketizer.c
++++ b/core/VideoDepacketizer.c
+@@ -1,4 +1,5 @@
+ #include "Limelight-internal.h"
++#include "FogMoonlightDiagnosticsInternal.h"
+ 
+ // Uncomment to test 3 byte Annex B start sequences with GFE
+ //#define FORCE_3_BYTE_START_SEQUENCES
+@@ -61,11 +62,12 @@ typedef struct _LENTRY_INTERNAL {
+ // Init
+ void initializeVideoDepacketizer(int pktSize) {
+     LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
++    FogDiagRegisterDecodeQueue(&decodeUnitQueue);
+ 
+     nextFrameNumber = 1;
+     startFrameNumber = 0;
+     waitingForNextSuccessfulFrame = false;
+-    waitingForIdrFrame = true;
++    waitingForIdrFrame = true; FogDiagSetWaitingForIdr(1, 1, PltGetMicroseconds());
+     waitingForRefInvalFrame = false;
+     lastPacketInStream = UINT32_MAX;
+     decodingFrame = false;
+@@ -106,7 +108,7 @@ static void dropFrameState(void) {
+     if (strictIdrFrameWait || !idrFrameProcessed || waitingForIdrFrame) {
+         // We'll need an IDR frame now if we're in non-RFI mode, if we've never
+         // received an IDR frame, or if we explicitly need an IDR frame.
+-        waitingForIdrFrame = true;
++        waitingForIdrFrame = true; FogDiagSetWaitingForIdr(1, 2, PltGetMicroseconds());
+     }
+     else {
+         waitingForRefInvalFrame = true;
+@@ -123,7 +125,7 @@ static void dropFrameState(void) {
+         consecutiveFrameDrops = 0;
+ 
+         // Request an IDR frame
+-        waitingForIdrFrame = true;
++        waitingForIdrFrame = true; FogDiagSetWaitingForIdr(1, 3, PltGetMicroseconds());
+         LiRequestIdrFrame();
+     }
+ 
+@@ -500,6 +502,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
+             // Invoke the key frame callback if needed
+             if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
+                 qdu->decodeUnit.frameType = FRAME_TYPE_IDR;
++                FogDiagAdd(FOG_DIAG_idrFramesCompleted, 1);
+                 notifyKeyFrameReceived();
+             }
+             else {
+@@ -511,10 +514,11 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
+ 
+             if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
+                 if (LbqOfferQueueItem(&decodeUnitQueue, qdu, &qdu->entry) == LBQ_BOUND_EXCEEDED) {
++                    FogDiagAdd(FOG_DIAG_decodeQueueOverflows, 1);
+                     Limelog("Video decode unit queue overflow\n");
+ 
+                     // RFI recovery is not supported here
+-                    waitingForIdrFrame = true;
++                    waitingForIdrFrame = true; FogDiagSetWaitingForIdr(1, 4, PltGetMicroseconds());
+ 
+                     // Clear NAL state for the frame that we failed to enqueue
+                     nalChainHead = qdu->decodeUnit.bufferList;
+@@ -678,7 +682,7 @@ static void processAvcHevcRtpPayloadSlow(PBUFFER_DESC currentPos, PLENTRY_INTERN
+ 
+         if (isSeqReferenceFrameStart(currentPos)) {
+             // No longer waiting for an IDR frame
+-            waitingForIdrFrame = false;
++            waitingForIdrFrame = false; FogDiagSetWaitingForIdr(0, 0, PltGetMicroseconds());
+             waitingForRefInvalFrame = false;
+ 
+             // Cancel any pending IDR frame request
+@@ -716,7 +720,7 @@ static void processAvcHevcRtpPayloadSlow(PBUFFER_DESC currentPos, PLENTRY_INTERN
+ // an IDR frame
+ void requestDecoderRefresh(void) {
+     // Wait for the next IDR frame
+-    waitingForIdrFrame = true;
++    waitingForIdrFrame = true; FogDiagSetWaitingForIdr(1, 5, PltGetMicroseconds());
+ 
+     // Flush the decode unit queue
+     freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
+@@ -862,7 +866,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
+                 // For other codecs, we trust the frame header rather than parsing the bitstream
+                 // to determine if a given frame is an IDR frame.
+                 if (!(NegotiatedVideoFormat & (VIDEO_FORMAT_MASK_H264 | VIDEO_FORMAT_MASK_H265))) {
+-                    waitingForIdrFrame = false;
++                    waitingForIdrFrame = false; FogDiagSetWaitingForIdr(0, 0, PltGetMicroseconds());
+                     waitingForNextSuccessfulFrame = false;
+                     frameType = FRAME_TYPE_IDR;
+                 }
+@@ -1078,6 +1082,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
+         if (waitingForIdrFrame || waitingForRefInvalFrame) {
+             // IDR wait takes priority over RFI wait (and an IDR frame will satisfy both)
+             if (waitingForIdrFrame) {
++                FogDiagAdd(FOG_DIAG_waitingForIdrDrops, 1);
+                 Limelog("Waiting for IDR frame\n");
+ 
+                 // We wait for the first fully received frame after a loss to approximate
+diff --git a/core/VideoStream.c b/core/VideoStream.c
+index 402b056..c31dcf0 100644
+--- a/core/VideoStream.c
++++ b/core/VideoStream.c
+@@ -1,4 +1,5 @@
+ #include "Limelight-internal.h"
++#include "FogMoonlightDiagnosticsInternal.h"
+ 
+ #define FIRST_FRAME_MAX 1500
+ #define FIRST_FRAME_TIMEOUT_SEC 10
+@@ -122,25 +123,40 @@ static void VideoReceiveThreadProc(void* context) {
+     }
+ 
+     waitingForVideoMs = 0;
++    uint64_t previousCycleEndUs = 0;
+     while (!PltIsThreadInterrupted(&receiveThread)) {
+         PRTP_PACKET packet;
++        const uint64_t cycleStartUs = PltGetMicroseconds();
++        uint64_t waitStartUs = cycleStartUs, waitEndUs = cycleStartUs;
++        FogDiagVideoReceiveLoopGap(previousCycleEndUs, cycleStartUs);
+ 
+         if (buffer == NULL) {
++            const uint64_t allocationStartUs = PltGetMicroseconds();
+             buffer = (char*)malloc(bufferSize);
++            FogDiagVideoReceiveAllocation(allocationStartUs, PltGetMicroseconds());
+             if (buffer == NULL) {
+                 Limelog("Video Receive: malloc() failed\n");
+                 ListenerCallbacks.connectionTerminated(-1);
++                previousCycleEndUs = PltGetMicroseconds();
++                FogDiagVideoReceiveCycle(cycleStartUs, waitStartUs, waitEndUs, previousCycleEndUs);
+                 break;
+             }
+         }
+ 
++        waitStartUs = PltGetMicroseconds();
+         err = recvUdpSocket(rtpSocket,
+                             encrypted ? encryptedBuffer : buffer,
+                             receiveSize,
+                             useSelect);
++        const int receiveSocketError = err < 0 ? (int)LastSocketError() : 0;
++        waitEndUs = PltGetMicroseconds();
++        if (err < 0) SetLastSocketError(receiveSocketError);
+         if (err < 0) {
++            FogDiagAdd(FOG_DIAG_videoReceiveErrors, 1);
+             Limelog("Video Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
+             ListenerCallbacks.connectionTerminated(LastSocketFail());
++            previousCycleEndUs = PltGetMicroseconds();
++            FogDiagVideoReceiveCycle(cycleStartUs, waitStartUs, waitEndUs, previousCycleEndUs);
+             break;
+         }
+         else if  (err == 0) {
+@@ -151,14 +167,20 @@ static void VideoReceiveThreadProc(void* context) {
+                 if (waitingForVideoMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                     Limelog("Terminating connection due to lack of video traffic\n");
+                     ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_TRAFFIC);
++                    previousCycleEndUs = PltGetMicroseconds();
++                    FogDiagVideoReceiveCycle(cycleStartUs, waitStartUs, waitEndUs, previousCycleEndUs);
+                     break;
+                 }
+             }
+ 
+             // Receive timed out; try again
++            previousCycleEndUs = PltGetMicroseconds();
++            FogDiagVideoReceiveCycle(cycleStartUs, waitStartUs, waitEndUs, previousCycleEndUs);
+             continue;
+         }
+ 
++        FogDiagVideoPacket((uint64_t)err, PltGetMicroseconds());
++
+         if (!receivedDataFromPeer) {
+             receivedDataFromPeer = true;
+             Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
+@@ -171,6 +193,8 @@ static void VideoReceiveThreadProc(void* context) {
+             if (PltGetMillis() - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                 Limelog("Terminating connection due to lack of a successful video frame\n");
+                 ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
++                previousCycleEndUs = PltGetMicroseconds();
++                FogDiagVideoReceiveCycle(cycleStartUs, waitStartUs, waitEndUs, previousCycleEndUs);
+                 break;
+             }
+         }
+@@ -178,6 +202,9 @@ static void VideoReceiveThreadProc(void* context) {
+ 
+         if (err < minSize) {
+             // Runt packet
++            FogDiagAdd(FOG_DIAG_videoRuntPackets, 1);
++            previousCycleEndUs = PltGetMicroseconds();
++            FogDiagVideoReceiveCycle(cycleStartUs, waitStartUs, waitEndUs, previousCycleEndUs);
+             continue;
+         }
+ 
+@@ -207,16 +234,24 @@ static void VideoReceiveThreadProc(void* context) {
+             // traffic away (as mentioned in the paragraph above) and continue accepting
+             // legitmate video traffic.
+             if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
++                previousCycleEndUs = PltGetMicroseconds();
++                FogDiagVideoReceiveCycle(cycleStartUs, waitStartUs, waitEndUs, previousCycleEndUs);
+                 continue;
+             }
+ 
+-            if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
++            const uint64_t decryptStartUs = PltGetMicroseconds();
++            const bool decryptedOk = PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
+                                    (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
+                                    encHeader->iv, sizeof(encHeader->iv),
+                                    encHeader->tag, sizeof(encHeader->tag),
+                                    ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER), // The ciphertext is after the header
+-                                   (unsigned char*)buffer, &err)) {
++                                   (unsigned char*)buffer, &err);
++            FogDiagVideoReceiveDecrypt(decryptStartUs, PltGetMicroseconds());
++            if (!decryptedOk) {
++                FogDiagAdd(FOG_DIAG_videoDecryptFailures, 1);
+                 Limelog("Failed to decrypt video packet!\n");
++                previousCycleEndUs = PltGetMicroseconds();
++                FogDiagVideoReceiveCycle(cycleStartUs, waitStartUs, waitEndUs, previousCycleEndUs);
+                 continue;
+             }
+         }
+@@ -227,12 +262,16 @@ static void VideoReceiveThreadProc(void* context) {
+         packet->timestamp = BE32(packet->timestamp);
+         packet->ssrc = BE32(packet->ssrc);
+ 
++        const uint64_t packetProcessingStartUs = PltGetMicroseconds();
+         queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
++        FogDiagVideoPacketProcessing(packetProcessingStartUs, PltGetMicroseconds());
+ 
+         if (queueStatus == RTPF_RET_QUEUED) {
+             // The queue owns the buffer
+             buffer = NULL;
+         }
++        previousCycleEndUs = PltGetMicroseconds();
++        FogDiagVideoReceiveCycle(cycleStartUs, waitStartUs, waitEndUs, previousCycleEndUs);
+     }
+ 
+     if (buffer != NULL) {

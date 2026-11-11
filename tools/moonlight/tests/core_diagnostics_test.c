@@ -259,6 +259,37 @@ static void journalTests(void) {
         (void)FogDiagPayloadStartsIdr(h264, i, 4, 0);
 }
 
+static void packetGapEvents(void) {
+    uint64_t cursor = 0, missed = 0;
+    FogMoonlightEvent event;
+    while (FogMoonlightReadEvent(&cursor, &event, &missed)) {}
+    FogDiagReset(); missed = 0;
+    FogDiagVideoPacket(100, 1000); // No previous receipt: no guessed startup gap.
+    FogDiagVideoPacket(100, 51000); // Exactly threshold is not a slow gap.
+    assert(!FogMoonlightReadEvent(&cursor, &event, &missed));
+    FogDiagVideoPacket(100, 101001);
+    assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+    assert(event.kind == FOG_EVENT_VIDEO_PACKET_GAP && event.timeUs == 101001);
+    assert(event.value == 50001 && event.frameNumber == 0 && event.waitId == 0 && event.totalsValid == 0);
+    const uint64_t firstConnection = event.connectionId;
+    FogDiagSetWaitingForIdr(1, 8, 101002);
+    assert(FogMoonlightReadEvent(&cursor, &event, &missed) && event.kind == FOG_EVENT_WAIT_ENTER);
+    FogDiagVideoPacket(100, 701001);
+    assert(FogMoonlightReadEvent(&cursor, &event, &missed));
+    assert(event.kind == FOG_EVENT_VIDEO_PACKET_GAP && event.waitId == 1 && event.value == 600000);
+    assert(event.connectionId == firstConnection && event.totalsValid == 1);
+    FogDiagVideoPacket(100, 700000); // Backward clock must not underflow into a gap.
+    assert(!FogMoonlightReadEvent(&cursor, &event, &missed));
+    FogMoonlightDiagnostics snapshot;
+    FogMoonlightGetDiagnostics(&snapshot);
+    assert(snapshot.maxVideoPacketGapUs == 600000 && snapshot.videoPacketsReceived == 5);
+    assert(snapshot.idrRequests == 0 && snapshot.idrWaitEntries == 1);
+    FogDiagReset();
+    FogDiagVideoPacket(100, 9000000); // New connection cannot inherit a gap.
+    assert(!FogMoonlightReadEvent(&cursor, &event, &missed));
+    assert(missed == 0);
+}
+
 static void* writer(void* ignored) {
     (void)ignored;
     for (int i = 0; i < 100000; i++) {
@@ -279,6 +310,7 @@ int main(void) {
     idleAndTypedEventTests();
     idleHintCompletionTests();
     journalTests();
+    packetGapEvents();
     FogMoonlightDiagnostics snapshot;
     FogDiagReset();
     FogMoonlightGetDiagnostics(NULL);

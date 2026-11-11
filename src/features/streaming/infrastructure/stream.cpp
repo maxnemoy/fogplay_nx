@@ -1,6 +1,16 @@
+#include "features/streaming/infrastructure/assembly_telemetry_cache.hpp"
+#include "features/streaming/infrastructure/bounded_network_events.hpp"
+#include "features/streaming/infrastructure/network_telemetry_capture.hpp"
+#include "features/streaming/infrastructure/ice_telemetry_capture.hpp"
+#include "features/streaming/application/network_diagnostics_formatter.hpp"
+#include "features/streaming/infrastructure/telemetry_capture.hpp"
+#include "features/streaming/application/stream_diagnostics_formatter.hpp"
 #include "features/streaming/infrastructure/input_protocol.hpp"
 #include "core/constants/error_text.hpp"
+#include "features/streaming/domain/input_experiments.hpp"
 #include "features/streaming/infrastructure/stream.hpp"
+#include "features/streaming/infrastructure/protocol_telemetry_capture.hpp"
+#include "features/streaming/application/network_diagnostics_formatter.hpp"
 #include "features/streaming/infrastructure/dtls_diagnostics.hpp"
 #include "features/streaming/infrastructure/stream_protocol.hpp"
 #include "features/streaming/domain/h264_rtp.hpp"
@@ -11,6 +21,7 @@
 #include "features/streaming/infrastructure/spsc_video_queue.hpp"
 #include "features/streaming/infrastructure/async_control_sender.hpp"
 #include "features/streaming/infrastructure/async_ice_snapshot.hpp"
+#include "features/streaming/infrastructure/udp_poll_capture.hpp"
 #include "features/streaming/infrastructure/rtcp_feedback_worker.hpp"
 #include "features/streaming/infrastructure/incoming_control.hpp"
 #include "features/streaming/infrastructure/server_performance.hpp"
@@ -87,7 +98,10 @@ static std::uint64_t videoNow() {
 }
 struct Client::Impl {
     struct IceData {
-        std::string diagnostics;
+        rtc::IceDiagnostics ice;
+        rtc::IceUdpPollDiagnostics udp;
+        std::uint64_t udpQueryBeforeUs=0,udpQueryAfterUs=0;
+        Clock::time_point iceCapturedAt{};
         rtc::DtlsDiagnostics dtls;
         std::optional<std::chrono::milliseconds> rtt;
         Clock::time_point rttCapturedAt{};
@@ -108,6 +122,7 @@ struct Client::Impl {
         std::uint64_t arrivedMs = 0;
         std::string text;
         std::string mid;
+        telemetry::protocol::Reliability reliability{};
         std::shared_ptr<rtc::DataChannel> channel;
         std::shared_ptr<rtc::Track> track;
         rtc::PeerConnection::State peerState = rtc::PeerConnection::State::New;
@@ -166,7 +181,66 @@ struct Client::Impl {
             revokeMedia(); ingressWake.notify_all();
             if (assemblyWorker.joinable()) assemblyWorker.join();
         }
+        std::uint64_t telemetryTransportEpoch=0,telemetryStreamEpoch=0,cacheGeneration=0,nextNetworkAtUs=0;
+        std::atomic<bool> telemetryRequested{false};
+        telemetry::network::AssemblyTelemetryCache assemblyTelemetry;
+        telemetry::network::SnapshotSlot<std::array<telemetry::protocol::MutexStats,3>> videoMutexTelemetry;
+        telemetry::network::SnapshotSlot<telemetry::network::ControlSnapshot> controlTelemetry;
+        telemetry::network::SnapshotSlot<telemetry::network::HistorySnapshot> historyTelemetry;
+        std::shared_ptr<telemetry::network::EventJournal<telemetry::network::NetworkEvent>> networkEvents;
+        void requestTelemetry() {
+            std::lock_guard<std::mutex> lock(ingressMutex);
+            if(assemblyStopping)return;
+            telemetryRequested=true;ingressWake.notify_one();
+        }
+        void publishControlTelemetry(bool final=false) {
+            telemetry::network::ControlSnapshot value{incoming.numericSnapshot(),incomingEvents.numericSnapshot(),serverPerformance.numericSnapshot(videoNow())};
+            controlTelemetry.publish(telemetryTransportEpoch,0,value,fog::metrics::steadyNowUs(),final);
+        }
+        void publishHistoryTelemetry(bool final=false) {
+            historyTelemetry.publish(telemetryTransportEpoch,0,transportHistory.numericSnapshot(),fog::metrics::steadyNowUs(),final);
+        }
+        telemetry::network::QueueSnapshot queueSnapshotLocked() const {
+            telemetry::network::QueueSnapshot q;const auto now=videoNow();
+            {
+                std::lock_guard<std::mutex> audioLock(audioMutex);
+                q.nackSendErrors=nackSendErrors;q.videoQueue=videoQueue.size();q.audioQueue=media.audioCount;
+                q.queue=q.videoQueue+q.audioQueue;q.queueBytes=videoQueue.bytes()+media.audioBytes;q.videoAgeMs=videoQueue.age(now);q.audioAgeMs=media.age(Kind::Audio,now);
+                q.videoEmptyObserved=q.videoQueue==0;q.audioEmptyObserved=q.audioQueue==0;q.videoAgeKnown=q.videoAgeMs>0;q.audioAgeKnown=q.audioQueue!=0;
+                q.videoAgeHighMs=media.videoAgeHighMs;q.audioAgeHighMs=media.audioAgeHighMs;q.videoHigh=media.videoHigh;q.audioHigh=media.audioHigh;q.bytesHigh=media.bytesHigh;
+                q.resyncs=queueResyncs;q.capacity=queueCapacity;q.age=queueAge;q.audioDrop=media.audioDropped;q.audioReject=media.audioRejected;q.generation=videoGeneration;q.pli=pliRequests;
+                const auto& pressure=media.lastPressure;q.pressureReason=static_cast<unsigned>(pressure.reason);q.pressureCount=media.pressureCount;q.pressureAtMs=pressure.atMs;
+                q.pressureVideoCount=pressure.videoCount;q.pressureAudioCount=pressure.audioCount;q.pressureVideoBytes=pressure.videoBytes;q.pressureAudioBytes=pressure.audioBytes;
+                q.pressureVideoAgeMs=pressure.videoAgeMs;q.pressureAudioAgeMs=pressure.audioAgeMs;q.pressureIncomingBytes=pressure.incomingBytes;
+                q.audioAgeDropped=media.audioAgeDropped;q.audioCapacityDropped=media.audioCapacityDropped;q.audioPriorityPopped=media.audioPriorityPopped;
+                q.audioCadence=audioCadence.snapshot();
+            }
+            q.ingressDrops=ingressDrops.load(std::memory_order_relaxed);q.ingressWaitSamples=ingressWaitSamples;q.ingressWaitTotalMs=ingressWaitTotalMs;q.ingressWaitMaxMs=ingressWaitMaxMs;
+            return q;
+        }
+        void publishAssemblyLocked(const TimedMutex::Snapshot& mutexSnapshot,bool force=false,bool final=false) {
+            using namespace telemetry::network;
+            RtpEvent event;
+            while(video.pollNumericEvent(event)){
+                NetworkEvent out;out.provider=Provider::Mts;out.kind=EventKind::Rtp;out.streamEpoch=telemetryStreamEpoch;
+                out.transportEpoch=telemetryTransportEpoch;out.videoGeneration=videoGeneration;out.transportBindingKnown=true;out.videoBindingKnown=true;out.rtp=event;
+                networkEvents->push(out);
+            }
+            const auto nowUs=fog::metrics::steadyNowUs();
+            force=telemetryRequested.exchange(false)||force;
+            if(cacheGeneration!=videoGeneration){assemblyTelemetry.reset(telemetryTransportEpoch,videoGeneration);videoMutexTelemetry.reset(telemetryTransportEpoch,videoGeneration);cacheGeneration=videoGeneration;force=true;}
+            if(!force&&!final&&nowUs<nextNetworkAtUs)return;
+            videoMutexTelemetry.publish(telemetryTransportEpoch,videoGeneration,telemetry::protocol::captureMutex(mutexSnapshot),nowUs,final);
+            const auto q=queueSnapshotLocked();
+            assemblyTelemetry.publishIfDue(telemetryTransportEpoch,videoGeneration,video,repair,nowUs,final,q);nextNetworkAtUs=nowUs+1000000;
+        }
+        void publishAssembly(bool force=false,bool final=false)noexcept {
+            try{TimedMutex::Guard lock(videoMutex,TimedMutex::Scope::Diagnostics);publishAssemblyLocked(lock.snapshot(),force,final);}catch(...){}
+        }
         void startAssembly() {
+            assemblyTelemetry.reset(telemetryTransportEpoch,videoGeneration);videoMutexTelemetry.reset(telemetryTransportEpoch,videoGeneration);cacheGeneration=videoGeneration;
+            controlTelemetry.reset(telemetryTransportEpoch,0);historyTelemetry.reset(telemetryTransportEpoch,0);
+            publishControlTelemetry();publishHistoryTelemetry();
             assemblyWorker = std::thread([this] { runAssembly(); });
         }
         void wakeAssembly() {
@@ -184,6 +258,8 @@ struct Client::Impl {
         }
         void runAssembly() noexcept {
             fog::diagnostics::observeThread("mts-assembly");
+            struct FinalPublication {Shared& owner;~FinalPublication(){owner.publishAssembly(true);}} finalPublication{*this};
+            publishAssembly(true);
             auto maintenanceAt = Clock::time_point::max();
             std::uint64_t observedWake = 0;
             for (;;) {
@@ -196,7 +272,7 @@ struct Client::Impl {
                     // deadlines use a timer. Packets, commands and dequeues wake
                     // the owner through a revision checked under this mutex.
                     ingressWake.wait_until(lock, maintenanceAt, [this, observedWake] {
-                        return assemblyStopping || ingressOverflow || assemblyCodec || !ingress.empty() ||
+                        return assemblyStopping || telemetryRequested.load() || ingressOverflow || assemblyCodec || !ingress.empty() ||
                             observedWake != assemblyWakeVersion;
                     });
                     if (assemblyStopping) return;
@@ -242,6 +318,7 @@ struct Client::Impl {
                     }
                     {
                         TimedMutex::Guard lock(videoMutex, TimedMutex::Scope::Client);
+                        publishAssemblyLocked(lock.snapshot());
                         maintenanceAt = Clock::time_point::max();
                         if (!stopped && (video.pendingPackets() || video.assemblyBytes()))
                             maintenanceAt = Clock::now() + std::chrono::milliseconds(10);
@@ -269,6 +346,7 @@ struct Client::Impl {
         std::uint64_t eventDropped = 0;
         std::deque<Event> events;
         MediaQueue media;
+        AudioRtpCadence audioCadence; // audioMutex, transport lifetime; never reset on video resync.
         TransportHistory transportHistory;
         IncomingControl incoming;
         ServerPerformance serverPerformance;
@@ -421,27 +499,9 @@ struct Client::Impl {
             transmitNack(std::move(feedback), videoFeedback, TimedMutex::Scope::Callback);
         }
         std::string videoDiagnostics() const {
-            TimedMutex::Guard videoLock(videoMutex, TimedMutex::Scope::Diagnostics);
-            std::lock_guard<std::mutex> audioLock(audioMutex);
-            const auto now = videoNow();
-            return video.diagnostics() + repair.diagnostics() + " nackSendErrors=" + std::to_string(nackSendErrors) + " queue=" + std::to_string(videoQueue.size() + media.audioCount) +
-                " queueBytes=" + std::to_string(videoQueue.bytes() + media.audioBytes) +
-                " videoQueue=" + std::to_string(videoQueue.size()) + " audioQueue=" + std::to_string(media.audioCount) +
-                " videoAgeMs=" + std::to_string(videoQueue.age(now)) +
-                " audioAgeMs=" + std::to_string(media.age(Kind::Audio, now)) +
-                " videoAgeHighMs=" + std::to_string(media.videoAgeHighMs) +
-                " audioAgeHighMs=" + std::to_string(media.audioAgeHighMs) +
-                " videoHigh=" + std::to_string(media.videoHigh) + " audioHigh=" + std::to_string(media.audioHigh) +
-                " queueBytesHigh=" + std::to_string(media.bytesHigh) +
-                " queueResync=" + std::to_string(queueResyncs) + " queueCapacity=" + std::to_string(queueCapacity) +
-                " queueAge=" + std::to_string(queueAge) + " audioDrop=" + std::to_string(media.audioDropped) +
-                " audioReject=" + std::to_string(media.audioRejected) + " videoGeneration=" + std::to_string(videoGeneration) +
-                " pli=" + std::to_string(pliRequests) + " videoQueueOwner=assembly videoQueueSpsc=1 ingressDrops=" +
-                std::to_string(ingressDrops.load(std::memory_order_relaxed)) +
-                " ingressWaitScope=receive-to-assembly ingressWaitSamples=" + std::to_string(ingressWaitSamples) +
-                " ingressWaitTotalMs=" + std::to_string(ingressWaitTotalMs) +
-                " ingressWaitAvgMs=" + std::to_string(ingressWaitSamples ? ingressWaitTotalMs / ingressWaitSamples : 0) +
-                " ingressWaitMaxMs=" + std::to_string(ingressWaitMaxMs);
+            TimedMutex::Guard videoLock(videoMutex,TimedMutex::Scope::Diagnostics);
+            auto value=video.numericSnapshot();value.counters.eventOverflow+=networkEvents?networkEvents->lost():0;
+            return telemetry::network::rtpText(value)+telemetry::network::repairText(repair.numericSnapshot())+telemetry::network::queueVideoText(queueSnapshotLocked());
         }
         std::string transportDiagnostics() const {
             std::lock_guard<std::mutex> telemetryLock(telemetryMutex);
@@ -508,6 +568,7 @@ struct Client::Impl {
                 transportHistory.record(e.type == EventType::WsClosed ? HistoryKind::Closed : HistoryKind::Failure,
                     code, now, true, age(lastRtpMs), age(lastAudioMs), age(lastControlMs));
             }
+            publishHistoryTelemetry();
             e.arrivedMs = now;
             const auto bytes = e.text.size() + e.mid.size();
             if (events.size() >= 128 || eventBytes + bytes > 1024 * 1024) { eventOverflow = true; ++eventDropped; revokeMedia(); return; }
@@ -554,12 +615,11 @@ struct Client::Impl {
                 }
                 try {
                     auto description = message.diagnostic;
-                    const auto classification = std::string(" parsed=") + IncomingControl::kindName(message.kind);
-                    description.key += classification;
-                    description.sample += classification;
+                    description.classification=static_cast<unsigned>(message.kind);
                     incomingEvents.receive(description, now);
                 }
                 catch (...) {} // Losing a diagnostic sample must not end the stream.
+                publishControlTelemetry();
             }
             if (message.kind == IncomingControl::Kind::Ping) {
                 // Pong dispatch is independent of the application's frame pump,
@@ -569,7 +629,7 @@ struct Client::Impl {
                     {
                         std::lock_guard<std::mutex> telemetryLock(telemetryMutex);
                         if (stopped) return;
-                        incoming.pongFailed();
+                        incoming.pongFailed();publishControlTelemetry();
                     }
                     Event e(EventType::Failure); e.text = "Ping response transport failed"; event(std::move(e));
                 }
@@ -590,6 +650,7 @@ struct Client::Impl {
             {
                 std::lock_guard<std::mutex> audioLock(audioMutex);
                 if (stopped) return;
+                audioCadence.received(timestamp,bytes.size(),now);
                 media.push({kind, std::move(bytes), timestamp, 0, 0, now,
                     publishedVideoGeneration.load(std::memory_order_acquire)}, now);
                 media.bytesHigh = std::max(media.bytesHigh, videoQueue.bytes() + media.audioBytes);
@@ -626,6 +687,7 @@ struct Client::Impl {
     Clock::time_point routeCapturedAt{};
     TransportStageTiming icePublishTiming;
     AsyncControlSender::Snapshot finalControl;
+    bool finalControlAvailable = false;
     std::uint64_t psUnavailableFrames = 0;
     std::uint64_t psInvalidNative = 0;
 #ifdef FOG_STREAM_TESTING
@@ -669,6 +731,12 @@ struct Client::Impl {
     SelectedRoute route;
     CandidateProofs remoteCandidateProofs;
     RouteSnapshotSchedule routeSnapshotSchedule;
+    std::uint64_t telemetryStreamEpoch=0;
+    telemetry::network::NetworkSnapshot finalNetwork;
+    telemetry::protocol::ProtocolSnapshot finalProtocol;
+    std::shared_ptr<telemetry::network::EventJournal<telemetry::network::NetworkEvent>> networkEvents=std::make_shared<telemetry::network::EventJournal<telemetry::network::NetworkEvent>>();
+    std::uint64_t telemetryEpoch = 0;
+    mutable std::uint64_t telemetrySequence = 0;
     TransportStageTiming pumpTiming, nackTiming;
     TransportStageTiming receiveTiming, eventsTiming, qualityTiming, controlTiming, pliTiming, heartbeatTiming;
     std::string transportTimings() const {
@@ -720,11 +788,15 @@ struct Client::Impl {
     }
     rtc::Candidate selectedLocal, selectedRemote;
     unsigned routeSelections = 0, routeEventDrops = 0;
-    std::deque<std::string> routeEvents;
-    std::string finalIceDiagnostics;
+    std::deque<telemetry::network::NetworkEvent> routeEvents;
+    telemetry::network::IceCounters finalIceCounters;
+    telemetry::network::UdpPollCapture udpPoll;
+    telemetry::network::Observation finalIceObservation;
+    bool finalIceClockKnown=false;
     std::optional<std::chrono::milliseconds> sctpRtt;
     Clock::time_point rttCapturedAt{};
     std::shared_ptr<ControlDelivery> controlDelivery = std::make_shared<ControlDelivery>();
+    telemetry::protocol::Reliability numericReliability{};
     std::string channelReliability = " reliabilityKnown=0";
     rtc::DtlsDiagnostics finalDtlsDiagnostics;
     bool iceSnapshotAvailable = false;
@@ -766,8 +838,28 @@ struct Client::Impl {
         if (!completed || completed->revision != iceWorker->state().revision) return;
         publishedSerial = completed->serial;
         auto& value = completed->value;
-        iceSnapshotAvailable = !value.diagnostics.empty();
-        if (iceSnapshotAvailable) finalIceDiagnostics = std::move(value.diagnostics);
+        udpPoll.publish(value.udp,value.udpQueryBeforeUs,value.udpQueryAfterUs,[this](const auto& udp){
+            telemetry::network::NetworkEvent event;event.kind=telemetry::network::EventKind::UdpPoll;
+            event.transition.setUdp(udp);stampEvent(event);event.videoBindingKnown=false;event.videoGeneration=0;
+            return networkEvents->tryPushReserved(event,16);
+        });
+        const auto numericIce=telemetry::network::captureIce(value.ice);
+        iceSnapshotAvailable=numericIce.availability==telemetry::network::IceCounters::Availability::Available;
+        if(iceSnapshotAvailable){
+            finalIceCounters=numericIce;
+            finalIceObservation.hasValue=true;
+            finalIceObservation.epoch=telemetryEpoch;
+            finalIceObservation.generation=completed->revision;
+            finalIceObservation.revision=completed->serial;
+            telemetry::network::updateIceSourceClock(numericIce.provenance,static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(value.iceCapturedAt.time_since_epoch()).count()),finalIceObservation.capturedAtUs,finalIceClockKnown);
+            finalIceObservation.state=numericIce.provenance==telemetry::network::IceCounters::Provenance::FinalRetained?telemetry::network::State::FinalRetained:telemetry::network::State::Live;
+        }else{
+            // Retain the last successful numeric value and its original clock;
+            // a failed read cannot refresh its age or turn it into measured zero.
+            finalIceCounters.availability=numericIce.availability;
+            finalIceObservation.state=numericIce.availability==telemetry::network::IceCounters::Availability::NotSupported?
+                telemetry::network::State::NotSupported:telemetry::network::State::CaptureFailed;
+        }
         finalDtlsDiagnostics = value.dtls;
         sctpRtt = value.rtt;
         rttCapturedAt = value.rttCapturedAt;
@@ -798,7 +890,7 @@ struct Client::Impl {
         const bool first = !routeSelected;
         route = selected; routeSelected = true; ++routeSelections;
         if (routeEvents.size() >= 16) { routeEvents.pop_front(); ++routeEventDrops; }
-        routeEvents.push_back(std::string("routeEvent=") + (first ? "selected" : "changed") + routeDiagnostics());
+        telemetry::network::NetworkEvent event;event.kind=first?telemetry::network::EventKind::RouteSelected:telemetry::network::EventKind::RouteChanged;event.transition.setRoute(routeNumeric());stampEvent(event);routeEvents.push_back(event);
     }
     void snapshotIce() {
         if (!peer || !iceWorker) return;
@@ -823,7 +915,12 @@ struct Client::Impl {
 #endif
             {
                 TransportStageScope timing{value.diagnosticTiming};
-                try { value.diagnostics = transport->iceDiagnostics(); } catch (...) {}
+                value.udpQueryBeforeUs=fog::metrics::steadyNowUs();
+                try { value.udp = transport->getIceUdpPollDiagnostics(); }
+                catch (...) { value.udp.ice.availability=rtc::IceDiagnostics::Availability::ReadFailed; }
+                value.udpQueryAfterUs=fog::metrics::steadyNowUs();
+                value.ice=value.udp.ice;
+                value.iceCapturedAt=Clock::now();
             }
             try { value.dtls = transport->getDtlsDiagnostics(); } catch (...) {}
             // SCTP round-trip estimate, not an application input acknowledgement.
@@ -859,44 +956,103 @@ struct Client::Impl {
     quality::Controller autoQuality;
     ResolutionScale resolutionScale;
     std::uint64_t invalidResolutionTables = 0;
-    std::deque<std::string> qualityEvents;
-    void qualityEvent(std::string event) {
-        if (qualityEvents.size() >= 32) qualityEvents.pop_front();
-        qualityEvents.push_back(std::move(event));
+    std::deque<telemetry::network::NetworkEvent> qualityEvents;
+    void stampEvent(telemetry::network::NetworkEvent& e) const {e.provider=telemetry::network::Provider::Mts;e.streamEpoch=telemetryStreamEpoch;e.transportEpoch=telemetryEpoch;e.videoGeneration=shared?shared->publishedVideoGeneration.load(std::memory_order_acquire):finalNetwork.videoGeneration;e.transportBindingKnown=true;e.videoBindingKnown=true;}
+    void qualityEvent(telemetry::network::FixedEvent value) {
+        if(qualityEvents.size()>=32){qualityEvents.pop_front();}
+        telemetry::network::NetworkEvent e;e.kind=telemetry::network::EventKind::Fixed;e.transition.setFixed(value);stampEvent(e);qualityEvents.push_back(e);
+    }
+    void publishTransitionEvents(){
+        // Preserve bounded producer buckets and their FIFO. SDK/RTP events
+        // already in the journal retain their admission sequence.
+        while(networkEvents->size()<32){
+            telemetry::network::NetworkEvent e;
+            if(!routeEvents.empty()){e=routeEvents.front();routeEvents.pop_front();}
+            else if(!qualityEvents.empty()){e=qualityEvents.front();qualityEvents.pop_front();}
+            else{quality::NumericEvent q;if(!autoQuality.pollNumericEvent(q))break;e.kind=telemetry::network::EventKind::Quality;e.transition.setQuality(q);stampEvent(e);e.videoBindingKnown=false;e.videoGeneration=0;}
+            networkEvents->push(e);
+        }
     }
     std::uint64_t qualityTimeOffset = 0;
     bool rateKnown = false;
     std::uint64_t qualityNow() const { return videoNow() + qualityTimeOffset; }
-    std::string qualityDiagnostics() const {
-        const auto now = qualityNow();
-        char numbers[650];
-        std::snprintf(numbers, sizeof(numbers),
-            " codec=%s requestedCodec=%s capMbps=%d quality=%d pliSeconds=%d requestedFps=%d receiveMbps=%.3f serverTargetMbps=%.3f targetAgeMs=%lld serverPreset=%s presetAgeMs=%lld statsCount=%llu statsAgeMs=%lld serverAuto=%d autoAgeMs=%lld serverFps=%.2f fpsAgeMs=%lld serverCodec=%s codecAgeMs=%lld qualityRequests=%u qualityPending=%d",
-            selectedCodec == VideoCodec::H265 ? "H265" : "H264",
-            videoSettings.codec == VideoCodec::H265 ? "H265" : "H264", videoSettings.bitrateMbps,
-            videoSettings.quality, videoSettings.keyframeSeconds, videoSettings.framesPerSecond, receiveMbps,
-            serverStats.targetMbps.known ? serverStats.targetMbps.value : -1,
-            static_cast<long long>(serverStats.targetMbps.age(now)), quality::name(serverStats.profile.value),
-            static_cast<long long>(serverStats.profile.age(now)), static_cast<unsigned long long>(serverStats.count),
-            serverStats.count ? static_cast<long long>(now - serverStats.at) : -1,
-            serverStats.automatic.known ? static_cast<int>(serverStats.automatic.value) : -1,
-            static_cast<long long>(serverStats.automatic.age(now)), serverStats.fps.known ? serverStats.fps.value : -1,
-            static_cast<long long>(serverStats.fps.age(now)), serverStats.codec.known ? serverStats.codec.value.c_str() : "unknown",
-            static_cast<long long>(serverStats.codec.age(now)), qualityRequests, qualityPending ? 1 : 0);
-        return std::string(numbers) + autoQuality.diagnostics() +
-            " offerLossProtection=" + offeredLossProtection +
-            " scaleTarget=1280x720 scaleAttempts=" + std::to_string(resolutionScale.attempts()) +
-            " scaleQueued=" + std::to_string(resolutionScale.accepted()) +
-            " scaleRejected=" + std::to_string(resolutionScale.rejected()) +
-            " scaleInvalidTables=" + std::to_string(invalidResolutionTables);
+    telemetry::network::QualitySnapshot qualityNumeric() const noexcept {
+        telemetry::network::QualitySnapshot out;const auto now=qualityNow();
+        out.negotiatedCodecKnown=shared&&shared->videoTrack.load();out.codecH265=selectedCodec==VideoCodec::H265;out.requestedH265=videoSettings.codec==VideoCodec::H265;
+        out.capMbps=videoSettings.bitrateMbps;out.quality=videoSettings.quality;out.pliSeconds=videoSettings.keyframeSeconds;out.requestedFps=videoSettings.framesPerSecond;
+        out.receiveMbps=receiveMbps;out.targetKnown=serverStats.targetMbps.known;out.targetMbps=out.targetKnown?serverStats.targetMbps.value:-1;
+        out.profileKnown=serverStats.profile.known;out.profile=static_cast<int>(serverStats.profile.value);
+        out.automaticKnown=serverStats.automatic.known;out.automatic=out.automaticKnown?int(serverStats.automatic.value):-1;
+        out.fpsKnown=serverStats.fps.known;out.fps=out.fpsKnown?serverStats.fps.value:-1;
+        out.codecKnown=serverStats.codec.known;out.serverCodec=out.codecKnown?(serverStats.codec.value=="H265"?2:1):0;
+        out.statsKnown=serverStats.count!=0;out.statsCount=serverStats.count;
+        out.targetAgeKnown=out.targetKnown&&now>=serverStats.targetMbps.at;out.presetAgeKnown=out.profileKnown&&now>=serverStats.profile.at;
+        out.statsAgeKnown=out.statsKnown&&now>=serverStats.at;out.autoAgeKnown=out.automaticKnown&&now>=serverStats.automatic.at;
+        out.fpsAgeKnown=out.fpsKnown&&now>=serverStats.fps.at;out.codecAgeKnown=out.codecKnown&&now>=serverStats.codec.at;
+        out.targetAgeMs=serverStats.targetMbps.age(now);out.presetAgeMs=serverStats.profile.age(now);out.autoAgeMs=serverStats.automatic.age(now);
+        out.fpsAgeMs=serverStats.fps.age(now);out.codecAgeMs=serverStats.codec.age(now);out.statsAgeMs=out.statsKnown?std::int64_t(now-serverStats.at):-1;
+        out.qualityRequests=qualityRequests;out.qualityPending=qualityPending;out.automaticPolicy=autoQuality.numericSnapshot();
+        out.scaleAttempts=resolutionScale.attempts();out.scaleQueued=resolutionScale.accepted();out.scaleRejected=resolutionScale.rejected();out.scaleInvalidTables=invalidResolutionTables;
+        out.scaleTableRevision=resolutionScale.tableRevision();out.scaleTableEntries=resolutionScale.tableEntries();
+        const auto native=resolutionScale.nativeSize();out.scaleNativeWidth=native[0];out.scaleNativeHeight=native[1];
+        out.scalePreset=resolutionScale.preset()?static_cast<int>(*resolutionScale.preset()):-1;
+        out.scaleLastPreset=resolutionScale.lastSubmittedPreset()?static_cast<int>(*resolutionScale.lastSubmittedPreset()):-1;
+        out.scalePendingReason=static_cast<unsigned>(resolutionScale.pendingState());
+        // This is the already normalized SDP codec family classification, not
+        // diagnostic text. Export only its fixed allowlisted enumeration.
+        out.offeredLossProtection=8;
+        for(unsigned mask=0;mask<8;++mask)if(offeredLossProtection==telemetry::network::lossProtectionName(mask)){out.offeredLossProtection=mask;break;}
+        return out;
     }
+    telemetry::network::NetworkSnapshot networkSnapshot() const {
+        using namespace telemetry::network;
+        const auto nowUs=fog::metrics::steadyNowUs();
+        NetworkSnapshot out=shared?NetworkSnapshot{}:finalNetwork;
+        out.provider=Provider::Mts;out.streamEpoch=telemetryStreamEpoch;out.transportEpoch=telemetryEpoch;out.capturedAtSteadyUs=nowUs;
+        if(shared){
+            shared->requestTelemetry();
+            out.videoGeneration=shared->publishedVideoGeneration.load(std::memory_order_acquire);
+            const auto assembly=shared->assemblyTelemetry.read(nowUs);
+            out.assembly=observation(assembly);
+            if(assembly.hasValue&&assembly.generation==out.videoGeneration){out.mts=assembly.value;}
+            else{out.assembly.hasValue=false;out.assembly.state=State::NotPublished;out.assembly.stale=true;}
+            const auto control=shared->controlTelemetry.read(nowUs,1000000);out.control=observation(control);if(control.hasValue)out.mtsControl=control.value;
+            const auto history=shared->historyTelemetry.read(nowUs,1000000);out.history=observation(history);if(history.hasValue)out.mtsHistory=history.value;
+            out.mtsQuality=qualityNumeric();
+        }
+        // Cache published by the existing ICE worker; this capture never calls SDK.
+        if(shared){
+            out.mtsDtls=captureDtls(finalDtlsDiagnostics);
+            out.mtsIce=finalIceCounters;out.mtsUdpPoll=udpPoll.summary();out.ice=finalIceObservation;out.iceSourceClockKnown=finalIceClockKnown;
+            if(shared->stopped){
+                out.ice.state=out.ice.hasValue?State::FinalRetained:State::ClosedWithoutFinal;
+                if(out.ice.hasValue)out.mtsIce.provenance=IceCounters::Provenance::FinalRetained;
+                if(out.mtsUdpPoll.hasValue)out.mtsUdpPoll.provenance=static_cast<unsigned>(rtc::IceDiagnostics::Provenance::FinalRetained);
+            }
+            out.dtls.epoch=telemetryEpoch;out.dtls.generation=routeRevision;out.dtls.revision=publishedSerial;
+            out.dtls.hasValue=finalDtlsDiagnostics.available;
+            out.dtls.state=out.dtls.hasValue?(shared->stopped?State::FinalRetained:State::Live):(shared->stopped?State::ClosedWithoutFinal:State::NotPublished);
+            out.dtls.capturedAtUs=routeCapturedAt==Clock::time_point{}?0:static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(routeCapturedAt.time_since_epoch()).count());
+        }
+        ageObservation(out.dtls,nowUs,RouteSnapshotSchedule::IntervalMs*2000);
+        out.detailedIceMigrated=true;
+        ageObservation(out.ice,nowUs,RouteSnapshotSchedule::IntervalMs*2000);
+        if(!out.iceSourceClockKnown){out.ice.ageKnown=false;out.ice.ageUs=0;out.ice.stale=true;}
+        if(out.mtsIce.availability!=IceCounters::Availability::Available)out.ice.stale=true;
+        if(rtcpWorker){const auto rtcp=rtcpWorker->numericSnapshot(nowUs);out.rtcp=observation(rtcp);if(rtcp.hasValue)out.mtsRtcp=rtcp.value;
+            out.rtcpWorkerActive=rtcp.workerActive;out.rtcpWorkerActiveMs=rtcp.workerActiveMs;out.rtcpStopped=rtcp.stopRequested;}
+        agePerformance(out.mtsControl.performance,videoNow());
+        ageObservation(out.assembly,nowUs,2000000);ageObservation(out.control,nowUs,1000000);ageObservation(out.history,nowUs,1000000);ageObservation(out.rtcp,nowUs,1000000);
+        out.eventMissed=networkEvents->lost();out.eventCursor=networkEvents->cursor();out.completedAtSteadyUs=fog::metrics::steadyNowUs();return out;
+    }
+    std::string qualityDiagnostics() const {return telemetry::network::qualityText(qualityNumeric());}
     void readQualityStats(const quality::Telemetry& data) {
         // Each valid optional field owns its timestamp. Empty/malformed extensions
         // cannot refresh an old profile/target and never reach logs as raw text.
         const auto before = serverStats.profile.value;
         serverStats = data;
         if (before != serverStats.profile.value)
-            qualityEvent(std::string("qualityEvent=stats-profile profile=") + quality::name(serverStats.profile.value));
+            qualityEvent({telemetry::network::FixedEventKind::StatsProfile,0,static_cast<std::uint64_t>(serverStats.profile.value)});
     }
     void applyQuality() {
         if ((!qualityPending && !bitratePending) || !channelOpen || !routeAllowed()) return;
@@ -944,14 +1100,12 @@ struct Client::Impl {
         try { accepted = control(Json{{"id", "apply_scale"}, {"preset", *preset}, {"enabled", *preset != 0}}.dump()); }
         catch (...) {}
         resolutionScale.submitted(accepted);
-        qualityEvent("scaleEvent=request target=1280x720 preset=" + std::to_string(*preset) +
-            " enabled=" + std::to_string(*preset != 0) + " queued=" + std::to_string(accepted) +
-            " actual=observe-decoded-video");
+        qualityEvent({telemetry::network::FixedEventKind::ScaleRequest,0,static_cast<std::uint64_t>(*preset),resolutionScale.attempts(),true,*preset!=0,accepted});
     }
     std::string finalVideoDiagnostics, finalTransportDiagnostics, finalQueueDiagnostics, finalGapDiagnostics;
     std::string finalMutexDiagnostics;
     std::deque<std::string> finalVideoEvents;
-    std::deque<std::string> finalControlEvents;
+    IncomingControlDiagnostics finalControlDiscovery;
     const char* operation = "idle";
     unsigned offers = 0, candidatesReceived = 0, emptyCandidates = 0, hostnameCandidatesSkipped = 0, heartbeatsSent = 0;
     // Application-thread counters. A non-throwing WebSocket send is local
@@ -971,8 +1125,90 @@ struct Client::Impl {
     SignalingSendCounts* testSignalingSend = nullptr;
     bool testSignalingReject = false;
 #endif
+    telemetry::protocol::Route routeNumeric() const {
+        telemetry::protocol::Route r;
+        r.relay=relay;r.selected=routeSelected;r.current=currentRoute();r.live=running;r.iceSnapshotAvailable=iceSnapshotAvailable;
+        r.local=static_cast<unsigned>(route.local);r.remote=static_cast<unsigned>(route.remote);r.localProtocol=static_cast<unsigned>(route.localProtocol);r.remoteProtocol=static_cast<unsigned>(route.remoteProtocol);r.proof=static_cast<unsigned>(route.remoteProof);r.actual=route.isTurn()?2:route.isDirect()?1:0;
+        r.workerPresent=bool(iceWorker);r.publishedRevision=routeRevision;r.serial=publishedSerial;
+        r.ageMs=routeCapturedAt==Clock::time_point{}?-1:std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-routeCapturedAt).count();
+        if(iceWorker){const auto st=iceWorker->state();r.revision=st.revision;r.active=st.active;r.activeMs=st.activeMs;r.pending=st.pending;r.requested=st.requested;r.completed=st.completed;r.discarded=st.discarded;r.stopping=st.stopping;}
+        r.candidateProofs=remoteCandidateProofs.size();r.candidateProofDrops=remoteCandidateProofs.dropped();r.selections=routeSelections;r.eventDrops=routeEventDrops;
+        return r;
+    }
+    telemetry::protocol::ProtocolSnapshot protocolSnapshot(bool eventLocked=false) const {
+        using namespace telemetry::protocol;
+        ProtocolSnapshot out=shared?ProtocolSnapshot{}:finalProtocol;
+        out.provider=Provider::Mts;out.transportEpoch=telemetryEpoch;out.streamEpoch=telemetryStreamEpoch;
+        out.capturedAtSteadyUs=fog::metrics::steadyNowUs();if(shared)out.sourceCapturedAtSteadyUs=out.capturedAtSteadyUs;out.state=running?State::Live:telemetryEpoch?State::FinalRetained:State::NotPublished;
+        auto& m=out.mts;m.route=routeNumeric();
+        if(std::string_view(operation)=="idle")m.operation=Operation::Op0;
+        if(std::string_view(operation)=="init.ice-servers")m.operation=Operation::Op1;
+        if(std::string_view(operation)=="init.peer-create")m.operation=Operation::Op2;
+        if(std::string_view(operation)=="init.send-request")m.operation=Operation::Op3;
+        if(std::string_view(operation)=="candidate.validate")m.operation=Operation::Op4;
+        if(std::string_view(operation)=="candidate.apply")m.operation=Operation::Op5;
+        if(std::string_view(operation)=="signal.envelope")m.operation=Operation::Op6;
+        if(std::string_view(operation)=="offer.envelope")m.operation=Operation::Op7;
+        if(std::string_view(operation)=="offer.base64")m.operation=Operation::Op8;
+        if(std::string_view(operation)=="offer.json")m.operation=Operation::Op9;
+        if(std::string_view(operation)=="offer.filter")m.operation=Operation::Op10;
+        if(std::string_view(operation)=="offer.mids")m.operation=Operation::Op11;
+        if(std::string_view(operation)=="offer.parse-sdp")m.operation=Operation::Op12;
+        if(std::string_view(operation)=="offer.candidates")m.operation=Operation::Op13;
+        if(std::string_view(operation)=="offer.set-remote")m.operation=Operation::Op14;
+        if(std::string_view(operation)=="offer.create-answer")m.operation=Operation::Op15;
+        if(std::string_view(operation)=="candidate.envelope")m.operation=Operation::Op16;
+        if(std::string_view(operation)=="candidate.base64")m.operation=Operation::Op17;
+        if(std::string_view(operation)=="candidate.json")m.operation=Operation::Op18;
+        if(std::string_view(operation)=="stomp.parse")m.operation=Operation::Op19;
+        if(std::string_view(operation)=="signal.json")m.operation=Operation::Op20;
+        if(std::string_view(operation)=="answer.send")m.operation=Operation::Op21;
+        if(std::string_view(operation)=="candidate.send")m.operation=Operation::Op22;
+        if(std::string_view(operation)=="control.json")m.operation=Operation::Op23;
+        m.offers=offers;
+        m.candidates=candidatesReceived;
+        m.emptyCandidates=emptyCandidates;
+        m.hostnameCandidatesSkipped=hostnameCandidatesSkipped;
+        m.hbOutMs=heartbeat.count();
+        m.hbInMs=incomingHeartbeat.count();
+        m.hbSent=heartbeatsSent;
+        m.wsMessages=wsMessages;
+        m.stompFrames=stompFrames;
+        m.stompConnected=stompConnectedFrames;
+        m.stompMessage=stompMessageFrames;
+        m.stompError=stompErrorFrames;
+        m.stompOther=stompOtherFrames;
+        m.signalInit=signalInitMessages;
+        m.wsAgeMs=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-lastWs).count();
+        m.subscribe={subscribeSends.attempts,subscribeSends.accepted,subscribeSends.buffered,subscribeSends.rejected};m.enabled={enabledSends.attempts,enabledSends.accepted,enabledSends.buffered,enabledSends.rejected};
+        const auto sender=controlSender?controlSender->snapshot():finalControl;m.sender=captureSender(sender);m.input=captureInput(sender);m.input.playStation=playStation;m.input.unavailable=psUnavailableFrames;m.input.invalidNative=psInvalidNative;
+        const auto d=controlDelivery->snapshot();m.delivery.known=d.known;m.delivery.bytes=d.currentBytes;m.delivery.maxBytes=d.maxBytes;m.delivery.sampledAtMs=d.sampledAt;m.delivery.blocked=d.blocked;m.delivery.blockedSinceMs=d.blockedSince;
+        m.delivery.reliability=numericReliability;m.delivery.rttKnown=sctpRtt.has_value();m.delivery.rttMs=sctpRtt?sctpRtt->count():0;
+        m.delivery.rttAgeMs=rttCapturedAt==Clock::time_point{}?-1:std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-rttCapturedAt).count();
+        m.delivery.rttCurrent=iceWorker&&routeRevision==iceWorker->state().revision&&m.delivery.rttAgeMs>=0&&static_cast<std::uint64_t>(m.delivery.rttAgeMs)<RouteSnapshotSchedule::IntervalMs*2;
+        if(shared){
+            // Keep the established event -> telemetry lock order. No video lock
+            // or SDK query occurs here; assembly publishes its own mutex copy.
+            if(eventLocked)captureProtocolShared(out,nullptr);
+            else {TimedMutex::Guard lock(shared->mutex,TimedMutex::Scope::Diagnostics);const auto completed=lock.snapshot();captureProtocolShared(out,&completed);}
+        }
+        out.completedAtSteadyUs=fog::metrics::steadyNowUs();return out;
+    }
+    void captureProtocolShared(telemetry::protocol::ProtocolSnapshot& out,const TimedMutex::Snapshot* completed)const {
+        auto& m=out.mts;const auto now=videoNow();
+        if(completed){m.eventMutex=telemetry::protocol::captureMutex(*completed);m.eventMutexKnown=true;}
+        m.mutexEnabled=TimedMutex::DiagnosticsEnabled;out.videoGeneration=shared->publishedVideoGeneration.load(std::memory_order_acquire);
+        const auto video=shared->videoMutexTelemetry.read(out.capturedAtSteadyUs,1000000);
+        if(video.hasValue){m.videoMutex=video.value;m.videoMutexKnown=true;m.videoMutexCapturedAtUs=video.capturedAtUs;}
+        m.peerState=static_cast<int>(shared->peerState);m.iceState=static_cast<int>(shared->iceState);m.gatheringState=static_cast<int>(shared->gatheringState);
+        const std::array<std::uint64_t,6> stamps{{shared->lastPeerMs,shared->lastIceMs,shared->lastGatheringMs,shared->lastRtpMs.load(),shared->lastAudioMs.load(),shared->lastControlMs}};
+        for(std::size_t i=0;i<stamps.size();++i)m.ages[i]=stamps[i]&&now>=stamps[i]?static_cast<std::int64_t>(now-stamps[i]):-1;
+        m.eventQueue=shared->events.size();m.eventBytes=shared->eventBytes;m.eventHigh=shared->eventHigh;m.eventDrop=shared->eventDropped;m.eventOverflow=shared->eventOverflow;m.callbackFailure=shared->callbackFailure;m.eventDelayHighMs=shared->eventDelayHighMs;
+        m.history=shared->transportHistory.numericSnapshot();
+        {std::lock_guard<std::mutex> lock(shared->telemetryMutex);m.incoming=shared->incoming.numericSnapshot();m.schemas=shared->incomingEvents.numericSnapshot();}
+    }
     std::string diagnostics() const {
-        return routeDiagnostics() + " " + finalIceDiagnostics + " operation=" + operation + " offers=" + std::to_string(offers) +
+        return routeDiagnostics() + " " + telemetry::network::iceText(finalIceCounters,finalIceObservation.hasValue) + " operation=" + operation + " offers=" + std::to_string(offers) +
             " candidates=" + std::to_string(candidatesReceived) + " emptyCandidates=" + std::to_string(emptyCandidates) +
             " hostnameCandidatesSkipped=" + std::to_string(hostnameCandidatesSkipped) +
             " hbOutMs=" + std::to_string(heartbeat.count()) + " hbInMs=" + std::to_string(incomingHeartbeat.count()) +
@@ -1034,17 +1270,7 @@ struct Client::Impl {
         sendSignaling(frame, counts);
     }
     std::string controlDiagnostics() const {
-        const auto out = controlSender ? controlSender->snapshot() : finalControl;
-        return " controlPending=" + std::to_string(out.pending) + " controlBytes=" + std::to_string(out.bytes) +
-            " controlRejected=" + std::to_string(out.rejected) + " controlSent=" + std::to_string(out.sent) + " controlPongCoalesced=" + std::to_string(out.pongCoalesced) +
-            " controlAgeMs=" + std::to_string(out.ageMs) + " controlAgeMaxMs=" + std::to_string(out.ageMaxMs) +
-            " controlBackpressure=" + std::to_string(out.backpressure) + " controlOperationStalled=" + std::to_string(out.operationStalled) +
-            " controlOperationMs=" + std::to_string(out.operationMs) + " controlQueueResets=" + std::to_string(out.queueResets) +
-            " controlTransportActive=" + std::to_string(out.transportActive) + " controlInFlight=" + std::to_string(out.inFlight) + " controlInFlightMs=" + std::to_string(out.inFlightMs) +
-            " controlSendCalls=" + std::to_string(out.sendCalls) + " controlSendAvgUs=" +
-            std::to_string(out.sendCalls ? out.sendTotalUs / out.sendCalls : 0) + " controlSendMaxUs=" + std::to_string(out.sendMaxUs) +
-            " controlWorkerIdleCalls=" + std::to_string(out.waitCalls) + " controlWorkerIdleAvgUs=" +
-            std::to_string(out.waitCalls ? out.waitTotalUs / out.waitCalls : 0) + " controlWorkerIdleMaxUs=" + std::to_string(out.waitMaxUs);
+        return telemetry::mtsControlText(telemetry::captureMtsControl(controlSender ? controlSender->snapshot() : finalControl));
     }
     void flushControl() {
         // Historical controlFlush stage now measures publication and health only;
@@ -1105,6 +1331,7 @@ struct Client::Impl {
         if (controlSender) {
             controlSender->stop();
             finalControl = controlSender->snapshot();
+            finalControlAvailable = true;
         }
         if (rtcpWorker) {
             rtcpWorker->join();
@@ -1124,6 +1351,8 @@ struct Client::Impl {
         if (shared) {
             TimedMutex::Guard lock(shared->mutex, TimedMutex::Scope::Client);
             shared->stopped = true;
+            shared->publishAssembly(true,true);
+            shared->publishHistoryTelemetry(true);
             shared->rumble.clear();
             // Diagnostics must never interrupt transport teardown, including
             // allocation failure while snapshotting counters or event strings.
@@ -1136,14 +1365,16 @@ struct Client::Impl {
                 finalTransportDiagnostics = shared->transportDiagnostics();
                 finalMutexDiagnostics = TimedMutex::diagnostics(lock.snapshot(), "event") + " | " +
                     TimedMutex::diagnostics(shared->videoMutex.snapshot(), "video");
-                std::string videoEvent;
-                { TimedMutex::Guard videoLock(shared->videoMutex, TimedMutex::Scope::Diagnostics);
-                  while (shared->video.pollEvent(videoEvent)) finalVideoEvents.push_back(std::move(videoEvent)); }
-                std::string controlEvent;
-                { std::lock_guard<std::mutex> telemetryLock(shared->telemetryMutex);
-                  while (finalControlEvents.size() < 33 && shared->incomingEvents.poll(controlEvent, videoNow(), true))
-                    finalControlEvents.push_back(std::move(controlEvent)); }
+
             } catch (...) {}
+            {std::lock_guard<std::mutex> telemetryLock(shared->telemetryMutex);shared->publishControlTelemetry(true);finalControlDiscovery=shared->incomingEvents;}
+            finalProtocol=protocolSnapshot(true);
+            // Assembly and callbacks are sealed. Retain the last completed
+            // diagnostic scopes as well; regular UI capture only reads the
+            // assembly publication and never takes this video mutex.
+            finalProtocol.mts.videoMutex=telemetry::protocol::captureMutex(shared->videoMutex.snapshot());finalProtocol.mts.videoMutexKnown=true;finalProtocol.mts.videoMutexCapturedAtUs=fog::metrics::steadyNowUs();
+            finalProtocol.mts.eventMutex=telemetry::protocol::captureMutex(lock.snapshot());finalProtocol.mts.eventMutexKnown=true;
+            finalNetwork=networkSnapshot();
             abandonedEvents.swap(shared->events);
             { std::lock_guard<std::mutex> audioLock(shared->audioMutex);
               abandonedPackets.swap(shared->media.packets); }
@@ -1305,8 +1536,7 @@ struct Client::Impl {
                         else if (const auto bytes = std::get_if<rtc::binary>(&msg)) {
                             std::lock_guard<std::mutex> telemetryLock(st.telemetryMutex);
                             if (!st.stopped) {
-                                try { st.incomingEvents.receive({"binary", "event=<binary> bytes=" +
-                                    std::to_string(bytes->size())}, videoNow()); }
+                                try { st.incomingEvents.receive(IncomingControlDiagnostics::specialDescription(bytes->size(),true), videoNow()); st.publishControlTelemetry(); }
                                 catch (...) {}
                             }
                         }
@@ -1315,6 +1545,7 @@ struct Client::Impl {
                 Event e(EventType::Channel); e.channel = dc;
                 try {
                     const auto reliability = dc->reliability();
+                    e.reliability={true,reliability.unordered,reliability.maxRetransmits.has_value(),reliability.maxPacketLifeTime.has_value(),reliability.maxRetransmits.value_or(0),static_cast<std::uint64_t>(reliability.maxPacketLifeTime?reliability.maxPacketLifeTime->count():0)};
                     e.text = " reliabilityKnown=1 unordered=" + std::to_string(reliability.unordered) +
                         " maxRetransmits=" + (reliability.maxRetransmits ? std::to_string(*reliability.maxRetransmits) : "unset") +
                         " maxLifetimeMs=" + (reliability.maxPacketLifeTime ? std::to_string(reliability.maxPacketLifeTime->count()) : "unset");
@@ -1565,6 +1796,7 @@ struct Client::Impl {
             {
                 const auto dc = channel;
                 if (!event.text.empty()) channelReliability = event.text;
+                numericReliability=event.reliability;
                 const auto delivery = controlDelivery;
                 const std::weak_ptr<Shared> weak(shared);
                 controlSender = std::make_shared<AsyncControlSender>(
@@ -1602,7 +1834,7 @@ struct Client::Impl {
                     [weak](bool sent) {
                         callback(weak, [sent](Shared& s) {
                             std::lock_guard<std::mutex> telemetryLock(s.telemetryMutex);
-                            if (!s.stopped) { if (sent) s.incoming.pongSent(); else s.incoming.pongFailed(); }
+                            if (!s.stopped) { if (sent) s.incoming.pongSent(); else s.incoming.pongFailed(); s.publishControlTelemetry(); }
                         });
                     }, protocol::gamepad(Gamepad{}, playStation).dump(), retryInputReleases, retryInputReset);
                 const std::weak_ptr<AsyncControlSender> weakSender(controlSender);
@@ -1629,7 +1861,7 @@ struct Client::Impl {
             throw TransportError(fog::constants::error::Stream::MalformedControlMessage);
         case EventType::Track: tracks.push_back(event.track); break;
         case EventType::PeerState:
-            qualityEvent("transportEvent=peer state=" + std::to_string(static_cast<int>(event.peerState)) + " ms=" + std::to_string(event.arrivedMs));
+            qualityEvent({telemetry::network::FixedEventKind::Peer,event.arrivedMs,static_cast<std::uint64_t>(event.peerState)});
             if (event.peerState == rtc::PeerConnection::State::Failed)
                 throw TransportError(relay ? fog::constants::error::Stream::RelayTransportUnavailablePeerFailed : fog::constants::error::Stream::PeerConnectionFailed, true);
             if (event.peerState == rtc::PeerConnection::State::Closed) throw TransportError(fog::constants::error::Stream::PeerConnectionClosed, true);
@@ -1643,10 +1875,10 @@ struct Client::Impl {
                 throw TransportError(relay ? fog::constants::error::Stream::RelayTransportUnavailableICEFailed : fog::constants::error::Stream::ICEConnectionFailed, true);
             if (event.iceState == rtc::PeerConnection::IceState::Closed)
                 throw TransportError(fog::constants::error::Stream::ICEConnectionClosed, true);
-            qualityEvent("transportEvent=ice state=" + std::to_string(static_cast<int>(event.iceState)) + " ms=" + std::to_string(event.arrivedMs));
+            qualityEvent({telemetry::network::FixedEventKind::Ice,event.arrivedMs,static_cast<std::uint64_t>(event.iceState)});
             break;
         case EventType::GatheringState:
-            qualityEvent("transportEvent=gathering state=" + std::to_string(static_cast<int>(event.gatheringState)) + " ms=" + std::to_string(event.arrivedMs));
+            qualityEvent({telemetry::network::FixedEventKind::Gathering,event.arrivedMs,static_cast<std::uint64_t>(event.gatheringState)});
             break;
         case EventType::WsClosed:
             throw TransportError(fog::constants::error::Stream::SignalingTransportClosed, true);
@@ -1656,9 +1888,9 @@ struct Client::Impl {
     }
 };
 
-Client::Client() : impl_(std::make_unique<Impl>()) {}
+Client::Client() : impl_(std::make_unique<Impl>()), telemetryStreamEpoch_(telemetry::nextStreamEpoch()) {}
 Client::Client(std::string caPath, std::string random5suffix)
-    : impl_(std::make_unique<Impl>()), caPath_(std::move(caPath)), random5suffix_(std::move(random5suffix)) {}
+    : impl_(std::make_unique<Impl>()), caPath_(std::move(caPath)), random5suffix_(std::move(random5suffix)), telemetryStreamEpoch_(telemetry::nextStreamEpoch()) {}
 bool Client::start(const StreamConnection& connection) {
     if (connection.rental.provider != fog::ProviderId::Mts) return false;
     return start(connection.rental.value, random5suffix_, caPath_);
@@ -1775,6 +2007,8 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
     const auto playStation = impl_->playStation;
     close();
     impl_ = std::make_unique<Impl>();
+    impl_->telemetryEpoch = ++telemetryEpoch_;
+    impl_->telemetryStreamEpoch=telemetryStreamEpoch_;
     impl_->videoSettings = preferences;
     impl_->relay = relay;
     impl_->playStation = playStation;
@@ -1796,6 +2030,7 @@ bool Client::startEndpoint(const std::string& hash, const std::string& suffix,
     }
     i.hash = hash; i.suffix = suffix; i.clientHash = hash + suffix;
     i.shared = std::make_shared<Impl::Shared>();
+    i.shared->telemetryTransportEpoch=i.telemetryEpoch;i.shared->telemetryStreamEpoch=telemetryStreamEpoch_;i.shared->networkEvents=i.networkEvents;
     i.shared->signals = mediaSignals();
     i.started = i.lastWs = i.lastHeartbeat = i.lastPli = i.rateAt = Clock::now();
     i.running = true; i.state = "Opening signaling";
@@ -1855,8 +2090,7 @@ void Client::pump() {
           if (i.observedVideoGeneration != i.shared->videoGeneration) {
               i.observedVideoGeneration = i.shared->videoGeneration;
               i.bitratePending = true; i.bitrateAttempt = {}; // The quality command keeps its own interval.
-              i.qualityEvent("qualityEvent=video-generation generation=" +
-                  std::to_string(i.observedVideoGeneration) + " remb=repeat");
+              i.qualityEvent({telemetry::network::FixedEventKind::VideoGeneration,0,i.observedVideoGeneration});
           } }
         const auto now = Clock::now();
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - i.rateAt).count();
@@ -1866,7 +2100,9 @@ void Client::pump() {
             i.rateKnown = true;
         }
         { std::lock_guard<std::mutex> telemetryLock(i.shared->telemetryMutex);
+          const auto priorControl=i.shared->incoming.numericSnapshot();
           statsPending = i.shared->incoming.takeStats(stats, i.qualityNow());
+          if(priorControl.burst||priorControl.statsPending||priorControl.firstPendingKnown)i.shared->publishControlTelemetry();
           i.invalidResolutionTables = i.shared->invalidResolutionTables;
           if (i.shared->resolutionsPending) {
               resolutions = i.shared->resolutions;
@@ -1907,8 +2143,10 @@ void Client::pump() {
             if (statsPending) i.readQualityStats(stats);
             if (resolutions && i.resolutionScale.observe(std::move(*resolutions))) {
                 const auto preset = i.resolutionScale.preset();
-                i.qualityEvent("scaleEvent=table target=1280x720 preset=" +
-                    (preset ? std::to_string(*preset) : std::string("unavailable")));
+                const auto native=i.resolutionScale.nativeSize();
+                telemetry::network::FixedEvent tableEvent{telemetry::network::FixedEventKind::ScaleTable,0,static_cast<std::uint64_t>(preset.value_or(0)),i.resolutionScale.tableRevision(),preset.has_value()};
+                tableEvent.nativeWidth=static_cast<unsigned>(native[0]);tableEvent.nativeHeight=static_cast<unsigned>(native[1]);
+                tableEvent.tableEntries=static_cast<unsigned>(i.resolutionScale.tableEntries());i.qualityEvent(tableEvent);
             }
         }
         if (i.closingForRetry) return;
@@ -2059,8 +2297,7 @@ bool Client::updateVideoSettings(const fog::video::Settings& settings) {
     impl_->videoSettings = settings;
     if (remoteChanged) {
         impl_->qualityPending = true; impl_->bitratePending = true; impl_->qualityAttempt = impl_->bitrateAttempt = {};
-        impl_->qualityEvent("qualityEvent=settings quality=" + std::to_string(settings.quality) +
-                            " capMbps=" + std::to_string(settings.bitrateMbps));
+        impl_->qualityEvent({telemetry::network::FixedEventKind::Settings,0,static_cast<std::uint64_t>(settings.quality),static_cast<std::uint64_t>(settings.bitrateMbps)});
         impl_->autoQuality.enable(false, impl_->qualityNow());
         impl_->autoQuality.enable(settings.quality == 0, impl_->qualityNow());
     }
@@ -2203,7 +2440,76 @@ bool Client::disconnectForRetry() {
     return true;
 }
 std::string Client::diagnostics() const { return impl_->diagnostics(); }
-std::string Client::transportTimings() const { return impl_->transportTimings(); }
+telemetry::Snapshot Client::captureTelemetry(telemetry::Capture mask) const noexcept {
+    using namespace telemetry;
+    Snapshot out; out.provider=Provider::Mts;
+    out.capturedAtSteadyUs=fog::metrics::steadyNowUs();
+    out.input.scope=Scope::TransportRolling5s;
+    try {
+        const auto& i=*impl_;
+        out.streamEpoch=telemetryStreamEpoch_;out.transportEpoch=i.telemetryEpoch;out.sequence=++i.telemetrySequence;
+        if(i.shared) out.videoGeneration=i.shared->publishedVideoGeneration.load(std::memory_order_acquire);
+        const Status status{i.telemetryEpoch ? (i.shared?Availability::Available:Availability::FinalRetained):Availability::NotStarted,
+            i.telemetryEpoch?Reason::None:Reason::NotYetPublished,Scope::TransportLifetime};
+        if(includes(mask,Capture::Transport)) {
+            out.transport=status;
+            out.mts.stages={captureTiming(i.pumpTiming),captureTiming(i.nackTiming),captureTiming(i.icePublishTiming),
+                Timing{},Timing{},Timing{},Timing{},Timing{},captureTiming(i.receiveTiming),captureTiming(i.eventsTiming),
+                captureTiming(i.qualityTiming),captureTiming(i.controlTiming),captureTiming(i.pliTiming),captureTiming(i.heartbeatTiming)};
+            if(i.iceWorker){ const auto ice=i.iceWorker->state();out.mts.iceWorkerPresent=true;
+                out.mts.stages[3]=captureTiming(ice.diagnostic);out.mts.stages[4]=captureTiming(ice.pair);
+                out.mts.stages[5]=captureTiming(ice.schedule);out.mts.stages[6]=captureTiming(ice.wait);out.mts.stages[7]=captureTiming(ice.work); }
+        }
+        if(includes(mask,Capture::Control)){
+            if(i.controlSender){out.control=status;out.mtsControl=captureMtsControl(i.controlSender->snapshot());}
+            else if(i.finalControlAvailable){out.control={Availability::FinalRetained,Reason::None,Scope::TransportLifetime};out.mtsControl=captureMtsControl(i.finalControl);}
+            else out.control={i.telemetryEpoch?Availability::TemporarilyUnavailable:Availability::NotStarted,
+                i.shared?Reason::NotYetPublished:(i.telemetryEpoch?Reason::ClosedWithoutFinal:Reason::NotYetPublished),Scope::TransportLifetime};
+        }
+        if(includes(mask,Capture::Input)) {
+            if(i.controlSender){out.input={Availability::Available,Reason::None,Scope::TransportRolling5s};
+                out.inputLatency=capturePercentiles(i.controlSender->inputLatencySnapshot(out.capturedAtSteadyUs));}
+            else out.input={i.telemetryEpoch?Availability::TemporarilyUnavailable:Availability::NotStarted,
+                i.shared?Reason::NotYetPublished:(i.telemetryEpoch?Reason::ClosedWithoutFinal:Reason::NotYetPublished),Scope::TransportRolling5s};
+        }
+    } catch (...) {
+        const Status failed{Availability::TemporarilyUnavailable,Reason::CaptureFailed,Scope::TransportLifetime};
+        if(includes(mask,Capture::Transport))out.transport=failed;
+        if(includes(mask,Capture::Control))out.control=failed;
+        if(includes(mask,Capture::Input)){out.input=failed;out.input.scope=Scope::TransportRolling5s;}
+    }
+    out.captureCompletedAtSteadyUs=fog::metrics::steadyNowUs();return out;
+}
+telemetry::protocol::ProtocolSnapshot Client::captureProtocolTelemetry() const noexcept {
+    try{auto out=impl_->protocolSnapshot();out.streamEpoch=telemetryStreamEpoch_;return out;}
+    catch(...){telemetry::protocol::ProtocolSnapshot out;out.provider=telemetry::protocol::Provider::Mts;out.state=telemetry::protocol::State::CaptureFailed;out.streamEpoch=telemetryStreamEpoch_;out.transportEpoch=impl_->telemetryEpoch;return out;}
+}
+telemetry::network::NetworkSnapshot Client::captureNetworkTelemetry() const noexcept {
+    try{auto out=impl_->networkSnapshot();out.streamEpoch=telemetryStreamEpoch_;return out;}
+    catch(...){telemetry::network::NetworkSnapshot out;out.provider=telemetry::network::Provider::Mts;
+        out.streamEpoch=telemetryStreamEpoch_;out.transportEpoch=impl_->telemetryEpoch;out.assembly.state=telemetry::network::State::CaptureFailed;return out;}
+}
+bool Client::peekNetworkEvent(telemetry::network::NetworkEvent& out) const noexcept {
+    try{impl_->publishTransitionEvents();telemetry::network::EventJournal<telemetry::network::NetworkEvent>::Entry entry;
+        if(!impl_->networkEvents->peek(entry))return false;
+        out=entry.value;out.journalSequence=entry.sequence;out.journalMissed=entry.missed;return true;
+    }catch(...){return false;}
+}
+std::size_t Client::peekNetworkEvents(telemetry::network::NetworkEvent* out,std::size_t capacity) const noexcept {
+    if(!out||!capacity)return 0;
+    try{
+        impl_->publishTransitionEvents();
+        using Journal=telemetry::network::EventJournal<telemetry::network::NetworkEvent>;
+        std::array<Journal::Entry,Journal::Capacity> entries{};
+        const auto count=impl_->networkEvents->peekBatch(entries.data(),std::min(capacity,entries.size()));
+        for(std::size_t i=0;i<count;++i){out[i]=entries[i].value;out[i].journalSequence=entries[i].sequence;out[i].journalMissed=entries[i].missed;}
+        return count;
+    }catch(...){return 0;}
+}
+bool Client::retireNetworkEvent(std::uint64_t sequence,bool admitted) noexcept {
+    try{return impl_->networkEvents->retire(sequence,admitted);}catch(...){return false;}
+}
+std::string Client::transportTimings() const { return telemetry::transportText(captureTelemetry(telemetry::Capture::Transport)); }
 std::string Client::rtcpDiagnostics() const {
     return (impl_->rtcpWorker ? impl_->rtcpWorker->snapshot() : impl_->finalRtcp).text();
 }
@@ -2231,39 +2537,51 @@ std::string Client::queueDiagnostics() const {
 std::string Client::gapDiagnostics() const {
     if (!impl_->shared) return impl_->finalGapDiagnostics;
     TimedMutex::Guard lock(impl_->shared->videoMutex, TimedMutex::Scope::Diagnostics);
-    return impl_->shared->video.gapDiagnostics();
+    return telemetry::network::gapText(impl_->shared->video.numericSnapshot());
 }
 std::string Client::videoDiagnostics() const {
     if (!impl_->shared) return impl_->finalVideoDiagnostics;
     TimedMutex::Guard lock(impl_->shared->mutex, TimedMutex::Scope::Diagnostics);
     return impl_->shared->videoDiagnostics() + impl_->qualityDiagnostics();
 }
+bool Client::pollUnmigratedNetworkEvent(std::string&) {return false;}
 bool Client::pollVideoDiagnostic(std::string& event) {
-    if (!impl_->routeEvents.empty()) {
-        event = std::move(impl_->routeEvents.front()); impl_->routeEvents.pop_front(); return true;
+    // Preserve the legacy aggregate's route -> quality -> AutoQuality -> RTP
+    // priority. Typed consumers use peekNetworkEvents and its journal FIFO;
+    // these two consumption modes must not be mixed on one client.
+    enum class Pending { Route, Quality, Automatic, Journal };
+    Pending pending=Pending::Journal;
+    telemetry::network::NetworkEvent value;
+    if(!impl_->routeEvents.empty()) {value=impl_->routeEvents.front();pending=Pending::Route;}
+    else if(!impl_->qualityEvents.empty()) {value=impl_->qualityEvents.front();pending=Pending::Quality;}
+    else {
+        quality::NumericEvent automatic;
+        if(impl_->autoQuality.pollNumericEvent(automatic)) {
+            value.kind=telemetry::network::EventKind::Quality;value.transition.setQuality(automatic);
+            impl_->stampEvent(value);value.videoBindingKnown=false;value.videoGeneration=0;
+            pending=Pending::Automatic;
+        } else {
+            telemetry::network::EventJournal<telemetry::network::NetworkEvent>::Entry entry;
+            if(!impl_->networkEvents->peek(entry))return false;
+            value=entry.value;value.journalSequence=entry.sequence;value.journalMissed=entry.missed;
+        }
     }
-    if (!impl_->qualityEvents.empty()) {
-        event = std::move(impl_->qualityEvents.front()); impl_->qualityEvents.pop_front(); return true;
-    }
-    if (impl_->autoQuality.pollEvent(event)) return true;
-    if (impl_->shared) {
-        TimedMutex::Guard lock(impl_->shared->videoMutex, TimedMutex::Scope::Diagnostics);
-        return impl_->shared->video.pollEvent(event);
-    }
-    if (impl_->finalVideoEvents.empty()) return false;
-    event = std::move(impl_->finalVideoEvents.front()); impl_->finalVideoEvents.pop_front(); return true;
-}
-bool Client::pollControlDiagnostic(std::string& event, bool final) {
-    if (impl_->shared) {
-        std::lock_guard<std::mutex> telemetryLock(impl_->shared->telemetryMutex);
-        if (!impl_->shared->incomingEvents.poll(event, videoNow(), final)) return false;
-    } else {
-        if (impl_->finalControlEvents.empty()) return false;
-        event = std::move(impl_->finalControlEvents.front());
-        impl_->finalControlEvents.pop_front();
-    }
-    event = "provider=mts " + event;
+    auto text=telemetry::network::networkEventText(value,false);
+    const std::string prefix="Video RTP event: ";if(text.rfind(prefix,0)==0)text.erase(0,prefix.size());
+    event=std::move(text);
+    if(pending==Pending::Route)impl_->routeEvents.pop_front();
+    else if(pending==Pending::Quality)impl_->qualityEvents.pop_front();
+    else if(pending==Pending::Journal)retireNetworkEvent(value.journalSequence,true);
     return true;
+}
+std::size_t Client::peekControlDiscoveryEvents(telemetry::network::ControlDiscoveryEvent* out,std::size_t capacity,bool final)const noexcept {
+    try{if(impl_->shared){std::lock_guard<std::mutex> lock(impl_->shared->telemetryMutex);return impl_->shared->incomingEvents.peekBatch(out,capacity,videoNow(),final);}return impl_->finalControlDiscovery.peekBatch(out,capacity,videoNow(),final);}catch(...){return 0;}
+}
+bool Client::retireControlDiscoveryEvent(std::uint64_t sequence,bool admitted)noexcept {
+    try{if(impl_->shared){std::lock_guard<std::mutex> lock(impl_->shared->telemetryMutex);const bool result=impl_->shared->incomingEvents.retire(sequence,admitted);impl_->shared->publishControlTelemetry();return result;}return impl_->finalControlDiscovery.retire(sequence,admitted);}catch(...){return false;}
+}
+bool Client::pollControlDiagnostic(std::string& event,bool final){
+    telemetry::network::ControlDiscoveryEvent value;if(!peekControlDiscoveryEvents(&value,1,final))return false;event="provider=mts "+telemetry::network::controlDiscoveryText(value);return retireControlDiscoveryEvent(value.sequence,true);
 }
 bool Client::waitingForVideoKeyframe() const {
     if (!impl_->shared) return false;
@@ -2349,7 +2667,7 @@ std::string Client::inputDiagnostics() const {
     return text + " sendSuccess=local-rtc-acceptance ack=unsupported";
 }
 std::string Client::inputLatencyDiagnostics() const {
-    return impl_->controlSender ? impl_->controlSender->inputLatencyDiagnostics() : "provider=MTS unavailable=closed";
+    return telemetry::inputText(captureTelemetry(telemetry::Capture::Input));
 }
 bool Client::sendGamepad(const Gamepad& state) {
     if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed() || !impl_->controlSender) {
@@ -2375,12 +2693,21 @@ bool Client::sendGamepad(const Gamepad& state) {
     } catch (const std::exception&) { impl_->fail(fog::constants::error::Stream::ControlSendFailed); return false; }
 }
 bool Client::sendInput(const fog::remote::Input& input) {
-    try { return sendControl(protocol::remoteInput(input).dump()); }
+    try {
+        const auto data = protocol::remoteInput(input);
+        const auto wire = data.dump();
+        if constexpr (fog::input_options::typedPath) return sendControlData(wire, data);
+        return sendControl(wire);
+    }
     catch (const std::exception&) { return false; }
 }
 bool Client::sendControl(const std::string& json) {
     if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed() || json.size() > 64 * 1024) return false;
     const auto data = Json::parse(json, nullptr, false);
+    return sendControlData(json, data);
+}
+bool Client::sendControlData(const std::string& json, const Json& data) {
+    if (!impl_->running || !impl_->channelOpen || !impl_->routeAllowed() || json.size() > 64 * 1024) return false;
     if (!data.is_object()) return false;
     auto mode = ControlQueue::Mode::Ordered;
     std::string input, release;

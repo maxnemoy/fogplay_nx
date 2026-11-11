@@ -3,6 +3,7 @@
 #include "features/streaming/infrastructure/moonlight/video_input_gate.hpp"
 #include "features/streaming/domain/video_limits.hpp"
 #include "core/constants/stage1_options.hpp"
+#include "features/streaming/infrastructure/moonlight/encryption_policy.hpp"
 #include <Settings.hpp>
 #include <Diagnostics.hpp>
 #include <FogMoonlightDiagnostics.h>
@@ -26,6 +27,7 @@
 
 namespace {
 std::atomic<bool> providerPin{false}, failPair{false};
+std::atomic<int> encryptionState{FOG_ENCRYPTION_UNKNOWN}, encryptionSelected{0}, encryptionAudio{0};
 std::atomic<int> stops{0}, launches{0}, interrupts{0};
 std::atomic<ConnListenerConnectionTerminated> terminateConnection{nullptr};
 std::atomic<ConnListenerRumble> rumbleConnection{nullptr};
@@ -101,6 +103,13 @@ void FogMoonlightGetDiagnostics(FogMoonlightDiagnostics* snapshot) {
     if (!snapshot) return;
     *snapshot = {};
     snapshot->waitingForIdr = coreWaiting;
+    snapshot->encryptionState = encryptionState;
+    snapshot->encryptionClientFlags = static_cast<std::uint32_t>(moonlight::detail::encryptionFlags());
+    snapshot->encryptionSelected = encryptionSelected;
+    snapshot->encryptionAudio = encryptionAudio;
+    snapshot->videoDecryptSuccesses = encryptionSelected & 2 ? 3 : 0;
+    snapshot->audioDecryptSuccesses = encryptionAudio ? 2 : 0;
+    snapshot->encryptionFailure = encryptionState == FOG_ENCRYPTION_FAILED ? FOG_ENCRYPTION_FAILURE_CONFLICT : 0;
     snapshot->videoReceiveCycleCount = 2; snapshot->videoReceiveCycleTotalUs = 200; snapshot->videoReceiveCycleMaxUs = 150;
     snapshot->videoReceiveWaitTotalUs = 160; snapshot->videoReceiveWaitMaxUs = 120;
     snapshot->videoReceiveWorkTotalUs = 40; snapshot->videoReceiveWorkMaxUs = 30;
@@ -159,6 +168,7 @@ int gs_applist(PSERVER_DATA, PAPP_LIST* list) {
 }
 int gs_start_app(PSERVER_DATA server, PSTREAM_CONFIGURATION config, int app, bool, bool, int mask) {
     assert(app == 42 && mask == 1);
+    assert(config->encryptionFlags == moonlight::detail::encryptionFlags());
     assert(config->width == 1280 && config->height == 720 && config->fps == expectedFps);
     assert(config->supportedVideoFormats == expectedVideoFormats && config->bitrate == 20000);
     ++launches;
@@ -193,6 +203,7 @@ int gs_start_app(PSERVER_DATA server, PSTREAM_CONFIGURATION config, int app, boo
 int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION config, PCONNECTION_LISTENER_CALLBACKS listeners,
     PDECODER_RENDERER_CALLBACKS video, PAUDIO_RENDERER_CALLBACKS audio, void*, int, void*, int) {
     ++connectionStarts;
+    assert(config->encryptionFlags == moonlight::detail::encryptionFlags());
     assert(config->fps == expectedFps && config->supportedVideoFormats == expectedVideoFormats);
     if (resetConnectionInterrupt.exchange(false)) {
         std::unique_lock<std::mutex> lock(connectionInitMutex);
@@ -895,6 +906,43 @@ void videoRecoveryScenarios(const std::filesystem::path& path) {
 }
 
 #ifndef FOG_MOONLIGHT_LOG_INTEGRATION_TEST
+void encryptionScenarios(const std::filesystem::path& path) {
+    currentApp = 0; connectionResult = 0;
+    moonlight::MoonlightSession session(path.string()); pair(session);
+    auto client = session.create(); assert(client);
+    encryptionState = FOG_ENCRYPTION_ACCEPTED; encryptionSelected = 1; encryptionAudio = 0;
+    assert(client->qualityStatus().find("режим не подтверждён") != std::string::npos);
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    assert(client->qualityStatus().find("Видео без шифрования; аудио без шифрования") != std::string::npos);
+    assert(client->diagnostics().find("enc_state=3") != std::string::npos);
+    client->close();
+    assert(client->qualityStatus().find("без шифрования") != std::string::npos);
+    // A new generation which fails before core start must hide the old result.
+    currentApp = 999;
+    assert(client->start({rental()})); eventually([&] { return !client->error().empty(); }); client->close();
+    assert(client->qualityStatus().find("режим не подтверждён") != std::string::npos);
+    currentApp = 0; encryptionSelected = 7; encryptionAudio = 1;
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    assert(client->qualityStatus().find("Видео AES-GCM; аудио AES-CBC") != std::string::npos);
+    assert(client->diagnostics().find("enc_observed_video=3 enc_observed_audio=2") != std::string::npos);
+    client->close();
+    // Preserve failed post-selection facts, never the last accepted generation.
+    encryptionState = FOG_ENCRYPTION_FAILED; encryptionSelected = 4; encryptionAudio = 0;
+    connectionResult = FOG_MOONLIGHT_ENCRYPTION_CONFLICT;
+    const auto beforeFailureLaunches=launches.load(), beforeFailureStops=stops.load();
+    assert(client->start({rental()})); eventually([&] { return !client->error().empty(); }); client->close();
+    assert(client->qualityStatus().find("согласование не удалось") != std::string::npos);
+    assert(client->diagnostics().find("enc_state=4 enc_failure=1") != std::string::npos);
+    assert(!client->retryableError());
+    assert(client->diagnostics().find("enc_selected=4 enc_audio=0") != std::string::npos);
+    assert(launches==beforeFailureLaunches+1 && stops==beforeFailureStops); // No plaintext retry.
+    encryptionState = FOG_ENCRYPTION_ACCEPTED; encryptionSelected = 0; encryptionAudio = 0; connectionResult = 0;
+    assert(client->start({rental()})); eventually([&] { return client->ready(); });
+    assert(client->diagnostics().find("enc_state=3 enc_failure=0") != std::string::npos);
+    assert(client->qualityStatus().find("Видео без шифрования; аудио без шифрования") != std::string::npos);
+    client->close();
+    encryptionState = FOG_ENCRYPTION_UNKNOWN; connectionResult = 0;
+}
 int main() {
     const auto path = std::filesystem::temp_directory_path() / ("fogplay-moonlight-session-test-" + std::to_string(::getpid()));
     {
@@ -1020,6 +1068,7 @@ int main() {
     rumbleScenarios(path / "rumble-tests");
     frameRateScenarios(path / "frame-rate-tests");
     videoRecoveryScenarios(path / "video-recovery-tests");
+    encryptionScenarios(path / "encryption-tests");
     std::filesystem::remove_all(path);
     std::cout << "Moonlight production lifecycle/input tests passed\n";
 }

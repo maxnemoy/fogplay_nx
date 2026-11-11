@@ -1,4 +1,5 @@
 #pragma once
+#include "features/streaming/domain/network_telemetry.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -16,8 +17,23 @@ struct RtpRepairConfig {
 // Authenticated RTP only. This layer never interprets compressed video bytes.
 class RtpRepair {
 public:
-    explicit RtpRepair(RtpRepairConfig config = {}) : config_(std::move(config)), source_(config_.mediaSsrc) {}
+    explicit RtpRepair(RtpRepairConfig config = {}) : config_(std::move(config)), source_(config_.mediaSsrc), configNack_(config_.nack()) {}
     const RtpRepairConfig& config() const { return config_; }
+    telemetry::network::RepairSnapshot numericSnapshot() const noexcept {
+        telemetry::network::RepairSnapshot out;
+        out.mediaCount=config_.media.size();out.rtxCount=config_.rtx.size();
+        std::size_t listedMedia=0,listedRtx=0;
+        for(unsigned pt=0;pt<128;++pt){
+            const auto media=config_.media.find(pt);
+            if(media!=config_.media.end()){out.media[pt]={true,media->second};++listedMedia;}
+            const auto rtx=config_.rtx.find(pt);
+            if(rtx!=config_.rtx.end()){out.rtx[pt]={true,rtx->second,rtx->second<128};++listedRtx;}
+        }
+        out.mediaOutOfRange=out.mediaCount-listedMedia;out.rtxOutOfRange=out.rtxCount-listedRtx;
+        out.fid=config_.mediaSsrc!=0&&config_.rtxSsrc!=0;out.sourceKnown=source_!=0;out.nackEnabled=configNack_;
+        out.rtxReceived=rtxReceived_;out.restored=restored_;out.rejected=rejected_;out.controlRejected=controlRejected_;out.nackBatches=nackBatches_;
+        return out;
+    }
     std::string diagnostics() const {
         std::string payloads;
         for (const auto& item : config_.media) payloads += std::to_string(item.first) + ":n" + std::to_string(item.second) + ",";
@@ -119,6 +135,7 @@ private:
     }
     RtpRepairConfig config_;
     std::uint32_t source_ = 0;
+    bool configNack_ = false; // immutable configuration, computed at setup rather than capture
     std::uint64_t rtxReceived_ = 0, restored_ = 0, rejected_ = 0, controlRejected_ = 0, nackBatches_ = 0;
 };
 }

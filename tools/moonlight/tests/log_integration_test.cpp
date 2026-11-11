@@ -52,9 +52,12 @@ int main() {
             FogDiagSetWaitingForIdr(0, 0, 3700);
             FogDiagIdrAssembled(77, 3800);
             FogDiagThreadStarted("VideoRecv", 2, -2, 7, 59, 0, 3900);
+            FogDiagSet(FOG_DIAG_encryptionState, FOG_ENCRYPTION_ACCEPTED);
+            FogDiagSet(FOG_DIAG_encryptionSelected, 1); // Control only, not encrypted video.
             initialVideoFrames = 0;
             assert(client->start({rental()}));
             eventually([&] { return client->ready(); });
+            moonlight_diagnostics::emit(client->diagnostics());
             std::thread mediaOwner([&] { stream::Packet packet; assert(!client->pollVideo(packet)); });
             eventually([&] { return videoWaitBlocked.load(); });
             FogDiagSetWaitingForIdr(1,5,4000);
@@ -78,6 +81,8 @@ int main() {
         assert(text.find("core_us=4100 ") != std::string::npos);
         assert(text.find("Moonlight IDR journal missed=") != std::string::npos);
         assert(text.find("Moonlight thread role=VideoRecv connection=1 core=2") != std::string::npos);
+        assert(text.find("enc_state=3") != std::string::npos && text.find("enc_selected=1") != std::string::npos);
+        for (const auto* secret : {"rikey=", "rtspenc://", "2001:db8", "1234"}) assert(text.find(secret) == std::string::npos);
         assert(fogplay::diagnostics::runLog.stats().droppedLines == 0);
     }
     std::filesystem::current_path(previous);

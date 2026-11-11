@@ -2,7 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "features/providers/infrastructure/foghub_html.hpp"
-#include "features/providers/infrastructure/html_raw_text.hpp"
+#include "features/providers/infrastructure/foghub_html_tree.hpp"
 #include "core/domain/repository_error.hpp"
 #include "features/session/domain/session_rating.hpp"
 #include <libxml/HTMLparser.h>
@@ -147,7 +147,7 @@ Nodes links(xmlNode* node, const char* path) {
 }
 void bounds(xmlNode* node, unsigned depth, std::size_t& count) {
     for (auto* current = node; current; current = current->next) {
-        require(++count <= maxNodes && depth <= maxDepth);
+        require(++count <= maxNodes && depth <= maxDepth && html_tree::allowedNode(current));
         if (current->children) bounds(current->children, depth + 1, count);
     }
 }
@@ -155,13 +155,15 @@ struct ParseErrors { bool invalid{false}; };
 bool toleratedError(const xmlError* error) {
     // libxml2's HTML4 tree builder (2.9.8 on Switch) reports these for actual
     // site templates: HTML5 main/nav, an optional p end tag after block
-    // content, a malformed attribute (class='class='...'') and an entity
-    // without ';' (&nbsp). HTML5 parsers, including the host libxml2 2.15,
-    // accept them silently. Semantic page/table/card checks below still
-    // require complete expected structure.
+    // content, a malformed attribute (class='class='...'') or invalid element
+    // name kept as text, an entity without ';' (&nbsp), and markup inside a
+    // script/style text ("Element script embeds close tag", see document()).
+    // HTML5 parsers, including the host libxml2 2.15, accept them silently.
+    // Semantic page/table/card checks below still require complete structure.
+    const std::string element = error && error->str1 ? error->str1 : "";
     return !error || error->level < XML_ERR_ERROR || error->code == XML_HTML_UNKNOWN_TAG ||
         error->code == XML_ERR_NAME_REQUIRED || error->code == XML_ERR_ENTITYREF_SEMICOL_MISSING ||
-        (error->code == XML_ERR_TAG_NAME_MISMATCH && error->str1 && std::string(error->str1) == "p");
+        (error->code == XML_ERR_TAG_NAME_MISMATCH && (element == "p" || element == "script" || element == "style"));
 }
 #if LIBXML_VERSION >= 21200
 void parseError(void* data, const xmlError* error) {
@@ -178,14 +180,12 @@ void contextParseError(void* data, const xmlError* error) {
 }
 #endif
 void quietError(void*, const char*, ...) {}
-Doc document(const std::string& source) {
-    require(!source.empty() && source.size() <= maxBytes && source.find('\0') == std::string::npos);
-    // Script/style text is opaque to every parser here; see html_raw_text.hpp.
-    const auto html = withoutRawTextContent(source);
-    const auto folded = lower(html);
-    // No DTD/entity declarations are needed by these pages. The HTML parser is
-    // memory-only, NONET, without NOENT/DTDLOAD or relaxed resource limits.
-    require(folded.find("<!entity") == std::string::npos && folded.find("<![") == std::string::npos);
+Doc document(const std::string& html) {
+    require(!html.empty() && html.size() <= maxBytes && html.find('\0') == std::string::npos);
+    // The HTML parser is memory-only, NONET, without NOENT/DTDLOAD or relaxed
+    // resource limits; declarations are judged on the built tree (bounds(),
+    // foghub_html_tree.hpp), not on raw text, which also occurs in script/style.
+    require(!html_tree::leadingInternalSubset(html));
     std::unique_ptr<htmlParserCtxt, decltype(&htmlFreeParserCtxt)> context(htmlNewParserCtxt(), htmlFreeParserCtxt);
     require(static_cast<bool>(context));
     ParseErrors errors;
@@ -197,8 +197,15 @@ Doc document(const std::string& source) {
 #if LIBXML_VERSION >= 21300
     xmlCtxtSetErrorHandler(context.get(), contextParseError, &errors);
 #endif
+    // HTML_PARSE_RECOVER is required on the Switch libxml2 2.9.8 (HTML4): only
+    // in recovery does a script/style element end at its own end tag, as in
+    // HTML5, instead of at the first "</" + letter, which turned FogHub's
+    // JavaScript strings ("<div>...</div>") into stray end tags and rejected
+    // every PC page. The library's own tokenizer decides what is an element;
+    // the input is never pre-processed. 2.9.8 recovery otherwise only keeps a
+    // bare '<' as text and reads a malformed end tag up to '>'.
     Doc doc(htmlCtxtReadMemory(context.get(), html.data(), static_cast<int>(html.size()), nullptr, "UTF-8",
-        HTML_PARSE_NONET | HTML_PARSE_COMPACT | HTML_PARSE_NODEFDTD), xmlFreeDoc);
+        HTML_PARSE_NONET | HTML_PARSE_COMPACT | HTML_PARSE_NODEFDTD | HTML_PARSE_RECOVER), xmlFreeDoc);
     require(doc && xmlDocGetRootElement(doc.get()));
     const auto* error = xmlCtxtGetLastError(context.get());
     // Older Switch libxml2 rejects HTML5 element names such as main/nav. They
@@ -206,7 +213,7 @@ Doc document(const std::string& source) {
     require(!errors.invalid && toleratedError(error));
     require(!doc->extSubset && (!doc->intSubset || !doc->intSubset->children));
     std::size_t count = 0;
-    bounds(xmlDocGetRootElement(doc.get()), 0, count);
+    bounds(doc->children, 0, count);
     return doc;
 }
 xmlNode* mainNode(xmlDoc* doc, const std::string& heading, bool protectedPage) {

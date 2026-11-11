@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+# Maintenance crashes retain this fence; never clear it automatically.
+if [ -e "$ROOT/tools/rtc/.typed-ice-integration.lock" ] || [ -L "$ROOT/tools/rtc/.typed-ice-integration.lock" ]; then
+  echo 'RTC maintenance lock present; inspect its recovery journal before building' >&2
+  exit 1
+fi
 mkdir -p "$ROOT/third_party/rtc"
 fetch() {
   local name=$1 url=$2 tag=$3 commit=$4
@@ -18,6 +23,6 @@ fetch() {
 }
 fetch libdatachannel https://github.com/paullouisageneau/libdatachannel.git v0.24.1 a02b751917ac8afc8c58dc6f4461d25ff9465d48
 fetch mbedtls https://github.com/Mbed-TLS/mbedtls.git mbedtls-3.6.4 c765c831e5c2a0971410692f92f7a81d6ec65ec2
-# patch-sources.py is the active patch recipe. The *.patch files are passive
-# historical diffs retained for provenance; do not apply them a second time.
+# Validate exact nested revisions and apply the checked series, or verify the
+# complete patched state without rewriting it.
 python3 "$ROOT/tools/rtc/patch-sources.py"

@@ -162,3 +162,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_include_directories(rtc-rtcp-feedback-test PRIVATE "${RTC_ROOT}/src")
   target_link_libraries(rtc-rtcp-feedback-test PRIVATE datachannel-static)
 endif()
+
+# Typed ICE numeric/public API and final-cache lifetime regression.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(rtc-typed-ice-test typed-ice/typed-ice-test.cpp)
+  target_compile_options(rtc-typed-ice-test PRIVATE -UNDEBUG)
+  target_include_directories(rtc-typed-ice-test PRIVATE
+    "${RTC_ROOT}/third_party/rtc/libdatachannel/deps/libjuice/include")
+  target_link_libraries(rtc-typed-ice-test PRIVATE datachannel-static)
+  target_link_options(rtc-typed-ice-test PRIVATE -Wl,--wrap=juice_get_diagnostics)
+  target_link_options(rtc-typed-ice-test PRIVATE -Wl,--wrap=juice_get_udp_poll_diagnostics)
+endif()

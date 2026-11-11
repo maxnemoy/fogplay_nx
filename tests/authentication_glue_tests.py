@@ -11,7 +11,8 @@ header = (root / 'src/app/application_controller.hpp').read_text()
 
 
 def method(source, name):
-    start = source.index('void ApplicationController::' + name + '(')
+    start = source.index('ApplicationController::' + name + '(')
+    start = source.rfind('\n', 0, start) + 1
     brace = source.index('{', start)
     depth, end = 1, brace + 1
     while depth:
@@ -26,8 +27,11 @@ def enum(name):
 
 
 harness = r'''
+#include "rental_session_ui_fake.hpp"
 #include "features/account/domain/account_repository.hpp"
 #include "features/session/application/session.hpp"
+#include "features/session/application/checkout.hpp"
+#include "features/playstation/domain/computer.hpp"
 #include "features/session/application/stop_retry_budget.hpp"
 #include "core/constants/ui_text.hpp"
 #include "core/diagnostics/thread_observation.hpp"
@@ -91,15 +95,15 @@ struct RestoredProviders {
     std::optional<fog::UserProfile> mtsProfile,foghubProfile;
 };
 struct RecoveryResult {bool matched=false;};
-struct FakeOrder {int computerId=0;std::string offerId;};
+using FakeOrder=fog::StartRentalRequest;
 struct VerifiedOffer {FakeOrder request;};
 struct ChangedOffer {std::vector<fog::Computer> computers;};
 using TaskResult=std::variant<std::monostate,RestoredProviders,fog::AuthResult,fog::UserProfile,
     fog::GameDetail,fog::Page<fog::Computer>,std::vector<fog::HistoryEntry>,std::vector<fog::Rental>,
     fog::FinishResult,RecoveryResult,VerifiedOffer,ChangedOffer,
-    std::optional<fog::SessionRatingForm>,fog::SessionRatingResult>;
+    std::optional<fog::SessionRatingForm>,fog::SessionRatingResult,fog::RentalSessionCoordinator::WorkerResult>;
 struct FakePaired {void create(const FakeOrder&) {} void bindAuthenticatedAccount() {} void stop() {}};
-struct FakeCheckout {int result() {return 0;} void create(const FakeOrder&) {}};
+struct FakeCheckout {fog::CheckoutResult result() {return {};} void create(const FakeOrder&) {}};
 struct ApplicationController {
     fog::rating::Presentation rating_;
     FakeAuth auth_;
@@ -113,9 +117,9 @@ struct ApplicationController {
     Task task_=Task::RestoreAuth;
     std::string status_,checkoutStatus_;
     std::size_t selection_=1;
-    bool sessionPending_=false,pairedPending_=false,stopAfterTask_=false,exitAfterStop_=false;
-    bool recoveryPaused_=false;
-    fog::StopRetryBudget stopRetry_;
+    bool exitAfterStop_=false; RentalSessionUiFake rentalSession_;
+
+
     bool checkoutAutoPoll_=false,selectedPlayStation_=false,authSaveFailed_=false;
     std::chrono::steady_clock::time_point retryAt_{},checkoutAt_{},playStationLoadedAt_{};
     std::optional<fog::UserProfile> mtsProfile_,foghubProfile_;
@@ -138,7 +142,13 @@ struct ApplicationController {
     void completeSessionRatingLoad(std::optional<fog::SessionRatingForm>) {}
     void completeSessionRatingSubmit(const fog::SessionRatingResult&) {}
     void setCaptcha(const fog::AuthResult&) {}
-    void refreshProfile();void beginLogin();void start(Task,std::function<TaskResult()>);void poll();
+    void refreshProfile();void beginLogin();bool start(Task,std::function<TaskResult()>);void poll();
+    fog::RentalSessionCoordinator::Admission rentalAdmission() const {return {pending_.valid(),exitAfterStop_,true};}
+    void applyRentalEffects(const fog::RentalSessionCoordinator::Effects& effects) {
+        if(effects.flow==fog::RentalSessionCoordinator::Flow::Paused) pauseSessionRecovery();
+    }
+    bool startRental(fog::RentalSessionCoordinator::Request,const char* = "") {return false;}
+    void startProviderRestore() {}
     void frame() {
         try {poll();}
         catch(const std::exception& error) {status_=error.what();}
@@ -147,8 +157,6 @@ struct ApplicationController {
 };
 }
 namespace fog {
-bool checkoutNeedsAutomaticCheck(int) {return false;}
-bool isPlayStationComputerId(int) {return false;}
 }
 namespace fogplay {
 ''' + '\n'.join([method(application, 'refreshProfile'), method(application, 'start'), method(rental, 'pauseSessionRecovery'),
@@ -166,18 +174,18 @@ void noSecretsInLogs() {
 int main() {
     using fogplay::ApplicationController;using fogplay::Screen;
     {
-        ApplicationController app; app.sessionPending_=true;
-        app.start(fogplay::Task::Recovery,[]() -> fogplay::TaskResult {throw std::runtime_error("synthetic active-list outage");});
+        ApplicationController app; app.rentalSession_.pending(true);
+        app.start(fogplay::Task::RentalOperation,[]() -> fogplay::TaskResult {throw std::runtime_error("synthetic active-list outage");});
         app.drain();
-        assert(app.sessionPending_ && app.recoveryPaused_ && !app.checkoutAutoPoll_ && app.screen_==Screen::Recovery);
+        assert(app.rentalSession_.state().pending && app.rentalSession_.paused() && !app.checkoutAutoPoll_ && app.screen_==Screen::Recovery);
         assert(!app.pending_.valid());
     }
     for (const bool paused : {false,true}) {
-        ApplicationController app; app.sessionPending_=true; app.pairedPending_=true; app.recoveryPaused_=paused;
+        ApplicationController app; app.rentalSession_.pending(true); app.rentalSession_.paired(true); if(paused) app.rentalSession_.pause();
         app.start(fogplay::Task::Profile,[]() -> fogplay::TaskResult {return fog::UserProfile{};}); app.drain();
         assert(app.recoveryCalls==(paused?0:1) && !app.pending_.valid());
-        assert(app.stopRetry_.attempts()==0); // profile never dispatches an unbudgeted PairedStop
-        if(paused) assert(app.recoveryPaused_ && app.screen_==Screen::Recovery);
+        assert(app.rentalSession_.attempts()==0); // profile never dispatches an unbudgeted PairedStop
+        if(paused) assert(app.rentalSession_.paused() && app.screen_==Screen::Recovery);
     }
     {
         reset({"identifier-private","password-private"});ApplicationController app;
@@ -231,7 +239,7 @@ int main() {
     }
     {
         reset({std::nullopt});ApplicationController app;app.auth_.method=fog::LoginMethod::PhoneCode;
-        app.sessionPending_=true;app.beginLogin();assert(app.screen_==Screen::Recovery && !app.pending_.valid());
+        app.rentalSession_.pending(true);app.beginLogin();assert(app.screen_==Screen::Recovery && !app.pending_.valid());
     }
     std::cout<<"Auth actual coordinator: direct FH login, login/password non-confirmed and empty input with visible retry status, keyboard/validation/request/profile failure, retry, unsupported response and MTS consent/phone route PASS\n";
 }
@@ -240,5 +248,5 @@ with tempfile.TemporaryDirectory(prefix='fog-auth-glue-') as directory:
     path = Path(directory)
     (path / 'test.cpp').write_text(harness)
     subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-pthread',
-                    '-I' + str(root / 'src'), str(path / 'test.cpp'), '-o', str(path / 'test')], check=True)
+                    '-I' + str(root / 'src'), '-I' + str(root / 'tests'), str(path / 'test.cpp'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True, timeout=15)

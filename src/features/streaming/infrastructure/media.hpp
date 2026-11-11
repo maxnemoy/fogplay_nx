@@ -1,10 +1,12 @@
 #pragma once
 #include "features/streaming/domain/video_codec.hpp"
-#include "features/streaming/domain/streaming_client.hpp"
+#include "features/streaming/domain/compressed_media_source.hpp"
+#include "features/streaming/domain/media_telemetry.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <functional>
 #include <exception>
 #include <stdexcept>
@@ -39,10 +41,14 @@ public:
     // Install before starting workers. Reporter executes on an observer thread;
     // it must only enqueue diagnostics, never call UI/media or block on storage.
     void setVideoStallReporter(std::function<void(const std::string&)> reporter);
+    void setVideoStallObserver(std::function<void(const media::telemetry::StallEvent&)> observer);
     // Observe the blocking SDL2 presentation call. Return is not proof of display scanout.
     void present();
     struct WorkerError {
         std::exception_ptr error;
+        media::telemetry::ErrorCategory category = media::telemetry::ErrorCategory::Unknown;
+        int code = 0;
+        bool recoverable = false;
         ::stream::Packet packet;
         bool hasPacket = false;
     };
@@ -64,7 +70,7 @@ public:
     // Video errors pause decode until the application applies its recovery policy
     // and resetVideoDecoder(). Audio recovers independently; only an exhausted
     // recovery budget or an unexpected failure pauses audio and reports an error.
-    void startWorkers(::stream::StreamingClient& client, int fps, WorkerPolicy policy = WorkerPolicy::FogHub);
+    void startWorkers(::stream::CompressedMediaSource& client, int fps, WorkerPolicy policy = WorkerPolicy::FogHub);
     void stopWorkers() noexcept;
     bool workersRunning() const;
     bool takeWorkerError(WorkerError& error);
@@ -112,6 +118,14 @@ public:
     int videoHeight() const;
     // Numeric decoder/HW metadata and cumulative stage timings; no payload.
     std::string diagnostics() const;
+    // Application owner only: bounded numeric copies from published worker
+    // caches, atomics and UI-owned values. No SDL/decoder/SDK query, formatting,
+    // or mutable worker reference. Format an owned record after this returns.
+    media::telemetry::Snapshot captureTelemetry(media::telemetry::Capture mask = media::telemetry::Capture::All) const;
+    // The last joined worker-run final value, including its UI presentation
+    // facts. Subsequent sync observations or a new run cannot relabel it.
+    // Copy-only while Media is alive; queue/format the returned value by ownership.
+    std::optional<media::telemetry::Snapshot> retainedTelemetry() const;
     // Application thread only. Sparse CPU image statistics and SDL submission
     // stages; no screenshot, GPU readback or proof of physical screen contents.
     std::string imageDiagnostics() const;

@@ -42,15 +42,16 @@ public:
     }
     // Shutdown only, after cancellation and dispatch of any required rental
     // stop. A rejected retry may still own a non-cancellable transport call.
-    void finish() noexcept {
+    Result finishRetained() noexcept {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stopping_ = true;
             changed_.notify_one();
         }
         if (worker_.joinable()) worker_.join();
-        client_.reset();
+        return take();
     }
+    void finish() noexcept { auto retained=finishRetained(); }
 private:
     void run() {
         fog::diagnostics::observeThread("transport-teardown");

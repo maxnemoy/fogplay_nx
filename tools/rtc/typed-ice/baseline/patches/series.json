@@ -1,0 +1,227 @@
+{
+  "repositories": [
+    {
+      "files": [
+        {
+          "base_sha256": "4349be2d68222498aef67afbc032c37708c9b26bfd8622a39b546aa3d33326aa",
+          "patched_sha256": "7d71d3e472a0559b899322becb1c7bb67a0a708468f2b86b2c10eb95cb0db0ff",
+          "path": "CMakeLists.txt"
+        },
+        {
+          "base_sha256": null,
+          "patched_sha256": "064ce74182b6416826249b1310275a02c3de99ef6caf07073f7190eefa80f1b5",
+          "path": "include/rtc/dtlsdiagnostics.hpp"
+        },
+        {
+          "base_sha256": "75f6eed13339eab58b13c9a776fd2fa83478d6854aeb6d926b0adb4942c87050",
+          "patched_sha256": "be74e8795a025b9933058dc235b9c10b782753d608e378433e710953c445b8b7",
+          "path": "include/rtc/global.hpp"
+        },
+        {
+          "base_sha256": "a0705ab92ba24b4083c42d466d62d2145a04eb6f75f971d6e9347ad06dfa0f38",
+          "patched_sha256": "d0211452b3132d1827aeb086ef944e1d9e1cdadf2ba18db623d63be53c91b7ab",
+          "path": "include/rtc/peerconnection.hpp"
+        },
+        {
+          "base_sha256": "81caa19a359f3b729bbfefc5fdf9d46f2a02a4d8b71a081599bcc7ea8bf0ca8d",
+          "patched_sha256": "2b4d550b70b48cf3ce92c424d7c7c8f37c418c4ae1662e54bae492e5b5e2db26",
+          "path": "include/rtc/rtcpreceivingsession.hpp"
+        },
+        {
+          "base_sha256": "157ae6c83da514913f46eabf1be62fa06a0a32f6c0e0f0ed8e68c4c7e5126202",
+          "patched_sha256": "1561d14062e1798bf5599b72060ffe34a064499f9b0badc4389175f23e0bc1e0",
+          "path": "src/global.cpp"
+        },
+        {
+          "base_sha256": null,
+          "patched_sha256": "2a456d6245c32edd769fb70bec051b54434e3e9d599cb6dd64d8fe39223ac30f",
+          "path": "src/impl/dtlsingressqueue.hpp"
+        },
+        {
+          "base_sha256": "02116bedf7e9789fcbd8d0e25422cb5d74c0b1c3fe2fe998e61d32d11d46ad6d",
+          "patched_sha256": "f0ec6aa19fc36a27919a217a1344a05b2d6324199fa60128579a84489d085dfa",
+          "path": "src/impl/dtlssrtptransport.cpp"
+        },
+        {
+          "base_sha256": "fdc4c4ba47528adb1320169f3d74bd7e2e72116733a10bcc9137d07fae884a8f",
+          "patched_sha256": "d2cabe5a12cf49dd4d4af6045d864833a93e5067bc8b9e475fec367e10660fdc",
+          "path": "src/impl/dtlssrtptransport.hpp"
+        },
+        {
+          "base_sha256": "516e7d10f3ae05808655923c3e1a99ba54de937459fe73c15fb08e6951c1fd83",
+          "patched_sha256": "e53896e4febcff910bcb7bfccfcf2c5299c58298a85a59e367e03cabecc89690",
+          "path": "src/impl/dtlstransport.cpp"
+        },
+        {
+          "base_sha256": "ec3a9ecb29448cdcc16ddc1fdda1db79dbf2088485a936eace231d3bef2ea51b",
+          "patched_sha256": "c6f83a73ed836aa6fdf1ef3bab9a401a5c4b7909dbe1aa20032652c663701d7f",
+          "path": "src/impl/dtlstransport.hpp"
+        },
+        {
+          "base_sha256": null,
+          "patched_sha256": "459e2a7f6f3fa104e4a0dedb83c683031277858973aacf423285692e2d5bea6e",
+          "path": "src/impl/fogthreadobservation.h"
+        },
+        {
+          "base_sha256": "792f27120c8b83bebfb4852fd190d688e95d657e94bd023ccd32dca4e2329973",
+          "patched_sha256": "c61bead3ec9bad14aa6f6b92bc80f7a8026dc255a27c1be98580bca41071d6f1",
+          "path": "src/impl/icetransport.cpp"
+        },
+        {
+          "base_sha256": "39f9fec6c9e80403f2707ffb72e7da634117c44248aad7c52e8ff5e27592eea0",
+          "patched_sha256": "39bf44e924c6ba9c706c66f87abbbad925010a747b15eee933c9473a821c1db3",
+          "path": "src/impl/icetransport.hpp"
+        },
+        {
+          "base_sha256": "81f257ac77aa518be48e702f9355a326cd9c45335d19ae3eda32746a757ff09c",
+          "patched_sha256": "6442182a015bc1f62b69dab1b329a3b618a12c9d5b707d7b6bdfc21144a50c53",
+          "path": "src/impl/init.cpp"
+        },
+        {
+          "base_sha256": "1188569fdc32ebc68ec643a9484c4869ee29efb0799f44ba6d669fdf18f1e685",
+          "patched_sha256": "9e17d8c283397caf8ecf8bdb446a8fd75421cdc44c3ff9ae8a4bbca199c823fa",
+          "path": "src/impl/init.hpp"
+        },
+        {
+          "base_sha256": "d323e8e5fc5a552588ec8a3eb449ec01f67177d30a1f512bed7365f6798c3002",
+          "patched_sha256": "2765b182f709f29f9b05b1dd914a336433a609cab65bfc9655e7996f0e280a86",
+          "path": "src/impl/peerconnection.cpp"
+        },
+        {
+          "base_sha256": "5d68fff588d20cf3e46cfa15a1c9d6cd6b65ceb494abcfe420c6ffe1c067b62c",
+          "patched_sha256": "b55af926e4d96a49c396931b0279c50674b0507c737875bf3fea42e56b3860ac",
+          "path": "src/impl/peerconnection.hpp"
+        },
+        {
+          "base_sha256": "2034f1ef0368557c29ad48a10e3cba42d7c53a86bf499f82cf7a6f129a8ab460",
+          "patched_sha256": "bc9a9c68e6d1fd3742248cd5ce0023ca5fd60c7947c122fa5101e6a84ac5a50f",
+          "path": "src/impl/pollinterrupter.cpp"
+        },
+        {
+          "base_sha256": "a808425be9f72cd8d5e79d7606b651b8cabd0fa8994442269840c95ab0952114",
+          "patched_sha256": "e7d5fcdeb9aca09b37a2cea9bd124654ab560ce5a1f90ce0f2d4de6570734872",
+          "path": "src/impl/pollservice.cpp"
+        },
+        {
+          "base_sha256": "fb06e88752c40742d083e8a197260652614bd5fa307cebea1e3baaad2e72eae1",
+          "patched_sha256": "3d97ee0386ac7ea03d95573feb6cd73ff885dcbf69757f56ff67520dfbbbf516",
+          "path": "src/impl/queue.hpp"
+        },
+        {
+          "base_sha256": "d0d472c481a959fd798f347f0638684d3e52e40e602137152d20744a71d6c826",
+          "patched_sha256": "6b6f6a902d7c036082b71f6dc5bd028fd775c40853cc5074c42d8dca911c97de",
+          "path": "src/impl/tlstransport.cpp"
+        },
+        {
+          "base_sha256": "391a96960426e62a8a5e3aaa3e2d39f2796588e60075a72b1824ef69894c2133",
+          "patched_sha256": "22a564ab863ab0e0d5596d2be775e0d52d22b206148bcda777e2226056c62681",
+          "path": "src/impl/utils.cpp"
+        },
+        {
+          "base_sha256": "67f18f3fae5eb291b2ba515b491a56347d3bfb82cee849d0b7f117a50aa707d3",
+          "patched_sha256": "1ea57721df9628651b39850be8e3e8b99abd3f9a6c18a4f12e4a8a1907250cdc",
+          "path": "src/peerconnection.cpp"
+        },
+        {
+          "base_sha256": "8384e4121dd41f930872b92f47c647a4949003f4a5b3b35572c192e81971a0f4",
+          "patched_sha256": "790905980e67dfbcb5704ba4b44453c370cb8e168f79f0e5715f358b8b1ce64e",
+          "path": "src/rtcpreceivingsession.cpp"
+        }
+      ],
+      "patch": "0001-libdatachannel.patch",
+      "patch_sha256": "018bcd82111bb931a8089cc678dfa2d3a226fe5ef25435526086391f5061076f",
+      "path": "third_party/rtc/libdatachannel",
+      "revision": "a02b751917ac8afc8c58dc6f4461d25ff9465d48",
+      "submodules": {
+        "deps/libjuice": "5948a4162d37bc213d6051b67ee2876ccc5a99a6",
+        "deps/usrsctp": "fec583d54493f879d2ae44a743423bf8a04371ab"
+      }
+    },
+    {
+      "files": [
+        {
+          "base_sha256": "eb53b351bd3ae21ce9046daab3cd2e66b8b7bd7d329ed0c2a338c1b3d0dc2e2a",
+          "patched_sha256": "45915bd76092bbe809255c0b473ebd637cfee88d984de71a4a672bb97e965a6a",
+          "path": "include/juice/juice.h"
+        },
+        {
+          "base_sha256": "841c4e58fcfc541dcd359d2d4bc17ecff3554aa7e21ebc78c2e881fd9f28dcc1",
+          "patched_sha256": "085f63a02d9c60ebb4709d3e788e400dee24e3fea5b916a8c43b7401ce7f9b7c",
+          "path": "src/agent.c"
+        },
+        {
+          "base_sha256": "d0e20b3d44e7cd6d7b2d5cbc8dbf42a6578dfbc180babea9f91323e5de8e5743",
+          "patched_sha256": "02574bb2b4855381b2883e5de8d7d7677b394c4bc1f7d4aad7d79ed77400e8a6",
+          "path": "src/agent.h"
+        },
+        {
+          "base_sha256": "6b657222e0d0a2a4439642c5b1cc183a8d43be6302eec69a91789edc55273463",
+          "patched_sha256": "e2bc18ee7428038cb1add1dfd1750e091026dec0149bb993df6c3ed2ef01dc69",
+          "path": "src/conn_poll.c"
+        },
+        {
+          "base_sha256": null,
+          "patched_sha256": "459e2a7f6f3fa104e4a0dedb83c683031277858973aacf423285692e2d5bea6e",
+          "path": "src/fogthreadobservation.h"
+        },
+        {
+          "base_sha256": "596f407b39a7a52ddd5ed197b8f383c7473c0bbaaa3626162904355e3076a5f9",
+          "patched_sha256": "b57ae39460af6d2b0e153f63f9dc419ca124da665bf9166e8b02adebed515cd1",
+          "path": "src/juice.c"
+        },
+        {
+          "base_sha256": "6d5cd3305d0e6eb1d5388d7287f9c2f1d7efeec4dc4f5b8e12312814cbf0ef7f",
+          "patched_sha256": "216c5a058dfeddd7861fb6045a5e2b141efad5a2cd0fd4ad14017a0677070da0",
+          "path": "src/random.c"
+        },
+        {
+          "base_sha256": "4e649b50f5ff96be9350530db72fcaadfcb35cf9e23d67164e412d0e8aa2421b",
+          "patched_sha256": "1dd557aae5275575574d11e80ce5f21e69c5c3609fdfa01969ed53fd78b32e3f",
+          "path": "src/thread.h"
+        }
+      ],
+      "patch": "0002-libjuice.patch",
+      "patch_sha256": "0b33c7a331fc9b981c6e91f5b934c2ab5525314c653f22d6be9919aab8394290",
+      "path": "third_party/rtc/libdatachannel/deps/libjuice",
+      "revision": "5948a4162d37bc213d6051b67ee2876ccc5a99a6"
+    },
+    {
+      "files": [
+        {
+          "base_sha256": null,
+          "patched_sha256": "459e2a7f6f3fa104e4a0dedb83c683031277858973aacf423285692e2d5bea6e",
+          "path": "usrsctplib/netinet/fogthreadobservation.h"
+        },
+        {
+          "base_sha256": "eff782228bd4f90fd2278b7ffced28c1578d0bf34614b45916cfb5dae6ec2ca8",
+          "patched_sha256": "cf80bd51b78270b887c7f4999584e00af7e527a626c11cb5d29441dd551a32c3",
+          "path": "usrsctplib/netinet/sctp_os_userspace.h"
+        },
+        {
+          "base_sha256": "0d37a02e4880faec5c0dc6bc4fb8e1007c9d0e1a43cb1dba1f2fafd022a2248c",
+          "patched_sha256": "5c5a2664173a809006c3762f63ddf338ebcdb2ca32b53af6664fbcd984ccc6d7",
+          "path": "usrsctplib/netinet/sctp_userspace.c"
+        },
+        {
+          "base_sha256": "06159d0127b1f1c520d9ddcb5e9113aee09a355510efff09ed4514035ed5e8bc",
+          "patched_sha256": "aa0f10fdc3e1dee124249719c5cf8706aac7f13b4e7d5ee1c9a662cb155c8c7c",
+          "path": "usrsctplib/user_environment.c"
+        },
+        {
+          "base_sha256": "c0b203501a7d18c4b162a08d521abccf491a867a592cd59b2fa0874622e42c21",
+          "patched_sha256": "86c5b43b0ef44037371ed797b9c7e0004109da42d6e4f6f1a17af597845b6fb9",
+          "path": "usrsctplib/usrsctp.h"
+        }
+      ],
+      "patch": "0003-usrsctp.patch",
+      "patch_sha256": "b02006dd7a7fa7a66d6bcf3ce5997a3adc4c3a17172041aa6a5d2b670cf6a572",
+      "path": "third_party/rtc/libdatachannel/deps/usrsctp",
+      "revision": "fec583d54493f879d2ae44a743423bf8a04371ab"
+    }
+  ],
+  "schema": 1,
+  "tool_inputs": {
+    "tools/rtc/dtls-ingress-queue.h": "2a456d6245c32edd769fb70bec051b54434e3e9d599cb6dd64d8fe39223ac30f",
+    "tools/rtc/thread-observation.h": "459e2a7f6f3fa104e4a0dedb83c683031277858973aacf423285692e2d5bea6e"
+  }
+}

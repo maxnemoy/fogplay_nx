@@ -48,11 +48,10 @@ and logged separately as `Moonlight thread`, including query failure bits.
 Thread events have dedicated signed core/ideal/priority fields, an affinity
 mask and query error bits; they never reuse IDR frame/counter fields.
 
-The raw hint's copied header-size policy is guarded by an exact SHA-256 contract
-against the canonical pinned depacketizer block. Preparation fails before edits
-if its boundaries or content change; review both implementations before
-updating the contract. The test mutates a canonical size branch and verifies
-that instrumentation rejects it without modifying the source.
+The raw hint's copied header-size policy is preserved by the frozen patch
+series and the exact pinned depacketizer file hash. A canonical size-branch
+mutation is rejected before publication in the isolated source-state tests;
+review both implementations before changing the pin or patch contract.
 
 `DECODE_UNIT.receiveTimeUs` becomes the adapter packet's first-receipt timestamp
 by subtracting validated core receipt age from the local steady clock. This
@@ -148,8 +147,17 @@ status refresh before cancellation decisions.
 
 ## Explicit transformations and limits
 
-`prepare.py` copies the pinned upstream HTTP/crypto sources into an ignored
-prepared directory. Every replacement checks its expected occurrence count:
+`prepare.py` reads pinned Git objects and applies ten ordered, checksummed
+patches into a sibling staging directory. The complete 24-file prepared tree
+must match its per-file hashes before publication; an exact existing tree is
+a no-op. The final prepared bytes restore the frozen C7 recovery policy.
+An exact 0.6.33 tree can be migrated through the same checked publication;
+unknown or partial trees are rejected without deleting them.
+See [Moonlight patch-series provenance and validation](../../docs/MOONLIGHT-PATCHES.md)
+for the frozen reference, custom APIs, rollback/recovery boundary, closed
+26-header publication and complete manifest checks. Historical replacement
+modules remain for provenance but are not imported by preparation or tests.
+The preserved transformations are:
 
 - Replace predictable, repeatedly seeded `rand()` with libnx OS-seeded RNG.
 - Implement the upstream TODO for server-secret RSA/SHA256 signature checking
@@ -317,15 +325,23 @@ performance or the OS's real buffer capacity.
 The pinned XITRIX core requests once after the first complete frame following
 loss, then falls back to another request after 120 dropped frames. At 30 fps
 that fallback alone can hold video for about four seconds while UDP reception
-continues. `recovery.py` keeps the original first-complete-frame gate, adds a
+continues. The frozen recovery patch keeps the original first-complete-frame gate, adds a
 500 ms retry deadline anchored to the latest API request, and only retries on
 complete frames already being discarded during IDR wait. Added retries are
-limited to two per second; original loss/decoder-triggered requests retain
-their upstream timing. The 120-drop escalation remains for incomplete frames
+limited to two per second when no new loss occurs. Each new hole rearms an
+immediate request at the next complete frame, including within the same wait
+or after a recent decoder/API request. This permits prompt recovery when a
+requested IDR was lost before recognition. Patch 0010 exactly reverses the
+same-wait throttle introduced by 0009 in 0.6.33; the ordered history and its
+0.6.33 checkpoint remain verified. Decoder refresh remains immediate and
+restarts the fallback deadline; corrupt-sequence and invalid-payload direct
+requests retain their prior timing.
+The 120-drop escalation remains for incomplete frames
 and RFI escalation, coalesced with a recent request. No dependent frame is
 released early. The deadline uses internal monotonic time (Switch hardware ticks), so wall-clock
 adjustments have no effect. Atomic updates reject stale samples after thread
-preemption; connection start resets the deadline.
+preemption; connection start resets the deadline. The unused per-wait
+request-generation state introduced with 0009 is removed.
 
 The preparation also carries current official common-c's partial-IDR guard:
 losing an IDR that has already released the parser's wait must require a fresh
@@ -343,8 +359,96 @@ acceptance, not proof that the host received the request or produced an IDR.
 
 The native recovery test includes the full prepared depacketizer, actual queue
 and exact prepared API/control transaction bodies. It exercises first-frame
-recovery, the 500 ms deadline, decoder request deadline reset, dense-frame
+recovery, the 500 ms fallback without a new hole, immediate repeated-hole recovery,
+lost requested IDR recovery within the same wait,
+new-wait immediacy after a recent request, decoder-thread refresh followed by
+a hole, decoder request deadline reset, dense-frame
 coalescing, P-frame exclusion, IDR release, speculative/confirmed loss, ordinary
 RFI, partial-IDR loss, both control protocols, send failures, wall-clock rollback, stale out-of-order request/retry samples,
-and teardown followed by a new connection. These host tests do not establish
-Switch/network/host recovery latency.
+and teardown followed by a new connection. A second build disables only
+host-input assertions with the pinned fuzzing mode to exercise the existing
+invalid-payload fallback while retaining harness assertions. These host tests
+establish the request-amplification correction, not the cause of all observed
+jitter or Switch/network/host recovery latency. MTS behavior is unchanged.
+
+
+
+# Bounded FH event delivery and receive-gap observations
+
+The typed FH consumer transfers the retained core ring on demand, reserving
+one adapter slot for a source-loss marker. Player admits at most one batch of
+32 events per pump, within the existing four-record diagnostic budget. The
+worker no longer copies a full 256-entry burst into a 32-entry adapter journal.
+MTS retains its existing cadence. Pre-join close preserves pending FH events;
+joined close accounts for remaining discarded events with a capacity-derived
+bound. Releasing the protocol lease closes the old State's core read gate
+before a new State can claim it, so a retained old Client cannot consume a
+new connection's events.
+
+Event 12 (`Moonlight receive event=packet-gap`) records observed packet receipt
+gaps strictly greater than 50000 microseconds. `core_us` and `previousCoreUs`
+are the receipt endpoints in the core clock; `gapUs` is their difference. It
+uses the existing nonblocking bounded journal without packet payloads, I/O or
+allocation on the receive thread. It does not prove network packet loss,
+identify a host stall, or establish a causal mapping to displayed frames.
+Startup without a previous packet and backward clock samples emit no gap.
+
+The Stage 0 reader retains up to 256 receive-gap observations and reports
+omitted records explicitly. It also reads cumulative `journalMissed` from
+core/thread events and final snapshots, plus `coreSourceMissed`. The resulting
+loss count is a conservative lower bound: a core connection ID does not
+identify the adapter journal lifetime, so snapshots, apparent resets and
+connections must not be added together. Loss has no exact wait attribution.
+
+# C7 encryption experiment (default off)
+
+`FOGPLAY_MOONLIGHT_ENCRYPTION=0` retains compatible client A/V opt-out;
+`=1` explicitly requests `ENCFLG_ALL` for each launch/resume/reconnect.
+This is independent of the Stage1, MTS, renderer and input experiments.
+The checked-in policy defaults to 0. Do not enable the release default until
+supporting and unsupported hosts have passed the C7 hardware matrix and the
+CPU/receive-decrypt/frame-age/stability limits defined before that run.
+Privacy is the benefit; faster playback is not a requirement.
+
+The core already supports the crypto primitives. This change observes the
+pinned selection; it does not replace algorithms, keys, IVs or wire formats.
+Known host-required capabilities missing from the host-supported mask fail
+before SETUP/ANNOUNCE with `FOG_MOONLIGHT_ENCRYPTION_CONFLICT` (-5501).
+After actual SDP selection, required video/control must be selected, required
+audio must have its CBC path enabled, and required control must pass the pinned
+control-version gate. An advertised-but-unavailable required mode is rejected
+before ANNOUNCE with the same safe code; the generated SDP is freed normally.
+There is no automatic plaintext retry after a crypto/required-mode failure.
+An unsupported video host can still connect in compatible mode, with the
+absence of video encryption explicitly shown by qualityStatus(). Audio uses
+its actual negotiated flag, including the independent Nvidia feature path;
+client and Sunshine bit masks are not interchangeable.
+
+Diagnostics separate requested client mask, host supported/required masks,
+selected mode, accepted RTSP handshake and observed successful decrypt calls.
+States: 0 unknown, 1 capabilities, 2 selected, 3 accepted, 4 failed;
+failures: 0 none, 1 contradictory requirement, 2 RTSP handshake failure.
+`enc_requested` is the configured policy; `enc_core_request` is the request
+actually observed by the core. UNKNOWN never means plaintext or encrypted.
+`enc_observed_video/audio` count successful local decrypt calls independently
+of timing validity. `rx_decrypt` includes measured successful and failed
+attempts and is elapsed time, not CPU time or a session percentile.
+No secret values, endpoints, raw SDP or packet content are added to logs.
+
+Remote input is encrypted by the existing protocol even with A/V opt-out.
+Control, RTSP (`rtspenc://`), video (AES-GCM) and audio (AES-CBC) are distinct:
+ALL is permission to negotiate, not an assertion that all channels are secure.
+The UI describes only the accepted media selection; observed crypto counters
+are separate diagnostic evidence. Audio CBC does not gain GCM authentication,
+and network headers/metadata are not hidden by the client flag.
+
+`tools/moonlight/test.sh` now runs real pinned mbedTLS known-vector/tamper
+checks, the full prepared RTSP handshake and pinned SDP generator with a
+transport fixture (including contradictory requirements and fallback), actual
+RTSP sealing/unsealing with plaintext/tag rejection, and exact prepared video
+receive/audio decode boundaries with real crypto and sink/I/O doubles.
+Production session tests run both default and opt-in flags, checking retained
+post-stop results, failure diagnostics, generation reset, and honest plaintext
+status. Existing ASan/UBSan diagnostics/lifecycle tests remain required.
+These host tests and Switch syntax checks do not prove on-device negotiation,
+paid FH compatibility, hardware performance or acceptance of C7.

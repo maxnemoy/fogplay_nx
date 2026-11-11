@@ -3,15 +3,15 @@
 #include "features/session/presentation/session_rating_view.hpp"
 
 namespace fogplay {
-bool ApplicationController::offerSessionRating(const fog::PairedCheckoutResult& result) {
-    if (ratingFocusLost_ || exitAfterStop_ || shutdownDone_ || sessionPending_) return false;
+bool ApplicationController::offerSessionRating(const fog::RentalSessionCoordinator::PairedView& result) {
+    if (ratingFocusLost_ || exitAfterStop_ || shutdownDone_ || rentalSession_.state().pending) return false;
     if (result.preparationError == fog::RepositoryErrorKind::ReviewRequired)
         return result.requiredRating && openSessionRating(*result.requiredRating);
     return result.state == fog::PairedCheckoutState::Terminal && !result.rental.empty() &&
         openSessionRating(result.rental);
 }
 bool ApplicationController::openSessionRating(std::optional<fog::RentalId> rental) {
-    if (sessionPending_ || pending_.valid() || exitAfterStop_ || shutdownDone_ ||
+    if (rentalSession_.state().pending || pending_.valid() || exitAfterStop_ || shutdownDone_ ||
         appletGetFocusState() != AppletFocusState_InFocus) return false;
     if (!pairedServices_ || !pairedServices_->rentals().sessionRatingSupported()) {
         status_ = fog::rating::text::Unavailable; return false;
@@ -38,7 +38,7 @@ void ApplicationController::completeSessionRatingSubmit(const fog::SessionRating
     status_.clear();
 }
 void ApplicationController::submitSessionRating() {
-    if (sessionPending_ || pending_.valid() || exitAfterStop_ || shutdownDone_ || !pairedServices_) return;
+    if (rentalSession_.state().pending || pending_.valid() || exitAfterStop_ || shutdownDone_ || !pairedServices_) return;
     const auto request = rating_.request();
     if (!request) return;
     rating_.submitting();

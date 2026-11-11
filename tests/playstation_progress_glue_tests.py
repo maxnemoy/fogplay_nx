@@ -16,6 +16,7 @@ def method(name):
 
 harness = r'''
 #include "core/diagnostics/thread_observation.hpp"
+#include "rental_session_ui_fake.hpp"
 #include "features/playstation/application/catalog_progress.hpp"
 #include "features/playstation/domain/computer.hpp"
 #include <cassert>
@@ -61,7 +62,7 @@ namespace fogplay {
 enum class Screen {PlayStation,PlayStationDetails,Games,Checkout};
 struct ApplicationController {
     Screen screen_=Screen::Games;
-    bool sessionPending_=false;
+    RentalSessionUiFake rentalSession_;
     std::future<int> pending_;
     struct Latency {void cancel() {}} latency_;
     int nav_=0;
@@ -177,6 +178,6 @@ with tempfile.TemporaryDirectory(prefix='fog-playstation-progress-') as director
     path=Path(directory)
     (path/'test.cpp').write_text(harness)
     subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-pthread',
-                    '-I'+str(root/'src'),'-I'+str(root/'third_party'),
+                    '-I'+str(root/'src'),'-I'+str(root/'tests'),'-I'+str(root/'third_party'),
                     str(path/'test.cpp'),'-o',str(path/'test')],check=True)
     subprocess.run([str(path/'test')],check=True,timeout=15)

@@ -34,6 +34,10 @@ private:
 // and acknowledged after SDL_RenderPresent returned, never a retained redraw.
 class VideoLatencyMetrics {
 public:
+    struct Snapshot {
+        std::array<metrics::LatencyHistogram::Snapshot,3> stages{};
+        std::uint64_t lateThresholdUs=0,lateCount=0,latePpm=0,unavailableAge=0,unavailableWait=0;
+    };
     void presented(VideoFrameOrigin origin, std::uint64_t nowUs) {
         if (origin.firstPacketMs && origin.firstPacketMs <= nowUs / 1000)
             frameAge_.record(nowUs - origin.firstPacketMs * 1000, nowUs);
@@ -43,17 +47,25 @@ public:
         if (havePrevious_ && nowUs >= previousUs_) gap_.record(nowUs - previousUs_, nowUs);
         previousUs_ = nowUs; havePrevious_ = true;
     }
-    std::string diagnostics(std::uint64_t nowUs, int fps) const {
-        const auto gap = gap_.snapshot(nowUs);
+    Snapshot snapshot(std::uint64_t nowUs,int fps) const {
+        Snapshot value;
+        value.stages={frameAge_.snapshot(nowUs),queueWait_.snapshot(nowUs),gap_.snapshot(nowUs)};
         const auto threshold = std::uint64_t(1500000) / (fps > 0 ? fps : 30);
         const auto late = gap_.countAbove(threshold, nowUs);
+        value.lateThresholdUs=threshold;value.lateCount=late;
+        value.latePpm=value.stages[2].samples?late*1000000/value.stages[2].samples:0;
+        value.unavailableAge=unavailableAge_;value.unavailableWait=unavailableWait_;
+        return value;
+    }
+    std::string diagnostics(std::uint64_t nowUs, int fps) const {
+        const auto value=snapshot(nowUs,fps);
         return "videoLatency windowMs=5000 sample=completed-new-present timestampResolutionMs=1 "
-            "frameAgeSource=local-first-packet-to-sdl-return frameAge{" + frameAge_.text(nowUs) +
-            "} assembledQueueWait{" + queueWait_.text(nowUs) + "} presentGap{" + gap.text() +
-            "} lateThresholdUs=" + std::to_string(threshold) + " lateCount=" + std::to_string(late) +
-            " latePpm=" + std::to_string(gap.samples ? late * 1000000 / gap.samples : 0) +
-            " frameAgeUnavailableLifetime=" + std::to_string(unavailableAge_) +
-            " queueWaitUnavailableLifetime=" + std::to_string(unavailableWait_);
+            "frameAgeSource=local-first-packet-to-sdl-return frameAge{" + value.stages[0].text() +
+            "} assembledQueueWait{" + value.stages[1].text() + "} presentGap{" + value.stages[2].text() +
+            "} lateThresholdUs=" + std::to_string(value.lateThresholdUs) + " lateCount=" + std::to_string(value.lateCount) +
+            " latePpm=" + std::to_string(value.latePpm) +
+            " frameAgeUnavailableLifetime=" + std::to_string(value.unavailableAge) +
+            " queueWaitUnavailableLifetime=" + std::to_string(value.unavailableWait);
     }
 private:
     metrics::LatencyHistogram frameAge_, queueWait_, gap_;

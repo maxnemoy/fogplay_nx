@@ -19,3 +19,5 @@ g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-fram
 ./work/typed_text_tests | tee work/logs/typed-text-tests.log
 g++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/gamepad_schedule_tests.cpp -o work/gamepad_schedule_tests
 ./work/gamepad_schedule_tests | tee work/logs/gamepad-schedule-tests.log
+g++ -std=c++17 -Wall -Wextra -Werror -DFOGPLAY_INPUT_CHANGE_ONLY=1 -Isrc tests/gamepad_schedule_tests.cpp -o work/gamepad_schedule_change_tests
+./work/gamepad_schedule_change_tests | tee work/logs/gamepad-schedule-change-tests.log

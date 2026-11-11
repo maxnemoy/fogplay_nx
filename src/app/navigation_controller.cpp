@@ -9,7 +9,7 @@ namespace fogplay {
 
 void ApplicationController::moveGrid(u64 keys, std::size_t count, std::size_t columns) {
     if (!count) { selection_ = 0; return; }
-    if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) { if (selection_ % columns) --selection_; else if (!sessionPending_ || recoveryPaused_) sidebar_ = true; }
+    if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) { if (selection_ % columns) --selection_; else if (!rentalSession_.state().pending || rentalSession_.paused()) sidebar_ = true; }
     if ((keys & (HidNpadButton_Right | HidNpadButton_StickLRight)) && selection_ + 1 < count) ++selection_;
     if ((keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) && selection_ >= columns) selection_ -= columns;
     if ((keys & (HidNpadButton_Down | HidNpadButton_StickLDown)) && selection_ + columns < count) selection_ += columns;
@@ -24,38 +24,38 @@ void ApplicationController::input(u64 keys) {
         return;
     }
     if (screen_ == Screen::ManualResolution) {
-        if (keys & HidNpadButton_A) start(Task::ManualResolution,[this] { checkout_.acknowledgeManualResolution(); return std::monostate{}; });
-        else if (keys & HidNpadButton_B) { screen_ = recoveryPaused_ ? Screen::Recovery : Screen::Checkout; }
+        if (keys & HidNpadButton_A) startRental(fog::RentalSessionCoordinator::ManualResolution{});
+        else if (keys & HidNpadButton_B) { screen_ = rentalSession_.paused() ? Screen::Recovery : Screen::Checkout; }
         return;
     }
     if (screen_ == Screen::Profile) {
         if (keys & (HidNpadButton_Up | HidNpadButton_Down | HidNpadButton_StickLUp | HidNpadButton_StickLDown)) selection_ = selection_ ? 0 : 1;
         loginProvider_ = selection_ ? fog::ProviderId::FogHub : fog::ProviderId::Mts;
-        if (keys & HidNpadButton_B) { screen_ = sessionPending_ ? Screen::Recovery : Screen::Games; return; }
+        if (keys & HidNpadButton_B) { screen_ = rentalSession_.state().pending ? Screen::Recovery : Screen::Games; return; }
         if (!providerServices(loginProvider_)) return;
         if (keys & HidNpadButton_A) refreshProfile();
-        else if ((keys & HidNpadButton_X) && !sessionPending_) {
+        else if ((keys & HidNpadButton_X) && !rentalSession_.state().pending) {
             start(Task::ProviderForget,[this] { loginAuth().forget(); return std::monostate{}; });
         } else if ((keys & HidNpadButton_R) && loginProvider_ == fog::ProviderId::Mts) loadSessions();
-        else if ((keys & HidNpadButton_R) && pairedPending_) recoverSession();
-        else if ((keys & HidNpadButton_R) && loginProvider_ == fog::ProviderId::FogHub && !sessionPending_)
+        else if ((keys & HidNpadButton_R) && rentalSession_.state().pairedPending) recoverSession();
+        else if ((keys & HidNpadButton_R) && loginProvider_ == fog::ProviderId::FogHub && !rentalSession_.state().pending)
             openSessionRating();
         return;
     }
     if (screen_ == Screen::Checkout) {
         if (keys & HidNpadButton_Y) openProfile();
         else if (keys & HidNpadButton_B) queueCheckoutStop();
-        else if ((keys & HidNpadButton_A) && (pairedPending_ ? pairedServices_->auth().authenticated() : auth_.authenticated())) pollCheckout(true);
-        else if ((keys & HidNpadButton_X) && !pairedPending_ && checkout_.unresolved()) screen_ = Screen::ManualResolution;
+        else if ((keys & HidNpadButton_A) && (rentalSession_.state().pairedPending ? pairedServices_->auth().authenticated() : auth_.authenticated())) pollCheckout(true);
+        else if ((keys & HidNpadButton_X) && !rentalSession_.state().pairedPending && rentalSession_.state().checkoutPending) screen_ = Screen::ManualResolution;
         return;
     }
     if (screen_ == Screen::Stopping || screen_ == Screen::Recovery) {
         if (keys & HidNpadButton_Y) openProfile();
-        else if ((keys & HidNpadButton_X) && !pairedPending_ && checkout_.unresolved()) screen_ = Screen::ManualResolution;
-        else if ((keys & HidNpadButton_B) && recoveryPaused_) {
+        else if ((keys & HidNpadButton_X) && !rentalSession_.state().pairedPending && rentalSession_.state().checkoutPending) screen_ = Screen::ManualResolution;
+        else if ((keys & HidNpadButton_B) && rentalSession_.paused()) {
             loadGames(); sidebar_ = true; status_ = uiText::Server::RecoveryStillPending;
         }
-        else if ((keys & HidNpadButton_A) && (pairedPending_ ? pairedServices_->auth().authenticated() : auth_.authenticated())) {
+        else if ((keys & HidNpadButton_A) && (rentalSession_.state().pairedPending ? pairedServices_->auth().authenticated() : auth_.authenticated())) {
             retrySessionRecovery();
         }
         return;
@@ -63,7 +63,7 @@ void ApplicationController::input(u64 keys) {
     if (screen_ == Screen::Consent) {
         if (keys & HidNpadButton_A) beginLogin();
         else if (keys & HidNpadButton_B) {
-            screen_ = sessionPending_ ? Screen::Recovery : loginReturn_;
+            screen_ = rentalSession_.state().pending ? Screen::Recovery : loginReturn_;
             if (screen_ == Screen::Games && catalog_.items().empty()) loadGames();
         }
         return;
@@ -71,7 +71,7 @@ void ApplicationController::input(u64 keys) {
     if (screen_ == Screen::Auth) {
         if (keys & HidNpadButton_A) enterCode();
         else if (keys & HidNpadButton_B) {
-            screen_ = sessionPending_ ? Screen::Recovery : loginReturn_;
+            screen_ = rentalSession_.state().pending ? Screen::Recovery : loginReturn_;
             if (screen_ == Screen::Games && catalog_.items().empty()) loadGames();
         }
         return;
@@ -127,7 +127,7 @@ void ApplicationController::input(u64 keys) {
             selection_ = std::min(selection_,count-1);
             if (keys & (HidNpadButton_Left | HidNpadButton_StickLLeft)) {
                 if (selection_ % columns) --selection_;
-                else if (!sessionPending_ || recoveryPaused_) sidebar_ = true;
+                else if (!rentalSession_.state().pending || rentalSession_.paused()) sidebar_ = true;
             }
             if ((keys & (HidNpadButton_Right | HidNpadButton_StickLRight)) && selection_ % columns < columns-1 && selection_+1 < count) ++selection_;
             if ((keys & (HidNpadButton_Up | HidNpadButton_StickLUp)) && selection_ >= columns) selection_ -= columns;

@@ -1,199 +1,250 @@
 #include "app/application_controller.hpp"
-#include <iostream>
-
+#include <atomic>
+using namespace player_adapter_test;
+using fogplay::ApplicationController;
 namespace {
-int assertions = 0, saves = 0;
-bool saveThrows = false;
+std::atomic<unsigned> saves{0};
+std::atomic<bool> saveThrows{false};
 fog::video::Settings saved;
-void require(bool condition,const char* message) {
-    ++assertions;
-    if (!condition) throw std::runtime_error(message);
-}
-fog::video::Settings changed(fogplay::ApplicationController& controller) {
-    auto value = controller.videoSettings_;
-    value.codec = stream::VideoCodec::H264; value.bitrateMbps = 30;
-    value.quality = 0; value.keyframeSeconds = 0;
+std::thread::id writer;
+player_test::Blocker* saveBlocker = nullptr;
+fog::video::Settings changed(const ApplicationController& c, int bitrate = 30) {
+    auto value = c.videoSettings_; value.codec = ::stream::VideoCodec::H264;
+    value.bitrateMbps = bitrate; value.quality = value.keyframeSeconds = 0;
     return value;
+}
+bool notice(const ApplicationController& c, const std::string& text) { return c.videoSaveStatus_.find(text) != std::string::npos; }
+void edit(ApplicationController& c, int bitrate = 30) { c.changeVideoSettings(changed(c,bitrate),true); c.settingsSaves_.flush(); }
+Rental::Effects quality(ApplicationController& c, unsigned inspections = 1) {
+    c.verifyRequest(Player::Purpose::Quality);
+    const auto count = c.rental.fh.inspections;
+    auto result = c.join();
+    require(result.operation == Rental::Operation::QualityInspection && c.rental.fh.inspections == count + inspections,
+        "quality uses real coordinator poll with expected ownership and stop-verification reads");
+    return result;
+}
+void resume(ApplicationController& c, const Rental::Effects& result) {
+    c.deliver(result); c.step(); c.joined(); c.effects(); c.step();
 }
 }
 namespace fog::video {
-void saveSettings(const std::string&,const Settings& settings) {
-    ++saves;
-    if (saveThrows) throw std::runtime_error("synthetic storage failure");
-    saved = settings;
+void saveSettings(const std::string&, const Settings& value) {
+    ++saves; writer = std::this_thread::get_id();
+    const bool fail = saveThrows.load();
+    if (saveBlocker) saveBlocker->block();
+    if (fail) throw std::runtime_error("synthetic storage failure");
+    saved = value;
 }
+}
+static void persistenceAndCoalescing() {
+    namespace Text = fog::constants::ui::Settings;
+    {
+        ApplicationController c(1h);
+        const auto count = saves.load(); auto value = changed(c); value.framesPerSecond = 60;
+        c.changeVideoSettings(value,true);
+        require(fog::stage1::asyncSettings ? saves == count && notice(c,Text::Saving) : saves == count + 1 && notice(c,Text::Saved),
+            "save status matches async or synchronous settings profile");
+        require(c.pending.valid() && c.videoSettings_.bitrateMbps == 30 && c.starts() == 1,
+            "in-memory preferences and quality inspection do not wait for storage");
+        c.settingsSaves_.flush();
+        require(saves == count + 1 && notice(c,Text::Saved) && notice(c,Text::FogHubReconnectNotice) &&
+            notice(c,"60 FPS") && c.overlay_.saved == c.videoSaveStatus_,
+            "owner completion preserves reconnect and next-FPS notices");
+        if (fog::stage1::asyncSettings) require(writer != std::this_thread::get_id(), "real settings writer runs off owner thread");
+    }
+    {
+        ApplicationController c; c.videoSettings_.quality = 4; c.videoSettings_.keyframeSeconds = 5;
+        auto original = c.client(); edit(c);
+        require(saved.quality == 4 && saved.keyframeSeconds == 5 && saved.bitrateMbps == 30,
+            "FH normalized edits preserve shared MTS quality and keyframe preferences");
+        require(c.pending.valid() && original->retries == 0 && original->closes == 0,
+            "healthy transport remains alive until verified quality verdict");
+        edit(c,40); require(c.dispatches == 1, "edits coalesce into single inspection");
+        auto result = quality(c); c.deliver(result);
+        require(original->retries == 0 && c.starts() == 1, "quality verdict is store-only until fresh admission");
+        c.step(); c.joined();
+        require(c.starts() == 1 && c.owner.snapshot().qualityClosing, "joined close never resumes before overlay input");
+        c.step();
+        require(c.starts() == 2 && c.client()->settings.bitrateMbps == 40 && c.client()->connection.resumeOnly &&
+            c.client()->connection.rental == c.identity && original->retries == 1 && original->closes == 0 && c.stops.empty(),
+            "real Player resumes exact rental with latest coalesced settings after nonfinal close");
+        require(c.owner.snapshot().attempts == 0 && c.rental.fh.creates == 1, "quality reconnect neither spends recovery budget nor creates rental");
+        c.deliver(result); c.step(); require(c.starts() == 2, "duplicate consumed result cannot resume twice");
+    }
+    {
+        ApplicationController c; saveThrows = true; edit(c); saveThrows = false;
+        require(notice(c,Text::NotSaved) && c.pending.valid() && c.videoSettings_.bitrateMbps == 30,
+            "storage failure is visible while explicit in-memory quality intent remains valid");
+    }
+    {
+        ApplicationController c; c.settingsSaves_.finish(); edit(c);
+        require(notice(c,Text::NotSaved) && c.pending.valid(), "settings dispatch failure reports unsaved preferences without losing live intent");
+    }
+    if (fog::stage1::asyncSettings) {
+        ApplicationController c; player_test::Blocker blocker; saveBlocker = &blocker; saveThrows = true;
+        c.changeVideoSettings(changed(c),true);
+        const bool entered = blocker.wait();
+        saveThrows = false;
+        c.changeVideoSettings(changed(c,40),true);
+        const bool responsive = c.pending.valid() && c.videoSettings_.bitrateMbps == 40 && c.dispatches == 1 && notice(c,Text::Saving);
+        blocker.release(); c.settingsSaves_.flush(); saveBlocker = nullptr;
+        require(entered && responsive, "blocked settings write does not block owner edits or inspection coalescing");
+        require(saved.bitrateMbps == 40 && notice(c,Text::Saved) && !notice(c,Text::NotSaved),
+            "older failed async write cannot overwrite latest successful revision status");
+    }
+}
+static void cancellationAndClose() {
+    for (int intent = 0; intent < 8; ++intent) {
+        ApplicationController c; player_test::Blocker blocker;
+        c.client()->retryAction = [&] { blocker.block(); };
+        edit(c); auto result = quality(c); c.deliver(result); c.step();
+        const bool entered = blocker.wait();
+        const bool blocked = c.owner.snapshot().teardown && c.starts() == 1;
+        edit(c,40);
+        const bool coalesced = c.dispatches == 1 && c.starts() == 1 && c.owner.snapshot().qualityClosing;
+        blocker.release(); c.joined();
+        require(entered && blocked && coalesced && c.starts() == 1,
+            "quality edits coalesce during blocked real close and mailbox join never resumes");
+        if (intent == 0) c.admission.stopRequested = true;
+        if (intent == 1) c.admission.shuttingDown = true;
+        if (intent == 2) c.admission.pairedPending = false;
+        if (intent == 3) c.admission.rentalPending = false;
+        if (intent == 4) c.admission.active = false;
+        if (intent == 5) c.owner.cancel();
+        if (intent == 6) c.owner.closeResolvedRental();
+        c.step();
+        if (intent == 7) {
+            require(c.starts() == 2 && !c.owner.snapshot().qualityClosing && c.stops.empty() &&
+                c.client()->settings.bitrateMbps == 40 && c.client()->connection.resumeOnly &&
+                c.client()->connection.rental == c.identity,
+                "fresh positive admission resumes exact rental with edits coalesced during blocked close");
+            c.step();
+            require(c.starts() == 2, "joined quality close is consumed exactly once");
+        } else {
+            require(c.starts() == 1 && !c.owner.snapshot().qualityClosing,
+                "post-join overlay stop, shutdown, lost ownership/focus, final close or cancel prevents resume");
+        }
+    }
+    {
+        ApplicationController c; player_test::Blocker blocker;
+        c.client()->retryAction = [&] { blocker.block(); };
+        edit(c); c.deliver(quality(c)); c.step(); const bool entered = blocker.wait();
+        c.now += 14999ms; c.step(); const bool alive = c.stops.empty();
+        c.now += 1ms; c.step(); blocker.release(); c.joined();
+        require(entered && alive && c.stops == std::vector<Player::StopReason>{Player::StopReason::QualityCloseDeadline} && c.starts() == 1,
+            "quality close remains bounded by fifteen seconds even with blocked callback");
+    }
+    for (int intent = 0; intent < 3; ++intent) {
+        ApplicationController c; edit(c); auto result = quality(c); auto original = c.client(); c.deliver(result);
+        if (intent == 0) c.admission.stopRequested = true;
+        if (intent == 1) c.admission.shuttingDown = true;
+        if (intent == 2) c.admission.active = false;
+        c.step();
+        require(c.starts() == 1 && original->retries == 0 && original->closes == 0,
+            "fresh overlay admission beats ready quality result before close begins");
+    }
+}
+static void failuresAndContracts() {
+    for (int invalid = 0; invalid < 7; ++invalid) {
+        ApplicationController c; edit(c); auto result = quality(c);
+        if (invalid == 0) result.resume->expected.value = "other";
+        if (invalid == 1) result.resume->expected.provider = ProviderId::Mts;
+        if (invalid == 2) result.resume->purpose = Rental::ResumePurpose::Transport;
+        if (invalid == 3) result.resume->status = Rental::ResumeStatus::Refused;
+        if (invalid == 4) result.resume.reset();
+        if (invalid == 5) c.client()->disconnected = true;
+        if (invalid == 6) c.client()->ready = false;
+        c.deliver(result); c.step();
+        require(c.starts() == 1 && c.stops.size() == 1, "invalid identity/purpose/evidence or failed live stream forbids quality resume");
+    }
+    for (int failure = 0; failure < 3; ++failure) {
+        ApplicationController c; edit(c); auto result = quality(c); auto original = c.client();
+        if (failure == 0) original->retryOk = false;
+        if (failure == 1) { auto next = std::make_shared<player_test::ClientState>(); next->startOk = false; c.transports.next.push_back(next); }
+        if (failure == 2) c.transports.fail = true;
+        resume(c,result);
+        require(c.stops.size() == 1 && (failure != 0 || original->closes == 0),
+            "refused retry-close, failed resume or thrown factory requests owned stop");
+    }
+    {
+        ApplicationController c; c.dispatchFails = true; edit(c);
+        require(c.stops == std::vector<Player::StopReason>{Player::StopReason::InspectionDispatch} && !c.owner.snapshot().inspection,
+            "quality dispatch failure clears pending intent and requires stop");
+    }
+    {
+        ApplicationController c; edit(c); c.rental.fh.pairedTerminal = true; c.deliver(quality(c)); c.joined(); c.step();
+        require(!c.owner.snapshot().ownsRental && c.starts() == 1 && c.stops.empty(),
+            "terminal coordinator evidence closes resolved rental without quality restart");
+    }
+    {
+        ApplicationController c; edit(c); c.rental.fh.inspectionFailure = true;
+        const auto result = quality(c,2);
+        require(c.rental.owner->requested() && c.rental.owner->state().paired.stopRequested && (!result.resume || result.resume->status != Rental::ResumeStatus::Retry),
+            "real quality poll preserves Stage2 stop-on-inspection-error contract unlike transport inspectForResume");
+        c.deliver(result); c.joined(); c.step();
+        require(c.starts() == 1, "quality inspection outage cannot start an unverified stream");
+    }
+    {
+        ApplicationController c; c.admission.serviceBusy = true; edit(c);
+        require(c.stops.empty() && c.starts() == 1 && c.client()->retries == 0 && !c.pending.valid() &&
+            notice(c,fog::constants::ui::Settings::FogHubReconnectBusyNotice), "busy service saves preferences and keeps healthy rental");
+    }
+}
+static void handshakeAndFps() {
+    namespace Text = fog::constants::ui::Settings;
+    for (bool resumed : {false,true}) {
+        ApplicationController c;
+        if (resumed) {
+            auto next = std::make_shared<player_test::ClientState>(); next->ready = false; c.transports.next.push_back(next);
+            edit(c); resume(c,quality(c));
+        } else c.client()->ready = false;
+        const auto starts = c.starts(); const auto dispatches = c.dispatches; const auto active = c.client()->settings;
+        edit(c,40);
+        require(c.starts() == starts && c.dispatches == dispatches && !c.pending.valid() && c.stops.empty() &&
+            c.client()->settings == active && c.client()->updates == 0 && c.videoSettings_.bitrateMbps == 40 && notice(c,Text::FogHubConnectingSavedNotice),
+            "initial/resumed handshake saves next settings without another stop or reconnect");
+    }
+    for (auto provider : {ProviderId::Mts,ProviderId::FogHub}) {
+        ApplicationController c(0ms,provider);
+        const auto original = c.client()->settings; auto value = c.videoSettings_; value.framesPerSecond = 60;
+        c.changeVideoSettings(value,true); c.settingsSaves_.flush();
+        require(saved.framesPerSecond == 60 && c.owner.snapshot().framesPerSecond == 30 && c.client()->settings == original &&
+            !c.pending.valid() && c.starts() == 1 && c.stops.empty() && notice(c,"60 FPS"),
+            "FPS-only edit persists for next connection without changing live transport");
+        require(c.client()->updates == 0, "FPS-only edit sends no live video settings request on either provider");
+        value.bitrateMbps = 30; c.changeVideoSettings(value,true); c.settingsSaves_.flush();
+        if (provider == ProviderId::Mts) {
+            require(c.client()->updates == 1 && c.client()->settings.bitrateMbps == 30 && c.client()->settings.framesPerSecond == 30 &&
+                saved.framesPerSecond == 60 && !c.pending.valid() && notice(c,Text::RequestSentNotice),
+                "MTS live bitrate preserves active FPS and saves next FPS");
+        } else {
+            resume(c,quality(c));
+            require(c.starts() == 2 && c.client()->settings.framesPerSecond == 60 && c.client()->connection.rental == c.identity,
+                "explicit FH bitrate reconnect applies latest saved FPS to exact rental");
+        }
+    }
+    {
+        ApplicationController c(0ms,ProviderId::Mts,60); auto value = c.videoSettings_; value.framesPerSecond = 30; value.quality = 2;
+        c.changeVideoSettings(value,true); c.settingsSaves_.flush();
+        require(saved.framesPerSecond == 30 && c.client()->updates == 1 && c.client()->settings.framesPerSecond == 60 && c.client()->settings.quality == 2,
+            "saved 30 FPS never implicitly downgrades live MTS 60 FPS");
+    }
+    {
+        ApplicationController c(0ms,ProviderId::Mts); c.client()->configOk = false; edit(c);
+        require(notice(c,Text::RequestNotSentNotice) && c.stops.empty(), "rejected MTS live request has explicit saved-but-not-applied notice");
+    }
+    {
+        ApplicationController c; const auto count = saves.load(); auto value = changed(c); value.framesPerSecond = 17;
+        c.changeVideoSettings(value,true); c.settingsSaves_.flush();
+        require(saves == count && !c.pending.valid(), "invalid settings never persist or start inspection");
+        c.changeVideoSettings(changed(c),false); c.settingsSaves_.flush();
+        require(saved.bitrateMbps == 30 && !c.pending.valid() && c.client()->updates == 0 && c.client()->settings.bitrateMbps == 20,
+            "non-live edit persists without touching transport");
+    }
 }
 int main() {
-    using namespace fogplay;
     try {
-        { ApplicationController c(std::chrono::hours(1));
-          const auto before = saves;
-          auto next = changed(c); next.framesPerSecond = 60;
-          c.changeVideoSettings(next,true);
-          require(fog::stage1::asyncSettings ?
-              saves == before && c.videoSaveStatus_.find(fog::constants::ui::Settings::Saving) == 0 :
-              saves == before + 1 && c.videoSaveStatus_.find(fog::constants::ui::Settings::Saved) == 0,
-              "controller save status matches asynchronous or synchronous A/B profile");
-          require(c.videoSettings_.bitrateMbps == 30 && c.pending_.valid(),
-              "active preferences and verified reconnect intent do not wait for storage");
-          c.settingsSaves_.flush();
-          require(saves == before + 1 && c.videoSaveStatus_.find(fog::constants::ui::Settings::Saved) == 0 &&
-              c.videoSaveStatus_.find(fog::constants::ui::Settings::FogHubReconnectNotice) != std::string::npos &&
-              c.videoSaveStatus_.find("60 FPS") != std::string::npos && c.overlay_.saved == c.videoSaveStatus_,
-              "owner completion reports durable save and retains live reconnect and FPS notices"); }
-        { ApplicationController c;
-          c.videoSettings_.quality = 4; c.videoSettings_.keyframeSeconds = 5;
-          c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush();
-          require(c.pending_.valid() && c.pairedVideoReconnectPending_ && c.paired_->polls == 0,
-              "controller dispatches ownership inspection without running it on the UI thread");
-          require(saved.quality == 4 && saved.keyframeSeconds == 5 && saved.bitrateMbps == 30,
-              "FH changes save codec/bitrate while preserving shared MTS preferences");
-          require(c.stream_ && c.disconnects == 0 && c.starts == 0 && c.finishes == 0,
-              "healthy stream stays connected during ownership verification");
-          auto latest = changed(c); latest.bitrateMbps = 40; c.changeVideoSettings(latest,true); c.settingsSaves_.flush();
-          require(c.dispatches == 1, "additional settings edits coalesce into the pending inspection");
-          c.joinInspection();
-          require(c.completePairedVideoReconnect() && c.starts == 1 && c.resumedOnly &&
-              c.startedRental == c.streamRental_ && c.startedSettings.bitrateMbps == 40,
-              "verified completion resumes only the exact original rental with latest preferences");
-          require(c.disconnects == 1 && !c.finalDisconnect && c.finishes == 0 &&
-              !c.pairedVideoReconnectPending_, "quality resume replaces transport without final rental teardown"); }
-        { ApplicationController c; c.deferClose = true;
-          c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush(); c.joinInspection();
-          require(c.completePairedVideoReconnect() && c.transportTeardown_.pending() &&
-              c.pairedVideoResumeAfterClose_ && !c.stream_ && c.closingStream_ && c.starts == 0,
-              "verified quality change waits for joined old transport before resume");
-          auto latest = changed(c); latest.bitrateMbps = 40;
-          c.changeVideoSettings(latest,true); c.settingsSaves_.flush();
-          require(c.starts == 0 && c.finishes == 0 && c.dispatches == 1 &&
-              c.pairedVideoResumeAfterClose_, "additional quality edits coalesce while old transport closes");
-          c.completeDeferredClose();
-          require(c.starts == 0 && c.pairedVideoResumeAfterClose_,
-              "mailbox completion leaves resume deferred until current frame input is handled");
-          c.dispatchDeferredResume();
-          require(!c.transportTeardown_.pending() && !c.closingStream_ && c.starts == 1 &&
-              c.resumedOnly && c.startedRental == c.streamRental_ && c.startedSettings.bitrateMbps == 40,
-              "joined quality teardown resumes exact rental with latest settings");
-          c.completeDeferredClose();
-          c.dispatchDeferredResume();
-          require(c.starts == 1, "consumed close completion cannot resume twice"); }
-        for (int cancellation = 0; cancellation < 7; ++cancellation) {
-            ApplicationController c; c.deferClose = true;
-            c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush(); c.joinInspection();
-            c.completePairedVideoReconnect();
-            require(c.transportTeardown_.pending() && c.starts == 0, "cancellation fixture owns blocked close");
-            c.dispatchDeferredResume();
-            require(c.starts == 0 && c.pairedVideoResumeAfterClose_,
-                "resume dispatch waits for old transport callback join");
-            c.completeDeferredClose();
-            require(c.starts == 0 && c.pairedVideoResumeAfterClose_,
-                "joined mailbox does not race current frame cancellation input");
-            if (cancellation == 0) c.stopAfterTask_ = true;
-            if (cancellation == 1) c.exitAfterStop_ = true;
-            if (cancellation == 2) c.shutdownDone_ = true;
-            if (cancellation == 3) c.pairedPending_ = false;
-            if (cancellation == 4) c.sessionPending_ = false;
-            if (cancellation == 5) c.streamRental_ = {};
-            if (cancellation == 6) c.screen_ = Screen::Recovery;
-            c.dispatchDeferredResume();
-            require(c.starts == 0 && !c.pairedVideoResumeAfterClose_ && !c.transportTeardown_.pending(),
-                "late close completion cannot undo stop, shutdown or lost rental ownership");
-        }
-        { ApplicationController c; c.deferClose = true;
-          c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush(); c.joinInspection();
-          c.completePairedVideoReconnect(); c.closeStream(); c.completeDeferredClose(); c.dispatchDeferredResume();
-          require(c.starts == 0 && !c.pairedVideoResumeAfterClose_,
-              "ordinary final close cancels deferred quality resume"); }
-        for (int intent = 0; intent < 3; ++intent) {
-            ApplicationController c; c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush();
-            if (intent == 0) { c.stopAfterTask_ = true; c.paired_->requestStop(); }
-            if (intent == 1) c.exitAfterStop_ = true;
-            if (intent == 2) c.shutdownDone_ = true;
-            c.joinInspection(); c.completePairedVideoReconnect();
-            require(c.starts == 0 && c.disconnects == 0 && c.finishes == 1,
-                "queued HOME, user stop or shutdown wins over stale ready inspection");
-        }
-        for (int bad = 0; bad < 4; ++bad) {
-            ApplicationController c; c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush();
-            if (bad == 0) c.paired_->value.rental.value = "other";
-            if (bad == 1) c.paired_->value.stopRequested = true;
-            if (bad == 2) c.paired_->value.state = fog::PairedCheckoutState::RecoveryRequired;
-            if (bad == 3) c.stream_->lost = true;
-            c.joinInspection(); c.completePairedVideoReconnect();
-            require(c.starts == 0 && c.finishes == 1, "unverified rental, stop result or failed live stream cannot resume");
-        }
-        for (int failure = 0; failure < 3; ++failure) {
-            ApplicationController c; c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush(); c.joinInspection();
-            if (failure == 0) c.disconnectAllowed = false;
-            if (failure == 1) c.startAllowed = false;
-            if (failure == 2) c.startThrows = true;
-            c.completePairedVideoReconnect();
-            require(c.finishes == 1 && (failure != 0 || c.starts == 0),
-                "refused disconnect or failed resume always finishes the owned rental");
-        }
-        { ApplicationController c; c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush(); c.joinInspection();
-          c.pairedPending_ = false; c.sessionPending_ = false;
-          require(!c.completePairedVideoReconnect() && c.streamCloses == 1 && c.starts == 0,
-              "terminal ownership evidence closes old transport and returns to ordinary terminal handling"); }
-        { ApplicationController c;
-          c.start(Task::Other,[] { return TaskResult{}; });
-          c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush();
-          require(c.finishes == 0 && c.disconnects == 0 && !c.pairedVideoReconnectPending_ &&
-              c.videoSaveStatus_.find(fog::constants::ui::Settings::FogHubReconnectBusyNotice) != std::string::npos,
-              "unrelated pending task saves preferences and leaves healthy rental running"); }
-        { ApplicationController c; c.dispatchThrows = true; c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush();
-          require(c.finishes == 1 && !c.pairedVideoReconnectPending_, "inspection dispatch failure finishes and clears intent"); }
-        { ApplicationController c; c.stream_->active = false; c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush();
-          require(c.finishes == 0 && c.starts == 0 && c.disconnects == 0 && !c.pending_.valid(),
-              "quality edit during healthy initial handshake never stops or replaces the rental");
-          require(c.videoSaveStatus_.find(fog::constants::ui::Settings::FogHubConnectingSavedNotice) != std::string::npos,
-              "deferred startup preference is explicitly marked for next connection"); }
-        { ApplicationController c; c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush(); c.joinInspection(); c.completePairedVideoReconnect();
-          require(c.stream_ && !c.stream_->ready() && c.starts == 1, "successful resume enters asynchronous handshake");
-          auto latest = changed(c); latest.bitrateMbps = 40; c.changeVideoSettings(latest,true); c.settingsSaves_.flush();
-          require(c.finishes == 0 && c.starts == 1 && c.disconnects == 1 && !c.pending_.valid(),
-              "another quality edit during resume handshake never stops or resumes again");
-          require(c.startedSettings.bitrateMbps == 30 && c.videoSettings_.bitrateMbps == 40 &&
-              c.videoSaveStatus_.find(fog::constants::ui::Settings::FogHubConnectingSavedNotice) != std::string::npos,
-              "controller distinguishes active handshake settings from explicitly saved next preferences"); }
-        { ApplicationController c; saveThrows = true; c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush(); saveThrows = false;
-          require(c.videoSaveStatus_.find(fog::constants::ui::Settings::NotSaved) == 0 && c.pending_.valid(),
-              "save failure is visible while the explicitly requested in-memory change can reconnect"); }
-        { ApplicationController c; c.streamRental_.provider = fog::ProviderId::Mts;
-          c.changeVideoSettings(changed(c),true); c.settingsSaves_.flush();
-          require(c.stream_->updates == 1 && !c.pending_.valid() && c.finishes == 0,
-              "MTS continues to use its existing live settings request"); }
-        for (const auto provider : {fog::ProviderId::Mts, fog::ProviderId::FogHub}) {
-            ApplicationController c; c.streamRental_.provider = provider;
-            auto fps = c.videoSettings_; fps.framesPerSecond = 60;
-            c.changeVideoSettings(fps,true); c.settingsSaves_.flush();
-            require(saved.framesPerSecond == 60 && c.videoSettings_.framesPerSecond == 60 &&
-                c.activeFramesPerSecond_ == 30 && c.stream_->updates == 0 &&
-                !c.pending_.valid() && c.starts == 0 && c.finishes == 0,
-                "FPS-only edit persists for next connection without interrupting either provider");
-            require(c.videoSaveStatus_.find("60 FPS") != std::string::npos,
-                "pending FPS is explicit while active stream stays at its negotiated rate");
-            fps.bitrateMbps = 30; c.changeVideoSettings(fps,true); c.settingsSaves_.flush();
-            if (provider == fog::ProviderId::Mts) {
-                require(c.stream_->updates == 1 && c.stream_->updatedSettings.framesPerSecond == 30 &&
-                    c.stream_->updatedSettings.bitrateMbps == 30 && saved.framesPerSecond == 60,
-                    "MTS live bitrate edit preserves active FPS and saved next-connection FPS");
-            } else {
-                c.joinInspection(); c.completePairedVideoReconnect();
-                require(c.starts == 1 && c.resumedOnly && c.startedSettings.framesPerSecond == 60,
-                    "explicit FH bitrate reconnect applies the latest saved FPS to the same rental");
-            }
-        }
-        { ApplicationController c; c.streamRental_.provider = fog::ProviderId::Mts;
-          c.activeFramesPerSecond_ = c.videoSettings_.framesPerSecond = 60;
-          auto next = c.videoSettings_; next.framesPerSecond = 30; next.quality = 2;
-          c.changeVideoSettings(next,true); c.settingsSaves_.flush();
-          require(saved.framesPerSecond == 30 && c.stream_->updatedSettings.framesPerSecond == 60 &&
-              c.stream_->updatedSettings.quality == 2, "saving 30 never downgrades a live 60 FPS stream implicitly"); }
-        require(saves > 0, "production settings persistence path exercised");
-        std::cout << "Paired video settings controller: " << assertions << " assertions passed\n";
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << "Paired video settings controller failed: " << error.what() << '\n'; return 1;
-    }
+        persistenceAndCoalescing(); cancellationAndClose(); failuresAndContracts(); handshakeAndFps();
+        std::cout << "Player settings adapter: " << assertions << " assertions passed\n";
+    } catch (const std::exception& error) { std::cerr << "Player settings adapter failed: " << error.what() << '\n'; return 1; }
 }

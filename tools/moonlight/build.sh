@@ -4,7 +4,8 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 export DEVKITPRO=${DEVKITPRO:-/opt/devkitpro}
 BUILD="$ROOT/work/moonlight/build-switch"
 PREFIX="$ROOT/third_party/moonlight/switch"
-mkdir -p "$ROOT/work/moonlight" "$PREFIX/lib" "$PREFIX/include/gamestream" "$PREFIX/include/crypto"
+python3 "$ROOT/tools/moonlight/headers.py" --preflight
+mkdir -p "$ROOT/work/moonlight" "$PREFIX/lib"
 LOG="$ROOT/work/moonlight/fetch.log"
 trap 'status=$?; printf "Moonlight build failed (%s). Log: %s\n" "$status" "$LOG" >&2; tail -n 40 "$LOG" >&2 || true; exit "$status"' ERR
 bash "$ROOT/tools/moonlight/fetch.sh" > "$LOG" 2>&1
@@ -31,13 +32,6 @@ grep -Eq ' [DdRr] fog_moonlight_Curl_ssl_mbedtls$' "$ROOT/work/moonlight/coexist
 cp "$BUILD/libgamestream.a" "$PREFIX/lib/"
 cp "$BUILD/moonlight-common-c/libmoonlight-common-c.a" "$PREFIX/lib/"
 cp "$BUILD/moonlight-common-c/enet/libenet.a" "$PREFIX/lib/"
-cp "$ROOT/third_party/moonlight/prepared/libgamestream/"*.h "$PREFIX/include/gamestream/"
-cp "$ROOT/third_party/moonlight/prepared/crypto/"*.hpp "$PREFIX/include/crypto/"
-cp "$ROOT/third_party/moonlight/moonlight-switch/extern/moonlight-common-c/src/Limelight.h" "$PREFIX/include/"
-cp "$ROOT/tools/moonlight/FogMoonlightDiagnostics.h" "$PREFIX/include/"
-cp "$ROOT/tools/moonlight/FogMoonlightRecovery.h" "$PREFIX/include/"
-cp "$ROOT/tools/moonlight/FogMoonlightTermination.h" "$PREFIX/include/"
-cp "$ROOT/tools/moonlight/compat/Settings.hpp" "$PREFIX/include/"
-cp "$ROOT/tools/moonlight/compat/Diagnostics.hpp" "$PREFIX/include/"
+python3 "$ROOT/tools/moonlight/headers.py"
 python3 "$ROOT/tools/moonlight/manifest.py" "$PREFIX"
 printf 'Moonlight Switch static libraries and complete link check passed: %s\n' "$PREFIX"

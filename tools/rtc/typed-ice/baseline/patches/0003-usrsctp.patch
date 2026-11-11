@@ -1,0 +1,88 @@
+diff --git a/usrsctplib/netinet/fogthreadobservation.h b/usrsctplib/netinet/fogthreadobservation.h
+new file mode 100644
+index 0000000..efbed70
+--- /dev/null
++++ b/usrsctplib/netinet/fogthreadobservation.h
+@@ -0,0 +1,20 @@
++#ifndef FOG_RTC_THREAD_OBSERVATION_H
++#define FOG_RTC_THREAD_OBSERVATION_H
++/* Optional application observer, called by thread naming helpers at entry.
++ * The observer must copy role before returning and must never throw, change
++ * scheduling, or call back into RTC. No application symbol is required. */
++#if defined(__GNUC__) || defined(__clang__)
++#ifdef __cplusplus
++extern "C" {
++#endif
++void fogObserveThread(const char *role) __attribute__((weak));
++#ifdef __cplusplus
++}
++#endif
++static inline void fog_observe_thread_start(const char *role) {
++    if (fogObserveThread) fogObserveThread(role);
++}
++#else
++static inline void fog_observe_thread_start(const char *role) { (void)role; }
++#endif
++#endif
+diff --git a/usrsctplib/netinet/sctp_os_userspace.h b/usrsctplib/netinet/sctp_os_userspace.h
+index 066fd40..5dd98ef 100755
+--- a/usrsctplib/netinet/sctp_os_userspace.h
++++ b/usrsctplib/netinet/sctp_os_userspace.h
+@@ -1007,7 +1007,7 @@ int sctp_userspace_get_mtu_from_ifn(uint32_t if_index);
+ 
+ #define AF_CONN 123
+ struct sockaddr_conn {
+-#ifdef HAVE_SCONN_LEN
++#if defined(HAVE_SCONN_LEN) || defined(__SWITCH__)
+ 	uint8_t sconn_len;
+ 	uint8_t sconn_family;
+ #else
+diff --git a/usrsctplib/netinet/sctp_userspace.c b/usrsctplib/netinet/sctp_userspace.c
+index 7188890..6709460 100755
+--- a/usrsctplib/netinet/sctp_userspace.c
++++ b/usrsctplib/netinet/sctp_userspace.c
+@@ -36,6 +36,7 @@
+ #endif
+ #endif
+ #include <netinet/sctp_os_userspace.h>
++#include "fogthreadobservation.h"
+ #if defined(__FreeBSD__)
+ #include <pthread_np.h>
+ #endif
+@@ -83,6 +84,7 @@ sctp_userspace_thread_create(userland_thread_t *thread, start_routine_t start_ro
+ void
+ sctp_userspace_set_threadname(const char *name)
+ {
++	fog_observe_thread_start(name);
+ #if defined(__APPLE__)
+ 	pthread_setname_np(name);
+ #endif
+diff --git a/usrsctplib/user_environment.c b/usrsctplib/user_environment.c
+index ea52f0a..d9782fa 100755
+--- a/usrsctplib/user_environment.c
++++ b/usrsctplib/user_environment.c
+@@ -379,6 +379,11 @@ finish_random(void)
+ {
+ 	return;
+ }
++#elif defined(__SWITCH__)
++#include <switch.h>
++void init_random(void) {}
++void read_random(void *buf, size_t size) { randomGet(buf, size); }
++void finish_random(void) {}
+ #else
+ #error "Unknown platform. Please provide platform specific RNG."
+ #endif
+diff --git a/usrsctplib/usrsctp.h b/usrsctplib/usrsctp.h
+index 93e89b3..b925b40 100644
+--- a/usrsctplib/usrsctp.h
++++ b/usrsctplib/usrsctp.h
+@@ -119,7 +119,7 @@ struct sctp_common_header {
+ /* The definition of struct sockaddr_conn MUST be in
+  * tune with other sockaddr_* structures.
+  */
+-#if defined(__APPLE__) || defined(__Bitrig__) || defined(__DragonFly__) || \
++#if defined(__APPLE__) || defined(__SWITCH__) || defined(__Bitrig__) || defined(__DragonFly__) || \
+     defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+ struct sockaddr_conn {
+ 	uint8_t sconn_len;

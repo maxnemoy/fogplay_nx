@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <type_traits>
 
 namespace fog::stream {
 // Fixed storage, application-thread only. Quantiles are histogram upper bounds:
@@ -51,6 +52,14 @@ public:
         std::uint64_t anchors = 0, suppressedFrames = 0, continuityBreaks = 0;
         const LoopDuration& at(Stage stage) const { return stages[static_cast<std::size_t>(stage)]; }
     };
+    // Owner-thread capture of the unfinished scope at an explicit instant.
+    struct ActiveSnapshot {
+        Stage phase = Stage::Count;
+        std::uint64_t loopUs = 0, phaseUs = 0;
+        bool active = false;
+    };
+    static_assert(std::is_trivially_copyable_v<Snapshot>);
+    static_assert(std::is_trivially_copyable_v<ActiveSnapshot>);
     Snapshot window, lifetime;
     void reset() noexcept {
         window = {}; lifetime = {}; ++epoch_;
@@ -80,14 +89,19 @@ public:
         } else { ++window.anchors; ++lifetime.anchors; }
         lastPresentAt_ = now; anchored_ = true;
     }
-    std::string activeText(Clock::time_point now) const {
-        return "activeLoop=" + std::to_string(active_) + " activePhase=" + name(phase_) +
-            " activeLoopUs=" + std::to_string(active_ ? elapsed(loopAt_, now) : 0) +
-            " activePhaseUs=" + std::to_string(active_ ? elapsed(phaseAt_, now) : 0);
+    ActiveSnapshot activeSnapshot(Clock::time_point now) const noexcept {
+        return {phase_, active_ ? elapsed(loopAt_, now) : 0, active_ ? elapsed(phaseAt_, now) : 0, active_};
     }
+    static std::string activeText(const ActiveSnapshot& value) {
+        return "activeLoop=" + std::to_string(value.active) + " activePhase=" + name(value.phase) +
+            " activeLoopUs=" + std::to_string(value.loopUs) +
+            " activePhaseUs=" + std::to_string(value.phaseUs);
+    }
+    std::string activeText(Clock::time_point now) const { return activeText(activeSnapshot(now)); }
     static const char* name(Stage stage) noexcept {
         constexpr std::array<const char*, 11> names{{"loop","events","poll","pumpTotal","input","draw","artwork","mediaDraw","overlay","present","none"}};
-        return names[static_cast<std::size_t>(stage)];
+        const auto index = static_cast<std::size_t>(stage);
+        return names[index < names.size() ? index : names.size() - 1];
     }
     // No allocations/logging in scope construction or destruction. Resetting
     // for a newly started rental invalidates scopes from its previous UI cycle.

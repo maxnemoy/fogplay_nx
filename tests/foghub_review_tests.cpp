@@ -92,6 +92,18 @@ void parser() {
     rejects(RepositoryErrorKind::InvalidResponse,[&]{parseSessionReviewForm(source,"9000002&x=1");});
     rejects(RepositoryErrorKind::InvalidResponse,[&]{parseSessionReviewForm(source+"<form></form>","9000002");});
     rejects(RepositoryErrorKind::NotAuthenticated,[&]{parseSessionReviewForm(replace(source,"/site/logout","/site/login"),"9000002");});
+    // The review page is parsed as is (HTML_PARSE_RECOVER, no pre-processing):
+    // protected elements around script/style mentions stay visible, and
+    // markup strings inside a real script do not reject the page.
+    rejects(RepositoryErrorKind::InvalidResponse,[&]{parseSessionReviewForm(replace(source,"<main","<!-- <style> --><div id='captcha'></div><!-- </style> --><main"),"9000002");});
+    rejects(RepositoryErrorKind::InvalidResponse,[&]{parseSessionReviewForm(replace(source,"<main","<style/><div id='captcha'></div></style><main"),"9000002");});
+    check(parseSessionReviewForm(replace(source,"<main","<!-- example: <script> --><div data-example='<script>'>x</div>"
+        "<script data-x='>'>s='<a>b</a><div></div>';</script><main"),"9000002").csrf=="synthetic-review-csrf");
+    // CDATA/ENTITY text in script/style and an IE conditional comment are raw text, not declarations.
+    for(const auto* harmless:{"<script>//<![CDATA[\nvar x=1;\n//]]></script>","<style>/*<![CDATA[*/ .x {color:red} /*]]>*/</style>",
+            "<script>var text='<!ENTITY demo>';</script>","<!--[if lt IE 9]><script src='/ie.js'></script><![endif]-->"})
+        check(parseSessionReviewForm(replace(source,"<main",std::string(harmless)+"<main"),"9000002").csrf=="synthetic-review-csrf");
+    rejects(RepositoryErrorKind::InvalidResponse,[&]{parseSessionReviewForm(replace(source,"<!doctype html>","<!doctype html [<!ENTITY x 'y'>]>"),"9000002");});
     check(!sessionHistoryRating(fixture("history-terminal"),"9000002"));
     check(sessionHistoryRating(rated(fixture("history-terminal")),"9000002")==4);
     rejects(RepositoryErrorKind::InvalidResponse,[&]{sessionHistoryRating(fixture("history-active"),"9000002");});

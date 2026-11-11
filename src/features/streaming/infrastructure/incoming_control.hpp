@@ -1,4 +1,5 @@
 #pragma once
+#include "features/streaming/domain/network_telemetry.hpp"
 #include "features/streaming/domain/rumble.hpp"
 #include "features/streaming/infrastructure/incoming_control_diagnostics.hpp"
 #include "features/streaming/infrastructure/quality_telemetry.hpp"
@@ -35,7 +36,7 @@ public:
     static Message classify(const std::string& text) {
         Message result;
         if (text.size() > 64 * 1024) {
-            try { result.diagnostic = {"oversized", "event=<oversized> bytes=" + std::to_string(text.size())}; }
+            try { result.diagnostic = IncomingControlDiagnostics::specialDescription(text.size(),false); }
             catch (...) {} // Optional logging cannot turn into a transport failure.
             return result;
         }
@@ -88,6 +89,10 @@ public:
     }
     void pongSent() { ++pongsSent_; }
     void pongFailed() { ++pongsFailed_; }
+    telemetry::network::IncomingSnapshot numericSnapshot() const noexcept {
+        static_assert(static_cast<std::size_t>(Kind::Count)==8);
+        return {counts_,statsPending_,firstPending_!=0,firstPending_,burst_,highBurst_,delayHigh_,statsCoalesced_,pongsSent_,pongsFailed_};
+    }
     std::string diagnostics() const {
         return " incomingIgnored=" + count(Kind::Ignored) + " incomingStats=" + count(Kind::Stats) +
             " incomingPing=" + count(Kind::Ping) + " incomingClose=" + count(Kind::Close) +

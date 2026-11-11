@@ -1,4 +1,6 @@
 #pragma once
+#include "features/streaming/domain/auto_quality_snapshot.hpp"
+#include "features/streaming/domain/auto_quality_event.hpp"
 // Deterministic application-thread Auto policy. Monotonic milliseconds; no RTC or platform dependencies.
 #include <optional>
 #include <algorithm>
@@ -274,6 +276,12 @@ public:
     const char* reason() const { return reason_; }
     bool pending() const { return pending_ != Action::None; }
     double fps() const { return fps_; }
+    NumericSnapshot numericSnapshot() const noexcept {
+        return {enabled_,pending(),stable_&&headroomPaused_,workerVideo_,diagnosticReason(reason_),static_cast<unsigned>(pauseCause_),
+            attemptsUp_,attemptsDown_,downgradeStreak_,queueWindows_,deliveryWindows_,audioWindows_,framesPerSecond_,
+            fps_,decodedFps_,workMs_,busy_,uiWorkMs_,decoderWorkMs_,uiBusy_,decoderBusy_,nextUp_,capCoalesced_,
+            stable_?headroomGoodMs_:0,headroomSpan(),pauseCounts_,rejectLoss_,rejectSuperseded_,rejectAudio_,rejectLoad_,rejectDelivery_};
+    }
     std::string diagnostics() const {
         char out[1280];
         std::snprintf(out, sizeof(out), " autoEnabled=%d autoReason=%s autoPending=%d autoTargetFps=%d sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f autoUpAttempts=%u autoDownAttempts=%u autoDowngrades=%u autoNextUpMs=%llu autoQueueWindows=%u autoDeliveryWindows=%u autoAudioWindows=%u autoCapCoalesced=%llu autoGoodMs=%llu autoEvidenceMs=%llu autoPaused=%d workerVideo=%d uiVideoMs=%.2f decoderVideoMs=%.2f uiVideoBusy=%.3f decoderVideoBusy=%.3f"
@@ -292,9 +300,12 @@ public:
             static_cast<unsigned long long>(rejectDelivery_));
         return out;
     }
+    bool pollNumericEvent(NumericEvent& out) noexcept {
+        if(!eventCount_){return false;}
+        out=events_[eventRead_];eventRead_=(eventRead_+1)%events_.size();--eventCount_;return true;
+    }
     bool pollEvent(std::string& out) {
-        if (events_.empty()) return false;
-        out = std::move(events_.front()); events_.pop_front(); return true;
+        NumericEvent numeric;if(!pollNumericEvent(numeric))return false;out=numericEventText(numeric);return true;
     }
 private:
     struct HeadroomWindow { std::uint64_t begin = 0, end = 0; bool healthy = false; };
@@ -354,13 +365,10 @@ private:
         if (reason_ != std::string(reason)) { reason_ = reason; event("decision", now); }
     }
     void event(const char* state, std::uint64_t now) {
-        if (events_.size() >= 32) events_.pop_front();
-        char values[640];
-        std::snprintf(values, sizeof(values), " sampleFps=%.2f decodedFps=%.2f videoWorkMs=%.2f videoBusy=%.3f downgrades=%u nextUpMs=%llu queueWindows=%u deliveryWindows=%u audioWindows=%u goodMs=%llu evidenceMs=%llu paused=%d workerVideo=%d uiVideoMs=%.2f decoderVideoMs=%.2f uiVideoBusy=%.3f decoderVideoBusy=%.3f", fps_, decodedFps_, workMs_, busy_, downgradeStreak_, static_cast<unsigned long long>(nextUp_), queueWindows_, deliveryWindows_, audioWindows_,
-            static_cast<unsigned long long>(stable_ ? headroomGoodMs_ : 0), static_cast<unsigned long long>(headroomSpan()), stable_ && headroomPaused_,
-            workerVideo_, uiWorkMs_, decoderWorkMs_, uiBusy_, decoderBusy_);
-        events_.push_back(std::string("qualityEvent=") + state + " ms=" + std::to_string(now) +
-            " reason=" + reason_ + " profile=" + name(observed_) + values);
+        if(eventCount_==events_.size()){eventRead_=(eventRead_+1)%events_.size();--eventCount_;}
+        NumericEvent e;e.ms=now;e.state=diagnosticState(state);e.reason=diagnosticReason(reason_);e.profile=static_cast<unsigned>(observed_);
+        e.sampleFps=fps_;e.decodedFps=decodedFps_;e.videoWorkMs=workMs_;e.videoBusy=busy_;e.downgrades=downgradeStreak_;e.nextUpMs=nextUp_;e.queueWindows=queueWindows_;e.deliveryWindows=deliveryWindows_;e.audioWindows=audioWindows_;e.goodMs=stable_?headroomGoodMs_:0;e.evidenceMs=headroomSpan();e.paused=stable_&&headroomPaused_;e.workerVideo=workerVideo_;e.uiVideoMs=uiWorkMs_;e.decoderVideoMs=decoderWorkMs_;e.uiVideoBusy=uiBusy_;e.decoderVideoBusy=decoderBusy_;
+        events_[(eventRead_+eventCount_)%events_.size()]=e;++eventCount_;
     }
     bool enabled_ = false, sampled_ = false, stable_ = false, interrupted_ = false;
     std::uint64_t baseAt_ = 0, lastObserve_ = 0, lastCommand_ = 0;
@@ -383,6 +391,6 @@ private:
     double uiWorkMs_ = 0, uiBusy_ = 0, decoderWorkMs_ = 0, decoderBusy_ = 0;
     bool workerVideo_ = false;
     const char* reason_ = "manual";
-    std::deque<std::string> events_;
+    std::array<NumericEvent,32> events_{};std::size_t eventRead_=0,eventCount_=0;
 };
 }

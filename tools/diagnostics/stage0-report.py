@@ -4,6 +4,7 @@ import argparse
 from collections import Counter, deque
 import csv
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -24,6 +25,10 @@ HEADER = re.compile(r"FogPlay NX (\d+\.\d+\.\d+) startup\.")
 STAMP = re.compile(r"^\[(\d+) ms\]\s*(.*)$")
 IDR_KINDS = {"wait-enter", "request", "dispatch", "dispatch-result", "fec-failure", "intact-frame",
              "idr-receive-hint", "idr-recognized", "wait-exit", "idr-assembled"}
+
+_NACK_SPEC = importlib.util.spec_from_file_location("fogplay_nack_report", Path(__file__).with_name("nack_report.py"))
+nack_report = importlib.util.module_from_spec(_NACK_SPEC)
+_NACK_SPEC.loader.exec_module(nack_report)
 
 
 class SchedulingJournal:
@@ -131,7 +136,7 @@ class SchedulingJournal:
 
 class IdrJournal:
     """Bounded evidence summaries; late events retain their immutable wait key."""
-    EventLimit, WaitLimit, FrameLimit, LossLimit = 4096, 256, 1024, 256
+    EventLimit, WaitLimit, FrameLimit, LossLimit, ConnectionLimit = 4096, 256, 1024, 256, 256
 
     def __init__(self):
         self.events = deque(maxlen=self.EventLimit)
@@ -142,8 +147,95 @@ class IdrJournal:
         self.counts = Counter()
         self.missed = self.loss_records = self.duplicates = self.malformed = 0
         self.omitted_events = self.omitted_wait_events = self.omitted_frame_events = 0
+        self.cumulative_states = {}
+        self.cumulative_overflow_max = 0
+        self.counter_resets = self.counter_delayed = self.counter_duplicates = 0
+        self.counter_conflicts = self.counter_unsequenced = self.counter_unknown_scopes = 0
+        self.counter_omitted_connections = 0
+        self.core_source_missed = 0
+        self.receive_gaps = deque(maxlen=256)
+        self.receive_gap_count = self.receive_gap_malformed = self.receive_gap_duplicates = 0
+
+    def observe_cumulative(self, values):
+        source_missed = values.get("coreSourceMissed")
+        if source_missed is not None:
+            if not isinstance(source_missed, int) or source_missed < 0:
+                self.malformed += 1
+            else:
+                self.core_source_missed = max(self.core_source_missed, source_missed)
+        if "journalMissed" not in values:
+            return
+        missed = values["journalMissed"]
+        sequence = values.get("journalSequence", values.get("journalCursor"))
+        if not isinstance(missed, int) or missed < 0 or (sequence is not None and
+                (not isinstance(sequence, int) or sequence < 0)):
+            self.malformed += 1
+            return
+        connection = values.get("connection")
+        if not isinstance(connection, int) or connection < 0:
+            connection = None
+            self.counter_unknown_scopes += 1
+        if connection not in self.cumulative_states:
+            if len(self.cumulative_states) >= self.ConnectionLimit:
+                self.counter_omitted_connections += 1
+                self.cumulative_overflow_max = max(self.cumulative_overflow_max, missed)
+                return
+            self.cumulative_states[connection] = {
+                "sequence": sequence, "missed": missed, "total": missed if sequence is not None else 0,
+                "unordered_max": missed}
+            if sequence is None:
+                self.counter_unsequenced += 1
+            return
+        state = self.cumulative_states[connection]
+        # A later peek/final can report more loss at the same cursor. Preserve
+        # every observed lower bound even when ordering/generation is ambiguous.
+        state["unordered_max"] = max(state["unordered_max"], missed)
+        if sequence is None:
+            self.counter_unsequenced += 1
+            state["unordered_max"] = max(state["unordered_max"], missed)
+            return
+        if state["sequence"] is None:
+            state.update(sequence=sequence, missed=missed, total=missed)
+            return
+        if sequence < state["sequence"]:
+            self.counter_delayed += 1
+            self.counter_conflicts += missed > state["missed"]
+            return
+        if sequence == state["sequence"]:
+            self.counter_duplicates += 1
+            self.counter_conflicts += missed != state["missed"]
+            return
+        if missed < state["missed"]:
+            self.counter_resets += 1
+        state["total"] = max(state["total"], missed)
+        state.update(sequence=sequence, missed=missed)
+
+    def cumulative_missed(self):
+        # Core connection IDs do not identify the adapter journal lifetime:
+        # a restarted Client can keep its State/journal, or create a new one.
+        # Without that identity, adding connections or apparent resets can
+        # overcount the same cumulative loss. Report only a sound lower bound.
+        return max([self.cumulative_overflow_max] + [max(s["total"], s["unordered_max"])
+                   for s in self.cumulative_states.values()])
+
+    def observe_receive(self, values, at_ms, line_number):
+        self.observe_cumulative(values)
+        required = ("seq", "connection", "wait", "core_us", "gapUs", "thresholdUs", "previousCoreUs")
+        if (values.get("event") != "packet-gap" or
+                not all(isinstance(values.get(k), int) and values[k] >= 0 for k in required) or
+                values["thresholdUs"] != 50000 or values["gapUs"] <= values["thresholdUs"] or
+                values["core_us"] < values["gapUs"] or
+                values["previousCoreUs"] != values["core_us"] - values["gapUs"]):
+            self.receive_gap_malformed += 1
+            return
+        if any(g["connection"] == values["connection"] and g["seq"] == values["seq"] for g in self.receive_gaps):
+            self.receive_gap_duplicates += 1
+            return
+        self.receive_gap_count += 1
+        self.receive_gaps.append({"line": line_number, "at_ms": at_ms, **{k: values[k] for k in required}})
 
     def observe(self, values, at_ms, line_number):
+        self.observe_cumulative(values)
         if "missed" in values:
             if not isinstance(values["missed"], int) or values["missed"] < 0:
                 self.malformed += 1
@@ -226,12 +318,14 @@ class IdrJournal:
                     frame["observed_failed_blocks"] += values["value"]
 
     def summary(self):
+        cumulative = self.cumulative_missed()
+        missed = max(self.missed, cumulative, self.core_source_missed)
         waits = []
         for wait in self.waits.values():
             entry, exit_event = wait["entry"], wait["exit"]
             duration = exit_event["core_us"] - entry["core_us"] if entry and exit_event else None
             reasons = []
-            if self.missed:
+            if missed:
                 reasons.append("journal-loss-unknown-wait-attribution")
             if self.malformed:
                 reasons.append("malformed-journal-lines")
@@ -253,14 +347,27 @@ class IdrJournal:
                                                          and frame["observed_event_counts"]["fec-failure"])}
                   for frame in self.frames.values()]
         return {"observed_event_counts": dict(self.counts), "events_in_log_order": list(self.events),
-                "waits": waits, "frames": frames, "journal_missed": self.missed,
-                "loss_attribution": "unknown" if self.missed else "no-loss-notice-observed",
+                "waits": waits, "frames": frames, "journal_missed": missed,
+                "loss_attribution": "unknown" if missed else "no-loss-notice-observed",
                 "loss_notices": list(self.losses), "omitted_loss_notices": max(0, self.loss_records - self.LossLimit),
+                "journal_missed_legacy_notices": self.missed, "journal_missed_cumulative": cumulative,
+                "core_source_missed_cumulative_lower_bound": self.core_source_missed,
+                "receive_packet_gaps": list(self.receive_gaps),
+                "receive_packet_gap_observed_count": self.receive_gap_count,
+                "receive_packet_gap_retention": {"limit": 256, "omitted": max(0, self.receive_gap_count - 256),
+                    "malformed": self.receive_gap_malformed, "duplicates_in_retained_window": self.receive_gap_duplicates},
+                "receive_packet_gap_note": "Core-clock inter-arrival gaps after a previous packet; not host latency or proven packet loss. Receipt endpoints are observations, not a causal mapping to displayed frames. Missing events may reflect journal loss or old instrumentation.",
+                "journal_counter": {"connection_limit": self.ConnectionLimit,
+                    "connections_observed": len(self.cumulative_states), "reset_boundaries": self.counter_resets,
+                    "delayed_records_ignored": self.counter_delayed, "duplicate_snapshots": self.counter_duplicates,
+                    "conflicting_snapshots": self.counter_conflicts, "unsequenced_observations": self.counter_unsequenced,
+                    "unknown_scope_observations": self.counter_unknown_scopes,
+                    "omitted_connections": self.counter_omitted_connections},
                 "duplicate_sequences_in_retained_window": self.duplicates, "malformed_lines": self.malformed,
                 "report_retention": {"event_limit": self.EventLimit, "wait_limit": self.WaitLimit,
                     "frame_limit": self.FrameLimit, "omitted_ordered_events": self.omitted_events,
                     "omitted_wait_events": self.omitted_wait_events, "omitted_frame_events": self.omitted_frame_events},
-                "note": "Admitted/logged evidence only. Missing hints do not prove no IDR; dispatch acceptance does not prove host receipt; wait-exit does not prove assembly/decode/presentation."}
+                "note": "Admitted/logged evidence only. Journal missed is a conservative lower bound: adapter journal lifetime is not identified by core connection, so snapshots/connections/apparent resets and legacy/source loss evidence are never added together. Loss has no precise wait/IDR/thread interval attribution; filtered sequence gaps alone do not prove loss. Missing hints do not prove no IDR; dispatch acceptance does not prove host receipt; wait-exit does not prove assembly/decode/presentation."}
 
 
 def sha256(path):
@@ -315,10 +422,11 @@ def identity(version, capture):
             "note": "Comparison groups separate version headers, not binary identity; matching groups do not verify identical artifacts. External manifest is operator evidence; no binary identity is embedded in the log."}
 
 
-def new_stream(number, at_ms, inferred=False):
+def new_stream(number, at_ms, inferred=False, episode=1, reconnect_episode=False, replacement=False):
     return {"stream": number, "start_ms": at_ms, "provider": None,
             "boundary_inferred": inferred, "configurations": [], "counter_samples": [],
-            "latency_windows": [], "display_paced_observations": [], "final_decoder_seen": False}
+            "latency_windows": [], "display_paced_observations": [], "final_decoder_seen": False,
+            "_nack": nack_report.NackSession(number, episode, reconnect_episode, replacement)}
 
 
 def observe_configuration(stream, values, at_ms):
@@ -359,32 +467,64 @@ def parse_log(path, captures=None):
     file_hash = sha256(path)
     capture = (captures or {}).get(file_hash)
     runs, run, stream = [], None, None
+    episode, reconnect_pending = 0, False
     for line_number, line in enumerate(log_lines(path), 1):
         stamp = STAMP.match(line)
         at_ms, text = (int(stamp[1]), stamp[2]) if stamp else (None, line)
         header = HEADER.search(text)
         if header:
             run = {"run": len(runs) + 1, "header_line": line_number,
-                   "identity": identity(header[1], capture), "streams": [], "_idr": IdrJournal(), "_threads": SchedulingJournal()}
+                   "identity": identity(header[1], capture), "streams": [], "_idr": IdrJournal(),
+                   "_threads": SchedulingJournal(), "_clock": nack_report.DiagnosticClock(),
+                   "_diagnostic_profile": nack_report.DiagnosticProfile()}
             runs.append(run)
             stream = None
+            episode, reconnect_pending = 0, False
             continue
+        if "Rental stop begin;" in text:
+            reconnect_pending = False
         relevant = any(marker in text for marker in
                        ("Controller profile:", "Stream protocol:", "Video decoder", "Client latency:", "Input latency:", "Moonlight IDR ",
-                        "Thread scheduling ", "Moonlight thread "))
+                        "Thread scheduling ", "Moonlight thread ", "Moonlight receive ", "Diagnostic clock:", "Video RTP", "Stream final event:",
+                        "Video chain resync:", "Transport reconnect attempt=", "Video gaps final: Moonlight ")) or text.startswith("Diagnostic profile:")
         if not relevant:
             continue
         if run is None:
-            run = {"run": 1, "header_line": None, "identity": identity(None, capture), "streams": [], "_idr": IdrJournal(), "_threads": SchedulingJournal()}
+            run = {"run": 1, "header_line": None, "identity": identity(None, capture), "streams": [],
+                   "_idr": IdrJournal(), "_threads": SchedulingJournal(), "_clock": nack_report.DiagnosticClock(),
+                   "_diagnostic_profile": nack_report.DiagnosticProfile()}
             runs.append(run)
+        if text.startswith("Diagnostic profile:"):
+            run["_diagnostic_profile"].observe(text)
+            continue
+        if "Diagnostic clock:" in text:
+            run["_clock"].observe(text, line_number)
+            continue
+        if text.startswith("Video gaps final: Moonlight "):
+            run["_idr"].observe_cumulative(fields(text))
+            continue
         if "Moonlight IDR " in text:
             run["_idr"].observe(fields(text), at_ms, line_number)
             continue  # Stable connection/wait IDs, never the current UI attempt.
+        if "Moonlight receive " in text:
+            run["_idr"].observe_receive(fields(text), at_ms, line_number)
+            continue
         if "Thread scheduling " in text or "Moonlight thread " in text:
+            if "Moonlight thread " in text:
+                run["_idr"].observe_cumulative(fields(text))
             run["_threads"].observe(text, at_ms, line_number, stream["stream"] if stream else None)
             continue
         if "Controller profile:" in text or stream is None:
-            stream = new_stream(len(run["streams"]) + 1, at_ms, "Controller profile:" not in text)
+            profile = "Controller profile:" in text
+            replacement = profile and reconnect_pending
+            if profile:
+                if not replacement:
+                    episode += 1
+                reconnect_pending = False
+            elif episode == 0:
+                episode = 1
+            stream = new_stream(len(run["streams"]) + 1, at_ms, not profile,
+                                max(1, episode), replacement, replacement)
             run["streams"].append(stream)
         values = fields(text)
         if "Controller profile:" in text:
@@ -393,6 +533,17 @@ def parse_log(path, captures=None):
             if "Moonlight" in text:
                 stream["provider"] = "FH"
             observe_configuration(stream, values, at_ms)
+            stream["_nack"].observe_route(text, at_ms, line_number)
+        if "Video RTP event:" in text or "Stream final event:" in text:
+            stream["_nack"].observe_clock_event(text, at_ms, line_number)
+            stream["_nack"].observe_route(text, at_ms, line_number)
+        if "Video RTP final:" in text or "Video RTP:" in text:
+            stream["_nack"].observe_snapshot(text, at_ms, line_number, "Video RTP final:" in text)
+        if "Video chain resync:" in text:
+            stream["_nack"].observe_resync(text, at_ms, line_number)
+        if "Transport reconnect attempt=" in text:
+            stream["_nack"].observe_reconnect(text, at_ms, line_number)
+            reconnect_pending = True
         if "Video decoder" in text:
             observe_configuration(stream, values, at_ms)
             if all(isinstance(values.get(key), int) and values[key] >= 0 for key in COUNTERS):
@@ -409,6 +560,7 @@ def parse_log(path, captures=None):
             stream["latency_windows"].append({"at_ms": at_ms, "kind": "video", "histograms": windows,
                 **{key: values[key] for key in ("windowMs", "lateThresholdUs", "lateCount", "latePpm",
                     "frameAgeUnavailableLifetime", "queueWaitUnavailableLifetime", "originMissesLifetime") if key in values}})
+            stream["_nack"].observe_latency(text, at_ms, line_number)
         if "Input latency:" in text:
             if values.get("provider") in ("FH", "MTS"):
                 stream["provider"] = values["provider"]
@@ -418,9 +570,20 @@ def parse_log(path, captures=None):
     for item in runs:
         item["moonlight_idr"] = item.pop("_idr").summary()
         item["thread_scheduling"] = item.pop("_threads").summary(item["moonlight_idr"]["journal_missed"])
+        clock = item.pop("_clock")
+        item["diagnostic_clock"] = clock.summary()
+        item["diagnostic_profile"] = item.pop("_diagnostic_profile").summary()
+        legacy_offsets = [entry["_nack"].event_offset_lower_bound() for entry in item["streams"]]
+        legacy_offsets = [offset for offset in legacy_offsets if offset is not None]
+        legacy_offset = max(legacy_offsets) if legacy_offsets and clock.origin is None else None
+        nack_sessions = []
         for entry in item["streams"]:
             entry["counters"] = counter_summary(entry["counter_samples"])
             entry["latency_note"] = "Rolling windows may overlap. Their percentiles and sample counts are observations, not mergeable distributions."
+            session = entry.pop("_nack").summary(entry["provider"], clock, legacy_offset, item["diagnostic_profile"])
+            entry["nack"] = session
+            nack_sessions.append(session)
+        item["nack_summary"] = nack_report.summarize_run(nack_sessions)
     return {"log": str(path), "log_sha256": file_hash, "capture_manifest_matched": capture is not None,
             "runs": runs, "av_skew": "unavailable: no common mapped audio/video presentation clock"}
 

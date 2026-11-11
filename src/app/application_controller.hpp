@@ -3,6 +3,7 @@
 #include "core/constants/ui_text.hpp"
 #include "app/services.hpp"
 #include "features/playstation/domain/computer.hpp"
+#include "features/playstation/application/input_telemetry.hpp"
 #include "features/playstation/application/catalog_progress.hpp"
 
 #include "features/catalog/domain/catalog.hpp"
@@ -12,7 +13,8 @@
 #include "features/catalog/presentation/home_catalog.hpp"
 #include "features/catalog/infrastructure/recent_games.hpp"
 #include "features/streaming/application/remote_input.hpp"
-#include "features/streaming/application/transport_teardown.hpp"
+#include "features/streaming/application/player.hpp"
+#include "features/streaming/infrastructure/player_media.hpp"
 #include "features/streaming/presentation/stream_overlay.hpp"
 #include "features/settings/domain/video_settings.hpp"
 #include "features/settings/infrastructure/video_settings_storage.hpp"
@@ -20,10 +22,7 @@
 #include "features/settings/infrastructure/rumble_settings_storage.hpp"
 #include "features/settings/infrastructure/deferred_settings.hpp"
 #include "features/session/application/session.hpp"
-#include "features/session/application/stop_retry_budget.hpp"
-#include "features/streaming/infrastructure/media.hpp"
-#include "features/streaming/domain/video_recovery.hpp"
-#include "features/streaming/domain/transport_reconnect.hpp"
+#include "features/session/application/rental_session_coordinator.hpp"
 #include "features/streaming/domain/stream_input_gate.hpp"
 #include "features/streaming/domain/mouse_buttons.hpp"
 #include "features/streaming/domain/key_releases.hpp"
@@ -31,6 +30,7 @@
 #include "features/streaming/domain/gamepad_schedule.hpp"
 #include "features/streaming/domain/loop_timing.hpp"
 #include "core/logging/run_log.hpp"
+#include "core/diagnostics/thread_observation.hpp"
 #include "features/streaming/domain/streaming_client.hpp"
 #include "features/session/application/checkout.hpp"
 #include "features/session/application/paired_checkout.hpp"
@@ -93,7 +93,7 @@ inline constexpr SDL_Color muted{163, 178, 200, 255};
 inline constexpr SDL_Color accent{107, 216, 190, 255};
 
 enum class Screen { Profile, Games, GameDetail, Computers, Details, History, Settings, ImageSettings, ConnectionSettings, Checkout, ManualResolution, Consent, Auth, Sessions, ConnectConsent, Streaming, StopConfirm, Stopping, Recovery, Genres, PlayStation, PlayStationDetails, SessionRating, RumbleSettings, ControllerSettings };
-enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation, PairedCreate, PairedPoll, PairedStop, ProviderProfile, ProviderForget, SessionRatingLoad, SessionRatingSubmit };
+enum class Task { Games, GameDetail, Computers, History, Create, CheckoutPoll, CheckoutStop, ManualResolution, Phone, Captcha, Otp, Profile, Sessions, Finish, Recovery, RestoreAuth, PlayStation, PairedCreate, PairedPoll, PairedStop, ProviderProfile, ProviderForget, SessionRatingLoad, SessionRatingSubmit, VerifyMtsOffer, VerifyPairedOffer, RentalOperation };
 
 struct RestoredProviders {
     bool mts = false, foghub = false;
@@ -106,10 +106,10 @@ struct ChangedOffer { std::vector<fog::Computer> computers; };
 using TaskResult = std::variant<std::monostate, RestoredProviders, fog::RestoreAuthResult, fog::AuthResult,
     fog::UserProfile, fog::GameDetail, fog::Page<fog::Computer>, std::vector<fog::HistoryEntry>,
     std::vector<fog::Rental>, fog::FinishResult, RecoveryResult, VerifiedOffer, ChangedOffer,
-    std::optional<fog::SessionRatingForm>, fog::SessionRatingResult>;
+    std::optional<fog::SessionRatingForm>, fog::SessionRatingResult, fog::RentalSessionCoordinator::WorkerResult>;
 
 // Main-thread presentation coordinator. Workers are joined before their state is read.
-class ApplicationController {
+class ApplicationController : private fog::stream::PlayerTransportFactory, private fog::stream::PlayerInputEffects, private fog::stream::PlayerDiagnosticsObserver {
 public:
     ApplicationController(Runtime& runtime, std::unique_ptr<Services> services);
     ~ApplicationController();
@@ -120,23 +120,28 @@ private:
     fog::AccountRepository& loginAccount();
     void openProfile();
     void refreshProfile();
-    RestoredProviders restoreProviders();
-    void handlePairedCheckout();
+    RestoredProviders restoreProviders(fog::RentalSessionCoordinator::AuthScope scope);
+    void startProviderRestore();
     bool openSessionRating(std::optional<fog::RentalId> rental = std::nullopt);
-    bool offerSessionRating(const fog::PairedCheckoutResult& result);
+    bool offerSessionRating(const fog::RentalSessionCoordinator::PairedView& result);
     void completeSessionRatingLoad(std::optional<fog::SessionRatingForm> form);
     void completeSessionRatingSubmit(const fog::SessionRatingResult& result);
     void submitSessionRating();
     void inputSessionRating(u64 keys);
     void drawSessionRating();
-    bool pairedPending() const { return pairedPending_; }
+    bool pairedPending() const { return rentalSession_.state().pairedPending; }
     void armExitHandling();
     void disarmExitHandling();
     std::string playbackTimings(bool takeLogTiming = false) const;
     void logOutputTimings(bool final);
+    void emitPendingFinalPsTelemetry() noexcept;
     std::uint64_t padSampledAtUs_ = 0;
-    std::string lastThreadObservations_;
-    void logIncomingControl(bool final = false) noexcept;
+    fog::diagnostics::ThreadObservationSnapshot lastThreadObservations_;
+    bool threadObservationsCaptured_=false;
+    std::size_t nextThreadChunk_=0;
+    std::uint64_t lastThreadCapturedElapsedMs_=0;
+    std::chrono::steady_clock::time_point lastThreadCapturedAt_{};
+    std::optional<fog::playstation::telemetry::Snapshot> pendingFinalPsTelemetry_;
     void closeStream() noexcept;
     void stopRumble() noexcept;
     void updateRumble(PadState& pad, bool focused);
@@ -144,29 +149,33 @@ private:
     void logPlayStationInput(bool final);
     void dispatchPlayStationInput(bool allowed);
     void releasePlayStationInput();
-    bool closeTransport(bool final) noexcept;
     void pollTransportTeardown();
-    void resumePairedVideoAfterClose();
-    bool startTransport(bool resumeOnly = false);
-    bool requestPairedVideoReconnect();
-    bool completePairedVideoReconnect();
-    void requestPairedTransportReconnect();
-    bool transportRecoveryAllowed() const;
-    void stopTransportRecovery(const char* reason);
-    void recordTransportBreak();
-    bool handleTransportState(std::chrono::steady_clock::time_point now);
-    bool advanceTransportRecovery(std::chrono::steady_clock::time_point now);
-    void requestTransportRecovery();
-    void completeTransportRecovery(fog::stream::TransportReconnect::Preparation preparation);
-    bool completePairedTransportReconnect();
-    void retryTransport(const char* reason);
+    fog::stream::Player::Admission playerAdmission() const;
+    void applyPlayerEffects();
+    void applyPlayerEvents();
+    bool completePlayerInspection(const fog::RentalSessionCoordinator::Effects&);
+    std::unique_ptr<stream::StreamingClient> create(fog::ProviderId) override;
+    void transportStarting(stream::ControllerProfile, stream::StreamInputSink&) override;
+    void transportPumped(stream::StreamInputSink&) override;
+    void videoSuspended(fog::stream::VideoSuspension) override;
+    void videoPrepared(bool) override;
+    void beforeTransportClose(stream::StreamInputSink*) noexcept override;
+    void transportClosed() noexcept override;
+    void report(fog::stream::PlayerDiagnosticPhase,const fog::stream::PlayerDiagnosticSnapshot&) noexcept override;
+    void captureFailed(fog::stream::PlayerDiagnosticPhase) noexcept override;
+    bool networkEvents(const stream::telemetry::network::NetworkEvent*,std::size_t,bool) noexcept override;
+    void networkEventsDiscarded(unsigned) noexcept override;
+    bool controlDiscoveryEvents(const stream::telemetry::network::ControlDiscoveryEvent*,std::size_t) noexcept override;
+    void controlDiscoveryDiscarded(unsigned) noexcept override;
+    stream::telemetry::Playback playbackSnapshot(stream::telemetry::Playback,bool takeLogTiming) const;
     void shutdownSession() noexcept;
     void pauseSessionRecovery();
     void retrySessionRecovery();
-    void syncPending();
+    fog::RentalSessionCoordinator::Admission rentalAdmission() const;
+    bool startRental(fog::RentalSessionCoordinator::Request request, const char* reason = "rental-guard");
+    void applyRentalEffects(const fog::RentalSessionCoordinator::Effects& effects);
     void logCheckoutResult(Task phase);
     void queueCheckoutStop();
-    void handleCheckout();
     void pollCheckout(bool manual);
     void createSession();
     void createPairedSession(const fog::Computer& pc);
@@ -179,11 +188,8 @@ private:
                      const fog::EntityId& computer = {});
     void rememberDecodedGame() noexcept;
     void beginFinish(const char* reason = "rental-guard");
-    void recoverVideoError(const fog::VideoDecodeError& error, const stream::Packet* packet);
     void pumpStream(PadState& pad, u64 held, u64 down);
     void sendStreamInput(PadState& pad, u64 held, bool overlayHandled);
-    void feedStreamAudio(const stream::Packet& packet);
-    void drainStreamAudio();
     SDL_Rect videoRect() const;
     bool sendRemote(const fog::remote::Input& command);
     void releaseMouse() noexcept;
@@ -216,7 +222,7 @@ private:
     void drawStreamOverlay();
     void text(const std::string& value, int x, int y, SDL_Color color = white, int width = 1190, bool title = false);
     void box(int x, int y, int w, int h, SDL_Color color);
-    void start(Task kind, std::function<TaskResult()> work);
+    bool start(Task kind, std::function<TaskResult()> work);
     void loadGames();
     void requestCatalog(bool manual = false);
     void pollCatalog();
@@ -249,10 +255,6 @@ private:
     fog::CatalogRepository& catalogRepository_;
     fog::RentalRepository& rentals_;
     Services* pairedServices_ = nullptr;
-    std::unique_ptr<fog::PairedCheckoutGuard> paired_;
-    bool pairedPending_ = false;
-    bool pairedVideoReconnectPending_ = false;
-    bool pairedTransportReconnectPending_ = false;
     fog::rating::Presentation rating_;
     bool ratingFocusLost_ = false;
     fog::ProviderId loginProvider_ = fog::ProviderId::Mts;
@@ -272,8 +274,9 @@ private:
     std::shared_ptr<fog::CatalogRepository> catalogApi_;
     std::future<fog::Page<fog::Game>> catalogPending_;
     fog::Catalog::Request catalogRequest_{0, 1, {}};
-    fog::SessionGuard guard_;
-    fog::CheckoutGuard checkout_;
+    fog::RentalSessionCoordinator rentalSession_;
+    fog::stream::SdlPlayerMediaFactory playerMediaFactory_;
+    fog::stream::Player player_;
     fog::ui::Ui ui_;
     fog::ArtworkCache artwork_;
     fog::SteamArtworkResolver steamArtwork_;
@@ -285,7 +288,6 @@ private:
     fog::EntityId selectedComputerId_;
     platform::PsSensors psSensors_;
     platform::Rumble rumble_;
-    std::uint64_t rumbleLogAtMs_ = 0;
     fog::playstation::TouchTrace psTouchTrace_;
     fog::playstation::NativeInput psNativeInput_;
     bool psTouchLastSubmitted_ = false;
@@ -300,26 +302,18 @@ private:
     std::string playStationError_;
     std::chrono::steady_clock::time_point playStationLoadedAt_{};
     std::size_t automaticSelection_ = 1;
-    bool ownSteam_ = false, sidebar_ = false, checkoutAutoPoll_ = false, stopAfterTask_ = false;
+    bool ownSteam_ = false, sidebar_ = false, checkoutAutoPoll_ = false;
     bool authSaveFailed_ = false;
     int nav_ = 1;
     Screen loginReturn_ = Screen::Games;
     std::chrono::steady_clock::time_point checkoutAt_{};
-    std::unique_ptr<stream::StreamingClient> stream_;
-    std::unique_ptr<stream::StreamingClient> retryStream_;
-    fog::stream::TransportTeardown<stream::StreamingClient> transportTeardown_;
-    bool pairedVideoResumeAfterClose_ = false;
-    std::chrono::steady_clock::time_point transportCloseStarted_{};
     fog::stream::Overlay overlay_;
     fog::video::Settings videoSettings_;
-    int activeFramesPerSecond_ = fog::video::DefaultFramesPerSecond;
     fog::connection::Settings connectionSettings_;
-    fog::connection::RelaySelection relaySelection_;
     fog::controller::Settings controllerSettings_;
     std::string controllerSaveStatus_;
     fog::rumble::Settings rumbleSettings_;
     std::string rumbleSaveStatus_;
-    bool firstFramePresented_ = false;
     std::string videoSaveStatus_ = uiText::Settings::AutoSaveNotice;
     std::string connectionSaveStatus_ = uiText::Settings::ConnectionAutoSaveNotice;
     fog::settings::DeferredSettings settingsSaves_;
@@ -342,33 +336,13 @@ private:
     float pointerX_ = 640.0f, pointerY_ = 360.0f;
     std::chrono::steady_clock::time_point mouseAt_{}, lastPointerSent_{}, overlayNoticeAt_{}, overlayHintAt_{};
     std::string overlayNotice_;
-    std::string lastStreamState_, lastStreamDiagnostics_;
-    std::unique_ptr<fog::Media> media_;
-    fog::VideoRecovery videoRecovery_;
-    fog::stream::TransportReconnect transportReconnect_;
-    // Private rental identity, retained only until final close; never logged.
-    fog::RentalId streamRental_;
-    std::uint64_t videoWorkUs_ = 0, videoDecodeErrors_ = 0, lastVideoGeneration_ = 0;
-    PlaybackTiming drainTiming_, presentTiming_;
+    PlaybackTiming presentTiming_;
     fog::stream::LoopTiming loopTiming_;
     std::chrono::steady_clock::time_point loopTimingWindowAt_{};
     std::chrono::steady_clock::time_point loopTimingLifetimeAt_{};
-    PlaybackTiming transportPumpTiming_, videoFeedTiming_, decoderResetTiming_, audioFeedTiming_, prepareTiming_;
-    std::uint64_t drainVideoTotal_ = 0, drainVideoMax_ = 0, drainVideoBudgetHits_ = 0;
-    std::uint64_t videoQueueWaitMaxMs_ = 0, audioQueueWaitMaxMs_ = 0;
-    std::uint64_t lastPumpWorkUs_ = 0, slowPlaybackCycles_ = 0;
-    std::chrono::steady_clock::time_point lastSlowPlaybackLog_{};
-    std::uint64_t pumpGapMaxUs_ = 0, outsideMeasuredPumpMaxUs_ = 0, drainBudgetHits_ = 0, catchupWindows_ = 0;
-    std::chrono::steady_clock::time_point lastPumpAt_{}, lastProtocolLog_{}, lastMetricsLog_{};
-    bool videoLossWaiting_ = false;
-    std::chrono::steady_clock::time_point lastVideoEventLog_{};
     unsigned sessionSequence_ = 0;
     std::vector<fog::Rental> sessions_;
-    bool sessionPending_ = false, exitLocked_ = false, exitAfterStop_ = false, shutdownDone_ = false;
-    fog::StopRetryBudget stopRetry_;
-    bool recoveryPaused_ = false;
-    bool resetStopChecks_ = false;
-    std::chrono::steady_clock::time_point streamStarted_{}, lastVideo_{}, retryAt_{}, lastMediaLog_{};
+    bool exitLocked_ = false, exitAfterStop_ = false, shutdownDone_ = false;
     std::future<TaskResult> pending_;
     Task task_ = Task::RestoreAuth;
     Screen screen_ = Screen::Games;

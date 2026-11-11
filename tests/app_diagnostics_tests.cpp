@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -14,6 +15,24 @@ void check(bool condition, const char* message) {
 void validSnapshot(const fogplay::diagnostics::PlaybackTiming& value) {
     check(value.maxUs <= value.totalUs, "snapshot combines different timing updates");
     check(value.calls != 0 || (value.totalUs == 0 && value.maxUs == 0), "partial timing reset");
+}
+void validClockAnchor(std::int64_t earliest, std::int64_t latest) {
+    using namespace fogplay::diagnostics;
+    check(runLog.flush(), "startup diagnostics did not flush");
+    std::ifstream input(runLog.archivePath());
+    check(input.good(), "startup archive missing");
+    const std::string marker = "Diagnostic clock: schema=1 clock=steady startupEpochMs=";
+    unsigned anchors = 0;
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto at = line.find(marker);
+        if (at == std::string::npos) continue;
+        ++anchors;
+        const auto origin = std::stoll(line.substr(at + marker.size()));
+        check(origin >= earliest && origin <= latest, "clock origin is not session startup steady time");
+        check(line.find(" resolutionMs=1") != std::string::npos, "clock precision missing");
+    }
+    check(anchors == 1, "clock anchor absent or duplicated");
 }
 void concurrentDiagnostics(bool reset) {
     using namespace fogplay::diagnostics;
@@ -57,8 +76,13 @@ int main() {
     std::filesystem::current_path(directory);
     try {
         {
+            const auto earliest = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             fogplay::diagnostics::LogSession session;
+            const auto latest = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
             session.start();
+            validClockAnchor(earliest, latest);
             concurrentDiagnostics(false);
             concurrentDiagnostics(true);
             // All producers hit the append-failure latch concurrently after close.

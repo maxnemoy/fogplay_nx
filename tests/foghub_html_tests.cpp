@@ -326,6 +326,11 @@ void malformedAndLimits() {
     rejects([&] { parseLogin(replace(login, "<h1>", "<h1 id='captcha'>")); });
     rejects([&] { parseLogin("<!DOCTYPE html [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]>" + login); });
     rejects([&] { parseLogin("<!DOCTYPE html [<!ENTITY a 'secret-not-captured'>]>" + login); });
+    rejects([&] { parseLogin("\xEF\xBB\xBF <!-- c --><?x?>\n<!doctype html [<!ENTITY a 'secret-not-captured'>]>" + replace(login, "<!doctype html>", "")); });
+    // The same text inside script/style or a conditional comment is not a declaration.
+    for (const auto* harmless : {"<script>//<![CDATA[\nvar x=1;\n//]]></script>", "<style>/*<![CDATA[*/ .x {color:red} /*]]>*/</style>",
+            "<script>var text='<!ENTITY demo>';</script>", "<!--[if lt IE 9]><script src='/ie.js'></script><![endif]-->"})
+        check(parseLogin(replace(login, "<main", std::string(harmless) + "<main")).csrf == "fixture-csrf-placeholder");
     rejects([&] { parseLogin(login + std::string(2 * 1024 * 1024, ' ')); });
     rejects([&] { parseLogin(login + std::string(1, '\0')); });
     std::string deep;

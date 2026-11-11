@@ -1,6 +1,6 @@
 #pragma once
+#include "features/session/application/rental_session_coordinator.hpp"
 #include "features/session/presentation/session_rating.hpp"
-#include "features/session/application/paired_checkout.hpp"
 #include <functional>
 #include <future>
 #include <stdexcept>
@@ -42,11 +42,18 @@ struct TestServices {
     TestRatingRepository& rentals() { return repository; }
     TestAuth& auth() { return authentication; }
 };
+struct TestRentalSession {
+    fog::RentalSessionCoordinator::State snapshot;
+    bool stopRequested = false;
+    const fog::RentalSessionCoordinator::State& state() const noexcept { return snapshot; }
+    void request() noexcept { stopRequested = true; }
+    void clearRequest() noexcept { stopRequested = false; }
+};
 std::optional<std::string> keyboard(const char*,const std::string&,int,bool=false);
 class ApplicationController {
 public:
     bool openSessionRating(std::optional<fog::RentalId> rental = std::nullopt);
-    bool offerSessionRating(const fog::PairedCheckoutResult& result);
+    bool offerSessionRating(const fog::RentalSessionCoordinator::PairedView& result);
     void completeSessionRatingLoad(std::optional<fog::SessionRatingForm>);
     void completeSessionRatingSubmit(const fog::SessionRatingResult&);
     void submitSessionRating();
@@ -59,9 +66,10 @@ public:
     TaskResult join() { return pending_.get(); }
     TestServices service;
     TestServices* pairedServices_ = &service;
-    bool sessionPending_ = false, exitAfterStop_ = false, shutdownDone_ = false, sidebar_ = true;
+    TestRentalSession rentalSession_;
+    bool exitAfterStop_ = false, shutdownDone_ = false, sidebar_ = true;
     bool dispatchThrows = false;
-    bool ratingFocusLost_ = false, stopAfterTask_ = false;
+    bool ratingFocusLost_ = false;
     unsigned dispatches = 0;
     Screen screen_ = Screen::Profile;
     Task task_ = Task::SessionRatingLoad;

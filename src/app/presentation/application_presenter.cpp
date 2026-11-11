@@ -45,18 +45,18 @@ void ApplicationController::drawStreamOverlay() {
         SDL_RenderDrawLine(rt_.renderer,x-6,y,x+6,y);
         SDL_RenderDrawLine(rt_.renderer,x,y-6,x,y+6);
     }
-    if (overlay_.mode() == Mode::ImageSettings && stream_)
-        overlay_.setVideoStatus(stream_->qualityStatus());
+    if (overlay_.mode() == Mode::ImageSettings && player_.inputSink())
+        overlay_.setVideoStatus(player_.qualityStatus());
     // Mouse instructions fade so they do not obscure remote fields/taskbar.
     if (overlay_.mode() != Mode::Mouse || std::chrono::steady_clock::now()-overlayHintAt_ < std::chrono::seconds(5))
         overlay_.paint(ui_,rt_.renderer);
-    if (transportReconnect_.recovering()) {
-        const auto attempt = transportReconnect_.connecting() ? transportReconnect_.attempts() :
-            std::min(transportReconnect_.attempts()+1,fog::stream::TransportReconnect::MaxAttempts);
+    if (player_.snapshot().recovering) {
+        const auto attempt = player_.snapshot().connecting ? player_.snapshot().attempts :
+            std::min(player_.snapshot().attempts+1,3u);
         box(0,0,1280,82,{23,32,46,255});
         text(uiText::Stream::ReconnectAttemptPrefix + std::to_string(attempt) + uiText::Stream::ReconnectAttemptSuffix,20,8,accent,1240);
         text(uiText::Stream::ReconnectLimitHint,20,44,white,1240);
-    } else if (videoRecovery_.active() || videoLossWaiting_) {
+    } else if (player_.snapshot().videoRecovering || player_.snapshot().lossWaiting) {
         box(0,0,1280,45,{23,32,46,255});
         text(uiText::Stream::RecoveringVideo,20,8,accent,1240);
     } else if (!overlayNotice_.empty() && std::chrono::steady_clock::now()-overlayNoticeAt_ < std::chrono::seconds(4)) {
@@ -89,12 +89,12 @@ void ApplicationController::draw() {
     bool videoDrawn = false;
     {
         fog::stream::LoopTiming::Scope mediaScope(loopTiming_, fog::stream::LoopTiming::Stage::MediaDraw,
-            screen_ == Screen::Streaming && media_);
-        if (screen_ == Screen::Streaming && media_) videoDrawn = media_->draw();
+            screen_ == Screen::Streaming && player_.mediaView());
+        if (screen_ == Screen::Streaming && player_.mediaView()) videoDrawn = player_.presentation()->draw();
     }
     if (videoDrawn) {
         fog::stream::LoopTiming::Scope overlayScope(loopTiming_, fog::stream::LoopTiming::Stage::Overlay);
-        if (overlay_.mode() == fog::stream::OverlayMode::Closed && std::chrono::steady_clock::now()-streamStarted_ < std::chrono::seconds(12)) {
+        if (overlay_.mode() == fog::stream::OverlayMode::Closed && player_.snapshot().transportAgeMs < 12000) {
             box(0,665,1280,55,{23,32,46,255});
             text(uiText::Stream::OverlayMenuHint,30,680,accent);
         }
@@ -102,13 +102,14 @@ void ApplicationController::draw() {
         overlayScope.finish();
         const auto presentStarted = std::chrono::steady_clock::now();
         fog::stream::LoopTiming::Scope presentScope(loopTiming_, fog::stream::LoopTiming::Stage::Present);
-        media_->present();
+        player_.presentation()->present();
+        player_.presentationCompleted(std::chrono::steady_clock::now());
         streamMenuPresented(true);
         presentTiming_.record(presentStarted);
         presentScope.finish();
-        loopTiming_.presented(media_->presentedFrames(),
-            !stopAfterTask_ && !transportReconnect_.recovering() && !videoRecovery_.active() &&
-            !videoLossWaiting_ && !media_->waitingForVideoKeyframe() &&
+        loopTiming_.presented(player_.snapshot().progress.presented,
+            !rentalSession_.requested() && !player_.snapshot().recovering && !player_.snapshot().videoRecovering &&
+            !player_.snapshot().lossWaiting && !player_.snapshot().progress.waiting &&
             (overlay_.mode() == fog::stream::OverlayMode::Closed || overlay_.mode() == fog::stream::OverlayMode::Mouse),
             std::chrono::steady_clock::now());
         return;
@@ -127,7 +128,7 @@ void ApplicationController::draw() {
     }
     if (screen_ == Screen::Profile) {
         chrome.title = "ПРОФИЛЬ";
-        chrome.hints = sessionPending_ ? "A — вход / обновить · R — проверить аренду · B — назад" :
+        chrome.hints = rentalSession_.state().pending ? "A — вход / обновить · R — проверить аренду · B — назад" :
             selection_ ? "A — вход / обновить · R — оценить сеанс · X — выйти · B — назад" : "A — вход / обновить · X — выйти · R — аренды · B — назад";
     }
     if (screen_ == Screen::SessionRating) {
@@ -160,7 +161,7 @@ void ApplicationController::draw() {
     if (screen_ == Screen::Genres) { chrome.title = uiText::Catalog::GenresTitle; chrome.hints = uiText::Catalog::GenreHints; }
     if (screen_ == Screen::Computers) chrome.hints = uiText::Server::CatalogHints;
     if (screen_ == Screen::Details) chrome.hints = detailsFromAutomatic_ ? uiText::Server::ConnectHints : uiText::Server::RefreshPingHints;
-    if (sessionPending_ && screen_ != Screen::Profile) chrome.hints = uiText::Server::PendingSessionHints;
+    if (rentalSession_.state().pending && screen_ != Screen::Profile) chrome.hints = uiText::Server::PendingSessionHints;
     if (auth_.authenticated() && authSaveFailed_) chrome.subtitle.clear();
     ui_.frame(chrome);
     const auto area = ui_.content();
@@ -266,24 +267,24 @@ void ApplicationController::draw() {
         ui_.dialog({uiText::Server::AdoptRentalTitle,uiText::Server::AdoptRentalNotice,uiText::Common::Connect,uiText::Common::Back});
     } else if (screen_ == Screen::Checkout) {
         // Worker owns the coordinator while a request is running. Never read its mutable result here.
-        ui_.dialog({uiText::Server::ConnectingTitle, checkoutStatus_ + (pairedPending_ || task_ == Task::PairedCreate ? "\nНеопределённый результат сохраняется. Проверьте аренду в исходном аккаунте FogHub." : ui_.controllerHints(uiText::Server::ManualCheckHint)),ui_.controllerHints(uiText::Server::CheckButtonHint),ui_.controllerHints(uiText::Server::FinishButtonHint)});
+        ui_.dialog({uiText::Server::ConnectingTitle, checkoutStatus_ + (rentalSession_.state().pairedPending || task_ == Task::PairedCreate ? "\nНеопределённый результат сохраняется. Проверьте аренду в исходном аккаунте FogHub." : ui_.controllerHints(uiText::Server::ManualCheckHint)),ui_.controllerHints(uiText::Server::CheckButtonHint),ui_.controllerHints(uiText::Server::FinishButtonHint)});
     } else if (screen_ == Screen::ManualResolution) {
         ui_.dialog({uiText::Server::ManualResolutionTitle,uiText::Server::ManualResolutionNotice,uiText::Server::ManualResolutionConfirmed,uiText::Common::Back,true,true});
     } else if (screen_ == Screen::StopConfirm) {
         ui_.dialog({uiText::Server::FinishGameSessionTitle,uiText::Server::FinishRentalNotice,uiText::Server::FinishRental,uiText::Common::Continue,true,true});
     } else if (screen_ == Screen::Stopping || screen_ == Screen::Recovery) {
-        std::string hint = pairedPending_ ? status_ : ui_.controllerHints(uiText::Server::TerminationRecoveryHint);
-        if (recoveryPaused_) {
+        std::string hint = rentalSession_.state().pairedPending ? status_ : ui_.controllerHints(uiText::Server::TerminationRecoveryHint);
+        if (rentalSession_.paused()) {
             hint = uiText::Server::RecoveryPaused;
-            if (!pairedPending_ && !pending_.valid() && checkout_.unresolved()) hint += uiText::Server::RecoveryMtsManualHint;
+            if (!rentalSession_.state().pairedPending && !pending_.valid() && rentalSession_.state().checkoutPending) hint += uiText::Server::RecoveryMtsManualHint;
             hint = ui_.controllerHints(hint);
         }
         ui_.dialog({uiText::Server::TerminationUnconfirmed,
             hint,uiText::Common::Check,"",true,true});
     } else if (screen_ == Screen::Streaming) {
-        if (transportTeardown_.pending())
+        if (player_.snapshot().teardown)
             ui_.empty(uiText::Stream::StoppingTransport,uiText::Stream::StoppingTransportNotice);
-        else if (transportReconnect_.recovering())
+        else if (player_.snapshot().recovering)
             ui_.empty(uiText::Stream::Reconnecting,uiText::Stream::ReconnectNotice);
         else ui_.empty(uiText::Stream::ConnectingComputer,uiText::Stream::FirstFrameHint);
     } else if (screen_ == Screen::Consent) {
@@ -306,10 +307,10 @@ void ApplicationController::draw() {
         ui_.status(playStationError_,false,true);
     else if (screen_ != Screen::Genres && screen_ != Screen::SessionRating && (pending_.valid() || !routineStatus(status_)))
         ui_.status(pending_.valid() ? uiText::Common::Loading : status_, pending_.valid());
-    if (transportTeardown_.pending() && screen_ != Screen::Streaming)
+    if (player_.snapshot().teardown && screen_ != Screen::Streaming)
         ui_.status(uiText::Stream::StoppingTransport,true);
     if (screen_ == Screen::Streaming) drawStreamOverlay();
-    if (screen_ == Screen::Streaming && media_) media_->present();
+    if (screen_ == Screen::Streaming && player_.mediaView()) player_.presentation()->present();
     else SDL_RenderPresent(rt_.renderer);
     streamMenuPresented(false);
     fogplay::diagnostics::firstUiFramePresented();

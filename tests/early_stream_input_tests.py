@@ -6,21 +6,26 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 source = (root / 'src/features/streaming/presentation/playback_controller.cpp').read_text()
 begin = source.index('void ApplicationController::sendStreamInput(')
-method = source[begin:source.rindex('\n}')]
+brace = source.index('{',begin)
+depth,end = 1,brace+1
+while depth:
+    depth += (source[end]=='{')-(source[end]=='}'); end+=1
+method = source[begin:end]
 inputs = (root / 'src/features/streaming/presentation/stream_input_controller.cpp').read_text()
 remote_begin = inputs.index('bool ApplicationController::sendRemote(')
 remote_end = inputs.index('void ApplicationController::releaseMouse(', remote_begin)
 remote_methods = inputs[remote_begin:remote_end]
-pump = source[source.index('void ApplicationController::pumpStream('):begin]
+pump = source[source.index('void ApplicationController::pumpStream('):source.index('void ApplicationController::logOutputTimings(')]
 # Wiring checks complement the executable coordinator test below.
-for gate in ('handleStreamOverlay(', 'handleTransportState(', 'advanceTransportRecovery(',
-             'const bool lossWaiting', 'takeWorkerError(', 'workerVideoGeneration('):
+for gate in ('handleStreamOverlay(', 'player_.beforeMedia('):
     assert pump.index(gate) < pump.index('sendStreamInput('), gate
-for work in ('media_->checkAudioRecovery();', 'drainStreamAudio();', 'stream_->poll(packet)', 'media_->preparePresentation('):
+for work in ('player_.media(',):
     assert pump.index('sendStreamInput(') < pump.index(work), work
-assert pump.index('stream_->pump();') < pump.index('handleStreamOverlay(')
+assert pump.index('player_.observe(') < pump.index('handleStreamOverlay(')
 
 harness = r'''
+#include "features/session/application/rental_stop_coordinator.hpp"
+#include "features/streaming/application/player.hpp"
 #include "features/streaming/domain/streaming_client.hpp"
 #include "core/constants/stage1_options.hpp"
 #include "features/streaming/domain/stream_input_gate.hpp"
@@ -83,7 +88,7 @@ struct ApplicationController {
         bool click(std::uint64_t,bool) { return false; }
     } psNativeInput_;
     Screen screen_=Screen::Streaming;
-    bool stopAfterTask_=false, exitAfterStop_=false, firstFramePresented_=true, streamPlayStation_=false;
+    bool  exitAfterStop_=false, firstFramePresented_=true, streamPlayStation_=false; fog::RentalStopCoordinator rentalSession_;
     bool videoLossWaiting_=false, psTouchLastSubmitted_=false, nativeAllowed=false;
     unsigned psGamepadAccepted_=0,psGamepadRejected_=0;
     std::uint64_t lastVideoGeneration_=1,padSampledAtUs_=123;
@@ -99,6 +104,22 @@ struct ApplicationController {
     void sendStreamInput(PadState& pad,u64 held,bool overlayHandled);
     bool sendRemote(const fog::remote::Input& command);
     void retryKeyReleases() noexcept;
+    struct PlayerView {
+        ApplicationController* owner;
+        Transport* inputSink() const { return owner->stream_; }
+        fog::stream::Player::Snapshot snapshot() const {
+            fog::stream::Player::Snapshot value;
+            value.media=bool(owner->media_);
+            value.ready=owner->transport.connected;value.disconnected=owner->transport.broken;
+            value.connected=owner->transport.state==stream::RecoveryState::Connected;
+            value.inputAllowed=owner->firstFramePresented_&&!owner->transportReconnect_.active&&!owner->videoLossWaiting_&&
+                !owner->transport.waiting&&!owner->media.waiting&&!owner->transport.broken&&value.connected&&value.ready&&
+                !owner->transport.freeze&&!owner->videoRecovery_.active()&&
+                std::chrono::steady_clock::now()-owner->lastVideo_<std::chrono::seconds(10)&&
+                (owner->media.workers?owner->media.generation:owner->transport.generation)==owner->lastVideoGeneration_;
+            return value;
+        }
+    } player_{this};
 };
 '''
 harness += method
@@ -121,7 +142,7 @@ int main() {
     for (int prohibition=0;prohibition<18;++prohibition) {
         ApplicationController app;
         switch(prohibition) {
-            case 0: app.stopAfterTask_=true; break;
+            case 0: app.rentalSession_.request(); break;
             case 1: app.exitAfterStop_=true; break;
             case 2: app.screen_=Screen::StopConfirm; break;
             case 3: app.transportReconnect_.active=true; break;

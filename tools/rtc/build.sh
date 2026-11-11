@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+# Maintenance crashes retain this fence; never clear it automatically.
+if [ -e "$ROOT/tools/rtc/.typed-ice-integration.lock" ] || [ -L "$ROOT/tools/rtc/.typed-ice-integration.lock" ]; then
+  echo 'RTC maintenance lock present; inspect its recovery journal before building' >&2
+  exit 1
+fi
 PLATFORM=${1:-switch}
 case "$PLATFORM" in switch|host) ;; *) echo 'Usage: build.sh [switch|host]' >&2; exit 2;; esac
 BUILD="$ROOT/work/rtc/build-$PLATFORM"
@@ -40,9 +45,11 @@ if [ "$PLATFORM" = host ]; then
   LOG="$ROOT/work/rtc/thread-observation-run.log"
   timeout 25 "$BUILD/rtc-thread-observation-test" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/udp-budget-build.log"
-  cmake --build "$BUILD" --target rtc-udp-budget-test rtc-ice-diagnostics-test rtc-dtls-queue-test rtc-dtls-diagnostics-test rtc-dtls-receive-test rtc-dtls-ingress-test rtc-media-send-diagnostics-test rtc-rtcp-feedback-test -j "${JOBS:-8}" > "$LOG" 2>&1
+  cmake --build "$BUILD" --target rtc-typed-ice-test rtc-udp-budget-test rtc-ice-diagnostics-test rtc-dtls-queue-test rtc-dtls-diagnostics-test rtc-dtls-receive-test rtc-dtls-ingress-test rtc-media-send-diagnostics-test rtc-rtcp-feedback-test -j "${JOBS:-8}" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/udp-budget-run.log"
   timeout 10 "$BUILD/rtc-udp-budget-test" > "$LOG" 2>&1
+  LOG="$ROOT/work/rtc/typed-ice-run.log"
+  timeout 10 "$BUILD/rtc-typed-ice-test" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/ice-diagnostics-run.log"
   timeout 10 "$BUILD/rtc-ice-diagnostics-test" > "$LOG" 2>&1
   LOG="$ROOT/work/rtc/dtls-queue-run.log"

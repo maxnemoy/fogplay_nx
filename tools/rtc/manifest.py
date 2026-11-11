@@ -40,7 +40,7 @@ def inputs(platform):
     result = {path.relative_to(ROOT).as_posix(): digest(path)
               for path in sorted((ROOT / 'tools/rtc').rglob('*'))
               if path.is_file() and '__pycache__' not in path.parts
-              and path.suffix in ('.py', '.sh', '.txt', '.h', '.c', '.cpp', '.patch')}
+              and path.suffix in ('.py', '.sh', '.txt', '.h', '.c', '.cpp', '.patch', '.json')}
     for name in ('libdatachannel', 'mbedtls'):
         result.update(source_inputs(ROOT / 'third_party/rtc' / name))
     compiler = os.environ.get('CXX', 'c++')
@@ -59,7 +59,7 @@ def outputs(prefix):
     for name in LIBRARIES:
         if not (prefix / 'lib' / ('lib' + name + '.a')).is_file():
             raise ValueError('missing RTC archive: lib' + name + '.a')
-    for name in ('rtc/rtc.hpp', 'mbedtls/ssl.h', 'psa/crypto.h', 'mbedtls-user-config.h'):
+    for name in ('rtc/rtc.hpp', 'rtc/icediagnostics.hpp', 'mbedtls/ssl.h', 'psa/crypto.h', 'mbedtls-user-config.h'):
         if not (prefix / 'include' / name).is_file():
             raise ValueError('missing RTC header: ' + name)
     return {path.relative_to(prefix).as_posix(): digest(path)

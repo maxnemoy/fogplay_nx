@@ -1,11 +1,10 @@
 #include "features/providers/infrastructure/foghub_review_html.hpp"
 #include "features/providers/infrastructure/foghub_html.hpp"
-#include "features/providers/infrastructure/html_raw_text.hpp"
+#include "features/providers/infrastructure/foghub_html_tree.hpp"
 #include "core/domain/repository_error.hpp"
 #include <libxml/HTMLparser.h>
 #include <libxml/xpath.h>
 #include <algorithm>
-#include <cctype>
 #include <memory>
 #include <set>
 #include <vector>
@@ -39,13 +38,16 @@ Nodes select(xmlNode* node,const char* query) {
 }
 xmlNode* one(xmlNode* node,const char* query) { auto nodes=select(node,query); require(nodes.size()==1); return nodes.front(); }
 void bounds(xmlNode* node,unsigned depth,std::size_t& count) {
-    for (;node;node=node->next) { require(++count<=60000 && depth<=96); if(node->children) bounds(node->children,depth+1,count); }
+    for (;node;node=node->next) {
+        require(++count<=60000 && depth<=96 && html_tree::allowedNode(node)); if(node->children) bounds(node->children,depth+1,count);
+    }
 }
 bool tolerated(const xmlError* error) {
     // Same benign HTML4-parser (Switch libxml2 2.9.8) reports as foghub_html.cpp.
+    const std::string element=error && error->str1 ? error->str1 : "";
     return !error || error->level<XML_ERR_ERROR || error->code==XML_HTML_UNKNOWN_TAG ||
         error->code==XML_ERR_NAME_REQUIRED || error->code==XML_ERR_ENTITYREF_SEMICOL_MISSING ||
-        (error->code==XML_ERR_TAG_NAME_MISMATCH && error->str1 && std::string(error->str1)=="p");
+        (error->code==XML_ERR_TAG_NAME_MISMATCH && (element=="p" || element=="script" || element=="style"));
 }
 struct Errors { bool invalid=false; };
 #if LIBXML_VERSION >= 21200
@@ -60,22 +62,22 @@ void quiet(void*,const char*,...) {}
 #if LIBXML_VERSION >= 21300
 void contextError(void* data,const xmlError* error) { if(!tolerated(error)) static_cast<Errors*>(data)->invalid=true; }
 #endif
-Doc document(const std::string& source) {
-    require(!source.empty() && source.size()<=2*1024*1024 && source.find('\0')==std::string::npos);
-    const auto html=withoutRawTextContent(source); // Script/style text is opaque here.
-    auto folded=html; for(auto& c:folded) c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    require(folded.find("<!entity")==std::string::npos && folded.find("<![")==std::string::npos);
+Doc document(const std::string& html) {
+    require(!html.empty() && html.size()<=2*1024*1024 && html.find('\0')==std::string::npos);
+    require(!html_tree::leadingInternalSubset(html)); // declarations: see foghub_html_tree.hpp
     std::unique_ptr<htmlParserCtxt,decltype(&htmlFreeParserCtxt)> context(htmlNewParserCtxt(),htmlFreeParserCtxt);
     require(bool(context)); Errors errors; context->_private=&errors;
     context->sax->serror=parseError; context->sax->warning=quiet; context->sax->error=quiet; context->sax->fatalError=quiet;
 #if LIBXML_VERSION >= 21300
     xmlCtxtSetErrorHandler(context.get(),contextError,&errors);
 #endif
+    // RECOVER: on the Switch libxml2 2.9.8 a script/style ends only at its own
+    // end tag, as in HTML5 (see foghub_html.cpp document()); no pre-processing.
     Doc doc(htmlCtxtReadMemory(context.get(),html.data(),static_cast<int>(html.size()),nullptr,"UTF-8",
-        HTML_PARSE_NONET|HTML_PARSE_COMPACT|HTML_PARSE_NODEFDTD),xmlFreeDoc);
+        HTML_PARSE_NONET|HTML_PARSE_COMPACT|HTML_PARSE_NODEFDTD|HTML_PARSE_RECOVER),xmlFreeDoc);
     require(doc && xmlDocGetRootElement(doc.get()) && !errors.invalid && tolerated(xmlCtxtGetLastError(context.get())));
     require(!doc->extSubset && (!doc->intSubset || !doc->intSubset->children));
-    std::size_t count=0; bounds(xmlDocGetRootElement(doc.get()),0,count); return doc;
+    std::size_t count=0; bounds(doc->children,0,count); return doc;
 }
 void id(const std::string& value) {
     require(!value.empty() && value.size()<=20 && value.front()!='0' &&

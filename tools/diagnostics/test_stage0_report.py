@@ -36,6 +36,11 @@ class Stage0ReportTests(unittest.TestCase):
                 f"core_us={core_us if core_us is not None else seq * 100} frame={frame} value={value} "
                 f"totalsValid={valid} requests={requests} intact={intact} fecFailedBlocks={failed}")
 
+    @staticmethod
+    def cumulative(line, sequence, missed):
+        prefix = f" journalSequence={sequence}" if sequence is not None else ""
+        return f"{line}{prefix} journalMissed={missed}"
+
     def parse_idr(self, lines):
         path = self.log("[0 ms] FogPlay NX 0.6.19 startup.\n" + "\n".join(lines) + "\n")
         return report.parse_log(path)["runs"][0]["moonlight_idr"]
@@ -91,6 +96,114 @@ class Stage0ReportTests(unittest.TestCase):
         for wait in result["waits"]:
             self.assertIn("journal-loss-unknown-wait-attribution", wait["incompleteness_reasons"])
         self.assertEqual(result["waits"][0]["admitted_totals_max"]["requests"], 3)
+
+    def test_final_core_cumulative_loss_without_idr_events(self):
+        result = self.parse_idr([
+            "[1 ms] Video gaps final: Moonlight core cumulative available=1 journalCursor=20 journalMissed=54 coreSourceMissed=0"])
+        self.assertEqual(result["journal_missed"], 54)
+        self.assertEqual(result["journal_missed_cumulative"], 54)
+        self.assertEqual(result["journal_missed_legacy_notices"], 0)
+        self.assertEqual(result["loss_attribution"], "unknown")
+        self.assertEqual(result["loss_notices"], [])
+        self.assertEqual(result["malformed_lines"], 0)
+
+    def test_cumulative_snapshots_and_shared_thread_events_are_not_summed(self):
+        result = self.parse_idr([
+            self.cumulative(self.idr("wait-enter", 2, wait=9), 2, 4),
+            self.cumulative(self.idr("wait-exit", 3, wait=9), 3, 4),
+            "[4 ms] Moonlight thread role=AudioPing connection=1 core=0 priority=59 mask=7 ideal=0 "
+            "queryErrors=0 available=1 seq=4 core_us=400 journalSequence=4 journalMissed=4",
+            self.cumulative(self.idr("request", 5, wait=9), 5, 9)])
+        self.assertEqual(result["journal_missed"], 9)
+        self.assertEqual(sum(result["observed_event_counts"].values()), 3)
+        self.assertEqual(result["journal_counter"]["duplicate_snapshots"], 0)
+        self.assertIn("journal-loss-unknown-wait-attribution", result["waits"][0]["incompleteness_reasons"])
+
+    def test_legacy_notices_and_cumulative_fields_do_not_double_count(self):
+        result = self.parse_idr([
+            "[1 ms] Moonlight IDR journal missed=5 through_seq=4",
+            self.cumulative(self.idr("request", 5), 5, 9),
+            "[6 ms] Moonlight IDR journal missed=2 through_seq=5"])
+        self.assertEqual(result["journal_missed"], 9)
+        self.assertEqual(result["journal_missed_legacy_notices"], 7)
+        self.assertEqual(result["journal_missed_cumulative"], 9)
+        self.assertEqual(len(result["loss_notices"]), 2)
+
+    def test_cumulative_reset_delayed_duplicate_and_invalid_values_are_conservative(self):
+        result = self.parse_idr([
+            self.cumulative(self.idr("request", 1), 10, 5),
+            self.cumulative(self.idr("request", 2), 10, 5),
+            self.cumulative(self.idr("request", 3), 11, 9),
+            self.cumulative(self.idr("request", 4), 9, 2),
+            self.cumulative(self.idr("request", 5), 12, 1),
+            self.cumulative(self.idr("request", 6), 13, "bad")])
+        self.assertEqual(result["journal_missed"], 9)
+        self.assertEqual(result["journal_counter"]["reset_boundaries"], 1)
+        self.assertEqual(result["journal_counter"]["delayed_records_ignored"], 1)
+        self.assertEqual(result["journal_counter"]["duplicate_snapshots"], 1)
+        self.assertEqual(result["journal_counter"]["conflicting_snapshots"], 0)
+        self.assertEqual(result["malformed_lines"], 1)
+        self.assertEqual(result["observed_event_counts"]["request"], 6)
+
+    def test_cumulative_connections_and_runs_are_isolated(self):
+        path = self.log("\n".join([
+            "[0 ms] FogPlay NX 0.6.19 startup.",
+            self.cumulative(self.idr("request", 1, connection=1), 1, 5),
+            self.cumulative(self.idr("request", 2, connection=2), 1, 7),
+            "[3 ms] Video gaps final: Moonlight core cumulative journalCursor=2 journalMissed=7 coreSourceMissed=0",
+            "[4 ms] FogPlay NX 0.6.20 startup.",
+            self.cumulative(self.idr("request", 1, connection=1), 1, 3)]))
+        first, second = report.parse_log(path)["runs"]
+        self.assertEqual(first["moonlight_idr"]["journal_missed"], 7)
+        self.assertEqual(first["moonlight_idr"]["journal_missed_cumulative"], 7)
+        self.assertEqual(second["moonlight_idr"]["journal_missed"], 3)
+
+    def test_unsequenced_cumulative_generation_is_a_lower_bound(self):
+        result = self.parse_idr([
+            self.cumulative(self.idr("request", 1), None, 8),
+            self.cumulative(self.idr("request", 2), 2, 3)])
+        self.assertEqual(result["journal_missed"], 8)
+        self.assertEqual(result["journal_counter"]["unsequenced_observations"], 1)
+
+    def test_core_connection_does_not_reset_adapter_journal_identity(self):
+        result = self.parse_idr([
+            self.cumulative(self.idr("request", 1, connection=1), 100, 54),
+            self.cumulative(self.idr("request", 2, connection=2), 101, 54),
+            self.cumulative(self.idr("request", 3, connection=2), 101, 55)])
+        self.assertEqual(result["journal_missed"], 55)
+        self.assertEqual(result["journal_counter"]["conflicting_snapshots"], 1)
+        result = self.parse_idr([
+            "[1 ms] Video gaps final: Moonlight core cumulative available=1 journalCursor=0 journalMissed=0 coreSourceMissed=4"])
+        self.assertEqual(result["journal_missed"], 4)
+        self.assertEqual(result["loss_attribution"], "unknown")
+
+    def test_packet_gap_source_endpoints_identity_and_loss(self):
+        gap = ("[80 ms] Moonlight receive event=packet-gap seq=5 connection=2 wait=3 "
+               "core_us=900000 gapUs=600000 thresholdUs=50000 previousCoreUs=300000 "
+               "videoBindingKnown=0 journalSequence=8 journalMissed=9")
+        result = self.parse_idr([gap, gap, gap.replace("seq=5", "seq=6").replace("previousCoreUs=300000", "previousCoreUs=400000")])
+        self.assertEqual(result["journal_missed"], 9)
+        self.assertEqual(result["receive_packet_gap_observed_count"], 1)
+        self.assertEqual(result["receive_packet_gaps"][0]["wait"], 3)
+        self.assertEqual(result["receive_packet_gaps"][0]["gapUs"], 600000)
+        self.assertEqual(result["receive_packet_gap_retention"]["malformed"], 1)
+        self.assertEqual(result["receive_packet_gap_retention"]["duplicates_in_retained_window"], 1)
+        self.assertEqual(result["observed_event_counts"], {})
+
+    def test_packet_gap_retention_is_bounded(self):
+        result = self.parse_idr([
+            f"[{i} ms] Moonlight receive event=packet-gap seq={i} connection=1 wait=0 "
+            "core_us=100001 gapUs=50001 thresholdUs=50000 previousCoreUs=50000"
+            for i in range(300)])
+        self.assertEqual(len(result["receive_packet_gaps"]), 256)
+        self.assertEqual(result["receive_packet_gap_retention"]["omitted"], 44)
+        self.assertEqual(result["receive_packet_gap_observed_count"], 300)
+        self.assertEqual(result["journal_missed"], 0)
+
+    def test_filtered_event_sequence_gaps_alone_do_not_imply_loss(self):
+        result = self.parse_idr([self.idr("request", 10), self.idr("request", 20)])
+        self.assertEqual(result["journal_missed"], 0)
+        self.assertEqual(result["loss_attribution"], "no-loss-notice-observed")
 
     def test_idr_unavailable_totals_clock_rollback_and_duplicate(self):
         entry = self.idr("wait-enter", 1, core_us=1000)

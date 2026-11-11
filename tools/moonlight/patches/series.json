@@ -1,0 +1,316 @@
+{
+  "schema": 2,
+  "repositories": [
+    {
+      "name": "switch",
+      "path": "third_party/moonlight/moonlight-switch",
+      "revision": "a75fee223914f36ec26b29739d95331307960fa3"
+    },
+    {
+      "name": "common-c",
+      "path": "third_party/moonlight/moonlight-switch/extern/moonlight-common-c",
+      "revision": "206c79c240c342229555494a8cadda6c11cad479"
+    },
+    {
+      "name": "enet",
+      "path": "third_party/moonlight/moonlight-switch/extern/moonlight-common-c/enet",
+      "revision": "e261d80db1de7ee92fe4fc45db67887df8b45314"
+    },
+    {
+      "name": "nanors",
+      "path": "third_party/moonlight/moonlight-switch/extern/moonlight-common-c/nanors",
+      "revision": "b1e3c22ca0cdc0bb83e3cd6ed1a2fc77869ed99a"
+    }
+  ],
+  "patches": [
+    {
+      "path": "0001-probe-and-termination.patch",
+      "sha256": "b33133f37e1a58df1467b19d90691fd2d674130285c4b64066a056f1b9962cde",
+      "transformation": "Probe, crypto, pairing and synchronous termination fixes",
+      "legacy_source": "tools/moonlight/prepare.py",
+      "legacy_sha256": "423e8187bcdea6b00eb1a35a913ad03433551764c30c7ca73c5abd90b8ff5efa"
+    },
+    {
+      "path": "0002-production.patch",
+      "sha256": "0da807ef992fb0ebc79d238037a02f2d07eec236920f34196e9aca78205a09f4",
+      "transformation": "Production identity, SPKI pinning and addressing",
+      "legacy_source": "tools/moonlight/production.py",
+      "legacy_sha256": "e3b494a23497c37acd4bd294aff33ddb0ddc3ece8b6a0a2113c7b657ecbfacb5"
+    },
+    {
+      "path": "0003-command-diagnostics.patch",
+      "sha256": "0fafb47d527381bde642ca7a2290c5d71778182a17c5d37612b03df6e7d94e81",
+      "transformation": "Redacted numeric HTTP/XML/command diagnostics",
+      "legacy_source": "tools/moonlight/prepare.py",
+      "legacy_sha256": "423e8187bcdea6b00eb1a35a913ad03433551764c30c7ca73c5abd90b8ff5efa"
+    },
+    {
+      "path": "0004-core-diagnostics.patch",
+      "sha256": "f19bb4ed0e52d8dc72c032b4d390ec4683f0034429c8cbeec6e4e5065cd04282",
+      "transformation": "Core receive, queue, FEC and IDR diagnostics",
+      "legacy_source": "tools/moonlight/diagnostics.py",
+      "legacy_sha256": "3f5794b30dae851bf3325556645e332d32332fb46950b3e12b7e880642085cc8"
+    },
+    {
+      "path": "0005-idr-recovery.patch",
+      "sha256": "dfb5a2022f5874f2c74587f8f6d2273ab2d626ede77930b3c4d9610e43171791",
+      "transformation": "Bounded IDR recovery and partial-IDR guard",
+      "legacy_source": "tools/moonlight/recovery.py",
+      "legacy_sha256": "a7b1f90f42993761a09d01202521d664219055d56b6cf3dfedf3301b80bfef74"
+    },
+    {
+      "path": "0006-idr-diagnostics.patch",
+      "sha256": "3eb9444685fb3ed23c44a7bbc810a4a426c7a35e88d3bdbee9c4da994e8a521c",
+      "transformation": "Detailed IDR/FEC and thread observations",
+      "legacy_source": "tools/moonlight/idr_diagnostics.py",
+      "legacy_sha256": "892c690db1a07c69b2bf25d528439b332420d03b2e2babacd173853d43d3b32e"
+    },
+    {
+      "path": "0007-rtsp-transport.patch",
+      "sha256": "d2b9b0290c897536c6cb96afb7c5670409f7789ed346e5ae9775095790366b86",
+      "transformation": "Cancellable RTSP transport and termination provenance",
+      "legacy_source": "tools/moonlight/transport.py",
+      "legacy_sha256": "be1598b2571d0aba28db21856fec5f1b0a983c04151cd46da6b37e05d6251f23"
+    },
+    {
+      "path": "0008-encryption.patch",
+      "sha256": "63a4b3fbae63b51886362430c0455d8ab442da7ecbb183c7fa0defb323ac87ea",
+      "transformation": "Frozen C7 encryption negotiation and observations",
+      "legacy_source": "tools/moonlight/encryption.py",
+      "legacy_sha256": "05a4b2f4f4cb3b3a9600019d7f4d3598cf42e548a06d34698bebc1422d5a3a50"
+    },
+    {
+      "path": "0009-same-wait-idr-gate.patch",
+      "sha256": "d0a63619f348bfc88f6d6807c23f747909944dc8d80372402da6384b1159a6bd",
+      "transformation": "Share the existing 500 ms retry gate across repeated complete-frame holes in one IDR wait",
+      "provenance": "post-frozen same-wait IDR recovery correction"
+    },
+    {
+      "path": "0010-restore-loss-idr-retry.patch",
+      "sha256": "008d84edde5f6d72b04c89aa62c3abf5f697f03142355041219aea4a24a33e93",
+      "transformation": "Restore immediate IDR retry after each new loss; retain the existing 500 ms fallback without a new loss",
+      "provenance": "restore per-loss IDR retry after 0.6.33 regression"
+    }
+  ],
+  "outputs": [
+    {
+      "path": "core/AudioStream.c",
+      "repository": "common-c",
+      "source_path": "src/AudioStream.c",
+      "base_sha256": "1b0d9f1c41b79c294073e0e6c5e5939a8ecd14c1c4b0a3cd62dd8fd416fdd9c0",
+      "prepared_sha256": "8e4a913450a90d21bd31136ea8dcc0ee093d5433b32ca614ccd3b6e5f720bfe8",
+      "frozen_sha256": "8e4a913450a90d21bd31136ea8dcc0ee093d5433b32ca614ccd3b6e5f720bfe8",
+      "previous_sha256": "8e4a913450a90d21bd31136ea8dcc0ee093d5433b32ca614ccd3b6e5f720bfe8"
+    },
+    {
+      "path": "core/Connection.c",
+      "repository": "common-c",
+      "source_path": "src/Connection.c",
+      "base_sha256": "3e95815001e259f4a0102b4c40754dff90acf7105824ee79f7d48ee1068e5488",
+      "prepared_sha256": "922cf9bd7f534bcddc272877235f79d65da59d0aaaa22bad7df0a1e7fb6facf8",
+      "frozen_sha256": "922cf9bd7f534bcddc272877235f79d65da59d0aaaa22bad7df0a1e7fb6facf8",
+      "previous_sha256": "922cf9bd7f534bcddc272877235f79d65da59d0aaaa22bad7df0a1e7fb6facf8"
+    },
+    {
+      "path": "core/ControlStream.c",
+      "repository": "common-c",
+      "source_path": "src/ControlStream.c",
+      "base_sha256": "214c7b6652727a9f1657e37a8296967e628053ec399c55812f5e6f6850278bab",
+      "prepared_sha256": "a266ebfab0739e5d38151bf31cec5f7ae385f9d6d8a360a1e1f86300129ed1ed",
+      "frozen_sha256": "a266ebfab0739e5d38151bf31cec5f7ae385f9d6d8a360a1e1f86300129ed1ed",
+      "previous_sha256": "a266ebfab0739e5d38151bf31cec5f7ae385f9d6d8a360a1e1f86300129ed1ed"
+    },
+    {
+      "path": "core/LinkedBlockingQueue.c",
+      "repository": "common-c",
+      "source_path": "src/LinkedBlockingQueue.c",
+      "base_sha256": "4e95cbf1abc64ad8f5357d76615f81e8f8310b9d2974b058ddf2fc03935e71c6",
+      "prepared_sha256": "250c17082a863032f2f15e3c4e1b85f32a77e75e8ae7cbbf16031c38d087c0ab",
+      "frozen_sha256": "250c17082a863032f2f15e3c4e1b85f32a77e75e8ae7cbbf16031c38d087c0ab",
+      "previous_sha256": "250c17082a863032f2f15e3c4e1b85f32a77e75e8ae7cbbf16031c38d087c0ab"
+    },
+    {
+      "path": "core/PlatformSockets.c",
+      "repository": "common-c",
+      "source_path": "src/PlatformSockets.c",
+      "base_sha256": "54410723e33b101cb73f5d2f930d4db0f295ce5a86349d6519c05ffd28f9c945",
+      "prepared_sha256": "2fa2fbd59e5751fef02f491481594788b783a1839f85fe03142d6e18d5e5812b",
+      "frozen_sha256": "2fa2fbd59e5751fef02f491481594788b783a1839f85fe03142d6e18d5e5812b",
+      "previous_sha256": "2fa2fbd59e5751fef02f491481594788b783a1839f85fe03142d6e18d5e5812b"
+    },
+    {
+      "path": "core/PlatformStuff.c",
+      "repository": "common-c",
+      "source_path": "src/PlatformStuff.c",
+      "base_sha256": "6dec7a58d32add4c7632e65914222c8109a42238ab82674741140e6c4c2b0502",
+      "prepared_sha256": "a5927a7c75b60cd1a08db814b1c1a521a5b927113efec3bd8562451c97374453",
+      "frozen_sha256": "a5927a7c75b60cd1a08db814b1c1a521a5b927113efec3bd8562451c97374453",
+      "previous_sha256": "a5927a7c75b60cd1a08db814b1c1a521a5b927113efec3bd8562451c97374453"
+    },
+    {
+      "path": "core/RtpVideoQueue.c",
+      "repository": "common-c",
+      "source_path": "src/RtpVideoQueue.c",
+      "base_sha256": "bd61187bdacf049b954638d2de79408a6a41dfd9dc7bbedf0fcc2664e3a0fc4b",
+      "prepared_sha256": "da2bafabc4877b7e1abd432bce844bf9f2ae50d285da8ed003d60b979482d975",
+      "frozen_sha256": "da2bafabc4877b7e1abd432bce844bf9f2ae50d285da8ed003d60b979482d975",
+      "previous_sha256": "da2bafabc4877b7e1abd432bce844bf9f2ae50d285da8ed003d60b979482d975"
+    },
+    {
+      "path": "core/RtspConnection.c",
+      "repository": "common-c",
+      "source_path": "src/RtspConnection.c",
+      "base_sha256": "44cfd110f637c64c1108a10e1c0efbc4dd2c938613979a645a61346d1979e75f",
+      "prepared_sha256": "44a863b855bd67b8a7dd9d99376aa8273c5dbd8a055fae772c41ef30d10a33cc",
+      "frozen_sha256": "44a863b855bd67b8a7dd9d99376aa8273c5dbd8a055fae772c41ef30d10a33cc",
+      "previous_sha256": "44a863b855bd67b8a7dd9d99376aa8273c5dbd8a055fae772c41ef30d10a33cc"
+    },
+    {
+      "path": "core/VideoDepacketizer.c",
+      "repository": "common-c",
+      "source_path": "src/VideoDepacketizer.c",
+      "base_sha256": "8c84109789896a34934f7a775bfbc0023c21e027a0f919c2c3d3e0b88f7442c4",
+      "prepared_sha256": "4b3b677d018f4fff0a601343a36981e196f35d7bd06228bbac79d3d3ebfc2999",
+      "frozen_sha256": "4b3b677d018f4fff0a601343a36981e196f35d7bd06228bbac79d3d3ebfc2999",
+      "previous_sha256": "d8478b673c80cfb5dbbc8c1c4d6b761a3850c059f45390b74212f4a0ce1d7b25"
+    },
+    {
+      "path": "core/VideoStream.c",
+      "repository": "common-c",
+      "source_path": "src/VideoStream.c",
+      "base_sha256": "7e1e3170ace7a96d9e61743dde9b8a60dc72c1fb2ffda8ba79f9fd505743d498",
+      "prepared_sha256": "d7acb8a8c0da744415756044fefac1a421543104aaf601ed7165bcfb2c1e76bc",
+      "frozen_sha256": "d7acb8a8c0da744415756044fefac1a421543104aaf601ed7165bcfb2c1e76bc",
+      "previous_sha256": "d7acb8a8c0da744415756044fefac1a421543104aaf601ed7165bcfb2c1e76bc"
+    },
+    {
+      "path": "crypto/CryptoManager.hpp",
+      "repository": "switch",
+      "source_path": "app/src/crypto/CryptoManager.hpp",
+      "base_sha256": "74f91b5abe5e4780dfa7c16850e7884b93c46b6fb64e8ac787f722ff79eb8e55",
+      "prepared_sha256": "74f91b5abe5e4780dfa7c16850e7884b93c46b6fb64e8ac787f722ff79eb8e55",
+      "frozen_sha256": "74f91b5abe5e4780dfa7c16850e7884b93c46b6fb64e8ac787f722ff79eb8e55",
+      "previous_sha256": "74f91b5abe5e4780dfa7c16850e7884b93c46b6fb64e8ac787f722ff79eb8e55"
+    },
+    {
+      "path": "crypto/Data.cpp",
+      "repository": "switch",
+      "source_path": "app/src/crypto/Data.cpp",
+      "base_sha256": "92e37c4fdb26c58213ff52b9928ec65b2e3f8f4039a6dd9efa6fe65e4023f46c",
+      "prepared_sha256": "04af18bebae5a3826a75a8219ea3e229537ec68c1a6313c8fb650be7356f75be",
+      "frozen_sha256": "04af18bebae5a3826a75a8219ea3e229537ec68c1a6313c8fb650be7356f75be",
+      "previous_sha256": "04af18bebae5a3826a75a8219ea3e229537ec68c1a6313c8fb650be7356f75be"
+    },
+    {
+      "path": "crypto/Data.hpp",
+      "repository": "switch",
+      "source_path": "app/src/crypto/Data.hpp",
+      "base_sha256": "5ef584c8b76df671b1cc1ee7c2ea1067fe86810ad99e53aed31306d21ad0d6b7",
+      "prepared_sha256": "5ef584c8b76df671b1cc1ee7c2ea1067fe86810ad99e53aed31306d21ad0d6b7",
+      "frozen_sha256": "5ef584c8b76df671b1cc1ee7c2ea1067fe86810ad99e53aed31306d21ad0d6b7",
+      "previous_sha256": "5ef584c8b76df671b1cc1ee7c2ea1067fe86810ad99e53aed31306d21ad0d6b7"
+    },
+    {
+      "path": "crypto/MbedTLSCryptoManager.cpp",
+      "repository": "switch",
+      "source_path": "app/src/crypto/MbedTLSCryptoManager.cpp",
+      "base_sha256": "737a2588e3d0e8e0c5a01944e7b03643c1e4396680314b87d70b4e8824a990e7",
+      "prepared_sha256": "c60ef815094f6a77318d273b22dd6bdab5b7784a90c9cfdc2c32f4f3bde9a4e9",
+      "frozen_sha256": "c60ef815094f6a77318d273b22dd6bdab5b7784a90c9cfdc2c32f4f3bde9a4e9",
+      "previous_sha256": "c60ef815094f6a77318d273b22dd6bdab5b7784a90c9cfdc2c32f4f3bde9a4e9"
+    },
+    {
+      "path": "crypto/MbedTLSCryptoManager.hpp",
+      "repository": "switch",
+      "source_path": "app/src/crypto/MbedTLSCryptoManager.hpp",
+      "base_sha256": "9fa867b8181512bb30b32506148ade3278555abbe995593992625a3bce18ab84",
+      "prepared_sha256": "9fa867b8181512bb30b32506148ade3278555abbe995593992625a3bce18ab84",
+      "frozen_sha256": "9fa867b8181512bb30b32506148ade3278555abbe995593992625a3bce18ab84",
+      "previous_sha256": "9fa867b8181512bb30b32506148ade3278555abbe995593992625a3bce18ab84"
+    },
+    {
+      "path": "crypto/OpenSSLCryptoManager.cpp",
+      "repository": "switch",
+      "source_path": "app/src/crypto/OpenSSLCryptoManager.cpp",
+      "base_sha256": "ce2c3da84ef106782ca6f85229d22932b677ed71f78a109946040c29f308a935",
+      "prepared_sha256": "ce2c3da84ef106782ca6f85229d22932b677ed71f78a109946040c29f308a935",
+      "frozen_sha256": "ce2c3da84ef106782ca6f85229d22932b677ed71f78a109946040c29f308a935",
+      "previous_sha256": "ce2c3da84ef106782ca6f85229d22932b677ed71f78a109946040c29f308a935"
+    },
+    {
+      "path": "crypto/OpenSSLCryptoManager.hpp",
+      "repository": "switch",
+      "source_path": "app/src/crypto/OpenSSLCryptoManager.hpp",
+      "base_sha256": "0f702069a3e9dd59fa8173889f87bdce891bc515fcd89d240f6c8e97721d5592",
+      "prepared_sha256": "0f702069a3e9dd59fa8173889f87bdce891bc515fcd89d240f6c8e97721d5592",
+      "frozen_sha256": "0f702069a3e9dd59fa8173889f87bdce891bc515fcd89d240f6c8e97721d5592",
+      "previous_sha256": "0f702069a3e9dd59fa8173889f87bdce891bc515fcd89d240f6c8e97721d5592"
+    },
+    {
+      "path": "libgamestream/client.cpp",
+      "repository": "switch",
+      "source_path": "app/src/libgamestream/client.cpp",
+      "base_sha256": "45dad2f43b26788dda3fe5af057d369cb6bf90de7c12f73167cea16cecde7533",
+      "prepared_sha256": "e26c87ac61243498b35d4f9d5d21413792e1ae519b450f957f33057ad55a39cd",
+      "frozen_sha256": "e26c87ac61243498b35d4f9d5d21413792e1ae519b450f957f33057ad55a39cd",
+      "previous_sha256": "e26c87ac61243498b35d4f9d5d21413792e1ae519b450f957f33057ad55a39cd"
+    },
+    {
+      "path": "libgamestream/client.h",
+      "repository": "switch",
+      "source_path": "app/src/libgamestream/client.h",
+      "base_sha256": "e591e4d94622631c67cd9c816e8659adcebff9d2deca51aeca2a7cbdba81a315",
+      "prepared_sha256": "f3f3f88d4a5c49ed0cb66db6ea5e439bbf20cc1972b1d93052d2f3da0d57cb86",
+      "frozen_sha256": "f3f3f88d4a5c49ed0cb66db6ea5e439bbf20cc1972b1d93052d2f3da0d57cb86",
+      "previous_sha256": "f3f3f88d4a5c49ed0cb66db6ea5e439bbf20cc1972b1d93052d2f3da0d57cb86"
+    },
+    {
+      "path": "libgamestream/errors.h",
+      "repository": "switch",
+      "source_path": "app/src/libgamestream/errors.h",
+      "base_sha256": "23fee84f887f2d070e0332a1350b25b297c64ad1c2903473c76ea605eb234b25",
+      "prepared_sha256": "23fee84f887f2d070e0332a1350b25b297c64ad1c2903473c76ea605eb234b25",
+      "frozen_sha256": "23fee84f887f2d070e0332a1350b25b297c64ad1c2903473c76ea605eb234b25",
+      "previous_sha256": "23fee84f887f2d070e0332a1350b25b297c64ad1c2903473c76ea605eb234b25"
+    },
+    {
+      "path": "libgamestream/http.cpp",
+      "repository": "switch",
+      "source_path": "app/src/libgamestream/http.cpp",
+      "base_sha256": "68eb565dfacf5a897ea7832c235aed33d8db432641da7ae3cca6c5d60fccf8d1",
+      "prepared_sha256": "9da3bb9c8cc38e0164061806511632f3979f43a7d388c90844e0cc92fed9d03d",
+      "frozen_sha256": "9da3bb9c8cc38e0164061806511632f3979f43a7d388c90844e0cc92fed9d03d",
+      "previous_sha256": "9da3bb9c8cc38e0164061806511632f3979f43a7d388c90844e0cc92fed9d03d"
+    },
+    {
+      "path": "libgamestream/http.h",
+      "repository": "switch",
+      "source_path": "app/src/libgamestream/http.h",
+      "base_sha256": "806b9e45ea2c93726ae3c31f3e581486be5968763f93f9047c489b5b8f00fa66",
+      "prepared_sha256": "cd9a96f73d7d974495a3f9ffdf6f5e8e51a66b420d4877a15cc393ec082b87f4",
+      "frozen_sha256": "cd9a96f73d7d974495a3f9ffdf6f5e8e51a66b420d4877a15cc393ec082b87f4",
+      "previous_sha256": "cd9a96f73d7d974495a3f9ffdf6f5e8e51a66b420d4877a15cc393ec082b87f4"
+    },
+    {
+      "path": "libgamestream/xml.cpp",
+      "repository": "switch",
+      "source_path": "app/src/libgamestream/xml.cpp",
+      "base_sha256": "afd63217ef1e6ea0796ba9f5cd0a9e2961417ad13d93a75086a135c918aea7e8",
+      "prepared_sha256": "2dab9d6c8093fe5b11bd45e1d1220ce442fd0020e222ec1487457eaf9ea30fbd",
+      "frozen_sha256": "2dab9d6c8093fe5b11bd45e1d1220ce442fd0020e222ec1487457eaf9ea30fbd",
+      "previous_sha256": "2dab9d6c8093fe5b11bd45e1d1220ce442fd0020e222ec1487457eaf9ea30fbd"
+    },
+    {
+      "path": "libgamestream/xml.h",
+      "repository": "switch",
+      "source_path": "app/src/libgamestream/xml.h",
+      "base_sha256": "317ad8706cfde19596e16883255bbb65f9212bd38f8c68c915da4302d2e0dd97",
+      "prepared_sha256": "317ad8706cfde19596e16883255bbb65f9212bd38f8c68c915da4302d2e0dd97",
+      "frozen_sha256": "317ad8706cfde19596e16883255bbb65f9212bd38f8c68c915da4302d2e0dd97",
+      "previous_sha256": "317ad8706cfde19596e16883255bbb65f9212bd38f8c68c915da4302d2e0dd97"
+    }
+  ],
+  "tool_inputs": {
+    "tools/moonlight/prepare.py": "82fef1dccc0730e261ee538e651dc0e0394fae2d905bf83f9072a51aa084ec7e"
+  }
+}

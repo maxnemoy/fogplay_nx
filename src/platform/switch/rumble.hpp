@@ -1,6 +1,7 @@
 #pragma once
 #include "features/settings/domain/rumble_settings.hpp"
 #include "features/streaming/domain/rumble_playback.hpp"
+#include "features/streaming/domain/rumble_telemetry.hpp"
 #include <switch.h>
 #include <array>
 #include <string>
@@ -19,6 +20,7 @@ public:
     void stop(std::uint64_t nowMs) noexcept;
     void setMode(fog::rumble::Mode mode, std::uint64_t nowMs) noexcept;
     std::string diagnostics() const;
+    stream::telemetry::rumble::Snapshot captureTelemetry() const noexcept;
 private:
     void bind(const PadState& pad, std::uint64_t nowMs) noexcept;
     void apply(std::uint64_t nowMs, bool force = false) noexcept;

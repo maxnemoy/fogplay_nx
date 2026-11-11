@@ -1,10 +1,12 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 #ifdef __SWITCH__
 #include <switch.h>
@@ -109,24 +111,82 @@ inline void observeThread(const char* role) noexcept {
         }
     } catch (...) { /* Optional diagnostics must not affect worker startup. */ }
 }
-inline std::vector<std::string> threadObservationLines() {
+// Published values deliberately exclude the thread handle/id. These are
+// observations of thread entry, never live scheduling queries.
+struct ThreadObservationValue {
+    std::array<char,48> role{};
+    int core=-1, idealCore=-1, priority=-1;
+    std::uint64_t affinity=0, observedEpoch=0;
+    std::int64_t affinityResult=-1, priorityResult=-1;
+    unsigned queryErrors=0;
+    bool carried=false, available=false;
+};
+struct ThreadObservationSnapshot {
+    std::array<ThreadObservationValue,128> entries{};
+    std::size_t size=0;
+    std::uint64_t epoch=0, overflow=0, persistentOverflow=0;
+};
+static_assert(std::is_trivially_copyable_v<ThreadObservationSnapshot>);
+static_assert(sizeof(ThreadObservationSnapshot) <= 16384);
+inline ThreadObservationSnapshot captureThreadObservations() {
     auto& state = threadObservations();
     std::lock_guard<std::mutex> lock(state.mutex);
-    std::vector<std::string> result;
-    result.push_back("Thread scheduling scope=transport-observed-starts inventory=not-live epoch=" + std::to_string(state.epoch) +
-        " count=" + std::to_string(state.size) + " overflow=" + std::to_string(state.overflow) +
-        " persistentOverflowLifetime=" + std::to_string(state.persistentOverflow));
+    ThreadObservationSnapshot value;
+    value.size=state.size; value.epoch=state.epoch; value.overflow=state.overflow;
+    value.persistentOverflow=state.persistentOverflow;
     for (std::size_t i = 0; i < state.size; ++i) {
         const auto& item = state.entries[i];
-        result.push_back("Thread scheduling role=" + std::string(item.role.data()) + " slot=" + std::to_string(i) +
-            " epoch=" + std::to_string(state.epoch) + " observedEpoch=" + std::to_string(item.observedEpoch) +
+        value.entries[i]={item.role,item.core,item.idealCore,item.priority,item.affinity,item.observedEpoch,
+            item.affinityResult,item.priorityResult,item.queryErrors,item.carried,item.available};
+    }
+    return value;
+}
+inline bool operator==(const ThreadObservationValue& a, const ThreadObservationValue& b) noexcept {
+    return a.role == b.role && a.core == b.core && a.idealCore == b.idealCore && a.priority == b.priority &&
+        a.affinity == b.affinity && a.observedEpoch == b.observedEpoch && a.affinityResult == b.affinityResult &&
+        a.priorityResult == b.priorityResult && a.queryErrors == b.queryErrors && a.carried == b.carried && a.available == b.available;
+}
+inline bool operator==(const ThreadObservationSnapshot& a, const ThreadObservationSnapshot& b) noexcept {
+    if (a.size != b.size || a.epoch != b.epoch || a.overflow != b.overflow || a.persistentOverflow != b.persistentOverflow)
+        return false;
+    return std::equal(a.entries.begin(), a.entries.begin() + std::min(a.size, a.entries.size()), b.entries.begin());
+}
+inline bool operator!=(const ThreadObservationSnapshot& a, const ThreadObservationSnapshot& b) noexcept { return !(a == b); }
+inline std::string threadObservationSummary(std::uint64_t epoch, std::size_t size,
+        std::uint64_t overflow, std::uint64_t persistentOverflow) {
+    return "Thread scheduling scope=transport-observed-starts inventory=not-live epoch=" + std::to_string(epoch) +
+        " count=" + std::to_string(size) + " overflow=" + std::to_string(overflow) +
+        " persistentOverflowLifetime=" + std::to_string(persistentOverflow);
+}
+inline std::string threadObservationRow(const ThreadObservationValue& item, std::size_t slot, std::uint64_t epoch) {
+    const auto end = std::find(item.role.begin(), item.role.end(), '\0');
+    std::string role(item.role.begin(), end);
+    // Matches diagnostic(safeText): role names never inject a deferred separator.
+    for (char& c : role) if (static_cast<unsigned char>(c) < 32 || c == 127) c = ' ';
+    return "Thread scheduling role=" + role + " slot=" + std::to_string(slot) +
+            " epoch=" + std::to_string(epoch) + " observedEpoch=" + std::to_string(item.observedEpoch) +
             " carried=" + std::to_string(item.carried) +
             " available=" + std::to_string(item.available) + " core=" + std::to_string(item.core) +
             " ideal=" + std::to_string(item.idealCore) + " mask=" + std::to_string(item.affinity) +
             " priority=" + std::to_string(item.priority) + " queryErrors=" + std::to_string(item.queryErrors) +
-            " affinityResult=" + std::to_string(item.affinityResult) + " priorityResult=" + std::to_string(item.priorityResult));
-    }
+            " affinityResult=" + std::to_string(item.affinityResult) + " priorityResult=" + std::to_string(item.priorityResult);
+}
+// Pure formatter, independent of registry lock and worker/application lifetime.
+inline std::string threadObservationLine(const ThreadObservationSnapshot& value, std::size_t line) {
+    if (!line) return threadObservationSummary(value.epoch, value.size, value.overflow, value.persistentOverflow);
+    const auto i = line - 1;
+    if (i >= value.size || i >= value.entries.size()) return {};
+    return threadObservationRow(value.entries[i], i, value.epoch);
+}
+inline std::vector<std::string> threadObservationLines(const ThreadObservationSnapshot& value) {
+    std::vector<std::string> result;
+    result.push_back(threadObservationLine(value,0));
+    for(std::size_t i=0;i<value.size && i<value.entries.size();++i)
+        result.push_back(threadObservationLine(value,i+1));
     return result;
+}
+inline std::vector<std::string> threadObservationLines() {
+    return threadObservationLines(captureThreadObservations());
 }
 inline std::string threadObservationText() {
     std::string result;

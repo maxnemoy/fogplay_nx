@@ -1,0 +1,139 @@
+diff --git a/core/Connection.c b/core/Connection.c
+index ceef0f1..0e3fcd3 100644
+--- a/core/Connection.c
++++ b/core/Connection.c
+@@ -1,4 +1,5 @@
+ #include "Limelight-internal.h"
++#include "FogMoonlightTermination.h"
+ #include "FogMoonlightRecovery.h"
+ #include "FogMoonlightDiagnosticsInternal.h"
+ #include <stdatomic.h>
+@@ -149,8 +150,13 @@ void LiStopConnection(void) {
+ // stream-thread joins now also wait for termination callback completion.
+ static void ClInternalConnectionTerminated(int errorCode)
+ {
+-    if (ConnectionInterrupted ||
+-        atomic_exchange_explicit(&alreadyTerminated, true, memory_order_relaxed)) {
++    // An explicit host stop remains authoritative if it races socket failure
++    // or teardown. All delivery is synchronous and the owner joins this thread.
++    if (FogMoonlightGetTerminationOrigin() == FOG_TERMINATION_HOST) {
++        atomic_store_explicit(&alreadyTerminated, true, memory_order_relaxed);
++    }
++    else if (ConnectionInterrupted ||
++             atomic_exchange_explicit(&alreadyTerminated, true, memory_order_relaxed)) {
+         return;
+     }
+     originalTerminationCallback(errorCode);
+diff --git a/core/ControlStream.c b/core/ControlStream.c
+index 89173ef..030e70f 100644
+--- a/core/ControlStream.c
++++ b/core/ControlStream.c
+@@ -1,4 +1,5 @@
+ #include "Limelight-internal.h"
++#include "FogMoonlightTermination.h"
+ #include "FogMoonlightRecovery.h"
+ #include "FogMoonlightDiagnosticsInternal.h"
+ 
+@@ -1375,7 +1376,7 @@ static void controlReceiveThreadFunc(void* context) {
+                 PltLockMutex(&enetMutex);
+                 enet_peer_disconnect_now(peer, 0);
+                 PltUnlockMutex(&enetMutex);
+-                ListenerCallbacks.connectionTerminated((int)terminationErrorCode);
++                FogMoonlightNotifyHostTermination(ListenerCallbacks.connectionTerminated, (int)terminationErrorCode);
+                 free(ctlHdr);
+                 return;
+             }
+diff --git a/core/PlatformSockets.c b/core/PlatformSockets.c
+index 4a024c3..b8ba9a8 100644
+--- a/core/PlatformSockets.c
++++ b/core/PlatformSockets.c
+@@ -462,7 +462,25 @@ SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlo
+     return s;
+ }
+ 
+-SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
++int FogMoonlightPollSockets(struct pollfd* fds, int count, int timeoutMs) {
++    const uint64_t started = PltGetMillis();
++    for (;;) {
++        if (ConnectionInterrupted) {
++            SetLastSocketError(EINTR);
++            return -1;
++        }
++        const uint64_t elapsed = PltGetMillis() - started;
++        const int remaining = elapsed < (uint64_t)timeoutMs ? timeoutMs - (int)elapsed : 0;
++        const int result = pollSockets(fds, count, remaining < 100 ? remaining : 100);
++        if (ConnectionInterrupted) {
++            SetLastSocketError(EINTR);
++            return -1;
++        }
++        if (result != 0 || PltGetMillis() - started >= (uint64_t)timeoutMs) return result;
++    }
++}
++
++static SOCKET connectTcpSocketInternal(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec, bool interruptible) {
+     SOCKET s;
+     LC_SOCKADDR addr;
+     struct pollfd pfd;
+@@ -532,7 +550,8 @@ SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen,
+     // Wait for the connection to complete or the timeout to elapse
+     pfd.fd = s;
+     pfd.events = POLLOUT;
+-    err = pollSockets(&pfd, 1, timeoutSec * 1000);
++    err = interruptible ? FogMoonlightPollSockets(&pfd, 1, timeoutSec * 1000) :
++                          pollSockets(&pfd, 1, timeoutSec * 1000);
+     if (err < 0) {
+         // pollSockets() failed
+         err = LastSocketError();
+@@ -584,6 +603,15 @@ Exit:
+     return s;
+ }
+ 
++SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
++    return connectTcpSocketInternal(dstaddr, addrlen, port, timeoutSec, false);
++}
++
++SOCKET FogMoonlightConnectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec) {
++    if (ConnectionInterrupted) { SetLastSocketError(EINTR); return INVALID_SOCKET; }
++    return connectTcpSocketInternal(dstaddr, addrlen, port, timeoutSec, true);
++}
++
+ int getLocalAddressByUdpConnect(const struct sockaddr_storage* targetAddr, SOCKADDR_LEN targetAddrLen, unsigned short targetPort,
+                                 struct sockaddr_storage* localAddr, SOCKADDR_LEN* localAddrLen) {
+     SOCKET udpSocket;
+diff --git a/core/RtspConnection.c b/core/RtspConnection.c
+index e958101..901d978 100644
+--- a/core/RtspConnection.c
++++ b/core/RtspConnection.c
+@@ -1,4 +1,6 @@
+ #include "Limelight-internal.h"
++extern int FogMoonlightPollSockets(struct pollfd*, int, int);
++extern SOCKET FogMoonlightConnectTcpSocket(struct sockaddr_storage*, SOCKADDR_LEN, unsigned short, int);
+ #include "Rtsp.h"
+ 
+ #define RTSP_CONNECT_TIMEOUT_SEC 10
+@@ -404,12 +406,14 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
+     // returns HTTP 200 OK for the /launch request before the RTSP handshake port
+     // is listening.
+     do {
+-        sock = connectTcpSocket(&RemoteAddr, AddrLen, RtspPortNumber, RTSP_CONNECT_TIMEOUT_SEC);
++        sock = FogMoonlightConnectTcpSocket(&RemoteAddr, AddrLen, RtspPortNumber, RTSP_CONNECT_TIMEOUT_SEC);
+         if (sock == INVALID_SOCKET) {
+             *error = LastSocketError();
+             if (*error == ECONNREFUSED) {
+                 // Try again after 500 ms on ECONNREFUSED
+-                PltSleepMs(RTSP_RETRY_DELAY_MS);
++                for (int slept = 0; slept < RTSP_RETRY_DELAY_MS && !ConnectionInterrupted; slept += 100) {
++                    PltSleepMs(RTSP_RETRY_DELAY_MS - slept < 100 ? RTSP_RETRY_DELAY_MS - slept : 100);
++                }
+             }
+             else {
+                 // Fail if we get some other error
+@@ -466,7 +470,7 @@ static bool transactRtspMessageTcp(PRTSP_MESSAGE request, PRTSP_MESSAGE response
+ 
+         pfd.fd = sock;
+         pfd.events = POLLIN;
+-        err = pollSockets(&pfd, 1, RTSP_RECEIVE_TIMEOUT_SEC * 1000);
++        err = FogMoonlightPollSockets(&pfd, 1, RTSP_RECEIVE_TIMEOUT_SEC * 1000);
+         if (err == 0) {
+             *error = ETIMEDOUT;
+             Limelog("RTSP request timed out\n");

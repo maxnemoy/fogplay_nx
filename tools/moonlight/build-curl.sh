@@ -16,7 +16,8 @@ PREFIX="$ROOT/third_party/moonlight/switch"
 PORTLIBS="$DEVKITPRO/portlibs/switch"
 TLS_PREFIX="$ROOT/third_party/rtc/switch"
 test -f "$TLS_PREFIX/lib/libmbedcrypto.a"
-mkdir -p "$WORK/downloads" "$PREFIX/lib" "$PREFIX/include/curl"
+python3 "$ROOT/tools/moonlight/headers.py" --preflight
+mkdir -p "$WORK/downloads" "$PREFIX/lib"
 if [ ! -f "$ARCHIVE" ]; then
   curl --fail --location --proto '=https' --tlsv1.2 "$URL" -o "$ARCHIVE.tmp"
   mv "$ARCHIVE.tmp" "$ARCHIVE"
@@ -63,7 +64,7 @@ python3 "$ROOT/tools/moonlight/namespace-curl.py" "$BUILD/lib/libcurl.a" \
   --nm "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-nm" \
   --objcopy "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-objcopy" \
   --ranlib "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-ranlib"
-cp "$SOURCE/include/curl/"*.h "$PREFIX/include/curl/"
+python3 "$ROOT/tools/moonlight/headers.py"
 cp "$SOURCE/COPYING" "$ROOT/licenses/moonlight/curl-COPYING"
 python3 - "$PREFIX" "$URL" "$SHA256" "$BUILD/lib/curl_config.h" <<'PY'
 import hashlib

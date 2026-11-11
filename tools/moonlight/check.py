@@ -1,36 +1,25 @@
 #!/usr/bin/env python3
-"""Check the cached production dependency recipe and exact archive hashes."""
-import hashlib
+"""Reject cached builds unless current sources, tools and artifacts all match."""
 import json
-from pathlib import Path
+import subprocess
+import sys
 
-root = Path(__file__).resolve().parents[2]
-prefix = root / "third_party/moonlight/switch"
-
-
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+import manifest
+import prepare
 
 
-try:
-    manifest = json.loads((prefix / "build-manifest.json").read_text())
-    current = {str(path.relative_to(root)): digest(path)
-               for path in sorted((root / "tools/moonlight").rglob("*"))
-               if path.is_file() and "__pycache__" not in path.parts}
-    assert manifest["tools"] == current
-    for name, expected in manifest["diagnostic_headers"].items():
-        assert digest(prefix / "include" / name) == expected
-    assert "FogMoonlightDiagnostics.h" in manifest["diagnostic_headers"]
-    assert "FogMoonlightRecovery.h" in manifest["diagnostic_headers"]
-    assert "FogMoonlightTermination.h" in manifest["diagnostic_headers"]
-    for name, expected in manifest["libraries"].items():
-        assert digest(prefix / "lib" / name) == expected
-    for name in ("libgamestream.a", "libmoonlight-common-c.a", "libmoonlight-curl.a", "libenet.a"):
-        assert name in manifest["libraries"]
-    for name, expected in manifest["portlibs"].items():
-        assert digest(Path("/opt/devkitpro/portlibs/switch/lib") / name) == expected
-    for name, expected in manifest["shared_mbedtls"].items():
-        assert digest(root / "third_party/rtc/switch/lib" / name) == expected
-    assert digest(root / "tools/rtc/mbedtls-user-config.h") == manifest["shared_mbedtls_config"]
-except (OSError, KeyError, ValueError, AssertionError):
-    raise SystemExit(1)
+def check():
+    prefix = manifest.ROOT / 'third_party/moonlight/switch'
+    recorded = json.loads((prefix / 'build-manifest.json').read_text())
+    current = manifest.build_manifest(prefix)
+    if recorded != current:
+        raise ValueError('Moonlight build manifest is stale; rebuild through tools/moonlight/build.sh')
+
+
+if __name__ == '__main__':
+    try:
+        check()
+    except (OSError, KeyError, TypeError, ValueError, prepare.PrepareError,
+            subprocess.CalledProcessError) as error:
+        print(f'Moonlight cache rejected: {error}', file=sys.stderr)
+        raise SystemExit(1)

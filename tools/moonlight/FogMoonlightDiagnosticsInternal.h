@@ -4,6 +4,10 @@
 #include "FogMoonlightDiagnostics.h"
 
 #define FOG_DIAG_FIELDS(X) \
+    X(encryptionState) X(encryptionFailure) X(encryptionClientFlags) \
+    X(encryptionHostSupported) X(encryptionHostRequired) X(encryptionSelected) \
+    X(encryptionAudio) X(encryptionControl) X(encryptionRtsp) \
+    X(videoDecryptSuccesses) X(audioDecryptSuccesses) X(audioDecryptFailures) \
     X(videoPacketsReceived) X(videoBytesReceived) X(videoReceiveErrors) \
     X(videoDecryptFailures) X(videoRuntPackets) X(lastVideoPacketUs) \
     X(maxVideoPacketGapUs) X(videoPacketProcessingCount) \
@@ -41,6 +45,7 @@ typedef enum FogDiagCounter { FOG_DIAG_FIELDS(FOG_DIAG_ENUM) FOG_DIAG_COUNT } Fo
 
 void FogDiagReset(void);
 void FogDiagAdd(FogDiagCounter counter, uint64_t amount);
+void FogDiagSet(FogDiagCounter counter, uint64_t value);
 void FogDiagVideoPacket(uint64_t bytes, uint64_t nowUs);
 void FogDiagVideoPacketProcessing(uint64_t startUs, uint64_t endUs);
 void FogDiagVideoReceiveCycle(uint64_t startUs, uint64_t waitStartUs,

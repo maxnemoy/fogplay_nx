@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reapply all RTC recipes to pristine pinned source archives, without checkout changes."""
+"""Replay the checked RTC series on pristine pinned archives, without checkout changes."""
 import hashlib
 from pathlib import Path
 import shutil
@@ -19,11 +19,28 @@ def archive(source, target):
         process.stdout.close()
     if process.wait() != 0:
         raise RuntimeError('git archive failed: ' + str(source))
+    origin = Path(subprocess.check_output(
+        ['git', '-C', str(source), 'rev-parse', '--absolute-git-dir'], text=True).strip())
+    commit = subprocess.check_output(
+        ['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+    gitdir = target / '.git'
+    (gitdir / 'objects/info').mkdir(parents=True)
+    (gitdir / 'refs').mkdir()
+    (gitdir / 'HEAD').write_text(commit + '\n')
+    (gitdir / 'config').write_text(
+        '[core]\n repositoryformatversion = 0\n bare = false\n worktree = '
+        + str(target) + '\n')
+    (gitdir / 'objects/info/alternates').write_text(str(origin / 'objects') + '\n')
+    subprocess.run(['git', '-C', str(target), 'read-tree', 'HEAD'], check=True)
+    worktree = Path(subprocess.check_output(
+        ['git', '-C', str(target), 'rev-parse', '--show-toplevel'], text=True).strip())
+    if worktree != target:
+        raise RuntimeError('temporary Git worktree escaped its archive: ' + str(target))
 
 
 def digests(root):
     return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in root.rglob('*') if p.is_file()}
+            for p in root.rglob('*') if p.is_file() and '.git' not in p.parts}
 
 
 def main():

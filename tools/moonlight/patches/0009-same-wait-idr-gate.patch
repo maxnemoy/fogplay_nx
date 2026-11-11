@@ -1,0 +1,63 @@
+--- a/core/VideoDepacketizer.c
++++ b/core/VideoDepacketizer.c
+@@ -14,6 +14,8 @@
+ static bool waitingForNextSuccessfulFrame;
+ static bool waitingForIdrFrame;
+ static bool localDecoderRecovery;
++// Receive-thread-owned baseline; API/decoder requests are observed atomically.
++static uint64_t idrWaitRequestGeneration;
+ static bool waitingForRefInvalFrame;
+ static unsigned int lastPacketInStream;
+ static bool decodingFrame;
+@@ -68,6 +70,7 @@
+ 
+     nextFrameNumber = 1;
+     localDecoderRecovery = false;
++    idrWaitRequestGeneration = FogIdrRecoveryRequestGeneration();
+     startFrameNumber = 0;
+     waitingForNextSuccessfulFrame = false;
+     waitingForIdrFrame = true; FogDiagSetWaitingForIdr(1, 1, PltGetMicroseconds());
+@@ -111,6 +114,7 @@
+     if (strictIdrFrameWait || !idrFrameProcessed || waitingForIdrFrame || (nalChainHead && frameType == FRAME_TYPE_IDR)) {
+         // We'll need an IDR frame now if we're in non-RFI mode, if we've never
+         // received an IDR frame, or if we explicitly need an IDR frame.
++        if (!waitingForIdrFrame) idrWaitRequestGeneration = FogIdrRecoveryRequestGeneration();
+         waitingForIdrFrame = true; FogDiagSetWaitingForIdr(1, waitReason, PltGetMicroseconds());
+     }
+     else {
+@@ -128,6 +132,7 @@
+         consecutiveFrameDrops = 0;
+ 
+         // Request an IDR frame
++        if (!waitingForIdrFrame) idrWaitRequestGeneration = FogIdrRecoveryRequestGeneration();
+         waitingForIdrFrame = true; FogDiagSetWaitingForIdr(1, 3, PltGetMicroseconds());
+         if (FogIdrRecoveryTryRetry()) {
+             FogDiagAdd(FOG_DIAG_idrDropLimitRequests, 1);
+@@ -690,6 +695,7 @@
+         if (isSeqReferenceFrameStart(currentPos)) {
+             // No longer waiting for an IDR frame
+             localDecoderRecovery = false;
++            idrWaitRequestGeneration = FogIdrRecoveryRequestGeneration();
+             FogDiagIdrRecognized(nextFrameNumber, PltGetMicroseconds());
+             waitingForIdrFrame = false; FogDiagSetWaitingForIdr(0, 0, PltGetMicroseconds());
+             waitingForRefInvalFrame = false;
+@@ -888,6 +894,7 @@
+                 // to determine if a given frame is an IDR frame.
+                 if (!(NegotiatedVideoFormat & (VIDEO_FORMAT_MASK_H264 | VIDEO_FORMAT_MASK_H265))) {
+                     localDecoderRecovery = false;
++                    idrWaitRequestGeneration = FogIdrRecoveryRequestGeneration();
+             FogDiagIdrRecognized(nextFrameNumber, PltGetMicroseconds());
+             waitingForIdrFrame = false; FogDiagSetWaitingForIdr(0, 0, PltGetMicroseconds());
+                     waitingForNextSuccessfulFrame = false;
+@@ -1111,7 +1118,10 @@
+                 // We wait for the first fully received frame after a loss to approximate
+                 // detection of the recovery of the network. Requesting an IDR frame while
+                 // the network is unstable will just contribute to congestion collapse.
+-                if (waitingForNextSuccessfulFrame) {
++                // Only the first request in this wait bypasses the retry gate.
++                // Another hole in the same wait must not regain that bypass.
++                if (waitingForNextSuccessfulFrame &&
++                        FogIdrRecoveryRequestGeneration() == idrWaitRequestGeneration) {
+                     LiRequestIdrFrame();
+                 }
+                 else if (FogIdrRecoveryTryRetry()) {

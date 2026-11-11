@@ -11,7 +11,7 @@ int main() {
     stream::Gamepad state;
     assert(schedule.due(state, now)); schedule.accepted(state, now);
     state.axes[0] = 0.5f;
-    assert(!schedule.due(state, now + 15ms));
+    assert(schedule.due(state, now + 15ms) == fog::input_options::changeOnly);
     assert(schedule.due(state, now + 16ms)); schedule.accepted(state, now + 16ms);
     // A complete short tap fits inside the analog interval, for every button.
     for (std::size_t i = 0; i < state.buttons.size(); ++i) {
@@ -57,7 +57,26 @@ int main() {
             ++packets; schedule.accepted(state, now + std::chrono::milliseconds(ms));
         }
     }
-    assert(packets == 63);
+    if constexpr (fog::input_options::changeOnly) {
+        assert(packets > 63 && packets < 250); // Faster real changes, sub-threshold jitter suppressed.
+        Schedule quiet; stream::Gamepad neutral;
+        quiet.accepted(neutral, now);
+        assert(!quiet.due(neutral, now + 199ms));
+        assert(quiet.due(neutral, now + 200ms));
+        neutral.axes[0] = 0.001f;
+        assert(!quiet.due(neutral, now + 1ms));
+        neutral.axes[0] = 0.007f;
+        assert(quiet.due(neutral, now + 2ms));
+        assert(quiet.due(neutral, now + 3ms)); // Failed enqueue remains due.
+        quiet.accepted(neutral, now + 3ms);
+        neutral.axes[0] = 0.003f;
+        assert(!quiet.due(neutral, now + 4ms));
+        neutral.axes[0] = 0;
+        assert(quiet.due(neutral, now + 5ms)); // Centre must not wait for keepalive.
+        quiet.accepted(neutral, now + 5ms);
+        assert(!quiet.due(neutral, now + 204ms));
+        assert(quiet.due(neutral, now + 205ms));
+    } else assert(packets == 63);
     // Press edges count accepted new presses only: holds, releases, axes and
     // rejected (never accepted) samples do not count; reset keeps the count.
     Schedule edges; stream::Gamepad pad;
@@ -69,5 +88,6 @@ int main() {
     pad.buttons[2] = 1; edges.accepted(pad, now + 41ms); assert(edges.pressEdges() == 2);
     pad.buttons[1] = pad.buttons[2] = 0; edges.accepted(pad, now + 42ms); assert(edges.pressEdges() == 2);
     edges.reset(); pad.buttons[1] = 1; edges.accepted(pad, now + 43ms); assert(edges.pressEdges() == 3);
-    std::cout << "Gamepad schedule: immediate button/trigger edges, 16ms analog, rejected sends, menu neutral retry, fresh transport and press edges PASS\n";
+    std::cout << "Gamepad schedule: change-only=" << fog::input_options::changeOnly
+        << "; edges, accepted-state cadence, jitter/keepalive, neutral retry and press edges PASS\n";
 }

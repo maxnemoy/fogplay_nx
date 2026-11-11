@@ -170,6 +170,10 @@ public:
         if (allowed_ != allowed) ++writableRevision_;
         allowed_ = allowed; condition_.notify_one();
     }
+    fog::metrics::LatencyHistogram::Snapshot inputLatencySnapshot(std::uint64_t nowUs) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return inputLatency_.snapshot(nowUs);
+    }
     std::string inputLatencyDiagnostics() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return "provider=MTS scope=rolling-5s boundary=pad-to-send-return accepted-only=1 " +

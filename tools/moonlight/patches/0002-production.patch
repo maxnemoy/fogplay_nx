@@ -1,0 +1,400 @@
+diff --git a/crypto/Data.cpp b/crypto/Data.cpp
+index 14351d4..175fcb5 100644
+--- a/crypto/Data.cpp
++++ b/crypto/Data.cpp
+@@ -1,6 +1,7 @@
+ #include "Data.hpp"
+ #include <borealis.hpp>
+ #include <cstdlib>
++#include <stdexcept>
+ #include <switch.h>
+ #include <string.h>
+ 
+@@ -27,9 +28,9 @@ Data::~Data() {
+ }
+ 
+ Data Data::subdata(size_t start, size_t size) {
+-    if (start + size > m_size) {
++    if (start > m_size || size > m_size - start) {
+         brls::Logger::error("Data: Invalid data length...");
+-        exit(-1);
++        throw std::runtime_error("Invalid Moonlight data length");
+     }
+     return Data(&m_bytes[start], size);
+ }
+@@ -105,6 +106,12 @@ void Data::write_to_file(std::string path) {
+ }
+ 
+ Data Data::hex_to_bytes() const {
++    if (m_size % 2 != 0) throw std::runtime_error("Invalid Moonlight hex length");
++    for (size_t index = 0; index < m_size; ++index) {
++        unsigned char value = m_bytes[index];
++        if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F')))
++            throw std::runtime_error("Invalid Moonlight hex value");
++    }
+     Data data(m_size / 2);
+     char byte_chars[3] = {'\0', '\0', '\0'};
+     unsigned long whole_byte;
+diff --git a/crypto/MbedTLSCryptoManager.cpp b/crypto/MbedTLSCryptoManager.cpp
+index 1e71337..9f6447c 100644
+--- a/crypto/MbedTLSCryptoManager.cpp
++++ b/crypto/MbedTLSCryptoManager.cpp
+@@ -14,6 +14,7 @@
+ #include <string.h>
+ 
+ static Data m_cert;
++static std::string m_identity_directory;
+ static Data m_key;
+ 
+ static bool _generate_new_cert_key_pair();
+@@ -73,6 +74,10 @@ static int _mbedtls_pk_sign_sha256(mbedtls_pk_context* pk,
+ }
+ 
+ bool MbedTLSCryptoManager::load_cert_key_pair() {
++    if (m_identity_directory != Settings::instance().key_dir()) {
++        m_cert = Data(); m_key = Data();
++        m_identity_directory = Settings::instance().key_dir();
++    }
+     if (m_key.is_empty() || m_cert.is_empty()) {
+         Data cert = Data::read_from_file(Settings::instance().key_dir() + "/" +
+                                          CERTIFICATE_FILE_NAME);
+diff --git a/libgamestream/client.cpp b/libgamestream/client.cpp
+index a4d4118..49bda5f 100644
+--- a/libgamestream/client.cpp
++++ b/libgamestream/client.cpp
+@@ -79,7 +79,7 @@ static int load_serverinfo(PSERVER_DATA server, bool https) {
+     // doesn't accurately tell us if we're paired.
+ 
+     snprintf(url, sizeof(url), "%s://%s:%d/serverinfo?uniqueid=%s",
+-             https ? "https" : "http", server->serverInfo.address,
++             https ? "https" : "http", server->urlAddress.c_str(),
+              https ? server->httpsPort : server->httpPort, unique_id.c_str());
+ 
+     Data data;
+@@ -143,6 +143,10 @@ static int load_serverinfo(PSERVER_DATA server, bool https) {
+         currentGameText.empty() ? 0 : atoi(currentGameText.c_str());
+     server->supports4K = server->serverInfo.serverCodecModeSupport != 0;
+     server->serverMajorVersion = atoi(server->serverInfoAppVersion.c_str());
++    if (Settings::instance().production() && (httpsPortText.empty() ||
++        httpsPortText.find_first_not_of("0123456789") != std::string::npos ||
++        httpsPortText.size() > 5 || std::strtoul(httpsPortText.c_str(), nullptr, 10) == 0 ||
++        std::strtoul(httpsPortText.c_str(), nullptr, 10) > 65535)) return GS_INVALID;
+     server->httpsPort = atoi(httpsPortText.c_str());
+     if (!server->httpsPort)
+         server->httpsPort = 47984;
+@@ -165,6 +169,14 @@ static int load_server_status(PSERVER_DATA server) {
+             return ret;
+     }
+ 
++    // Before PIN-authentication production uses unsigned HTTP only for discovery.
++    // After authentication every refresh must succeed over the pinned HTTPS key.
++    if (Settings::instance().production()) {
++        ret = load_serverinfo(server, !Settings::instance().pinned_key().empty());
++        if (ret != GS_OK) return ret;
++        return server->serverMajorVersion >= MIN_SUPPORTED_GFE_VERSION &&
++               server->serverMajorVersion <= MAX_SUPPORTED_GFE_VERSION ? GS_OK : GS_UNSUPPORTED_VERSION;
++    }
+     // Modern GFE versions don't allow serverinfo to be fetched over HTTPS if the client
+     // is not already paired. Since we can't pair without knowing the server version, we
+     // make another request over HTTP if the HTTPS request fails. We can't just use HTTP
+@@ -209,7 +221,7 @@ int gs_unpair(PSERVER_DATA server) {
+     Data data;
+ 
+     snprintf(url, sizeof(url), "http://%s:%u/unpair?uniqueid=%s",
+-             server->serverInfo.address,
++             server->urlAddress.c_str(),
+              server->httpPort,
+              unique_id.c_str());
+     ret = http_request(url, &data, HTTPRequestTimeoutLow);
+@@ -253,7 +265,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         return GS_WRONG_STATE;
+     }
+ 
+-    if (server->currentGame != 0) {
++    if (server->currentGame != 0 && !Settings::instance().production()) {
+         gs_set_error(
+             "The computer is currently in a game. You must close the game "
+             "before pairing");
+@@ -272,7 +284,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+              "http://%s:%u/"
+              "pair?uniqueid=%s&devicename=roth&updateState=1&phrase="
+              "getservercert&salt=%s&clientcert=%s",
+-             server->serverInfo.address, 
++             server->urlAddress.c_str(), 
+              server->httpPort,
+              unique_id.c_str(), salt.hex().bytes(),
+              CryptoManager::cert_data().hex().bytes());
+@@ -312,7 +324,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         url, sizeof(url),
+         "http://%s:%u/"
+         "pair?uniqueid=%s&devicename=roth&updateState=1&clientchallenge=%s",
+-        server->serverInfo.address, 
++        server->urlAddress.c_str(), 
+         server->httpPort,
+         unique_id.c_str(),
+         encryptedChallenge.hex().bytes());
+@@ -361,7 +373,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         url, sizeof(url),
+         "http://%s:%u/"
+         "pair?uniqueid=%s&devicename=roth&updateState=1&serverchallengeresp=%s",
+-        server->serverInfo.address,
++        server->urlAddress.c_str(),
+         server->httpPort,
+         unique_id.c_str(),
+         challengeRespEncrypted.hex().bytes());
+@@ -422,7 +434,7 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         url, sizeof(url),
+         "http://%s:%u/"
+         "pair?uniqueid=%s&devicename=roth&updateState=1&clientpairingsecret=%s",
+-        server->serverInfo.address, 
++        server->urlAddress.c_str(), 
+         server->httpPort,
+         unique_id.c_str(),
+         clientPairingSecret.hex().bytes());
+@@ -434,13 +446,15 @@ int gs_pair(PSERVER_DATA server, char* pin) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+ 
++    if ((ret = http_pin_certificate(plainCert.hex_to_bytes())) != GS_OK)
++        return gs_pair_cleanup(ret, server, &result);
+     brls::Logger::info("Client: Start pairing stage #5");
+ 
+     snprintf(
+         url, sizeof(url),
+         "https://%s:%u/"
+         "pair?uniqueid=%s&devicename=roth&updateState=1&phrase=pairchallenge",
+-        server->serverInfo.address, server->httpsPort, unique_id.c_str());
++        server->urlAddress.c_str(), server->httpsPort, unique_id.c_str());
+     if ((ret = http_request(url, &data, HTTPRequestTimeoutLong)) != GS_OK) {
+         return gs_pair_cleanup(ret, server, &result);
+     }
+@@ -460,7 +474,7 @@ int gs_applist(PSERVER_DATA server, PAPP_LIST* list) {
+     Data data;
+ 
+     snprintf(url, sizeof(url), "https://%s:%u/applist?uniqueid=%s",
+-             server->serverInfo.address, server->httpsPort, unique_id.c_str());
++             server->urlAddress.c_str(), server->httpsPort, unique_id.c_str());
+ 
+     if (http_request(url, &data, HTTPRequestTimeoutMedium) != GS_OK)
+         ret = GS_IO_ERROR;
+@@ -479,7 +493,7 @@ int gs_app_boxart(PSERVER_DATA server, int app_id, Data* out) {
+     snprintf(
+         url, sizeof(url),
+         "https://%s:%u/appasset?uniqueid=%s&appid=%d&AssetType=2&AssetIdx=0",
+-        server->serverInfo.address, server->httpsPort, unique_id.c_str(), app_id);
++        server->urlAddress.c_str(), server->httpsPort, unique_id.c_str(), app_id);
+ 
+     if (http_request(url, &data, HTTPRequestTimeoutMedium) != GS_OK) {
+         ret = GS_IO_ERROR;
+@@ -521,14 +535,14 @@ int gs_start_app(PSERVER_DATA server, STREAM_CONFIGURATION* config, int appId,
+                  "launch?uniqueid=%s&appid=%d&mode=%dx%dx%d&additionalStates=1&"
+                  "sops=%d&rikey=%s&rikeyid=%d&localAudioPlayMode=%d&"
+                  "surroundAudioInfo=%d&remoteControllersBitmap=%d&gcmap=%d%s",
+-                 server->serverInfo.address, server->httpsPort, unique_id.c_str(), appId,
++                 server->urlAddress.c_str(), server->httpsPort, unique_id.c_str(), appId,
+                  config->width, config->height, fps, sops, rand.hex().bytes(),
+                  rikeyid, localaudio, (mask << 16) + channelCounnt,
+                  gamepad_mask, gamepad_mask, LiGetLaunchUrlQueryParameters());
+     } else {
+         snprintf(url, sizeof(url),
+                  "https://%s:%u/resume?uniqueid=%s&rikey=%s&rikeyid=%d%s",
+-                 server->serverInfo.address, server->httpsPort, unique_id.c_str(),
++                 server->urlAddress.c_str(), server->httpsPort, unique_id.c_str(),
+                  rand.hex().bytes(), rikeyid, LiGetLaunchUrlQueryParameters());
+     }
+ 
+@@ -551,10 +565,12 @@ int gs_start_app(PSERVER_DATA server, STREAM_CONFIGURATION* config, int appId,
+ 
+     if (xml_search(data, "sessionUrl0", &result) == GS_OK) {
+         const std::string::size_type size = result.size();
++        delete[] server->serverInfo.rtspSessionUrl;
+         server->serverInfo.rtspSessionUrl = new char[size + 1];
+         memcpy((void *) server->serverInfo.rtspSessionUrl, result.c_str(), size + 1);
+     } else {
+         brls::Logger::error("sessionUrl0 not found");
++        ret = GS_INVALID;
+     }
+ 
+ exit:
+@@ -568,7 +584,7 @@ int gs_quit_app(PSERVER_DATA server) {
+     Data data;
+ 
+     snprintf(url, sizeof(url), "https://%s:%u/cancel?uniqueid=%s",
+-             server->serverInfo.address, server->httpsPort, unique_id.c_str());
++             server->urlAddress.c_str(), server->httpsPort, unique_id.c_str());
+     if ((ret = http_request(url, &data, HTTPRequestTimeoutMedium)) != GS_OK)
+         goto exit;
+ 
+@@ -588,21 +604,22 @@ exit:
+ }
+ 
+ int gs_init(PSERVER_DATA server, const std::string address) {
+-    std::stringstream addressStream(address);
+-    std::string segment;
+-    std::vector<std::string> seglist;
+-    unsigned short httpPort = 47989; // Default HTTP port
+-
+-    while(std::getline(addressStream, segment, ':'))
+-    {
+-       seglist.push_back(segment);
++    std::string host = address;
++    unsigned short httpPort = 47989;
++    if (!address.empty() && address.front() == '[') {
++        auto close = address.find(']');
++        if (close == std::string::npos) return GS_INVALID;
++        host = address.substr(1, close - 1);
++        if (close + 1 < address.size()) {
++            if (address[close + 1] != ':') return GS_INVALID;
++            httpPort = static_cast<unsigned short>(std::strtoul(address.c_str() + close + 2, nullptr, 10));
++        }
++    } else if (auto colon = address.find(':'); colon != std::string::npos) {
++        host = address.substr(0, colon);
++        httpPort = static_cast<unsigned short>(std::strtoul(address.c_str() + colon + 1, nullptr, 10));
+     }
++    if (host.empty() || !httpPort) return GS_INVALID;
+ 
+-    // Override port if it presented
+-    if (seglist.size() > 1) {
+-        httpPort = atoi(seglist[1].c_str());
+-    }
+-    
+     if (!CryptoManager::load_cert_key_pair()) {
+         brls::Logger::info("Client: No certs, generate new...");
+ 
+@@ -619,7 +636,8 @@ int gs_init(PSERVER_DATA server, const std::string address) {
+     if (http_init(Settings::instance().key_dir()) != GS_OK) return GS_FAILED;
+ 
+     LiInitializeServerInformation(&server->serverInfo);
+-    server->address = seglist[0];
++    server->address = host;
++    server->urlAddress = host.find(':') != std::string::npos ? "[" + host + "]" : host;
+     server->serverInfo.address = server->address.c_str();
+     server->httpPort = httpPort;
+     server->httpsPort = 0; /* Populated by load_server_status() */
+diff --git a/libgamestream/client.h b/libgamestream/client.h
+index f226de8..9fba562 100644
+--- a/libgamestream/client.h
++++ b/libgamestream/client.h
+@@ -29,6 +29,7 @@
+ 
+ typedef struct _SERVER_DATA {
+     std::string address;
++    std::string urlAddress;
+     std::string serverInfoAppVersion;
+     std::string serverInfoGfeVersion;
+     std::string mac;
+diff --git a/libgamestream/http.cpp b/libgamestream/http.cpp
+index 0654ea9..574eb75 100644
+--- a/libgamestream/http.cpp
++++ b/libgamestream/http.cpp
+@@ -21,6 +21,12 @@
+ #include "Settings.hpp"
+ #include "Diagnostics.hpp"
+ #include <chrono>
++#include <mbedtls/x509_crt.h>
++#include <mbedtls/pk.h>
++#include <mbedtls/base64.h>
++#include <mbedtls/sha256.h>
++#include <mbedtls/version.h>
++
+ #include "CryptoManager.hpp"
+ #include "client.h"
+ #include "errors.h"
+@@ -29,6 +35,34 @@
+ #include <curl/curl.h>
+ #include <cstring>
+ 
++int http_pin_certificate(const Data& certificate) {
++    if (!Settings::instance().production()) return GS_OK;
++    mbedtls_x509_crt cert; mbedtls_x509_crt_init(&cert);
++    int rc = mbedtls_x509_crt_parse(&cert, certificate.bytes(), certificate.size() + 1);
++    unsigned char der[4096], hash[32], encoded[64]; size_t size = 0;
++    int length = rc == 0 ? mbedtls_pk_write_pubkey_der(&cert.pk, der, sizeof(der)) : -1;
++    if (length > 0) {
++#if MBEDTLS_VERSION_MAJOR >= 3
++        rc = mbedtls_sha256(der + sizeof(der) - length, length, hash, 0);
++#else
++        rc = mbedtls_sha256_ret(der + sizeof(der) - length, length, hash, 0);
++#endif
++        if (rc == 0) rc = mbedtls_base64_encode(encoded, sizeof(encoded), &size, hash, sizeof(hash));
++    } else rc = -1;
++    mbedtls_x509_crt_free(&cert);
++    if (rc != 0) return GS_FAILED;
++    Settings::instance().set_pinned_key("sha256//" + std::string(reinterpret_cast<char*>(encoded), size));
++    return GS_OK;
++}
++
++// libcurl's HEADER_OUT event means the request has entered transport dispatch;
++// it is not a remote acknowledgement. Swallow every debug payload: URLs contain
++// the client certificate and pairing secrets. No debug text reaches logging.
++static int dispatch_event(CURL*, curl_infotype type, char*, size_t, void* context) {
++    if (type == CURLINFO_HEADER_OUT && context) Settings::instance().pairing_dispatched();
++    return 0;
++}
++
+ static bool curlGlobalInit = false;
+ static std::string certificateFilePath;
+ static std::string keyFilePath;
+@@ -47,8 +81,10 @@ struct HTTP_DATA {
+ 
+ static size_t _write_curl(void* contents, size_t size, size_t nmemb,
+                           void* userp) {
++    if (size && nmemb > SIZE_MAX / size) return 0;
+     size_t realsize = size * nmemb;
+     auto* mem = (HTTP_DATA*)userp;
++    if (mem->size > 8 * 1024 * 1024 || realsize > 8 * 1024 * 1024 - mem->size) return 0;
+ 
+     char* resized = (char*)realloc(mem->memory, mem->size + realsize + 1);
+     if (resized == NULL)
+@@ -76,8 +112,6 @@ int http_init(const std::string& key_directory) {
+         }
+         moonlight_diagnostics::emit("TLS backend=mbedTLS identity=PEM");
+         brls::Logger::info("Curl: {}", curl_version());
+-    } else {
+-        return GS_OK;
+     }
+ 
+     certificateFilePath = key_directory + "/" + CERTIFICATE_FILE_NAME;
+@@ -125,7 +159,10 @@ int http_request(const std::string& url, Data* data,
+     brls::Logger::info("Curl: Request");
+ 
+     auto* http_data = (HTTP_DATA*)malloc(sizeof(HTTP_DATA));
++    if (!http_data) return GS_OUT_OF_MEMORY;
+     http_data->memory = (char*)malloc(1);
++    if (!http_data->memory) { free(http_data); return GS_OUT_OF_MEMORY; }
++    http_data->memory[0] = 0;
+     http_data->size = 0;
+ 
+     auto curl = makeCurl();
+@@ -135,6 +172,18 @@ int http_request(const std::string& url, Data* data,
+         return GS_FAILED;
+     }
+ 
++    if (Settings::instance().production() && url.compare(0, 8, "https://") == 0) {
++        if (Settings::instance().pinned_key().empty()) {
++            free(http_data->memory); free(http_data); freeCurl(curl); return GS_FAILED;
++        }
++        curl_easy_setopt(curl, CURLOPT_PINNEDPUBLICKEY, Settings::instance().pinned_key().c_str());
++    }
++    if (Settings::instance().production()) {
++        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
++        curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, dispatch_event);
++        curl_easy_setopt(curl, CURLOPT_DEBUGDATA,
++            url.find("phrase=getservercert") != std::string::npos ? reinterpret_cast<void*>(1) : nullptr);
++    }
+     curl_easy_setopt(curl, CURLOPT_WRITEDATA, http_data);
+     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
+diff --git a/libgamestream/http.h b/libgamestream/http.h
+index 6c87788..17b60e1 100644
+--- a/libgamestream/http.h
++++ b/libgamestream/http.h
+@@ -18,6 +18,8 @@
+  */
+ 
+ #pragma once
++class Data;
++int http_pin_certificate(const Data& certificate);
+ 
+ #include "Data.hpp"
+ 

@@ -1,6 +1,7 @@
 #pragma once
 #include "features/streaming/domain/streaming_client.hpp"
 #include "features/streaming/infrastructure/control_queue.hpp"
+#include <nlohmann/json_fwd.hpp>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -53,6 +54,16 @@ public:
     std::string diagnostics() const override;
     // Application-thread lifetime stages; nested scopes are not additive.
     std::string transportTimings() const override;
+    telemetry::Snapshot captureTelemetry(telemetry::Capture mask) const noexcept override;
+    telemetry::protocol::ProtocolSnapshot captureProtocolTelemetry() const noexcept override;
+    telemetry::network::NetworkSnapshot captureNetworkTelemetry() const noexcept override;
+    bool peekNetworkEvent(telemetry::network::NetworkEvent&) const noexcept override;
+    std::size_t peekNetworkEvents(telemetry::network::NetworkEvent*,std::size_t) const noexcept override;
+    bool retireNetworkEvent(std::uint64_t,bool) noexcept override;
+    bool supportsControlDiscoveryTelemetry()const noexcept override{return true;}
+    std::size_t peekControlDiscoveryEvents(telemetry::network::ControlDiscoveryEvent*,std::size_t,bool=false)const noexcept override;
+    bool retireControlDiscoveryEvent(std::uint64_t,bool)noexcept override;
+    bool pollUnmigratedNetworkEvent(std::string&) override;
     std::string videoDiagnostics() const override;
     std::string gapDiagnostics() const override;
     std::string queueDiagnostics() const override;
@@ -109,11 +120,14 @@ public:
     void pauseAssemblyForTesting(bool paused);
 #endif
 private:
+    bool sendControlData(const std::string& wire, const nlohmann::json& data);
     bool startEndpoint(const std::string& hash, const std::string& suffix,
                        const std::string& caPath, const std::string& url);
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::string caPath_, random5suffix_;
+    std::uint64_t telemetryEpoch_ = 0;
+    std::uint64_t telemetryStreamEpoch_ = 0;
     // Retry carries release-only obligations for this rental. No press, stick,
     // pointer movement, or historical current-state sample crosses generations.
     std::string retryInputHash_;

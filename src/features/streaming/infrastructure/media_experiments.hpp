@@ -1,0 +1,19 @@
+#pragma once
+#ifndef FOGPLAY_MEDIA_NV12
+#define FOGPLAY_MEDIA_NV12 0
+#endif
+#ifndef FOGPLAY_MEDIA_CPU_POOL
+#define FOGPLAY_MEDIA_CPU_POOL 0
+#endif
+#ifndef FOGPLAY_MEDIA_TEXTURES
+#define FOGPLAY_MEDIA_TEXTURES 1
+#endif
+#ifndef FOGPLAY_MEDIA_READY_DEPTH
+#define FOGPLAY_MEDIA_READY_DEPTH 3
+#endif
+namespace fog::detail {
+static_assert(FOGPLAY_MEDIA_NV12 == 0 || FOGPLAY_MEDIA_NV12 == 1);
+static_assert(FOGPLAY_MEDIA_CPU_POOL == 0 || FOGPLAY_MEDIA_CPU_POOL == 1);
+static_assert(FOGPLAY_MEDIA_TEXTURES == 1 || FOGPLAY_MEDIA_TEXTURES == 2);
+static_assert(FOGPLAY_MEDIA_READY_DEPTH == 1 || FOGPLAY_MEDIA_READY_DEPTH == 3);
+}

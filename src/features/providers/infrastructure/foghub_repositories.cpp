@@ -428,7 +428,7 @@ std::vector<Computer> Catalog::playStationComputers(const CatalogProgress& progr
     // The shared home-section API predates providers. FogHub supplies the
     // explicitly selected ordinary PCs here; the UI labels its own section.
     std::vector<Computer> result;
-    for (const auto* id : {"1838", "1836", "1233", "1232", "1231", "1235", "1237", "1230"}) {
+    for (const auto* id : {"1838", "1836", "1233", "1232", "1231", "1235", "1237", "1230", "193"}) {
         if (cancelled && cancelled()) fail(RepositoryErrorKind::Unavailable,"FogHub catalog cancelled");
         const auto page = session_.readPublic(std::string("/pc/preview?id=")+id);
         if (cancelled && cancelled()) fail(RepositoryErrorKind::Unavailable,"FogHub catalog cancelled");

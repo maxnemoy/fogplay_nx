@@ -1,4 +1,5 @@
 #include <rtc/rtc.hpp>
+#include <rtc/icediagnostics.hpp>
 #include <cstdio>
 #ifdef __SWITCH__
 #include <switch.h>
@@ -15,6 +16,11 @@ int main() {
         rtc::Configuration config;
         config.iceServers.clear();
         rtc::PeerConnection pc(config);
+        // Link the extension before ICE exists; this does not start network work.
+        const rtc::IceDiagnostics ice = pc.getIceDiagnostics();
+        if (ice.provenance != rtc::IceDiagnostics::Provenance::None) return 12;
+        const rtc::IceUdpPollDiagnostics udp = pc.getIceUdpPollDiagnostics();
+        if (udp.ice.provenance != rtc::IceDiagnostics::Provenance::None) return 13;
         rtc::Description::Video video("video", rtc::Description::Direction::RecvOnly);
         video.addH264Codec(96);
         auto track = pc.addTrack(video);

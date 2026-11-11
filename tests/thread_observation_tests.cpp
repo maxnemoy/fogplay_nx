@@ -1,6 +1,7 @@
 #include "core/diagnostics/thread_observation.hpp"
 #include <cassert>
 #include <iostream>
+#include <future>
 #include <thread>
 
 int main() {
@@ -51,5 +52,21 @@ int main() {
     observer.join();
     beginThreadObservationEpoch();
     assert(threadObservationText().find("role=RTC worker") != std::string::npos);
+    const auto frozen=captureThreadObservations();
+    const auto frozenLines=threadObservationLines(frozen);
+    assert(frozenLines==threadObservationLines());
+    beginThreadObservationEpoch();
+    observeThread("new-owner-after-capture");
+    assert(threadObservationLines(frozen)==frozenLines);
+    // Formatting a handed-off value must not query or lock mutable owners.
+    std::future<std::vector<std::string>> formatted;
+    bool ready=false;
+    {
+        std::lock_guard<std::mutex> blocked(threadObservations().mutex);
+        formatted=std::async(std::launch::async,[frozen] { return threadObservationLines(frozen); });
+        ready=formatted.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+    }
+    assert(ready && formatted.get()==frozenLines);
+    assert(threadObservationLine(frozen,frozen.size+1).empty());
     std::cout << "Thread observations PASS: saturated catalog history, per-transport reset, retained SDK starts with carried epoch, owner recapture, transient cleanup, new-start admission and concurrent epochs\n";
 }

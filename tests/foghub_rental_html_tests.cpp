@@ -1,6 +1,7 @@
 #include "features/providers/infrastructure/foghub_html.hpp"
 #include "core/domain/repository_error.hpp"
 #include "features/session/domain/session_rating.hpp"
+#include <libxml/xmlversion.h>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -245,17 +246,47 @@ void computerPreviewCurrentTemplate() {
         rejects([&] { parseComputerPreview(replace(html,"href=\"/pc/play?id=1838\"",std::string(action)+" href=\"/pc/play?id=1838\""),"1838"); });
 }
 void computerPreviewLivePage() {
-    // Complete public page captured on 04.11.2026 (CSRF values redacted). Its
-    // infinite-scroll script keeps "<div>...</div>" in JavaScript strings; the
-    // Switch libxml2 2.9.8 parser rejected every card at stage=document.
+    // Complete public page captured on 04.11.2026 (CSRF and link signatures
+    // redacted). Its infinite-scroll script keeps "<div>...</div>" in
+    // JavaScript strings: the Switch libxml2 2.9.8 (HTML4) parser ended the
+    // script there and rejected every card at stage=document until documents
+    // were parsed with HTML_PARSE_RECOVER (script ends at its own end tag).
     const auto html = fixture("computer-preview-2026-11-04");
     check(html.find("IASSpinnerExtension") != std::string::npos && html.find("</div>\"}") != std::string::npos);
     const char* stage = "unset";
     const auto pc = parseComputerPreview(html,"1838",&stage);
     check(pc.id == "1838" && pc.name == "f4bX8" && pc.online && !pc.busy && pc.fhAvailable && pc.pricePerHour == "25");
     rejects([&] { parseComputerPreview(html,"1836"); });
-    // The script blanking never hides page structure: removing the PC card still fails.
     rejects([&] { parseComputerPreview(replace(html,"class=\"pc-view\"","class=\"other-view\""),"1838"); });
+    // The input is never pre-processed: protected elements are judged on the
+    // library's own tree. Validation probes (rounds 3-4), same on 2.9.8 and 2.15:
+    rejects([&] { parseComputerPreview(replace(html,"<main","<!-- <script> --> <div id='captcha'></div> <!-- </script> --><main"),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"<main",
+        "<!-- <style> --><form id='login-form' action='/site/login'></form><!-- </style> --><main"),"1838"); },
+        RepositoryErrorKind::NotAuthenticated);
+    rejects([&] { parseComputerPreview(replace(html,"<main","<script/><div id='captcha'></div></script><main"),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"<main","<style/><form id='login-form' action='/site/login'></form></style><main"),"1838"); },
+        RepositoryErrorKind::NotAuthenticated);
+    // Harmless mentions and a script with a quoted '>' and markup strings stay accepted.
+    check(parseComputerPreview(replace(html,"<main","<!-- example: <script> --><div data-example='<script>'>example</div>"
+        "<script data-value='>'>x='<a>b</a>'; y='</div>';</script><main"),"1838").pricePerHour == "25");
+    // Declarations are judged on the built tree, not on raw text (round 5):
+    // CDATA markers and ENTITY text in script/style and an IE conditional
+    // comment stay accepted; a leading internal DTD subset fails closed.
+    for (const auto* harmless : {"<script>//<![CDATA[\nvar x=1;\n//]]></script>", "<style>/*<![CDATA[*/ .x {color:red} /*]]>*/</style>",
+            "<script>var text='<!ENTITY demo>';</script>", "<!--[if lt IE 9]><script src='/ie.js'></script><![endif]-->"})
+        check(parseComputerPreview(replace(html,"<main",std::string(harmless) + "<main"),"1838").pricePerHour == "25");
+    rejects([&] { parseComputerPreview(replace(html,"<!DOCTYPE html>","<!DOCTYPE html [<!ENTITY x 'y'>]>"),"1838"); });
+    rejects([&] { parseComputerPreview(replace(html,"<!DOCTYPE html>","<!-- c --><?x?>\n<!doctype html [<!ENTITY x 'y'>]>"),"1838"); });
+    // Double-escaped script text: HTML5 (libxml2 >= 2.14) keeps the CAPTCHA as
+    // script text; the HTML4 parser ends the script at the first "</script"
+    // and sees a real CAPTCHA, failing closed. Either way nothing is hidden.
+    const auto doubleEscaped = replace(html,"<main","<script><!--<script></script><div id='captcha'></div>--></script><main");
+#if LIBXML_VERSION >= 21400
+    check(parseComputerPreview(doubleEscaped,"1838").pricePerHour == "25");
+#else
+    rejects([&] { parseComputerPreview(doubleEscaped,"1838"); });
+#endif
 }
 }
 int main() {

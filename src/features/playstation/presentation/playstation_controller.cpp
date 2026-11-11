@@ -3,7 +3,7 @@
 
 namespace fogplay {
 void ApplicationController::loadPlayStation() {
-    if (sessionPending_ || pending_.valid()) return;
+    if (rentalSession_.state().pending || pending_.valid()) return;
     const bool alreadyViewing = screen_ == Screen::PlayStation || screen_ == Screen::PlayStationDetails;
     latency_.cancel();
     screen_ = Screen::PlayStation; nav_ = 2;

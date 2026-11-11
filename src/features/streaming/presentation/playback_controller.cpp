@@ -1,297 +1,227 @@
+#include "app/stream_telemetry_logging.hpp"
+#include "app/final_output_telemetry.hpp"
+#include "features/streaming/application/ui_telemetry_logging.hpp"
 #include "core/diagnostics/thread_observation.hpp"
-#include "core/constants/resources.hpp"
 #include "core/constants/ui_text.hpp"
 #include "app/application_controller.hpp"
-#include "features/streaming/domain/playback_drain.hpp"
 #include "features/streaming/domain/stick_deadzone.hpp"
 #include "core/constants/stage1_options.hpp"
-#include "core/constants/stage3_options.hpp"
 #include "features/playstation/domain/controller.hpp"
 
 namespace uiText = ::fog::constants::ui;
-
 namespace fogplay {
+using Player = fog::stream::Player;
 
-void ApplicationController::logIncomingControl(bool final) noexcept {
-    if (!stream_) return;
-    try {
-        std::string event;
-        for (unsigned i = 0; i < 40 && stream_->pollControlDiagnostic(event, final); ++i)
-            diagnostic("Stream control: " + event, 2048);
-    } catch (...) {} // Diagnostics cannot interrupt playback or teardown.
-}
-
-std::string ApplicationController::playbackTimings(bool takeLogTiming) const {
-    const auto logTiming = takeLogTiming ? takeDiagnosticTiming() : diagnosticTimingSnapshot();
+stream::telemetry::Playback ApplicationController::playbackSnapshot(stream::telemetry::Playback value,bool takeLogTiming) const {
+    const auto enqueue = takeLogTiming ? takeDiagnosticTiming() : diagnosticTimingSnapshot();
+    value.stages[1] = {presentTiming_.calls,presentTiming_.totalUs,presentTiming_.maxUs,0};
+    value.stages[7] = {enqueue.calls,enqueue.totalUs,enqueue.maxUs,0};
     const auto log = runLog.stats();
-    return "Playback timing: " + drainTiming_.text("drain") + " " + presentTiming_.text("present") +
-        " " + transportPumpTiming_.text("transportPump") + " " + videoFeedTiming_.text("videoFeed") +
-        " " + decoderResetTiming_.text("decoderReset") + " " + audioFeedTiming_.text("audioFeed") + " " + prepareTiming_.text("prepare") +
-        " " + logTiming.text("logEnqueue") + " pumpGapMaxUs=" + std::to_string(pumpGapMaxUs_) +
-        " outsideMeasuredPumpMaxUs=" + std::to_string(outsideMeasuredPumpMaxUs_) +
-        " videoQueueWaitMaxMs=" + std::to_string(videoQueueWaitMaxMs_) +
-        " audioQueueWaitMaxMs=" + std::to_string(audioQueueWaitMaxMs_) +
-        " slowCycles=" + std::to_string(slowPlaybackCycles_) +
-        " batchVideoTotal=" + std::to_string(drainVideoTotal_) + " batchVideoMax=" + std::to_string(drainVideoMax_) +
-        " frameBudgetYields=" + std::to_string(drainVideoBudgetHits_) +
-        " budgetYields=" + std::to_string(drainBudgetHits_) + " catchupWindows=" + std::to_string(catchupWindows_) +
-        " logQueued=" + std::to_string(log.queuedLines) + " logDropped=" + std::to_string(log.droppedLines) +
-        " logWritten=" + std::to_string(log.writtenLines) + " logBatches=" + std::to_string(log.batches) +
-        " logBatchLastUs=" + std::to_string(log.lastBatchUs) + " logBatchMaxUs=" + std::to_string(log.maxBatchUs);
+    value.logQueued=log.queuedLines; value.logDropped=log.droppedLines; value.logWritten=log.writtenLines;
+    value.logBatches=log.batches; value.logBatchLastUs=log.lastBatchUs; value.logBatchMaxUs=log.maxBatchUs;
+    return value;
 }
-
-void ApplicationController::logOutputTimings(bool final) {
-    const auto inputNowMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
-    diagnostic("Input suspension: enabled=" + std::to_string(fog::stage1::inputFreezeGate) + " " +
-        inputSuspensionStats_.text(inputNowMs),1024);
-    if (media_) diagnostic("Client latency: " + media_->latencyDiagnostics(),4096);
-    if (stream_) diagnostic("Input latency: " + stream_->inputLatencyDiagnostics(),1024);
-    const auto threads = fog::diagnostics::threadObservationText();
-    if (threads != lastThreadObservations_) {
-        for (const auto& line : fog::diagnostics::threadObservationLines()) diagnostic(line,512);
-        lastThreadObservations_ = threads;
-    }
-    using Timing = fog::stream::LoopTiming;
-    const auto now = std::chrono::steady_clock::now();
-    const auto active = loopTiming_.activeText(now);
-    // Samples belong to the window in which their scope finishes. Nested draw
-    // stages overlap the outer draw/loop; these durations must not be summed.
-    for (const bool lifetime : {false, true}) {
-        if (lifetime && !final) break;
-        const auto& snapshot = lifetime ? loopTiming_.lifetime : loopTiming_.window;
-        const auto spanMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now-(lifetime ? loopTimingLifetimeAt_ : loopTimingWindowAt_)).count();
-        const std::string scope = final ? (lifetime ? "final lifetime" : "final window") : "window";
-        std::string loop = "Output loop " + scope + ": spanMs=" + std::to_string(spanMs) + " " + active;
-        for (const auto stage : {Timing::Stage::Loop, Timing::Stage::Events, Timing::Stage::Poll,
-            Timing::Stage::Pump, Timing::Stage::Input, Timing::Stage::Draw})
-            loop += " " + snapshot.at(stage).text(Timing::name(stage));
-        diagnostic(loop,4096);
-        std::string draw = "Output draw " + scope + ":";
-        for (const auto stage : {Timing::Stage::Artwork, Timing::Stage::MediaDraw, Timing::Stage::Overlay, Timing::Stage::Present})
-            draw += " " + snapshot.at(stage).text(Timing::name(stage));
-        draw += " " + snapshot.newPresentGap.text("newPresentGap") +
-            " newPresentAnchors=" + std::to_string(snapshot.anchors) +
-            " suppressedNewFrames=" + std::to_string(snapshot.suppressedFrames) +
-            " presentContinuityBreaks=" + std::to_string(snapshot.continuityBreaks);
-        diagnostic(draw,4096);
-    }
-    if (!final) { loopTiming_.clearWindow(); loopTimingWindowAt_ = now; }
+std::string ApplicationController::playbackTimings(bool takeLogTiming) const {
+    return stream::telemetry::playbackText(playbackSnapshot(player_.timingsSnapshot(),takeLogTiming));
 }
-
-bool ApplicationController::closeTransport(bool final) noexcept {
-    stopRumble();
-    bool retryAllowed = true;
-    if (media_) media_->stopWorkers();
-    if (streamPlayStation_) {
-        try { releasePlayStationInput(); } catch (...) {}
-        psSensors_.stop();
-        try { logPlayStationInput(true); } catch (...) {}
-    }
-    releaseMouse();
-    retryKeyReleases();
-    typedText_.clear(); // Remaining text is never typed through a replacement transport.
-    touchWasDown_ = false;
-    videoRecovery_.reset();
-    videoLossWaiting_ = false;
-    loopTiming_.suspendPresentation();
-    inputSuspensionStats_.observe({},static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count()));
-    inputFreezeWaiting_ = false;
-    if (stream_) {
-        try {
-            logIncomingControl(true);
-            diagnostic(rumble_.diagnostics());
-            std::string event;
-            for (unsigned i = 0; i < 96 && stream_->pollVideoDiagnostic(event); ++i)
-                diagnostic("Stream final event: " + event,2048);
-            diagnostic("Video RTP final: " + stream_->videoDiagnostics(),4096);
-            diagnostic("Media queue final: " + stream_->queueDiagnostics(),2048);
-            diagnostic(playbackTimings(),2048);
-            logOutputTimings(true);
-            diagnostic("Stream transport final: " + stream_->transportTimings(),4096);
-            if (media_) {
-                diagnostic("Video decoder final: " + media_->diagnostics(),4096);
-                diagnostic("Audio playback final: " + media_->audioDiagnostics(),2048);
-            }
-        } catch (...) { retryAllowed = false; } // Cleanup must continue; an uncertain retry must stop.
-        if (streamRental_.provider == fog::ProviderId::FogHub) {
-            if (!final && !retryAllowed) return false;
-            // The old adapter stays alive in the reaper until callbacks have
-            // joined and its final retry decision is known. No new FH client
-            // may start while this mailbox is occupied.
-            if (!transportTeardown_.begin(stream_, !final)) return false;
-            transportCloseStarted_ = std::chrono::steady_clock::now();
-            try { diagnostic("Moonlight teardown scheduled; UI remains active."); } catch (...) {}
-        }
-        if (stream_) {
-            try {
-                if (final) stream_->close();
-                else if (!stream_->disconnectForRetry()) {
-                    retryAllowed = false;
-                    diagnostic("Transport retry cancelled: " + safeText(stream_->error()));
-                    diagnostic("Transport final protocol: " + stream_->diagnostics(),2048);
-                }
-            } catch (...) { retryAllowed = false; }
-            try {
-                logIncomingControl(true);
-                diagnostic("Stream transport closed: " + stream_->transportTimings(),4096);
-                if (streamPlayStation_) diagnostic("PS transport input closed: " + stream_->inputDiagnostics(),3072);
-                diagnostic("Video gaps final: " + stream_->gapDiagnostics(),4096);
-                diagnostic("Stream DTLS final: " + stream_->dtlsDiagnostics(),8192);
-                diagnostic("Stream RTCP final: " + stream_->rtcpDiagnostics(),4096);
-                diagnostic("Stream mutex final: " + stream_->mutexDiagnostics(),4096);
-            } catch (...) {} // Diagnostic failure cannot prevent rental termination.
-            // A refused retry can still own an in-flight RTC call. Keep it alive
-            // until beginFinish dispatches the rental stop, then performs final close.
-            if (!final && !retryAllowed) return false;
-            if (!final && streamRental_.provider == fog::ProviderId::Mts)
-                retryStream_ = std::move(stream_); // Retain release obligations, never old presses.
-            else stream_.reset();
-        }
-    }
-    mouseButtons_.reset();
-    keyReleases_.reset();
-    gamepadSchedule_.reset();
-    media_.reset();
-    return final || retryAllowed;
+std::unique_ptr<stream::StreamingClient> ApplicationController::create(fog::ProviderId provider) {
+    auto* services = providerServices(provider);
+    if (!services) throw std::runtime_error("Stream provider unavailable; stopping rental");
+    return services->stream();
 }
-
-void ApplicationController::closeStream() noexcept {
-    pairedVideoResumeAfterClose_ = false;
-    pairedVideoReconnectPending_ = false;
-    pairedTransportReconnectPending_ = false;
-    transportReconnect_.cancel();
-    closeTransport(true);
-    retryStream_.reset();
-    artwork_.setPaused(false);
-    steamArtwork_.setPaused(false);
-    streamRental_ = {};
-    streamPlayStation_ = false;
-    relaySelection_.reset();
-    transportReconnect_.reset();
-    recentLaunch_.close();
-    overlay_.close();
-    overlayNotice_.clear();
-    streamInputGate_.reset();
+Player::Admission ApplicationController::playerAdmission() const {
+    return {screen_ == Screen::Streaming && appletGetFocusState() == AppletFocusState_InFocus,
+        rentalSession_.requested(),shutdownDone_ || exitAfterStop_,pending_.valid(),
+        rentalSession_.state().pending,rentalSession_.state().pairedPending};
 }
-
-void ApplicationController::pollTransportTeardown() {
-    auto result = transportTeardown_.take();
-    if (!result.client) return;
-    try {
-        diagnostic("Moonlight teardown joined; retry=" + std::to_string(result.retry) +
-            " allowed=" + std::to_string(result.allowed));
-        diagnostic("Transport final protocol: " + result.client->diagnostics(),2048);
-        diagnostic("Video gaps final: " + result.client->gapDiagnostics(),4096);
-    } catch (...) {}
-    if (!result.allowed) {
-        // A retry refusal may still own transport resources. Dispatch the
-        // rental stop before putting that client back into final teardown.
-        pairedVideoResumeAfterClose_ = false;
-        if (!stopAfterTask_ && !shutdownDone_ && !streamRental_.empty()) {
-            stream_ = std::move(result.client);
-            stopTransportRecovery("transport-retry-terminal");
-        } else transportTeardown_.begin(result.client, false);
-        return;
-    }
-    result.client.reset();
-    // Resume is deliberately deferred to pumpStream, AFTER this frame's
-    // sampled overlay stop/cancel. A completed join cannot outrun user intent.
-}
-
-bool ApplicationController::startTransport(bool resumeOnly) {
-    if (transportTeardown_.pending())
-        throw std::runtime_error("Previous stream is still stopping");
-    fog::diagnostics::beginThreadObservationEpoch();
-    fog::diagnostics::observeThread("application");
-    // Transport replacement must not adopt, create, or reset rental ownership.
-    mouseButtons_.reset();
-    keyReleases_.reset();
-    gamepadSchedule_.reset();
-    videoRecovery_.reset();
-    videoLossWaiting_ = false; firstFramePresented_ = false;
-    loopTiming_.resetPresentationCounter();
-    videoWorkUs_ = videoDecodeErrors_ = lastVideoGeneration_ = 0;
-    media_ = std::make_unique<fog::Media>(rt_.renderer,stream::VideoCodec::H264,true);
-    media_->setVideoStallReporter([](const std::string& value) {
-        runLog.append("[Video watchdog] " + value);
-        runLog.requestFlush();
-    });
-    auto* provider = providerServices(streamRental_.provider);
-    if (!provider) throw std::runtime_error("Stream provider unavailable; stopping rental");
-    stream_ = retryStream_ ? std::move(retryStream_) : provider->stream();
-    if (!stream_) throw std::runtime_error("Stream transport unavailable; stopping rental");
-    if (!stream_->configureController(streamPlayStation_ ? ::stream::ControllerProfile::DualSense : ::stream::ControllerProfile::Xbox))
-        throw std::runtime_error("Invalid controller configuration; stopping rental");
-    if (streamPlayStation_) {
+void ApplicationController::transportStarting(stream::ControllerProfile profile,stream::StreamInputSink&) {
+    mouseButtons_.reset(); keyReleases_.reset(); gamepadSchedule_.reset(); loopTiming_.resetPresentationCounter();
+    if (profile == stream::ControllerProfile::DualSense) {
         psSensors_.start(); psTouchTrace_ = {}; psNativeInput_ = {}; psTouchLastSubmitted_ = false;
         psLogAtMs_ = psGamepadAccepted_ = psGamepadRejected_ = 0;
         psGyroPeak_ = psAccelPeak_ = 0; psMotionMovedFrames_ = 0;
         diagnostic("PS touch reset: pending both contacts UP for new transport");
     }
-    diagnostic(std::string("Controller profile: ") + (streamPlayStation_ ? "dualsense; PlayStation touch/motion enabled" : "xbox") +
-        "; provider=" + (streamRental_.provider == fog::ProviderId::Mts ? "mts" : "moonlight"));
-    const bool rtcTransport = streamRental_.provider == fog::ProviderId::Mts;
-    if (!stream_->configureRelay(rtcTransport && relaySelection_.relay()))
-        throw std::runtime_error("Invalid connection configuration; stopping rental");
-    diagnostic(rtcTransport ? std::string("Transport ICE policy: ") + (relaySelection_.relay() ? "relay" : "all") : "Moonlight direct transport; RTC relay policy unavailable");
-    auto streamSettings = videoSettings_;
-    if (!rtcTransport) {
-        if (!fog::Media::supportsH265()) streamSettings.codec = stream::VideoCodec::H264;
-        streamSettings.quality = 0; streamSettings.keyframeSeconds = 0;
+}
+void ApplicationController::transportPumped(stream::StreamInputSink&) {
+    retryMouseReleases(); retryKeyReleases(); pumpTypedText(); retryGamepadRelease();
+    if (player_.snapshot().provider == fog::ProviderId::FogHub) overlay_.setVideoChangesEnabled(player_.snapshot().ready);
+}
+void ApplicationController::videoSuspended(fog::stream::VideoSuspension reason) {
+    if (reason != fog::stream::VideoSuspension::InputFreeze) loopTiming_.suspendPresentation();
+    suspendVideoInput();
+}
+void ApplicationController::videoPrepared(bool waiting) { streamInputGate_.videoPrepared(waiting); }
+void ApplicationController::beforeTransportClose(stream::StreamInputSink*) noexcept {
+    stopRumble();
+    if (streamPlayStation_) {
+        try { releasePlayStationInput(); } catch (...) {}
+        psSensors_.stop(); try { logPlayStationInput(true); } catch (...) {}
     }
-    if (!stream_->configureVideo(streamSettings))
-        throw std::runtime_error("Invalid video configuration; stopping rental");
-    activeFramesPerSecond_ = streamSettings.framesPerSecond;
-    media_->setPresentationFrameRate(activeFramesPerSecond_);
-    overlay_.setProvider(streamRental_.provider);
-    overlay_.setVideoChangesEnabled(rtcTransport);
-    overlay_.setVideoSettings(streamSettings);
-    overlay_.setSaveStatus(videoSaveStatus_);
-    lastStreamState_.clear(); lastStreamDiagnostics_.clear();
-    const bool started = stream_->start({streamRental_, resumeOnly});
-    if (started && (!rtcTransport || fog::stage3::mtsMediaWorkers)) {
-        media_->startWorkers(*stream_, activeFramesPerSecond_, rtcTransport ? fog::Media::WorkerPolicy::Mts : fog::Media::WorkerPolicy::FogHub);
-        diagnostic(std::string(rtcTransport ? "MTS" : "FH") + " media workers started: independent video/audio; paced presentation fps=" + std::to_string(activeFramesPerSecond_));
+    releaseMouse(); retryKeyReleases(); typedText_.clear(); touchWasDown_ = false;
+    loopTiming_.suspendPresentation();
+    inputSuspensionStats_.observe({},static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()));
+    inputFreezeWaiting_ = false;
+}
+void ApplicationController::transportClosed() noexcept {
+    emitPendingFinalPsTelemetry();
+    mouseButtons_.reset(); keyReleases_.reset(); gamepadSchedule_.reset();
+}
+void ApplicationController::closeStream() noexcept {
+    player_.closeAfterStopDispatch();
+    artwork_.setPaused(false); steamArtwork_.setPaused(false); streamPlayStation_ = false;
+    recentLaunch_.close(); overlay_.close(); overlayNotice_.clear(); streamInputGate_.reset();
+}
+void ApplicationController::pollTransportTeardown() {
+    player_.pollTeardown(); applyPlayerEvents(); applyPlayerEffects();
+}
+void ApplicationController::applyPlayerEffects() {
+    while (const auto effect = player_.takeEffect()) {
+        if (const auto* stop = std::get_if<Player::StopRequired>(&*effect)) {
+            rentalSession_.request(); beginFinish(Player::stopReasonName(stop->reason));
+        } else {
+            const auto& inspection = std::get<Player::InspectionNeeded>(*effect);
+            bool admitted = false;
+            try {
+                admitted = inspection.purpose == Player::Purpose::Transport ?
+                    startRental(fog::RentalSessionCoordinator::InspectTransport{inspection.expected}) :
+                    startRental(fog::RentalSessionCoordinator::InspectQuality{inspection.expected});
+            } catch (...) { admitted = false; }
+            if (!admitted) player_.inspectionDispatchFailed();
+        }
     }
-    if (rtcTransport) diagnostic("Stage3 options mts_media_workers=" + std::to_string(fog::stage3::mtsMediaWorkers));
-    streamStarted_ = lastVideo_ = lastMediaLog_ = lastMetricsLog_ = lastVideoEventLog_ = std::chrono::steady_clock::now();
-    return started;
+    if (const auto error = player_.takeFailure()) {
+        try { std::rethrow_exception(error); } catch (const std::exception& value) {
+            status_=safeText(value.what()); diagnostic(status_);
+            if(screen_==Screen::Checkout)checkoutStatus_=status_;
+        }
+        catch (...) { diagnostic("Player failure; details unavailable."); }
+    }
+}
+bool ApplicationController::completePlayerInspection(const fog::RentalSessionCoordinator::Effects& effects) {
+    const bool inspectionResult = effects.operation == fog::RentalSessionCoordinator::Operation::TransportInspection ||
+        effects.operation == fog::RentalSessionCoordinator::Operation::QualityInspection;
+    if (!player_.snapshot().inspection && !inspectionResult) return false;
+    if (!rentalSession_.state().pairedPending) { player_.closeResolvedRental(); closeStream(); return false; }
+    // The outer loop deliberately skips playback turns after stop/focus intent.
+    // A joined inspection must therefore dispatch that queued stop here; only
+    // restart decisions are deferred to the post-overlay beforeMedia phase.
+    if (rentalSession_.requested() || exitAfterStop_ || shutdownDone_ || appletGetFocusState() != AppletFocusState_InFocus) {
+        beginFinish("inspection-stop-queued"); return true;
+    }
+    if (!player_.snapshot().inspection) return false;
+    const auto purpose = effects.operation == fog::RentalSessionCoordinator::Operation::TransportInspection ?
+        Player::Purpose::Transport : Player::Purpose::Quality;
+    Player::ResumeVerdict verdict{purpose,Player::Verdict::Refused,{}};
+    if (effects.resume) {
+        verdict.expected=effects.resume->expected;
+        verdict.purpose=effects.resume->purpose == fog::RentalSessionCoordinator::ResumePurpose::Transport ? Player::Purpose::Transport : Player::Purpose::Quality;
+        verdict.verdict=effects.resume->status == fog::RentalSessionCoordinator::ResumeStatus::Ready ? Player::Verdict::Ready :
+            effects.resume->status == fog::RentalSessionCoordinator::ResumeStatus::Retry ? Player::Verdict::Retry : Player::Verdict::Refused;
+    }
+    player_.resumeVerdict(std::move(verdict)); // Store only. Overlay stop runs before beforeMedia.
+    return true;
+}
+void ApplicationController::applyPlayerEvents() {
+    while (const auto event = player_.takeEvent()) {
+        switch (event->kind) {
+            case Player::EventKind::TransportStarted: {
+                const auto playback = player_.snapshot();
+                overlay_.setProvider(playback.provider); overlay_.setVideoChangesEnabled(playback.provider == fog::ProviderId::Mts);
+                overlay_.setVideoSettings(playback.activeVideo); overlay_.setSaveStatus(videoSaveStatus_);
+                diagnostic(std::string("Controller profile: ")+(playback.controller==stream::ControllerProfile::DualSense?"dualsense; PlayStation touch/motion enabled":"xbox")+
+                    "; provider="+(playback.provider==fog::ProviderId::Mts?"mts":"moonlight"));
+                diagnostic(playback.provider==fog::ProviderId::Mts?std::string("Transport ICE policy: ")+(playback.relay?"relay":"all"):"Moonlight direct transport; RTC relay policy unavailable");
+                if(playback.progress.workers)diagnostic(std::string(playback.provider==fog::ProviderId::Mts?"MTS":"FH")+" media workers started: independent video/audio; paced presentation fps="+std::to_string(playback.framesPerSecond));
+                if(playback.provider==fog::ProviderId::Mts)diagnostic("Stage3 options mts_media_workers="+std::to_string(playback.mtsMediaWorkers));
+                break;
+            }
+            case Player::EventKind::FirstPrepared: diagnostic(event->flag ? "First video frame prepared (hardware)." : "First video frame prepared (software)."); break;
+            case Player::EventKind::Prepared: rememberDecodedGame(); break;
+            case Player::EventKind::RecoverySucceeded: status_=uiText::Stream::RestoredMenuHint; diagnostic("Transport recovery succeeded; attemptsIn120s="+std::to_string(event->value)); break;
+            case Player::EventKind::RecoveryScheduled: status_=uiText::Stream::ReconnectStatus; diagnostic("Transport recovery scheduled; attemptsIn120s="+std::to_string(event->value)+" limit=3 rollingWindow=120s recoveryDeadline=90s"); break;
+            case Player::EventKind::QualityResume: status_=uiText::Settings::FogHubReconnectStatus; diagnostic("FH quality reconnect: verified same-rental resume requested."); break;
+            case Player::EventKind::DecoderReset: diagnostic("Video recovery begin; reset="+std::to_string(event->value)+" limit=3/60s deadline=10s keyframeRequested="+std::to_string(event->flag)); break;
+            case Player::EventKind::Generation: diagnostic("Video chain resync: generation="+std::to_string(event->value)); break;
+            case Player::EventKind::TeardownScheduled: diagnostic("Moonlight teardown scheduled; UI remains active."); break;
+            case Player::EventKind::TransportBreak:
+                diagnostic("Transport break recorded; recentBreaks="+std::to_string(event->value));
+                if(event->flag)diagnostic("Auto TURN selected after two breaks in 120s; retained until rental closes.");
+                break;
+            default: break;
+        }
+    }
+}
+void ApplicationController::pumpStream(PadState& pad,u64 held,u64 down) {
+    samplePlayStationInput(pad);
+    const auto refreshSlot=std::chrono::steady_clock::now();
+    player_.observe(refreshSlot);
+    logPlayStationInput(false);
+    bool overlayHandled=false;
+    if (screen_ == Screen::Streaming) {
+        overlayHandled=handleStreamOverlay(pad,held,down);
+        if (screen_ != Screen::Streaming || rentalSession_.requested()) { player_.cancel(); return; }
+    }
+    const auto before=player_.beforeMedia(playerAdmission(),std::chrono::steady_clock::now());
+    applyPlayerEvents(); applyPlayerEffects();
+    if (!before.media || rentalSession_.requested()) return;
+    const auto playback=player_.snapshot();
+    inputSuspensionStats_.observe(fog::stage1::inputFreezeGate ? playback.suspension : stream::InputSuspension{},
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+    inputFreezeWaiting_=fog::stage1::inputFreezeGate && playback.suspension.suspended();
+    if (fog::stage1::earlyInput) sendStreamInput(pad,held,overlayHandled);
+    player_.media(refreshSlot);
+    applyPlayerEvents(); applyPlayerEffects();
+    if (!fog::stage1::earlyInput) sendStreamInput(pad,held,overlayHandled);
 }
 
-void ApplicationController::recordTransportBreak() {
-    if (streamRental_.provider != fog::ProviderId::Mts) return;
-    const bool wasRelay = relaySelection_.relay();
-    if (relaySelection_.broken(std::chrono::steady_clock::now()))
-        diagnostic("Transport break recorded; recentBreaks=" + std::to_string(relaySelection_.breaks()));
-    if (!wasRelay && relaySelection_.relay()) diagnostic("Auto TURN selected after two breaks in 120s; retained until rental closes.");
+void ApplicationController::emitPendingFinalPsTelemetry() noexcept {
+    if(!pendingFinalPsTelemetry_)return;
+    const auto value=*pendingFinalPsTelemetry_;pendingFinalPsTelemetry_.reset();
+    fog::playstation::telemetry::enqueue(runLog,value);
 }
-
+void ApplicationController::logOutputTimings(bool final) {
+    const auto now=std::chrono::steady_clock::now();
+    const auto elapsed=diagnostics::diagnosticElapsedMs();
+    namespace t=stream::telemetry::ui;
+    if(final) {
+        const auto window=t::captureLoop(loopTiming_,t::LoopScope::FinalWindow,now,loopTimingWindowAt_,elapsed);
+        const auto lifetime=t::captureLoop(loopTiming_,t::LoopScope::FinalLifetime,now,loopTimingLifetimeAt_,elapsed);
+        auto ps=std::move(pendingFinalPsTelemetry_);pendingFinalPsTelemetry_.reset();
+        diagnostics::enqueueFinalOutput(runLog,window,lifetime,std::move(ps));
+    } else {
+        const auto loop=t::captureLoop(loopTiming_,t::LoopScope::Window,now,loopTimingWindowAt_,elapsed);
+        loopTiming_.clearWindow();loopTimingWindowAt_=now;
+        const auto threads=fog::diagnostics::captureThreadObservations();
+        if(!threadObservationsCaptured_||threads!=lastThreadObservations_) {
+            lastThreadObservations_=threads;threadObservationsCaptured_=true;nextThreadChunk_=0;
+            lastThreadCapturedElapsedMs_=elapsed;lastThreadCapturedAt_=now;
+        }
+        std::optional<t::ThreadChunk> chunk;
+        if(nextThreadChunk_<t::threadChunkCount(lastThreadObservations_)) {
+            chunk=t::captureThreadChunk(lastThreadObservations_,nextThreadChunk_,lastThreadCapturedElapsedMs_,lastThreadCapturedAt_);
+            // Process-global observations may span frames/sessions. Never retry
+            // an uncertain admission; every chunk owns the same frozen registry.
+            ++nextThreadChunk_;
+        }
+        diagnostics::diagnosticOutput(loop,std::move(chunk));
+    }
+}
 void ApplicationController::startStream(const fog::RentalId& rental, bool createdFromCatalog,
                                       const fog::EntityId& computer) {
+    emitPendingFinalPsTelemetry();
     if (fog::stage1::pauseArtwork) {
         artwork_.setPaused(true);
         steamArtwork_.setPaused(true);
     }
     streamPlayStation_ = (rental.provider == fog::ProviderId::Mts && fog::isPlayStationComputerId(computer)) ||
         controllerSettings_.profile == ::stream::ControllerProfile::DualSense;
-    pairedVideoReconnectPending_ = false;
-    pairedTransportReconnectPending_ = false;
     latency_.cancel();
     recentLaunch_.stream(createdFromCatalog);
-    relaySelection_.reset(connectionSettings_);
-    sessionPending_ = true;
-    transportReconnect_.reset();
     loopTiming_.reset(); loopTimingWindowAt_ = loopTimingLifetimeAt_ = std::chrono::steady_clock::now();
     inputSuspensionStats_ = {}; inputFreezeWaiting_ = false;
-    drainTiming_ = {}; presentTiming_ = {}; resetDiagnosticTiming();
-    lastPumpAt_ = {}; lastProtocolLog_ = {}; pumpGapMaxUs_ = 0; outsideMeasuredPumpMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
-    transportPumpTiming_ = {}; videoFeedTiming_ = {}; decoderResetTiming_ = {}; audioFeedTiming_ = {}; prepareTiming_ = {};
-    drainVideoTotal_ = drainVideoMax_ = drainVideoBudgetHits_ = 0;
-    videoQueueWaitMaxMs_ = audioQueueWaitMaxMs_ = lastPumpWorkUs_ = slowPlaybackCycles_ = 0;
-    lastSlowPlaybackLog_ = {};
+    presentTiming_ = {}; resetDiagnosticTiming();
     ++sessionSequence_;
     diagnostic("Stream session=" + std::to_string(sessionSequence_) +
         (createdFromCatalog ? " origin=catalog catalogGameId=" + safeText(selectedGameId_.value) +
@@ -308,388 +238,28 @@ void ApplicationController::startStream(const fog::RentalId& rental, bool create
             " fps=" + std::to_string(videoSettings_.framesPerSecond) +
             " pliSeconds=" + std::to_string(videoSettings_.keyframeSeconds));
         armExitHandling();
-        streamRental_ = rental;
-        if (!startTransport()) {
-            if (stream_->retryableError()) { retryTransport("initial-start"); return; }
-            throw std::runtime_error("Signaling startup failed; stopping rental");
-        }
+        fog::stream::Player::Start playback;
+        playback.rental = rental; playback.video = videoSettings_; playback.connection = connectionSettings_;
+        playback.controller = streamPlayStation_ ? stream::ControllerProfile::DualSense : stream::ControllerProfile::Xbox;
+        const auto result = player_.start(std::move(playback), playerAdmission());
+        applyPlayerEvents(); applyPlayerEffects();
+        if (result == fog::stream::Player::StartResult::Refused) { beginFinish("player-start-refused"); return; }
+        if (result != fog::stream::Player::StartResult::Started) return;
         status_ = uiText::Stream::ConnectingMenuHint;
         diagnostic("Stream connection requested; recovery journal saved.");
     } catch (...) { beginFinish(); throw; }
 }
-
-void ApplicationController::recoverVideoError(const fog::VideoDecodeError& error, const stream::Packet* packet) {
-    loopTiming_.suspendPresentation();
-    ++videoDecodeErrors_;
-    std::string detail = packet ? "Video decode error: " : "Video presentation error: ";
-    detail += error.what();
-    if (packet) detail += " rtpTimestamp=" + std::to_string(packet->timestamp) +
-        " rtpFirstSeq=" + std::to_string(packet->firstSequence) + " rtpLastSeq=" + std::to_string(packet->lastSequence);
-    diagnostic(detail,2048);
-    diagnostic("Video RTP at decode error: " + stream_->videoDiagnostics(),4096);
-    diagnostic("Video gaps at decode error: " + stream_->gapDiagnostics(),4096);
-    diagnostic("Media queue at decode error: " + stream_->queueDiagnostics(),2048);
-    diagnostic("Video decoder at error: " + media_->diagnostics(),2048);
-    if (!error.recoverable()) throw error;
-    if (!videoRecovery_.begin(std::chrono::steady_clock::now()))
-        throw std::runtime_error("Video recovery deadline/reset budget exhausted; stopping rental");
-    suspendVideoInput();
-    stream_->setDecoderWaitingForKeyframe(true);
-    const auto resetStarted = std::chrono::steady_clock::now();
-    media_->resetVideoDecoder();
-    decoderResetTiming_.record(resetStarted);
-    videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now()-resetStarted).count());
-    const bool requested = stream_->requestVideoKeyframe();
-    diagnostic("Video recovery begin; reset=" + std::to_string(videoRecovery_.recentResets()) +
-        " limit=3/60s deadline=10s keyframeRequested=" + std::to_string(requested));
-}
-
-void ApplicationController::feedStreamAudio(const stream::Packet& packet) {
-    const auto now = std::chrono::steady_clock::now();
-    if (videoRecovery_.expired(now))
-        throw std::runtime_error("Video recovery deadline reached; stopping rental");
-    const auto ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
-    audioQueueWaitMaxMs_ = std::max(audioQueueWaitMaxMs_, ms >= packet.enqueueMs ? ms-packet.enqueueMs : 0);
-    const auto before = media_->audioPackets();
-    media_->audio(packet.data.data(), packet.data.size(), packet.enqueueMs);
-    audioFeedTiming_.record(now);
-    if (!before && media_->audioPackets() > before) diagnostic("First Opus packet decoded.");
-}
-void ApplicationController::drainStreamAudio() {
-    if (media_->workersRunning()) return;
-    const auto started = std::chrono::steady_clock::now();
-    stream::Packet packet;
-    // Independent bounded audio slice, including when video exhausts its budget.
-    for (unsigned n = 0; n < 12; ++n) {
-        if (n && std::chrono::steady_clock::now()-started >= std::chrono::milliseconds(3)) break;
-        if (!stream_->pollAudio(packet)) break;
-        feedStreamAudio(packet);
-    }
-}
-void ApplicationController::pumpStream(PadState& pad, u64 held, u64 down) {
-    samplePlayStationInput(pad);
-    const auto pumpAt = std::chrono::steady_clock::now();
-    std::uint64_t pumpGapUs = 0;
-    const auto previousPumpWorkUs = lastPumpWorkUs_;
-    std::uint64_t transportWorkUs = 0;
-    // Consume queued terminal/remote-close events before any timeout can replace
-    // this transport; a local deadline must never turn them into another retry.
-    if (stream_) {
-        if (lastPumpAt_ != std::chrono::steady_clock::time_point{}) {
-            const auto gap = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(pumpAt-lastPumpAt_).count());
-            pumpGapUs = gap;
-            pumpGapMaxUs_ = std::max(pumpGapMaxUs_, gap);
-            outsideMeasuredPumpMaxUs_ = std::max(outsideMeasuredPumpMaxUs_, gap > previousPumpWorkUs ? gap-previousPumpWorkUs : 0);
-        }
-        lastPumpAt_ = pumpAt;
-        const auto transportStarted = std::chrono::steady_clock::now();
-        stream_->pump();
-        retryMouseReleases();
-        retryKeyReleases();
-        pumpTypedText();
-        retryGamepadRelease();
-        logIncomingControl();
-        if (streamRental_.provider == fog::ProviderId::FogHub)
-            overlay_.setVideoChangesEnabled(stream_->ready());
-        transportPumpTiming_.record(transportStarted);
-        transportWorkUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now()-transportStarted).count());
-        const auto streamState = stream_->status();
-        const bool stateChanged = streamState != lastStreamState_;
-        if (stateChanged) {
-            lastStreamState_ = streamState;
-            diagnostic("Stream stage: " + streamState);
-        }
-        // Build the mutex-protected snapshot only when a log is actually due.
-        if (stateChanged || !stream_->error().empty() ||
-            pumpAt-lastProtocolLog_ >= std::chrono::seconds(fog::stage1::sparseDiagnostics ? 15 : 5)) {
-            const auto details = stream_->diagnostics();
-            if (details != lastStreamDiagnostics_) {
-                lastStreamDiagnostics_ = details;
-                diagnostic("Stream protocol: " + details,2048);
-            }
-            diagnostic("Stream DTLS: " + stream_->dtlsDiagnostics(),8192);
-            diagnostic("Stream RTCP: " + stream_->rtcpDiagnostics(),4096);
-            diagnostic("Stream transport: " + stream_->transportTimings(),4096);
-            diagnostic("Stream mutex: " + stream_->mutexDiagnostics(),4096);
-            lastProtocolLog_ = pumpAt;
-        }
-        if (!stream_->error().empty()) diagnostic("Stream error: " + safeText(stream_->error()));
-    }
-    // Consume transport events before overlay commands; menu/stop intent still
-    // precedes every retry/replacement. No decode, conversion or upload has run.
-    bool overlayHandled = false;
-    if (screen_ == Screen::Streaming) {
-        overlayHandled = handleStreamOverlay(pad, held, down);
-        if (screen_ != Screen::Streaming || stopAfterTask_ || streamRental_.empty()) return;
-    }
-    if (!handleTransportState(pumpAt)) return;
-    if (!advanceTransportRecovery(std::chrono::steady_clock::now())) return;
-    const bool lossWaiting = stream_->waitingForVideoKeyframe();
-    if (lossWaiting && !videoLossWaiting_) {
-        loopTiming_.suspendPresentation();
-        suspendVideoInput();
-    }
-    videoLossWaiting_ = lossWaiting;
-    const auto suspension = fog::stage1::inputFreezeGate ? stream_->inputSuspension() : stream::InputSuspension{};
-    const auto inputObservedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
-    inputSuspensionStats_.observe(suspension,inputObservedMs);
-    if (suspension.suspended() && !inputFreezeWaiting_) {
-        // Input-only freeze: preserve LoopTiming's displayed-frame anchor and
-        // the existing keyframe/recovery banner semantics.
-        suspendVideoInput();
-    }
-    inputFreezeWaiting_ = suspension.suspended();
-    const auto diagnosticNow = std::chrono::steady_clock::now();
-    // SD lines are durable: drain a bounded event ring at most once per second,
-    // not on each RTP packet. Periodic counters include suppressed events.
-    if (diagnosticNow - lastVideoEventLog_ >= std::chrono::seconds(1)) {
-        std::string event;
-        if (stream_->pollVideoDiagnostic(event)) diagnostic("Video RTP event: " + event);
-        lastVideoEventLog_ = diagnosticNow;
-    }
-    if (videoRecovery_.expired(std::chrono::steady_clock::now()))
-        throw std::runtime_error("Video recovery deadline reached; stopping rental");
-    if (media_->workersRunning()) {
-        fog::Media::WorkerError failure;
-        if (media_->takeWorkerError(failure)) {
-            try { std::rethrow_exception(failure.error); }
-            catch (const fog::VideoDecodeError& error) {
-                recoverVideoError(error, failure.hasPacket ? &failure.packet : nullptr);
-            }
-        }
-        const auto generation = media_->workerVideoGeneration();
-        if (generation && generation != lastVideoGeneration_) {
-            lastVideoGeneration_ = generation;
-            loopTiming_.suspendPresentation();
-            suspendVideoInput();
-            diagnostic("Video chain resync: worker generation=" + std::to_string(generation));
-        }
-    }
-    // All current prohibitions (transport, menu, loss, decoder error and worker
-    // generation) have been applied. Send the sampled state before media work;
-    // a frame prepared below can only resume input on the next fresh sample.
-    if (fog::stage1::earlyInput) sendStreamInput(pad, held, overlayHandled);
-    media_->checkAudioRecovery();
-    drainStreamAudio();
-    stream::Packet packet;
-    int drained = 0;
-    const auto decoderResetBeforeUs = decoderResetTiming_.totalUs;
-    const auto drainStarted = std::chrono::steady_clock::now();
-    const auto queuedBeforeDrain = stream_->queuedVideoPackets();
-    const auto drainPolicy = streamRental_.provider == fog::ProviderId::FogHub
-        ? fog::stream::PlaybackDrainPolicy::BoundedQueue
-        : fog::stage1::mtsCatchup ? (fog::stage1::mtsCatchupAgeGuard
-            ? fog::stream::PlaybackDrainPolicy::PresentationFirst
-            : fog::stream::PlaybackDrainPolicy::ImmediatePresentationFirst)
-        : fog::stream::PlaybackDrainPolicy::LegacyPresentationFirst;
-    fog::stream::PlaybackDrainBudget drainBudget(queuedBeforeDrain, stream_->queuedVideoAgeMs(), drainPolicy, activeFramesPerSecond_);
-    if (!media_->workersRunning() && drainBudget.catchup()) ++catchupWindows_;
-    // Keep compressed references in FIFO order. Bound both work time and the
-    // number of video frames before presentation, audio and the next input turn.
-    while (!media_->workersRunning()) {
-        const auto elapsedUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now()-drainStarted).count());
-        const auto yield = drainBudget.yield(elapsedUs);
-        if (yield != fog::stream::PlaybackDrainBudget::Yield::None) {
-            if (yield == fog::stream::PlaybackDrainBudget::Yield::Video) ++drainVideoBudgetHits_;
-            if (yield == fog::stream::PlaybackDrainBudget::Yield::Time) ++drainBudgetHits_;
-            break;
-        }
-        if (!stream_->poll(packet)) break;
-        ++drained;
-        drainBudget.consumed(packet.kind == stream::Kind::Video);
-        const auto dequeueMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-        const auto waitMs = dequeueMs >= packet.enqueueMs ? dequeueMs-packet.enqueueMs : 0;
-        auto& waitMaximum = packet.kind == stream::Kind::Video ? videoQueueWaitMaxMs_ : audioQueueWaitMaxMs_;
-        waitMaximum = std::max(waitMaximum, waitMs);
-        if (videoRecovery_.expired(std::chrono::steady_clock::now()))
-            throw std::runtime_error("Video recovery deadline reached; stopping rental");
-        if (packet.kind == stream::Kind::Video) {
-            try {
-                media_->setVideoCodec(stream_->selectedVideoCodec());
-                if (packet.videoGeneration != lastVideoGeneration_) {
-                    loopTiming_.suspendPresentation();
-                    const auto resetStarted = std::chrono::steady_clock::now();
-                    media_->resetVideoDecoder();
-                    decoderResetTiming_.record(resetStarted);
-                    const auto resetUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now()-resetStarted).count());
-                    videoWorkUs_ += resetUs;
-                    lastVideoGeneration_ = packet.videoGeneration;
-                    suspendVideoInput();
-                    diagnostic("Video chain resync: decoder reset generation=" + std::to_string(lastVideoGeneration_));
-                }
-            } catch (const fog::VideoDecodeError& error) {
-                recoverVideoError(error,&packet);
-                continue;
-            }
-            const auto workStarted = std::chrono::steady_clock::now();
-            try { media_->video(packet.data.data(), packet.data.size(), packet.firstPacketMs, packet.enqueueMs); }
-            catch (const fog::VideoDecodeError& error) {
-                videoFeedTiming_.record(workStarted);
-                videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - workStarted).count());
-                recoverVideoError(error,&packet);
-                continue;
-            }
-            videoFeedTiming_.record(workStarted);
-            videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - workStarted).count());
-            if (videoRecovery_.expired(std::chrono::steady_clock::now()))
-                throw std::runtime_error("Video recovery deadline reached; stopping rental");
-        } else {
-            feedStreamAudio(packet);
-        }
-    }
-    drainStreamAudio();
-    drainVideoTotal_ += drainBudget.video();
-    drainVideoMax_ = std::max(drainVideoMax_, static_cast<std::uint64_t>(drainBudget.video()));
-    const auto presentationStarted = std::chrono::steady_clock::now();
-    bool prepared = false;
-    try { prepared = media_->preparePresentation(pumpAt); }
-    catch (const fog::VideoDecodeError& error) {
-        videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now()-presentationStarted).count());
-        recoverVideoError(error,nullptr);
-    }
-    prepareTiming_.record(presentationStarted);
-    const auto prepareWorkUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now()-presentationStarted).count());
-    if (prepared) {
-        videoWorkUs_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now()-presentationStarted).count());
-        if (videoRecovery_.expired(std::chrono::steady_clock::now()))
-            throw std::runtime_error("Video recovery deadline reached; stopping rental");
-        lastVideo_ = std::chrono::steady_clock::now();
-        rememberDecodedGame();
-        // Startup also waits for the decoder's first image, without a recovery episode.
-        stream_->setDecoderWaitingForKeyframe(false);
-        if (videoRecovery_.active()) {
-            diagnostic("Video recovery succeeded; frames=" + std::to_string(media_->videoFrames()) +
-                " width=" + std::to_string(media_->videoWidth()) + " height=" + std::to_string(media_->videoHeight()));
-            videoRecovery_.decoded();
-        }
-        if (transportReconnect_.recovering() && stream_->ready() && !stream_->disconnected() &&
-            transportReconnect_.prepared(std::chrono::steady_clock::now())) {
-            diagnostic("Transport recovery succeeded; attemptsIn120s=" + std::to_string(transportReconnect_.attempts()));
-            status_ = uiText::Stream::RestoredMenuHint;
-        }
-        if (!transportReconnect_.recovering() && stream_->ready() && !stream_->disconnected())
-            relaySelection_.connected();
-        // Queue recovery may finish before the decoder produces an image. Resume
-        // only after this generation has successfully prepared a visible frame.
-        videoLossWaiting_ = stream_->waitingForVideoKeyframe();
-        streamInputGate_.videoPrepared(transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe() ||
-            (fog::stage1::inputFreezeGate && stream_->inputSuspended()));
-        if (!firstFramePresented_) {
-            diagnostic(media_->hardwareVideo() ? "First video frame prepared (hardware)." : "First video frame prepared (software).");
-            firstFramePresented_ = true;
-        }
-    }
-    drainTiming_.record(drainStarted);
-    const auto measuredAt = std::chrono::steady_clock::now();
-    lastPumpWorkUs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(measuredAt-pumpAt).count());
-    // One alert per second at most; periodic aggregates count all stalls.
-    // The previous measured work distinguishes an app-thread gap from slow media work.
-    if (pumpGapUs >= 50000 || lastPumpWorkUs_ >= 50000) {
-        ++slowPlaybackCycles_;
-        if (measuredAt-lastSlowPlaybackLog_ >= std::chrono::seconds(1)) {
-            diagnostic("Playback slow cycle: pumpGapUs=" + std::to_string(pumpGapUs) +
-                " outsideMeasuredPumpUs=" + std::to_string(pumpGapUs > previousPumpWorkUs ? pumpGapUs-previousPumpWorkUs : 0) +
-                " previousPumpMeasuredUs=" + std::to_string(previousPumpWorkUs) +
-                " pumpMeasuredUs=" + std::to_string(lastPumpWorkUs_) +
-                " transportUs=" + std::to_string(transportWorkUs) +
-                " mediaBatchUs=" + std::to_string(static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(measuredAt-drainStarted).count())) +
-                " prepareUs=" + std::to_string(prepareWorkUs) +
-                " decoderResetUs=" + std::to_string(decoderResetTiming_.totalUs-decoderResetBeforeUs) +
-                " videoDrained=" + std::to_string(drainBudget.video()) +
-                " videoBefore=" + std::to_string(queuedBeforeDrain) +
-                " videoAfter=" + std::to_string(stream_->queuedVideoPackets()) +
-                " drained=" + std::to_string(drained), 1024);
-            lastSlowPlaybackLog_ = measuredAt;
-        }
-    }
-    // Presentation counts come from the preceding completed RenderPresent, never
-    // repeated drawing of an old texture or decoding alone.
-    const auto workerLoad = media_->workerVideoLoad();
-    if (streamRental_.provider == fog::ProviderId::Mts) stream_->observePlayback({media_->presentedFrames(), media_->videoFrames(), media_->supersededFrames(),
-        videoWorkUs_, videoDecodeErrors_, media_->audioUnderruns(), media_->audioQueueResets(),
-        transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ || media_->waitingForVideoKeyframe(),
-        media_->videoWidth(), media_->videoHeight(), workerLoad.decodeUs + workerLoad.convertUs, workerLoad.generation, media_->workersRunning()});
-    const auto now = std::chrono::steady_clock::now();
-    if (now-lastMediaLog_ >= std::chrono::seconds(fog::stage1::sparseDiagnostics ? 15 : 5)) {
-        diagnostic("Media video=" + std::to_string(media_->videoFrames()) +
-            " opus=" + std::to_string(media_->audioPackets()) +
-            " hardware=" + std::to_string(media_->hardwareVideo()) +
-            " controlReady=" + std::to_string(stream_->ready()) +
-            " width=" + std::to_string(media_->videoWidth()) + " height=" + std::to_string(media_->videoHeight()) +
-            " recovering=" + std::to_string(videoRecovery_.active()) +
-            " waitingIDR=" + std::to_string(media_->waitingForVideoKeyframe()));
-        diagnostic("Video RTP: " + stream_->videoDiagnostics(),4096);
-        diagnostic("Video gaps: " + stream_->gapDiagnostics(),4096);
-        diagnostic("Media queue: " + stream_->queueDiagnostics(),2048);
-        diagnostic("Video decoder: " + media_->diagnostics(),4096);
-        diagnostic("Audio playback: " + media_->audioDiagnostics(),2048);
-        const auto serverPerformance = stream_->serverPerformanceDiagnostics();
-        if (!serverPerformance.empty()) diagnostic("Server performance: " + serverPerformance,2048);
-        const auto controlDelivery = stream_->controlDeliveryDiagnostics();
-        if (!controlDelivery.empty()) diagnostic("Control delivery: " + controlDelivery,2048);
-        lastMediaLog_ = now;
-    }
-    // Keep the short latency/loop windows comparable with the 5-second base,
-    // independently of the less frequent verbose transport/decoder dumps.
-    if (now-lastMetricsLog_ >= std::chrono::seconds(5)) {
-        diagnostic("Playback load: workers=" + std::to_string(media_->workersRunning()) +
-            " generation=" + std::to_string(workerLoad.generation) +
-            " workerDecodeUs=" + std::to_string(workerLoad.decodeUs) +
-            " workerConvertUs=" + std::to_string(workerLoad.convertUs) +
-            " uiVideoUs=" + std::to_string(videoWorkUs_));
-        logOutputTimings(false);
-        const auto timings = playbackTimings(true);
-        drainTiming_ = {}; presentTiming_ = {};
-        pumpGapMaxUs_ = 0; outsideMeasuredPumpMaxUs_ = 0; drainBudgetHits_ = 0; catchupWindows_ = 0;
-        transportPumpTiming_ = {}; videoFeedTiming_ = {}; decoderResetTiming_ = {}; audioFeedTiming_ = {}; prepareTiming_ = {};
-        drainVideoTotal_ = drainVideoMax_ = drainVideoBudgetHits_ = 0;
-        videoQueueWaitMaxMs_ = audioQueueWaitMaxMs_ = slowPlaybackCycles_ = 0;
-        diagnostic(timings,2048);
-        lastMetricsLog_ = now;
-    }
-    if (videoRecovery_.expired(now)) throw std::runtime_error("Video recovery deadline reached; stopping rental");
-    if (!transportReconnect_.recovering() && (!firstFramePresented_ || !stream_->ready()) &&
-        now-streamStarted_ >= std::chrono::seconds(30)) {
-        retryTransport("startup-timeout"); return;
-    }
-    if (!transportReconnect_.recovering() && !videoRecovery_.active() &&
-        now-lastVideo_ >= std::chrono::seconds(firstFramePresented_ ? 10 : 30)) {
-        retryTransport("media-timeout"); return;
-    }
-    if (!fog::stage1::earlyInput) sendStreamInput(pad, held, overlayHandled);
-
-}
-
 void ApplicationController::sendStreamInput(PadState& pad, u64 held, bool overlayHandled) {
-    if (screen_ != Screen::Streaming || stopAfterTask_ || exitAfterStop_ || !stream_ || !media_) return;
+    const auto playback = player_.snapshot();
+    auto* sink = player_.inputSink();
+    if (screen_ != Screen::Streaming || rentalSession_.requested() || exitAfterStop_ || !sink || !playback.media) return;
     const auto now = std::chrono::steady_clock::now();
-    const bool inputAllowed = firstFramePresented_ &&
-        streamInputGate_.gamepadAllowed(overlayHandled) &&
-        !stream_->waitingForVideoKeyframe() && !media_->waitingForVideoKeyframe() &&
-        (!fog::stage1::inputFreezeGate || !stream_->inputSuspended()) &&
-        (media_->workersRunning() ? media_->workerVideoGeneration() == lastVideoGeneration_
-            : stream_->currentVideoGeneration() == lastVideoGeneration_) &&
-        !stream_->disconnected() && stream_->recoveryState() == stream::RecoveryState::Connected &&
-        !videoRecovery_.expired(now) && now-lastVideo_ < std::chrono::seconds(10);
-    dispatchPlayStationInput(inputAllowed && !transportReconnect_.recovering() && !videoRecovery_.active() &&
-        !videoLossWaiting_ && stream_->ready());
+    const bool inputAllowed = playback.inputAllowed && streamInputGate_.gamepadAllowed(overlayHandled);
+    dispatchPlayStationInput(inputAllowed);
     if (!inputAllowed || (streamPlayStation_ && !psNativeInput_.contactsInitialized())) return;
     const auto inputNowMs=static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
     const bool psTouching = streamPlayStation_ && psNativeInput_.click(inputNowMs,psTouchLastSubmitted_);
-    if (transportReconnect_.recovering() || videoRecovery_.active() || videoLossWaiting_ ||
-        !stream_->ready()) return;
+    if (!playback.inputAllowed) return;
     stream::Gamepad gamepad;
     const std::array<u64,16> buttons{HidNpadButton_B,HidNpadButton_A,HidNpadButton_Y,HidNpadButton_X,
         HidNpadButton_L,HidNpadButton_R,HidNpadButton_ZL,HidNpadButton_ZR,HidNpadButton_Minus,HidNpadButton_Plus,
@@ -707,12 +277,53 @@ void ApplicationController::sendStreamInput(PadState& pad, u64 held, bool overla
     gamepad.rightTrigger = (held & HidNpadButton_ZR) ? 1.0f : 0.0f;
     if (!gamepadSchedule_.due(gamepad, now)) return;
     gamepad.sampledAtUs = padSampledAtUs_;
-    const bool accepted = stream_->sendGamepad(gamepad);
+    const bool accepted = sink->sendGamepad(gamepad);
     if (accepted) gamepadSchedule_.accepted(gamepad, now);
     if (streamPlayStation_) {
         if (accepted) { ++psGamepadAccepted_; psTouchLastSubmitted_ = psTouching; }
         else ++psGamepadRejected_;
     }
+}
+
+bool ApplicationController::networkEvents(const stream::telemetry::network::NetworkEvent* events,std::size_t count,bool final) noexcept {
+    return diagnostics::diagnosticNetworkEvents(diagnostics::diagnosticElapsedMs(),events,count,final);
+}
+void ApplicationController::networkEventsDiscarded(unsigned count) noexcept {
+    while(count--)runLog.appendDeferred({});
+}
+bool ApplicationController::controlDiscoveryEvents(const stream::telemetry::network::ControlDiscoveryEvent* values,std::size_t count) noexcept {
+    return diagnostics::diagnosticControlDiscovery(diagnostics::diagnosticElapsedMs(),values,count);
+}
+void ApplicationController::controlDiscoveryDiscarded(unsigned count) noexcept {
+    while(count--)runLog.appendDeferred({});
+}
+void ApplicationController::captureFailed(fog::stream::PlayerDiagnosticPhase) noexcept {runLog.appendDeferred({});}
+void ApplicationController::report(fog::stream::PlayerDiagnosticPhase phase,const fog::stream::PlayerDiagnosticSnapshot& captured) noexcept {
+    using Phase=fog::stream::PlayerDiagnosticPhase;
+    try {
+        const auto elapsed=diagnostics::diagnosticElapsedMs();
+        if(phase==Phase::Control) {
+            for(const auto& line:captured.controls)diagnostic("Stream control: "+line,2048);
+            for(const auto& line:captured.videoEvents)diagnostic(std::string(captured.finalFlush?"Stream final event: ":"Video RTP event: ")+line,2048);
+            return;
+        }
+        if(phase==Phase::Protocol) {
+            if(captured.stateChanged)diagnostic("Stream stage: "+captured.status);
+            if(!captured.error.empty())diagnostic("Stream error: "+safeText(captured.error));
+        } else if(phase==Phase::Closed) {
+            if(captured.reaperJoined)diagnostic("Moonlight teardown joined; retry="+std::to_string(captured.retry)+" allowed="+std::to_string(captured.allowed));
+        } else if(phase==Phase::DecodeError) {
+            std::string detail=captured.hasPacket?"Video decode error: ":"Video presentation error: ";
+            detail+=safeText(captured.error,1800);
+            if(captured.hasPacket)detail+=" rtpTimestamp="+std::to_string(captured.rtpTimestamp)+" rtpFirstSeq="+std::to_string(captured.firstSequence)+" rtpLastSeq="+std::to_string(captured.lastSequence);
+            diagnostic(detail,2048);
+        }
+        const auto playback=(phase==Phase::Final||phase==Phase::Metrics)?playbackSnapshot(captured.playback,phase==Phase::Metrics):captured.playback;
+        diagnostics::diagnosticPlayer(elapsed,phase,captured,playback,{inputSuspensionStats_,static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()),fog::stage1::inputFreezeGate,streamPlayStation_,(phase==Phase::Final||phase==Phase::Metrics)?rumble_.captureTelemetry():stream::telemetry::rumble::Snapshot{}});
+        if(phase==Phase::Final||phase==Phase::Metrics)logOutputTimings(phase==Phase::Final);
+        if(phase==Phase::Metrics)presentTiming_={};
+    } catch (...) {} // Diagnostics never interrupt rental cleanup.
 }
 
 }

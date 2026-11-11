@@ -85,6 +85,7 @@ int main(void) {
         assert(rtpCalls == (scenario == 8 || scenario == 9 ? 2 : 0));
         assert(snapshot.videoReceiveDecryptCount == (scenario == 7 || scenario == 8 ? 2 : 0));
         assert(snapshot.videoDecryptFailures == (scenario == 7 ? 2 : 0));
+        assert(snapshot.videoDecryptSuccesses == (scenario == 8 ? 2 : 0));
         assert(snapshot.videoRuntPackets == (scenario == 5 ? 2 : 0));
         assert(snapshot.videoReceiveErrors == (scenario == 1 ? 1 : 0));
     }

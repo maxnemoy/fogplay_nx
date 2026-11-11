@@ -1,4 +1,5 @@
 #include "platform/switch/rumble.hpp"
+#include "features/streaming/application/rumble_diagnostics_formatter.hpp"
 #include <algorithm>
 
 namespace fogplay::platform {
@@ -103,11 +104,14 @@ void Rumble::update(const PadState& pad, const stream::Rumble* feedback,
     apply(nowMs);
 }
 
-std::string Rumble::diagnostics() const {
-    return "Rumble received=" + std::to_string(received_) + " applied=" + std::to_string(applied_) +
-        " stops=" + std::to_string(stops_) + " failures=" + std::to_string(failures_) +
-        " result=" + std::to_string(lastResult_) + " npad=" + std::to_string(npadId_) +
-        " style=" + std::to_string(style_) + " handles=" + std::to_string(count_) +
-        " mapping=" + fog::rumble::modeId(mode_);
+stream::telemetry::rumble::Snapshot Rumble::captureTelemetry() const noexcept {
+    using Mapping=stream::telemetry::rumble::Mapping;
+    Mapping mapping=Mapping::Invalid;
+    switch(mode_){case fog::rumble::Mode::Balanced:mapping=Mapping::Balanced;break;
+        case fog::rumble::Mode::DualBand:mapping=Mapping::DualBand;break;
+        case fog::rumble::Mode::Chromium:mapping=Mapping::Chromium;break;
+        case fog::rumble::Mode::Disabled:mapping=Mapping::Disabled;break;}
+    return {received_,applied_,stops_,failures_,lastResult_,style_,count_,npadId_,mapping};
 }
+std::string Rumble::diagnostics() const {return stream::telemetry::rumble::rumbleText(captureTelemetry());}
 }

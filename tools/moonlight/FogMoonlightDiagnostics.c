@@ -10,7 +10,7 @@ _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "Diagnostics require lock-free 64-bi
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "Diagnostics require lock-free pointer atomics");
 static _Atomic unsigned long long counters[FOG_DIAG_COUNT];
 static _Atomic(const void*) decodeQueue;
-enum { EVENT_CAPACITY = 256 };
+enum { EVENT_CAPACITY = FOG_MOONLIGHT_EVENT_CAPACITY };
 static FogMoonlightEvent events[EVENT_CAPACITY];
 static atomic_bool eventBusy;
 static _Atomic unsigned long long eventContention, connectionId;
@@ -155,6 +155,10 @@ void FogDiagReset(void) {
     hasIdleIdrHint = false;
 }
 
+void FogDiagSet(FogDiagCounter counter, uint64_t value) {
+    atomic_store_explicit(&counters[counter], value, memory_order_relaxed);
+}
+
 void FogDiagAdd(FogDiagCounter counter, uint64_t amount) {
     atomic_fetch_add_explicit(&counters[counter], amount, memory_order_relaxed);
 }
@@ -165,6 +169,10 @@ void FogDiagVideoPacket(uint64_t bytes, uint64_t nowUs) {
                                                        nowUs, memory_order_relaxed);
     if (previous && nowUs >= previous) {
         setMaximum(FOG_DIAG_maxVideoPacketGapUs, nowUs - previous);
+        // A sparse timestamped observation joins receive silence to nearby
+        // recovery events. No allocation, I/O or waiting on the receive thread.
+        if (nowUs - previous > 50000)
+            recordEvent(FOG_EVENT_VIDEO_PACKET_GAP, 0, nowUs - previous, nowUs, UINT64_MAX);
     }
     FogDiagAdd(FOG_DIAG_videoPacketsReceived, 1);
     FogDiagAdd(FOG_DIAG_videoBytesReceived, bytes);

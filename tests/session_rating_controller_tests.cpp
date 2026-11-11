@@ -1,3 +1,4 @@
+#include "features/session/application/rental_session_coordinator.hpp"
 #include "app/application_controller.hpp"
 #include "features/session/presentation/session_rating_text.hpp"
 #include <iostream>
@@ -61,7 +62,7 @@ int main() {
           check(c.rating_.score() == 1,"same-session draft survives later/manual reopen"); }
         for (int blocked=0; blocked<6; ++blocked) {
             ApplicationController c;
-            if (blocked==0) c.sessionPending_=true;
+            if (blocked==0) c.rentalSession_.snapshot.pending=true;
             if (blocked==1) c.exitAfterStop_=true;
             if (blocked==2) c.shutdownDone_=true;
             if (blocked==3) c.service.authentication.active=false;
@@ -92,19 +93,20 @@ int main() {
           c.completeSessionRatingLoad(std::get<std::optional<fog::SessionRatingForm>>(c.join())); c.submitSessionRating();
           check(c.rating_.alreadyRated() && c.rating_.state()==State::Sent && !c.pending_.valid(),
               "already-rated evidence shows success without another POST"); }
-        { ApplicationController c; fog::PairedCheckoutResult ended;
+        { ApplicationController c; fog::RentalSessionCoordinator::PairedView ended;
           ended.state=fog::PairedCheckoutState::Terminal; ended.rental=rental();
-          c.stopAfterTask_=true; c.ratingFocusLost_=true; ratingTestFocused=true;
+          c.rentalSession_.request(); c.ratingFocusLost_=true; ratingTestFocused=true;
           check(!c.offerSessionRating(ended) && !c.pending_.valid(),"HOME stop never auto-loads even after focus returns");
-          c.stopAfterTask_=false;
-          check(!c.offerSessionRating(ended) && !c.pending_.valid(),"clearing stopAfterTask after confirmed stop retains HOME suppression");
+          c.rentalSession_.clearRequest();
+          check(!c.offerSessionRating(ended) && !c.pending_.valid(),"clearing stop request after confirmed stop retains HOME suppression");
           check(c.openSessionRating(rental()),"manual profile can offer deferred HOME rating later"); c.join(); }
-        { ApplicationController c; fog::PairedCheckoutResult blocked;
+        { ApplicationController c; fog::RentalSessionCoordinator::PairedView blocked;
           blocked.preparationError=fog::RepositoryErrorKind::ReviewRequired;
           check(!c.offerSessionRating(blocked) && !c.pending_.valid(),"unknown blocker never falls back to another pending session");
           blocked.requiredRating=rental("exact-blocker");
           check(c.offerSessionRating(blocked),"verified blocker opens exact target"); c.join();
           check(c.service.repository.requested==rental("exact-blocker"),"preflight rating uses exact blocker, not latest pending"); }
         std::cout << "Rating production controller: " << assertions << " assertions passed\n";
+        return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
